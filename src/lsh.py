@@ -84,3 +84,58 @@ class CrossPolytopeLSH(LSH):
             signatures[:, i] = max_idx * 2 + (signs > 0).astype(int)
 
         return signatures
+
+
+class TurboQuantLSH(LSH):
+    def __init__(self, dim: int, num_rows: int, num_buckets: int):
+        """
+        Proxy for a TurboQuant-style LSH (Random Orthogonal Preconditioning + Quantization).
+        Uses orthogonal rotation matrices to isotropize the data, followed by 1-bit
+        scalar quantization, which is then universally hashed into bucket IDs.
+
+        Args:
+            dim: The dimensionality of the vectors.
+            num_rows: Number of independent hash tables (maps to CMS rows / K).
+            num_buckets: The size of each hash table (maps to N).
+        """
+        super().__init__(dim)
+        self.num_rows = num_rows
+        self.num_buckets = num_buckets
+
+        # 1. Generate random orthogonal matrices for each row
+        self.rotations = np.zeros((num_rows, dim, dim))
+        for i in range(num_rows):
+            # Generate a random orthogonal matrix using QR decomposition
+            # of a standard normal matrix (Haar measure proxy)
+            H = np.random.randn(dim, dim)
+            Q, R = np.linalg.qr(H)
+
+            # Ensure a uniform distribution of signs to prevent reflection bias
+            D = np.diag(np.sign(np.diag(R)))
+            self.rotations[i] = Q @ D
+
+        # 2. Random weights to hash the d-dimensional bit-vectors down to num_buckets
+        # We use large primes/random integers for a simple universal hash step
+        self.hash_weights = np.random.randint(1, 10000000, size=(num_rows, dim))
+
+    def hash(self, vectors: np.ndarray) -> np.ndarray:
+        n_samples = vectors.shape[0]
+        signatures = np.zeros((n_samples, self.num_rows), dtype=int)
+
+        for i in range(self.num_rows):
+            # Step 1: Isotropization
+            # Orthogonal rotation perfectly preserves L2 distances while forcing
+            # the embedding into a uniform distribution across all axes.
+            rotated = vectors @ self.rotations[i].T
+
+            # Step 2: 1-bit Scalar Quantization
+            # Converts the rotated floats into a discrete boolean signature
+            bits = (rotated > 0).astype(int)
+
+            # Step 3: Bucket Hashing
+            # Reduce the dim-length bit vector to an integer bucket ID [0, num_buckets - 1]
+            bucket_ids = (bits @ self.hash_weights[i]) % self.num_buckets
+
+            signatures[:, i] = bucket_ids
+
+        return signatures
