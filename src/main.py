@@ -2,12 +2,12 @@ from filters.pyfusefilter_filters import Xor8Filter, Xor16Filter, Fuse8Filter, F
 from filters.cuckoo_filter import CuckooFilter
 from filters.bloom_filter import BloomFilter
 from filters.naive_filter import NaiveFilter
+from filters.ribbon_filter import RibbonFilter
 from lsh import CrossPolytopeLSH, SimHashLSH
-import numpy as np
 from util.fetch_datasets import load_embeds
 
 def main():
-    filters = [Xor8Filter, Xor16Filter, Fuse8Filter, Fuse16Filter, CuckooFilter, BloomFilter]
+    filters = [Xor8Filter, Xor16Filter, Fuse8Filter, Fuse16Filter, CuckooFilter, BloomFilter, RibbonFilter]
     lsh_families = [SimHashLSH, CrossPolytopeLSH]
     num_vectors = 10000
     num_vectors_construct = 9000
