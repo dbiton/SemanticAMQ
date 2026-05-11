@@ -49,8 +49,8 @@ class Fuse8Filter(PyFuseFilter):
         self.filter.populate(hashes)
 
     def query(self, vectors: np.ndarray) -> List[bool]:
-        hash = self.lsh.hash(vectors.reshape(1, -1))[0]
-        return self.filter.contains(hash)
+        hashes = self.lsh.hash(vectors)
+        return [self.filter.contains(hash) for hash in hashes]
 
 
 class Fuse16Filter(PyFuseFilter):
