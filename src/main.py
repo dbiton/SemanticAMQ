@@ -7,6 +7,7 @@ import sys
 # Your specific imports
 from filters.pyfusefilter_filters import Xor8Filter, Xor16Filter, Fuse8Filter, Fuse16Filter
 from filters.cuckoo_filter import CuckooFilter
+from filters.lsh_bloom import LSHBloom
 from filters.bloom_filter import BloomFilter
 from filters.naive_filter import NaiveFilter
 from lsh import CrossPolytopeLSH, SimHashLSH
@@ -40,7 +41,7 @@ def save_fnr_plot(df, filename="fnr_vs_memory.png"):
     print(f"FNR plot saved to {filename}")
 
 def main():
-    filters = [Xor8Filter, Xor16Filter, Fuse8Filter, Fuse16Filter, CuckooFilter, BloomFilter]
+    filters = [Xor8Filter, Xor16Filter, Fuse8Filter, Fuse16Filter, CuckooFilter, BloomFilter, LSHBloom]
     lsh_families = [SimHashLSH, CrossPolytopeLSH]
     num_vectors = 1000
     num_vectors_construct = 900

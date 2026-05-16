@@ -15,7 +15,8 @@ class LSHBloom(Filter):
         threshold: float = 0.5, 
         num_perm: int = 128, 
         n: int = 1000, 
-        fp: float = 0.01
+        fp: float = 0.01,
+        lsh = None
     ):
         """
         Args:
