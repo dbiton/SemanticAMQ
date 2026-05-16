@@ -12,3 +12,4 @@ wordfreq
 xgboost
 pymilvus
 hnswlib
+datasketch[bloom]
