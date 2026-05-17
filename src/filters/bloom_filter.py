@@ -4,6 +4,7 @@ from lsh import LSH
 from typing import Optional, List
 from filters.filter import Filter
 
+
 class BloomFilter(Filter):
     """
     Wrapper around pybloom_live.BloomFilter.
@@ -31,6 +32,13 @@ class BloomFilter(Filter):
         self.filter: _BloomFilter = _BloomFilter(
             capacity=capacity, error_rate=error_rate
         )
+
+    def get_exact_matching_fpr(self) -> float:
+        """
+        Returns the configured exact-matching False Positive Rate (FPR)
+        of the underlying Bloom Filter, completely ignoring the LSH layer.
+        """
+        return float(self._error_rate)
 
     def construct(self, vectors: np.ndarray) -> None:
         """Populate the filter from a batch of vectors."""
@@ -77,6 +85,16 @@ class ScalableBloomFilter(Filter):
             initial_capacity=initial_capacity, error_rate=error_rate
         )
 
+    def get_exact_matching_fpr(self) -> float:
+        """
+        Returns the bounded exact-matching False Positive Rate (FPR)
+        of the Scalable Bloom Filter, completely ignoring the LSH layer.
+        
+        The scalable variant dynamically adds internal filters with tighter 
+        bounds to ensure the cumulative exact matching FPR stays below this limit.
+        """
+        return float(self._error_rate)
+
     def construct(self, vectors: np.ndarray) -> None:
         """Populate the filter from a batch of vectors."""
         self.filter = _ScalableBloomFilter(
@@ -91,5 +109,3 @@ class ScalableBloomFilter(Filter):
         """Return a per-vector list of membership booleans."""
         hashes = self.lsh.hash(vectors)
         return [h in self.filter for h in hashes]
-
-

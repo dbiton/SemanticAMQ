@@ -5,7 +5,6 @@ from filters.filter import Filter
 import numpy as np
 
 
-
 class CuckooFilter(Filter):
     """
     Wrapper around cuckoofilter.CuckooFilter.
@@ -37,6 +36,18 @@ class CuckooFilter(Filter):
         self.filter: _CuckooFilter = _CuckooFilter(
             capacity=capacity, fingerprint_size=fingerprint_size
         )
+
+    def get_exact_matching_fpr(self) -> float:
+        """
+        Returns the theoretical upper bound of the exact-matching False Positive Rate (FPR)
+        of the underlying Cuckoo Filter, ignoring the LSH layer.
+        
+        Assumes a standard architecture of 4 slots per bucket and 2 target bucket probes.
+        """
+        # Convert fingerprint size from bytes to bits (1 byte = 8 bits)
+        bits = 8 * self._fingerprint_size
+        # Formula: (2 * slots_per_bucket) / 2^bits where slots_per_bucket = 4
+        return float(8.0 / (2 ** bits))
 
     def construct(self, vectors: np.ndarray) -> None:
         """Populate the filter from a batch of vectors."""

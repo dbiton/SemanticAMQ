@@ -15,6 +15,9 @@ class NaiveFilter(Filter):
         self.index = faiss.IndexFlatL2(self.dim)
         self.index.add(vectors)
 
+    def get_exact_matching_fpr(self) -> float:
+        return 0
+
     def query(self, vectors: np.ndarray) -> List[bool]:
         if self.index is None:
             raise ValueError("Filter has not been constructed with any vectors.")

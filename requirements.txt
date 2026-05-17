@@ -13,3 +13,8 @@ xgboost
 pymilvus
 hnswlib
 datasketch[bloom]
+seaborn
+pyfusefilter
+cuckoofilter
+pybloom_live
+h5py

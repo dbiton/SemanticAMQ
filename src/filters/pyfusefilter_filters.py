@@ -1,6 +1,6 @@
 import numpy as np
 from lsh import LSH
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from filters.filter import Filter
 from pyfusefilter import Xor8, Xor16, Fuse8, Fuse16
 
@@ -9,12 +9,21 @@ class PyFuseFilter(Filter):
     def __init__(self, dim: int, lsh: Optional[LSH] = None):
         super().__init__(dim, lsh)
         self.filter: Xor8 | Xor16 | Fuse8 | Fuse16
+        self.epsilon: float = 0.0  # Overridden by subclasses
+
+    def get_exact_matching_fpr(self) -> float:
+        """
+        Returns the standard exact-matching False Positive Rate (FPR) 
+        of the underlying AMQ structure, completely ignoring the LSH layer.
+        """
+        return float(self.epsilon)
 
 
 class Xor8Filter(PyFuseFilter):
     def __init__(self, dim: int, lsh: Optional[LSH] = None):
         super().__init__(dim, lsh)
         self.filter = Xor8(dim)
+        self.epsilon = 1.0 / 256.0  # 8-bit fingerprint error rate (1/2^8)
 
     def construct(self, vectors: np.ndarray):
         hashes = self.lsh.hash(vectors)
@@ -29,6 +38,7 @@ class Xor16Filter(PyFuseFilter):
     def __init__(self, dim: int, lsh: Optional[LSH] = None):
         super().__init__(dim, lsh)
         self.filter = Xor16(dim)
+        self.epsilon = 1.0 / 65536.0  # 16-bit fingerprint error rate (1/2^16)
 
     def construct(self, vectors: np.ndarray) -> None:
         hashes = self.lsh.hash(vectors)
@@ -43,6 +53,7 @@ class Fuse8Filter(PyFuseFilter):
     def __init__(self, dim: int, lsh: Optional[LSH] = None):
         super().__init__(dim, lsh)
         self.filter = Fuse8(dim)
+        self.epsilon = 1.0 / 256.0  # 8-bit fingerprint error rate (1/2^8)
 
     def construct(self, vectors: np.ndarray) -> None:
         hashes = self.lsh.hash(vectors)
@@ -57,6 +68,7 @@ class Fuse16Filter(PyFuseFilter):
     def __init__(self, dim: int, lsh: Optional[LSH] = None):
         super().__init__(dim, lsh)
         self.filter = Fuse16(dim)
+        self.epsilon = 1.0 / 65536.0  # 16-bit fingerprint error rate (1/2^16)
 
     def construct(self, vectors: np.ndarray) -> None:
         hashes = self.lsh.hash(vectors)

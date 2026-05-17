@@ -13,15 +13,28 @@ from filters.naive_filter import NaiveFilter
 from lsh import CrossPolytopeLSH, SimHashLSH
 from util.fetch_datasets import load_embeds
 
+def save_cost_plot(df, filename="cost_vs_memory.png"):
+    """Saves the Cost vs. Bits Used plot."""
+    plt.figure()
+    # Using hue for the Filter+LSH pair creates a unique line for each
+    df['Cost'] = df['FPR'] * 10 + df['FNR']
+    sns.lineplot(data=df, x='Bits', y='Cost', hue='Config', marker='o')
+    plt.ylabel('Cost')
+    plt.grid(True, which="both", ls="-", alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
+    print(f"Cost plot saved to {filename}")
+
 def save_fpr_plot(df, filename="fpr_vs_memory.png"):
     """Saves the False Positive Rate vs. Bits Used plot."""
-    plt.figure(figsize=(12, 7))
+    plt.figure()
     # Using hue for the Filter+LSH pair creates a unique line for each
     sns.lineplot(data=df, x='Bits', y='FPR', hue='Config', marker='o')
-    plt.title('False Positive Rate (FPR) vs. Bits Used')
-    plt.ylabel('FPR (Log Scale)')
+    plt.ylabel('FPR')
     plt.grid(True, which="both", ls="-", alpha=0.3)
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small')
+    plt.legend()
     plt.tight_layout()
     plt.savefig(filename)
     plt.close()
@@ -29,12 +42,11 @@ def save_fpr_plot(df, filename="fpr_vs_memory.png"):
 
 def save_fnr_plot(df, filename="fnr_vs_memory.png"):
     """Saves the False Negative Rate vs. Bits Used plot."""
-    plt.figure(figsize=(12, 7))
+    plt.figure()
     sns.lineplot(data=df, x='Bits', y='FNR', hue='Config', marker='s')
-    plt.title('False Negative Rate (FNR) vs. Bits Used')
     plt.ylabel('FNR')
     plt.grid(True, alpha=0.3)
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small')
+    plt.legend()
     plt.tight_layout()
     plt.savefig(filename)
     plt.close()
@@ -43,15 +55,15 @@ def save_fnr_plot(df, filename="fnr_vs_memory.png"):
 def main():
     filters = [Xor8Filter, Xor16Filter, Fuse8Filter, Fuse16Filter, CuckooFilter, BloomFilter, LSHBloom]
     lsh_families = [SimHashLSH, CrossPolytopeLSH]
-    num_vectors = 1000
-    num_vectors_construct = 900
+    num_vectors = 10000
+    num_vectors_construct = 9000
     distance_threshold = 1.0
     dim = 384
     
     # We vary bits to create the 'line' for the plot
-    bit_range = [8, 16, 32, 64, 128, 256, 512, 1024] 
+    bit_range = [16, 64, 512] 
     
-    dataset_name = 'MsMarco'
+    dataset_name = 'StackOverflow'
     dataset = load_embeds(dataset_name, num_vectors)
     vectors = dataset[0]
     vectors_construct = vectors[:num_vectors_construct]
@@ -104,6 +116,7 @@ def main():
     results_df = pd.DataFrame(results_list)
     save_fpr_plot(results_df)
     save_fnr_plot(results_df)
+    save_cost_plot(results_df)
 
 if __name__ == "__main__":
     main()

@@ -1,7 +1,41 @@
 from datasketch import MinHash, MinHashLSHBloom
 from filters.filter import Filter
 import numpy as np
+from scipy.integrate import quad as integrate
 from typing import List
+
+
+def _false_positive_probability(threshold, b, r):
+    _probability = lambda s: 1 - (1 - s ** float(r)) ** float(b)
+    a, err = integrate(_probability, 0.0, threshold)
+    return a, err
+
+
+def _false_negative_probability(threshold, b, r):
+    _probability = lambda s: 1 - (1 - (1 - s ** float(r)) ** float(b))
+    a, err = integrate(_probability, threshold, 1.0)
+    return a, err
+
+
+def _optimal_param(threshold, num_perm, false_positive_weight, false_negative_weight):
+    """
+    Compute the optimal `MinHashLSH` parameter that minimizes the weighted sum
+    of probabilities of false positive and false negative.
+
+    Returns a tuple: (# bands, band size)
+    """
+    min_error = float("inf")
+    opt = (0, 0)
+    for b in range(1, num_perm + 1):
+        max_r = int(num_perm / b)
+        for r in range(1, max_r + 1):
+            fp, pe = _false_positive_probability(threshold, b, r)
+            fn, ne = _false_negative_probability(threshold, b, r)
+            error = fp * false_positive_weight + fn * false_negative_weight
+            if error < min_error:
+                min_error = error
+                opt = (b, r)
+    return opt
 
 
 class LSHBloom(Filter):
@@ -24,12 +58,21 @@ class LSHBloom(Filter):
             threshold: Jaccard similarity threshold T.
             num_perm: Number of permutations for MinHash.
             n: Estimated number of sets to be indexed (used to size the Bloom Filter).
-            fp: Acceptable false positive rate for each Bloom filter in the index.
+            fp: Acceptable total false positive rate for the LSH index.
         """
         super().__init__(dim)
         self.num_perm = num_perm
-        # MinHashLSHBloom requires the estimated dataset size (n) and FP rate (fp)
-        self.lsh = MinHashLSHBloom(threshold=threshold, num_perm=num_perm, n=n, fp=fp)
+        
+        # Calculate optimal parameters for LSH Bloom filter
+        p_effective = fp
+        b, r = _optimal_param(threshold, num_perm, 0.5, 0.5)
+        
+        if b > 0:
+            fp_optimal = 1.0 - (1.0 - p_effective)**(1.0 / b)
+        else:
+            fp_optimal = fp
+
+        self.lsh = MinHashLSHBloom(threshold=threshold, num_perm=num_perm, n=n, fp=fp_optimal)
 
     def _get_minhash(self, vector: np.ndarray) -> MinHash:
         """Helper to convert a vector into a MinHash signature."""
@@ -47,7 +90,7 @@ class LSHBloom(Filter):
                 continue
             m = self._get_minhash(vec)
             # key can be any unique string/identifier
-            self.lsh.insert(f"id_{i}", m)
+            self.lsh.insert(m)
 
     def query(self, vectors: np.ndarray) -> List[bool]:
         """
