@@ -24,7 +24,7 @@ class QuotientFilterWrapper(Filter):
         self.quotient: int = max(3, math.ceil(math.log2(dim)) + 1)
         
         # Initialize the underlying filter
-        self.filter = QuotientFilter(quotient=self.quotient, hash_function=lsh)
+        self.filter = QuotientFilter(quotient=self.quotient)
         
         # Exact-matching false positive rate for a quotient filter is roughly 1 / 2^r
         self.epsilon: float = 1.0 / (2**remainder_bits)
