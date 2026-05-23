@@ -51,3 +51,20 @@ class QuotientFilterWrapper(Filter):
         """
         hashes = self.lsh.hash(vectors)
         return [self.filter.check(str(h)) for h in hashes]
+
+    def get_bytesize(self) -> int:
+        """
+        Returns the approximate memory size in bytes of the Quotient Filter.
+        
+        Each entry in a quotient filter stores quotient (q bits) and remainder,
+        plus is_occupied, is_continuation, and is_shifted flags (3 bits each per slot).
+        """
+        # The number of slots is 2^quotient
+        num_slots = 2 ** self.quotient
+        # Each slot needs bits for: quotient (quotient bits) + remainder (3 bits) + 3 flags (is_occupied, is_continuation, is_shifted)
+        # Approximate: 1 byte per entry plus some overhead
+        bytes_per_entry = 1
+        total_bytes = num_slots * bytes_per_entry
+        # Add overhead for metadata (~5%)
+        overhead = int(total_bytes * 0.05)
+        return total_bytes + overhead

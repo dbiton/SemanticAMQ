@@ -1,4 +1,5 @@
 import numpy as np
+import math
 from pybloom_live import BloomFilter as _BloomFilter, ScalableBloomFilter as _ScalableBloomFilter
 from lsh import LSH
 from typing import Optional, List
@@ -56,6 +57,17 @@ class BloomFilter(Filter):
         hashes = self.lsh.hash(vectors)
         return [h in self.filter for h in hashes]
 
+    def get_bytesize(self) -> int:
+        """
+        Returns the approximate memory size in bytes of the Bloom Filter.
+        
+        Uses the formula: size = (capacity * -ln(error_rate)) / (ln(2)^2) bits
+        """
+        # Calculate the number of bits needed
+        bits_needed = -self._capacity * math.log(self._error_rate) / (math.log(2) ** 2)
+        # Convert bits to bytes
+        return int(math.ceil(bits_needed / 8))
+
 
 class ScalableBloomFilter(Filter):
     """
@@ -109,3 +121,15 @@ class ScalableBloomFilter(Filter):
         """Return a per-vector list of membership booleans."""
         hashes = self.lsh.hash(vectors)
         return [h in self.filter for h in hashes]
+
+    def get_bytesize(self) -> int:
+        """
+        Returns the approximate memory size in bytes of the Scalable Bloom Filter.
+        
+        Estimates based on the initial capacity and error rate.
+        The actual size may grow as the filter scales up.
+        """
+        # Calculate the number of bits needed for initial filter
+        bits_needed = -self._initial_capacity * math.log(self._error_rate) / (math.log(2) ** 2)
+        # Convert bits to bytes, add some overhead for scalability structure
+        return int(math.ceil(bits_needed / 8)) + 1024  # 1KB overhead for scalability metadata

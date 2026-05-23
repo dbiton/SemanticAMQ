@@ -39,3 +39,14 @@ class ComposedFilter(Filter):
     def query(self, vectors: np.ndarray) -> List[bool]:
         queries = [f.query(vectors) for f in self.filters]
         return np.all(queries, axis=0)
+
+    def get_bytesize(self) -> int:
+        """
+        Returns the total memory size in bytes of all composed filters.
+        
+        Sums the get_bytesize() of all component filters.
+        """
+        total_size = 0
+        for f in self.filters:
+            total_size += f.get_bytesize()
+        return total_size

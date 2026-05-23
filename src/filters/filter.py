@@ -48,3 +48,12 @@ class Filter:
 
     def query(self, vectors: np.ndarray) -> List[bool]:
         raise NotImplementedError("Subclasses must implement the query method.")
+
+    def get_bytesize(self) -> int:
+        """
+        Returns the approximate memory size in bytes used by the filter.
+        
+        Returns:
+            The estimated number of bytes used by the filter structure.
+        """
+        raise NotImplementedError("Subclasses must implement get_bytesize method.")

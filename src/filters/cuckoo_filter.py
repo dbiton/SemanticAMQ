@@ -3,6 +3,7 @@ from lsh import LSH
 from typing import Optional, List
 from filters.filter import Filter
 import numpy as np
+import sys
 
 
 class CuckooFilter(Filter):
@@ -80,3 +81,18 @@ class CuckooFilter(Filter):
             else:
                 results.append(False)
         return results
+
+    def get_bytesize(self) -> int:
+        """
+        Returns the approximate memory size in bytes of the Cuckoo Filter.
+        
+        Estimates based on capacity, fingerprint size, and typical cuckoo filter overhead.
+        Assumes 4 slots per bucket and 2 probes.
+        """
+        # Each bucket has 4 slots, each slot stores a fingerprint
+        num_buckets = self._capacity
+        bytes_per_bucket = 4 * self._fingerprint_size  # 4 slots per bucket
+        total_bytes = num_buckets * bytes_per_bucket
+        # Add overhead for metadata and hash tables (~10%)
+        overhead = int(total_bytes * 0.1)
+        return total_bytes + overhead

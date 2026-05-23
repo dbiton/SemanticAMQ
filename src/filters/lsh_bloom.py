@@ -3,6 +3,7 @@ from filters.filter import Filter
 import numpy as np
 from scipy.integrate import quad as integrate
 from typing import List
+import sys
 
 
 def _false_positive_probability(threshold, b, r):
@@ -104,3 +105,17 @@ class LSHBloom(Filter):
             is_duplicate = self.lsh.query(m)
             results.append(bool(is_duplicate))
         return results
+
+    def get_bytesize(self) -> int:
+        """
+        Returns the approximate memory size in bytes of the LSH Bloom Filter.
+        
+        Estimates based on the MinHash object size and the underlying LSH Bloom structure.
+        """
+        # Get approximate size from the LSH object
+        lsh_size = sys.getsizeof(self.lsh)
+        # Add estimated size for MinHash structures (rough estimate)
+        # Each MinHash uses num_perm permutations of hash values (4 bytes each)
+        minhash_size = self.num_perm * 4  # rough estimate per minhash
+        # Estimate total size including internal Bloom filter
+        return lsh_size + minhash_size + 2048  # 2KB additional overhead
