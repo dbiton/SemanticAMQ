@@ -1,5 +1,4 @@
 import os
-
 import h5py
 
 # Increase timeout to 100 seconds (default is 10)
@@ -22,15 +21,16 @@ embeds_dir = "datasets"
 models: Dict[str, SentenceTransformer] = {}
 
 dataset_filenames = {
-    "MsMarco": "C:\\Projects\\SemanticAMQ\\datasets\\embeds_msmarco.pkl",
-    "WildChat": "C:\\Projects\\SemanticAMQ\\datasets\\embeds_wildchat.pkl",
-    "ELI5": "C:\\Projects\\SemanticAMQ\\datasets\\embeds_eli5.pkl",
-    "NaturalQuestions": "C:\\Projects\\SemanticAMQ\\datasets\\embeds_nq.pkl",
-    "StackOverflow": "C:\\Projects\\SemanticAMQ\\datasets\\embeds_stackoverflow.pkl",
-    "Quora": "C:\\Projects\\SemanticAMQ\\datasets\\embeds_quora_qp.pkl",
-    "MMLU": "C:\\Projects\\SemanticAMQ\\datasets\\embeds_mmlu.pkl",
-    "TriviaQA": "C:\\Projects\\SemanticAMQ\\datasets\\embeds_triviaqa.pkl",
-    "HotPotQA": "C:\\Projects\\SemanticAMQ\\datasets\\embeds_hotpotqa.pkl",
+    "MsMarco": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_msmarco.pkl",
+    "WildChat": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_wildchat.pkl",
+    "ELI5": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_eli5.pkl",
+    "NaturalQuestions": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_nq.pkl",
+    "StackOverflow": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_stackoverflow.pkl",
+    "Quora": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_quora_qp.pkl",
+    "MMLU": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_mmlu.pkl",
+    "TriviaQA": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_triviaqa.pkl",
+    "HotPotQA": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_hotpotqa.pkl",
+    "peS2o": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_pes2o.pkl",
 }
 
 def load_embeds(dataset_name: str, N: int):
@@ -89,8 +89,7 @@ def pack_and_dump(path: str, texts: List[str], meta: Dict[str, List[Any]], model
 def build_eli5() -> Tuple[List[str], Dict[str, List[Any]]]:
     ds = load_dataset("sentence-transformers/eli5", trust_remote_code=True)
     texts: List[str] = ds["train"]["question"]
-    meta = {
-    }
+    meta = {}
     return texts, meta
 
 def build_wildchat() -> Tuple[List[str], Dict[str, List[Any]]]:
@@ -226,8 +225,7 @@ def build_nq() -> Tuple[List[str], Dict[str, List[Any]]]:
     ds = load_dataset("nq_open")
     for split in ("train", "validation"):
         texts.extend([q for q in ds[split]["question"] if q])
-    meta = {
-    }
+    meta = {}
     return texts, meta
 
 def build_msmarco() -> Tuple[List[str], Dict[str, List[Any]]]:
@@ -235,8 +233,23 @@ def build_msmarco() -> Tuple[List[str], Dict[str, List[Any]]]:
     ds = load_dataset("ms_marco", "v2.1")
     for split in ("train", "validation", "test"):
         texts.extend([q for q in ds[split]["query"] if q])
-    meta = {
-    }
+    meta = {}
+    return texts, meta
+
+def build_pes2o() -> Tuple[List[str], Dict[str, List[Any]]]:
+    # peS2o is massive (~39M docs). Use streaming to avoid gigabytes of downloads.
+    # We only pull the first 100,000 to satisfy the pack_and_dump requirement.
+    print("Loading peS2o (streaming first 100k documents)...")
+    ds = load_dataset("allenai/peS2o", split="train", streaming=True)
+    
+    texts = []
+    for i, ex in enumerate(ds):
+        if i >= 100000:
+            break
+        if ex.get("text"):
+            texts.append(ex["text"])
+            
+    meta = {}
     return texts, meta
 
 if __name__ == "__main__":
@@ -277,5 +290,9 @@ if __name__ == "__main__":
     print("generating MS MARCO...")
     texts, meta = build_msmarco()
     pack_and_dump(os.path.join(embeds_dir, "embeds_msmarco.pkl"), texts, meta)
+    
+    print("generating peS2o...")
+    texts, meta = build_pes2o()
+    pack_and_dump(os.path.join(embeds_dir, "embeds_pes2o.pkl"), texts, meta)
     
     print("Done.")
