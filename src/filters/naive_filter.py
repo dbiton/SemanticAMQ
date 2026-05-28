@@ -7,7 +7,7 @@ import faiss
 
 class NaiveFilter(Filter):
     def __init__(self, dim: int, distance_threshold: float):
-        super().__init__(dim)
+        super().__init__(dim, None)
         self.distance_threshold = distance_threshold
         self.index = None
 

@@ -40,17 +40,17 @@ class QuotientFilterWrapper(Filter):
         """
         Hashes the input vectors via LSH and populates the quotient filter.
         """
-        hashes = self.lsh.hash(vectors)
-        for h in hashes:
-            # pyprobables expects strings or bytes to internalize its hashing logic
-            self.filter.add(str(h))
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        for signature_keys in hashes:
+            for key in signature_keys:
+                self.filter.add(str(key))
 
     def query(self, vectors: np.ndarray) -> List[bool]:
         """
         Queries the quotient filter for membership of the provided vectors.
         """
-        hashes = self.lsh.hash(vectors)
-        return [self.filter.check(str(h)) for h in hashes]
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        return [any(self.filter.check(str(key)) for key in signature_keys) for signature_keys in hashes]
 
     def get_bytesize(self) -> int:
         """

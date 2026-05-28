@@ -5,11 +5,13 @@ import numpy as np
 import sys
 
 # Your specific imports
+from filters.dummy_filter import DummyFilter
 from filters.pyfusefilter_filters import Xor8Filter, Xor16Filter, Fuse8Filter, Fuse16Filter
 from filters.cuckoo_filter import CuckooFilter
 from filters.lsh_bloom import LSHBloom
 from filters.bloom_filter import BloomFilter
 from filters.naive_filter import NaiveFilter
+from filters.quotient_filter import QuotientFilterWrapper
 from lsh import CrossPolytopeLSH, SimHashLSH
 from util.fetch_datasets import load_embeds
 
@@ -53,10 +55,10 @@ def save_fnr_plot(df, filename="fnr_vs_memory.png"):
     print(f"FNR plot saved to {filename}")
 
 def main():
-    filters = [Xor8Filter, Xor16Filter, Fuse8Filter, Fuse16Filter, CuckooFilter, BloomFilter, LSHBloom]
-    lsh_families = [SimHashLSH, CrossPolytopeLSH]
-    num_vectors = 10000
-    num_vectors_construct = 9000
+    filters = [Fuse16Filter, LSHBloom, DummyFilter]
+    lsh_families = [CrossPolytopeLSH]
+    num_vectors = 1000
+    num_vectors_construct = 900
     distance_threshold = 1.0
     dim = 384
     
@@ -83,12 +85,8 @@ def main():
             for bits in bit_range:
                 print(f"Evaluating {config_label} at {bits} bits...")
 
-                # Initialize LSH with varying size
-                if lsh_cls == SimHashLSH:
-                    lsh_instance = lsh_cls(dim=dim, num_bits=bits)
-                else:
-                    # Adjusting rotations to scale memory for CrossPolytope
-                    lsh_instance = lsh_cls(dim=dim, num_rotations=max(1, bits // 16))
+                # Initialize LSH with varying size based on the current budget
+                lsh_instance = lsh_cls.build_optimized(dim=dim, threshold_d=distance_threshold, K=None, max_L=bits)
 
                 filter_instance = filter_cls(dim=dim, lsh=lsh_instance)
                 filter_instance.construct(vectors_construct)
@@ -105,12 +103,17 @@ def main():
                 fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
                 fnr = fn / (fn + tp) if (fn + tp) > 0 else 0
                 
-                results_list.append({
+                print(f"Results for {config_label} at {bits} bits: FPR={fpr:.4f}, FNR={fnr:.4f}, Bytes={filter_instance.get_bytesize()}")   
+
+                result = {
                     'Config': config_label,
                     'Bits': bits,
                     'FPR': fpr,
-                    'FNR': fnr
-                })
+                    'FNR': fnr,
+                    'Bytes': filter_instance.get_bytesize()
+                }
+
+                results_list.append(result)
 
     # Data transformation and plotting
     results_df = pd.DataFrame(results_list)

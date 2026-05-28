@@ -4,7 +4,7 @@ from lsh import LSH
 
 
 class Filter:
-    def __init__(self, dim: int, lsh: Optional[LSH] = None):
+    def __init__(self, dim: int, lsh: LSH):
         self.dim = dim
         self.lsh = lsh
 
@@ -42,6 +42,23 @@ class Filter:
         fpr = 1.0 - (1.0 - epsilon) * ((1.0 - p2) ** n)
 
         return float(fpr), float(fnr)
+
+    def _signature_to_key(self, signature):
+        """Convert an LSH signature tuple into a single filter key."""
+        if isinstance(signature, tuple):
+            if len(signature) == 1:
+                return signature[0]
+            return ":".join(map(str, signature))
+        return signature
+
+    def _normalize_hashes(self, hashes: np.ndarray):
+        """Normalize LSH hash output into a list of per-item signature lists."""
+        hashes = np.asarray(hashes, dtype=object)
+        if hashes.ndim == 1:
+            return [[self._signature_to_key(s)] for s in hashes]
+        if hashes.ndim == 2:
+            return [[self._signature_to_key(s) for s in row] for row in hashes]
+        raise ValueError(f"Unsupported hash shape: {hashes.shape}")
 
     def construct(self, vectors: np.ndarray) -> None:
         raise NotImplementedError("Subclasses must implement the construct method.")

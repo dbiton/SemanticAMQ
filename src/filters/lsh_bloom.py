@@ -61,7 +61,7 @@ class LSHBloom(Filter):
             n: Estimated number of sets to be indexed (used to size the Bloom Filter).
             fp: Acceptable total false positive rate for the LSH index.
         """
-        super().__init__(dim)
+        super().__init__(dim, lsh)
         self.num_perm = num_perm
         
         # Calculate optimal parameters for LSH Bloom filter

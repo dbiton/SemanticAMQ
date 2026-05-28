@@ -56,14 +56,33 @@ class CuckooFilter(Filter):
         self.filter = _CuckooFilter(
             capacity=self._capacity, fingerprint_size=self._fingerprint_size
         )
-        hashes = self.lsh.hash(vectors)
-        for h in hashes:
-            self.filter.insert(h)
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        for signature_keys in hashes:
+            for key in signature_keys:
+                self.filter.insert(key)
 
     def query(self, vectors: np.ndarray) -> List[bool]:
         """Return a per-vector list of membership booleans."""
-        hashes = self.lsh.hash(vectors)
-        return [self.filter.contains(h) for h in hashes]
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        return [any(self.filter.contains(key) for key in signature_keys) for signature_keys in hashes]
+
+    def delete(self, vectors: np.ndarray) -> List[bool]:
+        """
+        Remove vectors from the filter.
+
+        Returns a boolean list indicating whether each vector was present
+        (and successfully deleted) before the call.
+        """
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        results: List[bool] = []
+        for signature_keys in hashes:
+            deleted_any = False
+            for key in signature_keys:
+                if self.filter.contains(key):
+                    self.filter.delete(key)
+                    deleted_any = True
+            results.append(deleted_any)
+        return results
 
     def delete(self, vectors: np.ndarray) -> List[bool]:
         """

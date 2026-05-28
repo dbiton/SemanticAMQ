@@ -48,14 +48,15 @@ class BloomFilter(Filter):
             capacity=max(self._capacity, len(vectors)),
             error_rate=self._error_rate,
         )
-        hashes = self.lsh.hash(vectors)
-        for h in hashes:
-            self.filter.add(h)
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        for signature_keys in hashes:
+            for key in signature_keys:
+                self.filter.add(key)
 
     def query(self, vectors: np.ndarray) -> List[bool]:
         """Return a per-vector list of membership booleans."""
-        hashes = self.lsh.hash(vectors)
-        return [h in self.filter for h in hashes]
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        return [any(key in self.filter for key in signature_keys) for signature_keys in hashes]
 
     def get_bytesize(self) -> int:
         """

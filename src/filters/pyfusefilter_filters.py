@@ -43,12 +43,13 @@ class Xor8Filter(PyFuseFilter):
         return (self.dim * 8) // 8 + 512  # 8 bits per element converted to bytes, plus overhead
 
     def construct(self, vectors: np.ndarray):
-        hashes = self.lsh.hash(vectors)
-        self.filter.populate(hashes)
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        signature_keys = [key for signature_keys in hashes for key in signature_keys]
+        self.filter.populate(signature_keys)
 
     def query(self, vectors: np.ndarray):
-        hashes = self.lsh.hash(vectors)
-        return [self.filter.contains(hash) for hash in hashes]
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        return [any(self.filter.contains(key) for key in signature_keys) for signature_keys in hashes]
 
 
 class Xor16Filter(PyFuseFilter):
