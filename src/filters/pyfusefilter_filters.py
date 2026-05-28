@@ -31,7 +31,7 @@ class PyFuseFilter(Filter):
 class Xor8Filter(PyFuseFilter):
     def __init__(self, dim: int, lsh: Optional[LSH] = None):
         super().__init__(dim, lsh)
-        self.filter = Xor8(dim)
+        self.filter = Xor8(0)
         self.epsilon = 1.0 / 256.0  # 8-bit fingerprint error rate (1/2^8)
 
     def get_bytesize(self) -> int:
@@ -43,9 +43,10 @@ class Xor8Filter(PyFuseFilter):
         return (self.dim * 8) // 8 + 512  # 8 bits per element converted to bytes, plus overhead
 
     def construct(self, vectors: np.ndarray):
+        n = len(vectors)
         hashes = self._normalize_hashes(self.lsh.hash(vectors))
         signature_keys = [key for signature_keys in hashes for key in signature_keys]
-        self.filter.populate(signature_keys)
+        self.filter = Xor8(size_or_data=signature_keys)
 
     def query(self, vectors: np.ndarray):
         hashes = self._normalize_hashes(self.lsh.hash(vectors))
@@ -55,7 +56,7 @@ class Xor8Filter(PyFuseFilter):
 class Xor16Filter(PyFuseFilter):
     def __init__(self, dim: int, lsh: Optional[LSH] = None):
         super().__init__(dim, lsh)
-        self.filter = Xor16(dim)
+        self.filter = Xor16(0)
         self.epsilon = 1.0 / 65536.0  # 16-bit fingerprint error rate (1/2^16)
 
     def get_bytesize(self) -> int:
@@ -67,18 +68,19 @@ class Xor16Filter(PyFuseFilter):
         return (self.dim * 16) // 8 + 512  # 16 bits per element converted to bytes, plus overhead
 
     def construct(self, vectors: np.ndarray) -> None:
-        hashes = self.lsh.hash(vectors)
-        self.filter.populate(hashes)
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        signature_keys = [key for signature_keys in hashes for key in signature_keys]
+        self.filter = Xor16(size_or_data=signature_keys)
 
     def query(self, vectors: np.ndarray) -> List[bool]:
-        hashes = self.lsh.hash(vectors)
-        return [self.filter.contains(hash) for hash in hashes]
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        return [any(self.filter.contains(key) for key in signature_keys) for signature_keys in hashes]
 
 
 class Fuse8Filter(PyFuseFilter):
     def __init__(self, dim: int, lsh: Optional[LSH] = None):
         super().__init__(dim, lsh)
-        self.filter = Fuse8(dim)
+        self.filter = Fuse8(0)
         self.epsilon = 1.0 / 256.0  # 8-bit fingerprint error rate (1/2^8)
 
     def get_bytesize(self) -> int:
@@ -90,18 +92,19 @@ class Fuse8Filter(PyFuseFilter):
         return (self.dim * 8) // 8 + 512  # 8 bits per element converted to bytes, plus overhead
 
     def construct(self, vectors: np.ndarray) -> None:
-        hashes = self.lsh.hash(vectors)
-        self.filter.populate(hashes)
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        signature_keys = [key for signature_keys in hashes for key in signature_keys]
+        self.filter = Fuse8(size_or_data=signature_keys)
 
     def query(self, vectors: np.ndarray) -> List[bool]:
-        hashes = self.lsh.hash(vectors)
-        return [self.filter.contains(hash) for hash in hashes]
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        return [any(self.filter.contains(key) for key in signature_keys) for signature_keys in hashes]
 
 
 class Fuse16Filter(PyFuseFilter):
     def __init__(self, dim: int, lsh: Optional[LSH] = None):
         super().__init__(dim, lsh)
-        self.filter = Fuse16(dim)
+        self.filter = Fuse16(0)
         self.epsilon = 1.0 / 65536.0  # 16-bit fingerprint error rate (1/2^16)
 
     def get_bytesize(self) -> int:
@@ -113,9 +116,10 @@ class Fuse16Filter(PyFuseFilter):
         return (self.dim * 16) // 8 + 512  # 16 bits per element converted to bytes, plus overhead
 
     def construct(self, vectors: np.ndarray) -> None:
-        hashes = self.lsh.hash(vectors)
-        self.filter.populate(hashes)
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        signature_keys = [key for signature_keys in hashes for key in signature_keys]
+        self.filter = Fuse16(size_or_data=signature_keys)
 
     def query(self, vectors: np.ndarray) -> List[bool]:
-        hashes = self.lsh.hash(vectors)
-        return [self.filter.contains(hash) for hash in hashes]
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        return [any(self.filter.contains(key) for key in signature_keys) for signature_keys in hashes]
