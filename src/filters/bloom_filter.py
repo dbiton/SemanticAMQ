@@ -58,6 +58,17 @@ class BloomFilter(Filter):
         hashes = self._normalize_hashes(self.lsh.hash(vectors))
         return [any(key in self.filter for key in signature_keys) for signature_keys in hashes]
 
+    def add(self, vectors: np.ndarray) -> None:
+        """
+        Add vectors to the filter after construction.
+        
+        Bloom filters support dynamic insertion; automatically scales capacity if needed.
+        """
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        for signature_keys in hashes:
+            for key in signature_keys:
+                self.filter.add(key)
+
     def get_bytesize(self) -> int:
         """
         Returns the approximate memory size in bytes of the Bloom Filter.
@@ -122,6 +133,16 @@ class ScalableBloomFilter(Filter):
         """Return a per-vector list of membership booleans."""
         hashes = self.lsh.hash(vectors)
         return [h in self.filter for h in hashes]
+
+    def add(self, vectors: np.ndarray) -> None:
+        """
+        Add vectors to the scalable Bloom filter after construction.
+        
+        The scalable filter automatically grows as needed.
+        """
+        hashes = self.lsh.hash(vectors)
+        for h in hashes:
+            self.filter.add(h)
 
     def get_bytesize(self) -> int:
         """

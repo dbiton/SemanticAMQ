@@ -34,6 +34,34 @@ class DummyFilter(Filter):
         hashes = self._normalize_hashes(self.lsh.hash(vectors))
         return [any(key in self.hash_set for key in signature_keys) for signature_keys in hashes]
 
+    def add(self, vectors: np.ndarray) -> None:
+        """
+        Add vectors to the filter after construction.
+        
+        Simply inserts the normalized LSH signature keys into the set.
+        """
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        for signature_keys in hashes:
+            for key in signature_keys:
+                self.hash_set.add(key)
+
+    def remove(self, vectors: np.ndarray) -> List[bool]:
+        """
+        Remove vectors from the filter.
+        
+        Returns a list of booleans indicating whether each vector was present before removal.
+        """
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        results: List[bool] = []
+        for signature_keys in hashes:
+            removed_any = False
+            for key in signature_keys:
+                if key in self.hash_set:
+                    self.hash_set.discard(key)
+                    removed_any = True
+            results.append(removed_any)
+        return results
+
     def get_bytesize(self) -> int:
         # Approximate bytes used by the set contents; this is a rough estimate.
         return sum(len(str(key).encode("utf-8")) for key in self.hash_set)

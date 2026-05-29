@@ -106,6 +106,30 @@ class LSHBloom(Filter):
             results.append(bool(is_duplicate))
         return results
 
+    def add(self, vectors: np.ndarray) -> None:
+        """
+        Add vectors to the LSH Bloom Filter after construction.
+        
+        LSH Bloom filters support dynamic insertion.
+        """
+        for vec in vectors:
+            if len(vec) != self.dim:
+                continue
+            m = self._get_minhash(vec)
+            self.lsh.insert(m)
+
+    def remove(self, vectors: np.ndarray) -> List[bool]:
+        """
+        Remove vectors from the LSH Bloom Filter.
+        
+        Note: datasketch.MinHashLSHBloom does not natively support removal.
+        This method raises NotImplementedError.
+        """
+        raise NotImplementedError(
+            "LSHBloom does not support vector removal. "
+            "The underlying datasketch.MinHashLSHBloom structure is append-only."
+        )
+
     def get_bytesize(self) -> int:
         """
         Returns the approximate memory size in bytes of the LSH Bloom Filter.

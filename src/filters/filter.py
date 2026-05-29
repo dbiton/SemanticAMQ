@@ -66,6 +66,23 @@ class Filter:
     def query(self, vectors: np.ndarray) -> List[bool]:
         raise NotImplementedError("Subclasses must implement the query method.")
 
+    def add(self, vectors: np.ndarray) -> None:
+        """
+        Add vectors to an already-constructed filter.
+        
+        Not all filters support dynamic insertion. Filters that don't should raise NotImplementedError.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not support dynamic insertion.")
+
+    def remove(self, vectors: np.ndarray) -> List[bool]:
+        """
+        Remove vectors from the filter.
+        
+        Returns a list of booleans indicating whether each vector was present and removed.
+        Not all filters support removal. Filters that don't should raise NotImplementedError.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not support removal.")
+
     def get_bytesize(self) -> int:
         """
         Returns the approximate memory size in bytes used by the filter.

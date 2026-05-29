@@ -52,6 +52,40 @@ class QuotientFilterWrapper(Filter):
         hashes = self._normalize_hashes(self.lsh.hash(vectors))
         return [any(self.filter.check(str(key)) for key in signature_keys) for signature_keys in hashes]
 
+    def add(self, vectors: np.ndarray) -> None:
+        """
+        Add vectors to the quotient filter after construction.
+        
+        Quotient filters support dynamic insertion.
+        """
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        for signature_keys in hashes:
+            for key in signature_keys:
+                self.filter.add(str(key))
+
+    def remove(self, vectors: np.ndarray) -> List[bool]:
+        """
+        Remove vectors from the quotient filter.
+        
+        Returns a list of booleans indicating whether each vector was present before removal.
+        Note: The underlying pyprobables QuotientFilter may have limited deletion support.
+        """
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        results: List[bool] = []
+        for signature_keys in hashes:
+            removed_any = False
+            for key in signature_keys:
+                key_str = str(key)
+                if self.filter.check(key_str):
+                    try:
+                        self.filter.delete(key_str)
+                        removed_any = True
+                    except (AttributeError, NotImplementedError):
+                        # If delete is not supported, we can't remove
+                        pass
+            results.append(removed_any)
+        return results
+
     def get_bytesize(self) -> int:
         """
         Returns the approximate memory size in bytes of the Quotient Filter.

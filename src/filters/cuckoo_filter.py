@@ -66,6 +66,17 @@ class CuckooFilter(Filter):
         hashes = self._normalize_hashes(self.lsh.hash(vectors))
         return [any(self.filter.contains(key) for key in signature_keys) for signature_keys in hashes]
 
+    def add(self, vectors: np.ndarray) -> None:
+        """
+        Add vectors to the Cuckoo filter after construction.
+        
+        Cuckoo filters support dynamic insertion.
+        """
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        for signature_keys in hashes:
+            for key in signature_keys:
+                self.filter.insert(key)
+
     def delete(self, vectors: np.ndarray) -> List[bool]:
         """
         Remove vectors from the filter.
@@ -84,22 +95,14 @@ class CuckooFilter(Filter):
             results.append(deleted_any)
         return results
 
-    def delete(self, vectors: np.ndarray) -> List[bool]:
+    def remove(self, vectors: np.ndarray) -> List[bool]:
         """
-        Remove vectors from the filter.
+        Alias for delete(); removes vectors from the filter.
 
         Returns a boolean list indicating whether each vector was present
         (and successfully deleted) before the call.
         """
-        hashes = self.lsh.hash(vectors)
-        results: List[bool] = []
-        for h in hashes:
-            if self.filter.contains(h):
-                self.filter.delete(h)
-                results.append(True)
-            else:
-                results.append(False)
-        return results
+        return self.delete(vectors)
 
     def get_bytesize(self) -> int:
         """

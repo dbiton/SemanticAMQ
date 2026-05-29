@@ -19,6 +19,24 @@ class PyFuseFilter(Filter):
         """
         return float(self.epsilon)
 
+    def add(self, vectors: np.ndarray) -> None:
+        """
+        PyFuseFilters are static, immutable structures and do not support dynamic insertion.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support dynamic insertion. "
+            "PyFuseFilters are static and immutable. Please reconstruct with the full dataset."
+        )
+
+    def remove(self, vectors: np.ndarray) -> List[bool]:
+        """
+        PyFuseFilters are static, immutable structures and do not support removal.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support removal. "
+            "PyFuseFilters are static and immutable. Please reconstruct with the full dataset."
+        )
+
     def get_bytesize(self) -> int:
         """
         Returns the approximate memory size in bytes of the PyFuseFilter.
