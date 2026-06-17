@@ -259,15 +259,19 @@ def static_evaluation():
 
 def dynamic_evaluation():
     num_vectors = 10000
+    percentage_construct = 10
     dim = 384
     min_percentage_duplicates = 1
-    max_percentage_duplicates = 9
-    count_steps = 9
+    max_percentage_duplicates = 16
+    count_steps = 10
     bits = 64
 
     dataset_name = 'peS2o'
     dataset = load_embeds(dataset_name, num_vectors)
     vectors = dataset[0]
+    count_construct = num_vectors * percentage_construct // 100
+    vectors_construct = vectors[:count_construct]
+    vectors_query = vectors[count_construct:]
 
     results_list = []
     for percentage in np.linspace(min_percentage_duplicates, max_percentage_duplicates, count_steps):
@@ -287,10 +291,11 @@ def dynamic_evaluation():
 
                 filter_instance = filter_cls(dim=dim, lsh=lsh_instance)
                 print(f"filter_instance: {type(filter_instance).__name__}, lsh_instance: {type(lsh_instance).__name__}")
-                filter_instance.construct(np.array([vectors[0]]))  # Insert the first vector as the initial reference
-                predicted_results = [False]
+                               
+                filter_instance.construct(vectors_construct)  # Insert the first vector as the initial reference
+                predicted_results = [False] * count_construct  # First part is all False since they are the construct set
 
-                for v in vectors[1:]:
+                for v in vectors_query:
                     is_dup = filter_instance.query(np.array([v]))[0]
                     predicted_results.append(is_dup)
                     if not is_dup:
