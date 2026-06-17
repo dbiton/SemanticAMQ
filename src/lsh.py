@@ -37,8 +37,8 @@ class LSH(ABC):
 
         # 2. Mathematical function to calculate L given K for a 50% cutoff
         def calculate_L(k_val):
-            p_k = np.clip(p_threshold ** k_val, 0.0, 0.999999)
-            return int(np.ceil(np.log(0.5) / np.log(1.0 - p_k)))
+            p_k = np.clip(p_threshold ** k_val, 1e-300, 0.999999)
+            return int(np.ceil(np.log(0.5) / np.log1p(-p_k)))
 
         # 3. Optimize K and L
         if K is not None:
@@ -53,8 +53,11 @@ class LSH(ABC):
                 if test_L > max_L:
                     break  # Exceeded memory limit, stop searching
                 best_K, best_L = test_K, test_L
-                
+            
             K, L = best_K, best_L
+
+        if L > max_L:
+            raise ValueError(f"Cannot achieve 50% threshold at D={threshold_d} within max_L={max_L}. Requires L={L}.")
 
         print(f"[{cls.__name__}] Tuned for D={threshold_d} (Base Prob = {p_threshold:.3f})")
         print(f"  -> Selected K (Hashes) = {K}")

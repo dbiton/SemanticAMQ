@@ -58,6 +58,17 @@ class BloomFilter(Filter):
         hashes = self._normalize_hashes(self.lsh.hash(vectors))
         return [any(key in self.filter for key in signature_keys) for signature_keys in hashes]
 
+    def insert(self, vectors: np.ndarray) -> None:
+        """
+        Insert vectors into the filter after construction.
+        
+        Bloom filters support dynamic insertion; automatically scales capacity if needed.
+        """
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        for signature_keys in hashes:
+            for key in signature_keys:
+                self.filter.add(key)
+
     def add(self, vectors: np.ndarray) -> None:
         """
         Add vectors to the filter after construction.

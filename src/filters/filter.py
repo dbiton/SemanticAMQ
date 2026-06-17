@@ -60,6 +60,9 @@ class Filter:
             return [[self._signature_to_key(s) for s in row] for row in hashes]
         raise ValueError(f"Unsupported hash shape: {hashes.shape}")
 
+    def insert(self, vectors: np.ndarray) -> None:
+        raise NotImplementedError("Subclasses must implement the insert method.")
+
     def construct(self, vectors: np.ndarray) -> None:
         raise NotImplementedError("Subclasses must implement the construct method.")
 

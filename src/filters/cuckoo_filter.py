@@ -50,6 +50,17 @@ class CuckooFilter(Filter):
         # Formula: (2 * slots_per_bucket) / 2^bits where slots_per_bucket = 4
         return float(8.0 / (2 ** bits))
 
+    def insert(self, vectors: np.ndarray) -> None:
+        """
+        Insert vectors into the Cuckoo filter after construction.
+
+        Cuckoo filters support dynamic insertion.
+        """
+        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        for signature_keys in hashes:
+            for key in signature_keys:
+                self.filter.insert(key)
+
     def construct(self, vectors: np.ndarray) -> None:
         """Populate the filter from a batch of vectors."""
         # Re-create so that construct() is idempotent.
