@@ -266,7 +266,7 @@ def dynamic_evaluation():
     count_steps = 10
     bits = 64
 
-    dataset_name = 'peS2o'
+    dataset_name = 'ELI5'
     dataset = load_embeds(dataset_name, num_vectors)
     vectors = dataset[0]
     count_construct = num_vectors * percentage_construct // 100

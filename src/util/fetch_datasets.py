@@ -21,16 +21,16 @@ embeds_dir = "datasets"
 models: Dict[str, SentenceTransformer] = {}
 
 dataset_filenames = {
-    "MsMarco": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_msmarco.pkl",
-    "WildChat": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_wildchat.pkl",
-    "ELI5": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_eli5.pkl",
-    "NaturalQuestions": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_nq.pkl",
-    "StackOverflow": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_stackoverflow.pkl",
-    "Quora": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_quora_qp.pkl",
-    "MMLU": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_mmlu.pkl",
-    "TriviaQA": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_triviaqa.pkl",
-    "HotPotQA": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_hotpotqa.pkl",
-    "peS2o": "/home/dbiton/Desktop/projects/SemanticAMQ/datasets/embeds_pes2o.pkl",
+    "MsMarco": "./datasets/embeds_msmarco.pkl",
+    "WildChat": "./datasets/embeds_wildchat.pkl",
+    "ELI5": "./datasets/embeds_eli5.pkl",
+    "NaturalQuestions": "./datasets/embeds_nq.pkl",
+    "StackOverflow": "./datasets/embeds_stackoverflow.pkl",
+    "Quora": "./datasets/embeds_quora_qp.pkl",
+    "MMLU": "./datasets/embeds_mmlu.pkl",
+    "TriviaQA": "./datasets/embeds_triviaqa.pkl",
+    "HotPotQA": "./datasets/embeds_hotpotqa.pkl",
+    "peS2o": "./datasets/embeds_pes2o.pkl",
 }
 
 def load_embeds(dataset_name: str, N: int):
@@ -240,7 +240,7 @@ def build_pes2o() -> Tuple[List[str], Dict[str, List[Any]]]:
     # peS2o is massive (~39M docs). Use streaming to avoid gigabytes of downloads.
     # We only pull the first 100,000 to satisfy the pack_and_dump requirement.
     print("Loading peS2o (streaming first 100k documents)...")
-    ds = load_dataset("allenai/peS2o", split="train", streaming=True)
+    ds = load_dataset("allenai/peS2o", split="train", streaming=True, trust_remote_code=True)
     
     texts = []
     for i, ex in enumerate(ds):
@@ -258,11 +258,11 @@ if __name__ == "__main__":
     print("generating StackOverflow...")
     texts, meta = build_stackoverflow()
     pack_and_dump(os.path.join(embeds_dir, "embeds_stackoverflow.pkl"), texts, meta)
-
+    '''
     print("generating Quora Question Pairs...")
     texts, meta = build_quora()
     pack_and_dump(os.path.join(embeds_dir, "embeds_quora_qp.pkl"), texts, meta)
-
+    '''
     print("generating WildChat...")
     texts, meta = build_wildchat()
     pack_and_dump(os.path.join(embeds_dir, "embeds_wildchat.pkl"), texts, meta)
@@ -270,11 +270,11 @@ if __name__ == "__main__":
     print("generating TriviaQA...")
     texts, meta = build_triviaqa()
     pack_and_dump(os.path.join(embeds_dir, "embeds_triviaqa.pkl"), texts, meta)
-
+    '''
     print("generating HotpotQA...")
     texts, meta = build_hotpotqa()
     pack_and_dump(os.path.join(embeds_dir, "embeds_hotpotqa.pkl"), texts, meta)
-    
+    '''
     print("generating MMLU...")
     texts, meta = build_mmlu()
     pack_and_dump(os.path.join(embeds_dir, "embeds_mmlu.pkl"), texts, meta)
@@ -282,17 +282,18 @@ if __name__ == "__main__":
     print("generating ELI5...")
     texts, meta = build_eli5()
     pack_and_dump(os.path.join(embeds_dir, "embeds_eli5.pkl"), texts, meta)
-
+    '''
     print("generating Natural Questions...")
     texts, meta = build_nq()
     pack_and_dump(os.path.join(embeds_dir, "embeds_nq.pkl"), texts, meta)
-    
+
     print("generating MS MARCO...")
     texts, meta = build_msmarco()
     pack_and_dump(os.path.join(embeds_dir, "embeds_msmarco.pkl"), texts, meta)
-    
+
     print("generating peS2o...")
     texts, meta = build_pes2o()
     pack_and_dump(os.path.join(embeds_dir, "embeds_pes2o.pkl"), texts, meta)
+    '''
     
     print("Done.")

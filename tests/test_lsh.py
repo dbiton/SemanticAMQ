@@ -1,0 +1,96 @@
+import math
+import unittest
+import numpy as np
+from typing import Tuple
+
+from src.lsh import CrossPolytopeLSH, SimHashLSH
+
+# Assuming your LSH classes are saved in a file named `lsh_module.py`
+# from lsh_module import SimHashLSH, CrossPolytopeLSH
+
+def generate_pairs_at_distance(n_pairs: int, dim: int, r: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Generates pairs of unit vectors separated by an exact Euclidean distance 'r'.
+    """
+    # 1. Generate first set of random unit vectors
+    v1 = np.random.randn(n_pairs, dim)
+    v1 /= np.linalg.norm(v1, axis=1, keepdims=True)
+    
+    # 2. Calculate the required angle (theta) for the target Euclidean distance (r)
+    # Euclidean distance r = sqrt(2 - 2*cos(theta)) => cos(theta) = 1 - r^2/2
+    cos_theta = np.clip(1.0 - (r**2) / 2.0, -1.0, 1.0)
+    sin_theta = np.sqrt(1.0 - cos_theta**2)
+    
+    # 3. Generate a random orthogonal vector for each v1
+    v_rand = np.random.randn(n_pairs, dim)
+    proj = np.sum(v_rand * v1, axis=1, keepdims=True) * v1  # Projection of v_rand onto v1
+    v_ortho = v_rand - proj                                 # Remove projection to make orthogonal
+    v_ortho /= np.linalg.norm(v_ortho, axis=1, keepdims=True)
+    
+    # 4. Construct v2 by rotating v1 towards v_ortho by theta
+    v2 = v1 * cos_theta + v_ortho * sin_theta
+    
+    return v1, v2
+
+class TestLSHProbabilities(unittest.TestCase):
+    
+    def setUp(self):
+        # High dimensionality ensures CrossPolytope approximations hold true
+        self.dim = 128
+        # Using a large sample size minimizes variance in empirical probability
+        self.n_samples = 15000
+        # Absolute tolerance for the probability check (3%)
+        self.tolerance = 0.03  
+        
+        # Generate some test distances (S-curve validation points)
+        self.test_distances = [0.2, 0.7, 1.1, 1.5]
+
+    def verify_empirical_vs_theoretical(self, lsh_instance, r: float):
+        """Helper method to execute the probabilistic test for a given LSH instance and distance."""
+        # Generate vectors
+        v1, v2 = generate_pairs_at_distance(self.n_samples, self.dim, r)
+        
+        # Hash both vector batches
+        sig1 = lsh_instance.hash(v1)  # Shape: (N, L)
+        sig2 = lsh_instance.hash(v2)  # Shape: (N, L)
+        
+        # Boolean matrix of matches: True if the K-tuple matches at table 'l'
+        matches = (sig1 == sig2)
+        
+        # A collision is successful if there is a match in ANY of the L tables (OR condition)
+        collisions = matches.any(axis=1)
+        
+        empirical_p = np.mean(collisions)
+        theoretical_p, _ = lsh_instance.get_criteria(r, r)
+        
+        # Validate that empirical matches theoretical within the tolerance
+        is_accurate = math.isclose(empirical_p, theoretical_p, abs_tol=self.tolerance)
+        
+        error_msg = (f"\nFailed at distance {r}:\n"
+                     f"  Theoretical Prob: {theoretical_p:.4f}\n"
+                     f"  Empirical Prob:   {empirical_p:.4f}\n"
+                     f"  Difference:       {abs(theoretical_p - empirical_p):.4f} "
+                     f"(Tolerance: {self.tolerance})")
+        
+        self.assertTrue(is_accurate, error_msg)
+
+    def test_simhash_probabilities(self):
+        """Test SimHash theoretical vs empirical probabilities."""
+        # Using a standard configuration: 5 tables (OR), 12 hashes per table (AND)
+        lsh = SimHashLSH(dim=self.dim, L=5, K=12)
+        
+        for r in self.test_distances:
+            with self.subTest(r=r, method="SimHash"):
+                self.verify_empirical_vs_theoretical(lsh, r)
+
+    def test_crosspolytope_probabilities(self):
+        """Test CrossPolytope theoretical vs empirical probabilities."""
+        # Using a standard configuration: 8 tables (OR), 2 hashes per table (AND)
+        lsh = CrossPolytopeLSH(dim=self.dim, L=8, K=2)
+        
+        for r in self.test_distances:
+            with self.subTest(r=r, method="CrossPolytope"):
+                self.verify_empirical_vs_theoretical(lsh, r)
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)
