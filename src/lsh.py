@@ -93,26 +93,38 @@ class CrossPolytopeLSH(LSH):
             if r <= 0.0: return 1.0
             if r >= 2.0: return 0.0
             
-            # The theoretical formula d^(-r^2 / (4-r^2)) is an asymptotic bound. 
-            # For finite dimensions, no simple closed form exists. We use a fast, 
-            # vectorized Monte Carlo approximation of the exact underlying distribution.
-            n_sim = 50000
             cos_theta = np.clip(1.0 - (r**2) / 2.0, -1.0, 1.0)
             sin_theta = np.sqrt(1.0 - cos_theta**2)
             
-            # Generate bivariate Gaussians projected onto d dimensions
-            X = np.random.randn(n_sim, self.dim)
-            Z = np.random.randn(n_sim, self.dim)
-            Y = X * cos_theta + Z * sin_theta
+            batch_size = 25000
+            max_sims = 250000  # Hard ceiling to prevent infinite loops
+            target_se = 0.0015 # Target Standard Error (0.15%)
             
-            max_idx_X = np.argmax(np.abs(X), axis=1)
-            max_idx_Y = np.argmax(np.abs(Y), axis=1)
+            matches = 0
+            total_sims = 0
             
-            signs_X = np.sign(X[np.arange(n_sim), max_idx_X])
-            signs_Y = np.sign(Y[np.arange(n_sim), max_idx_Y])
-            
-            matches = (max_idx_X == max_idx_Y) & (signs_X == signs_Y)
-            return float(np.mean(matches))
+            while total_sims < max_sims:
+                X = np.random.randn(batch_size, self.dim)
+                Z = np.random.randn(batch_size, self.dim)
+                Y = X * cos_theta + Z * sin_theta
+                
+                max_idx_X = np.argmax(np.abs(X), axis=1)
+                max_idx_Y = np.argmax(np.abs(Y), axis=1)
+                
+                signs_X = np.sign(X[np.arange(batch_size), max_idx_X])
+                signs_Y = np.sign(Y[np.arange(batch_size), max_idx_Y])
+                
+                matches += np.sum((max_idx_X == max_idx_Y) & (signs_X == signs_Y))
+                total_sims += batch_size
+                
+                # Check our statistical bounds
+                p_hat = matches / total_sims
+                se = np.sqrt(p_hat * (1.0 - p_hat) / total_sims)
+                
+                if se <= target_se:
+                    break
+                    
+            return float(p_hat)
             
         return estimate_p(r1), estimate_p(r2)
 

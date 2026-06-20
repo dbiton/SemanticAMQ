@@ -45,6 +45,8 @@ class TestLSHProbabilities(unittest.TestCase):
         # Generate some test distances (S-curve validation points)
         self.test_distances = [0.2, 0.7, 1.1, 1.5]
 
+        self.build_optimized_threshold_d = 0.7
+
     def verify_empirical_vs_theoretical(self, lsh_instance, r: float):
         """Helper method to execute the probabilistic test for a given LSH instance and distance."""
         # Generate vectors
@@ -91,6 +93,71 @@ class TestLSHProbabilities(unittest.TestCase):
         for r in self.test_distances:
             with self.subTest(r=r, method="CrossPolytope"):
                 self.verify_empirical_vs_theoretical(lsh, r)
+        
+    def test_simhash_build_optimized_explicit_k(self):
+        """Test SimHash optimization when K is explicitly provided."""
+        K_target = 8
+        lsh = SimHashLSH.build_optimized(dim=self.dim, threshold_d=self.build_optimized_threshold_d, K=K_target)
+        
+        self.assertIsInstance(lsh, SimHashLSH)
+        self.assertEqual(lsh.K, K_target)
+        
+        # Theoretical probability at threshold should be >= 0.5 (allowing slight float rounding)
+        p, _ = lsh.get_criteria(self.build_optimized_threshold_d, self.build_optimized_threshold_d)
+        self.assertGreaterEqual(p, 0.49)
+
+    def test_simhash_build_optimized_auto_k(self):
+        """Test SimHash optimization when K must be automatically discovered."""
+        max_L_target = 150
+        lsh = SimHashLSH.build_optimized(dim=self.dim, threshold_d=self.build_optimized_threshold_d, max_L=max_L_target)
+        
+        self.assertIsInstance(lsh, SimHashLSH)
+        self.assertLessEqual(lsh.L, max_L_target)
+        self.assertGreaterEqual(lsh.K, 1)
+        
+        # Theoretical probability at threshold should be >= 0.5
+        p, _ = lsh.get_criteria(self.build_optimized_threshold_d, self.build_optimized_threshold_d)
+        self.assertGreaterEqual(p, 0.49)
+
+    def test_crosspolytope_build_optimized_explicit_k(self):
+        """Test CrossPolytope optimization when K is explicitly provided."""
+        K_target = 3
+        lsh = CrossPolytopeLSH.build_optimized(dim=self.dim, threshold_d=self.build_optimized_threshold_d, K=K_target)
+        
+        self.assertIsInstance(lsh, CrossPolytopeLSH)
+        self.assertEqual(lsh.K, K_target)
+        
+        p, _ = lsh.get_criteria(self.build_optimized_threshold_d, self.build_optimized_threshold_d)
+        
+        self.assertGreaterEqual(p, 0.49)
+
+    def test_crosspolytope_build_optimized_auto_k(self):
+        """Test CrossPolytope optimization when K must be automatically discovered."""
+        max_L_target = 100
+        lsh = CrossPolytopeLSH.build_optimized(dim=self.dim, threshold_d=self.build_optimized_threshold_d, max_L=max_L_target)
+        
+        self.assertIsInstance(lsh, CrossPolytopeLSH)
+        self.assertLessEqual(lsh.L, max_L_target)
+        self.assertGreaterEqual(lsh.K, 1)
+        
+        p, _ = lsh.get_criteria(self.build_optimized_threshold_d, self.build_optimized_threshold_d)
+        
+        # Account for Monte Carlo variance
+        self.assertGreaterEqual(p, 0.49)
+
+    def test_build_optimized_zero_probability_error(self):
+        """Test that a threshold yielding <= 0% base probability raises a ValueError."""
+        # For SimHash, a distance of 2.0 means vectors are perfectly opposite (180 degrees), 
+        # resulting in a base collision probability of exactly 0.0.
+        with self.assertRaisesRegex(ValueError, "yields a 0% base collision probability"):
+            SimHashLSH.build_optimized(dim=self.dim, threshold_d=2.0)
+
+    def test_build_optimized_max_l_error(self):
+        """Test that failure to achieve the 50% threshold within max_L raises a ValueError."""
+        # Force a failure by requiring an impossibly strict K for a relaxed distance, 
+        # combined with a very small max_L allowance.
+        with self.assertRaisesRegex(ValueError, "Cannot achieve 50% threshold"):
+            SimHashLSH.build_optimized(dim=self.dim, threshold_d=1.5, K=50, max_L=5)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
