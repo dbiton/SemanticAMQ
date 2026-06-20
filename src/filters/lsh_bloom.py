@@ -1,8 +1,9 @@
+import math
 from datasketch import MinHash, MinHashLSHBloom
 from filters.filter import Filter
 import numpy as np
 from scipy.integrate import quad as integrate
-from typing import List
+from typing import List, Optional
 import sys
 
 
@@ -51,7 +52,8 @@ class LSHBloom(Filter):
         num_perm: int = 128, 
         n: int = 1000, 
         fp: float = 0.01,
-        lsh = None
+        lsh = None,
+        max_memory: Optional[int] = None
     ):
         """
         Args:
@@ -60,8 +62,22 @@ class LSHBloom(Filter):
             num_perm: Number of permutations for MinHash.
             n: Estimated number of sets to be indexed (used to size the Bloom Filter).
             fp: Acceptable total false positive rate for the LSH index.
+            max_memory: Maximum memory usage in bytes. If set, n is derived from
+                        the memory budget.
         """
-        super().__init__(dim, lsh)
+        super().__init__(dim, lsh, max_memory=max_memory)
+
+        if max_memory is not None:
+            # LSHBloom internally uses a Bloom filter sized by n and fp.
+            # The Bloom filter uses: n * -ln(fp) / (ln(2)^2) bits.
+            # Derive n from max_memory: n = max_memory * 8 * (ln(2)^2) / -ln(fp)
+            bits_available = max_memory * 8
+            derived_n = int(
+                bits_available * (math.log(2) ** 2) / (-math.log(fp))
+            )
+            n = max(derived_n, 1)
+
+        self.n = n
         self.num_perm = num_perm
         
         # Calculate optimal parameters for LSH Bloom filter

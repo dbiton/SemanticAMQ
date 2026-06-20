@@ -14,10 +14,12 @@ class BloomFilter(Filter):
     so there is no need to serialise raw vectors into the filter itself.
 
     Args:
-        dim:        Dimensionality of the input vectors (passed to Filter).
-        capacity:   Maximum number of elements before false-positive rate rises.
-        error_rate: Desired maximum false-positive probability (default 0.1 %).
-        lsh:        Optional pre-built LSH instance; one is created if omitted.
+        dim:         Dimensionality of the input vectors (passed to Filter).
+        capacity:    Maximum number of elements before false-positive rate rises.
+        error_rate:  Desired maximum false-positive probability (default 0.1 %).
+        lsh:         Optional pre-built LSH instance; one is created if omitted.
+        max_memory:  Maximum memory usage in bytes. If set, capacity is derived
+                     from the memory budget instead of being specified directly.
     """
 
     def __init__(
@@ -26,12 +28,25 @@ class BloomFilter(Filter):
         capacity: int = 1_000,
         error_rate: float = 0.001,
         lsh: Optional[LSH] = None,
+        max_memory: Optional[int] = None,
     ):
-        super().__init__(dim, lsh)
-        self._capacity = capacity
+        super().__init__(dim, lsh, max_memory=max_memory)
         self._error_rate = error_rate
+
+        if max_memory is not None:
+            # Derive capacity from the memory budget.
+            # Bloom filter memory (bits) = capacity * -ln(error_rate) / (ln(2)^2)
+            # So capacity = memory_bytes * 8 * (ln(2)^2) / -ln(error_rate)
+            bits_available = max_memory * 8
+            self._capacity = int(
+                bits_available * (math.log(2) ** 2) / (-math.log(error_rate))
+            )
+            self._capacity = max(self._capacity, 1)
+        else:
+            self._capacity = capacity
+
         self.filter: _BloomFilter = _BloomFilter(
-            capacity=capacity, error_rate=error_rate
+            capacity=self._capacity, error_rate=error_rate
         )
 
     def get_exact_matching_fpr(self) -> float:
@@ -104,6 +119,8 @@ class ScalableBloomFilter(Filter):
         initial_capacity: Starting capacity before the first scale-up.
         error_rate:       Desired false-positive probability (default 0.1 %).
         lsh:              Optional pre-built LSH instance.
+        max_memory:       Maximum memory usage in bytes. If set, the initial
+                          capacity is derived from the memory budget.
     """
 
     def __init__(
@@ -112,12 +129,23 @@ class ScalableBloomFilter(Filter):
         initial_capacity: int = 1_000,
         error_rate: float = 0.001,
         lsh: Optional[LSH] = None,
+        max_memory: Optional[int] = None,
     ):
-        super().__init__(dim, lsh)
-        self._initial_capacity = initial_capacity
+        super().__init__(dim, lsh, max_memory=max_memory)
         self._error_rate = error_rate
+
+        if max_memory is not None:
+            # Derive initial capacity from the memory budget (same formula as BloomFilter).
+            bits_available = max_memory * 8
+            self._initial_capacity = int(
+                bits_available * (math.log(2) ** 2) / (-math.log(error_rate))
+            )
+            self._initial_capacity = max(self._initial_capacity, 1)
+        else:
+            self._initial_capacity = initial_capacity
+
         self.filter: _ScalableBloomFilter = _ScalableBloomFilter(
-            initial_capacity=initial_capacity, error_rate=error_rate
+            initial_capacity=self._initial_capacity, error_rate=error_rate
         )
 
     def get_exact_matching_fpr(self) -> float:

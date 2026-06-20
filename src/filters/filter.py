@@ -4,9 +4,10 @@ from lsh import LSH
 
 
 class Filter:
-    def __init__(self, dim: int, lsh: LSH):
+    def __init__(self, dim: int, lsh: LSH, max_memory: Optional[int] = None):
         self.dim = dim
         self.lsh = lsh
+        self.max_memory = max_memory
 
     def get_exact_matching_fpr(self) -> float:
         """

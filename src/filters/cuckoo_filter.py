@@ -30,12 +30,24 @@ class CuckooFilter(Filter):
         capacity: int = 1_000,
         fingerprint_size: int = 2,
         lsh: Optional[LSH] = None,
+        max_memory: Optional[int] = None,
     ):
-        super().__init__(dim, lsh)
-        self._capacity = capacity
+        super().__init__(dim, lsh, max_memory=max_memory)
         self._fingerprint_size = fingerprint_size
+
+        if max_memory is not None:
+            # Cuckoo filter memory: each bucket has 4 slots, each slot stores a fingerprint.
+            # With ~10% overhead: memory ≈ capacity * 4 * fingerprint_size * 1.1
+            # So capacity ≈ max_memory / (4 * fingerprint_size * 1.1)
+            bytes_per_bucket = 4 * fingerprint_size
+            overhead_factor = 1.1
+            self._capacity = int(max_memory / (bytes_per_bucket * overhead_factor))
+            self._capacity = max(self._capacity, 1)
+        else:
+            self._capacity = capacity
+
         self.filter: _CuckooFilter = _CuckooFilter(
-            capacity=capacity, fingerprint_size=fingerprint_size
+            capacity=self._capacity, fingerprint_size=fingerprint_size
         )
 
     def get_exact_matching_fpr(self) -> float:

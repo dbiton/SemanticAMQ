@@ -7,7 +7,7 @@ from probables import QuotientFilter
 
 
 class QuotientFilterWrapper(Filter):
-    def __init__(self, dim: int, lsh: Optional[LSH] = None, remainder_bits: int = 8):
+    def __init__(self, dim: int, lsh: Optional[LSH] = None, remainder_bits: int = 8, max_memory: Optional[int] = None):
         """
         A wrapper for pyprobables.QuotientFilter integrating with the Filter interface.
         
@@ -16,12 +16,21 @@ class QuotientFilterWrapper(Filter):
             lsh: The locality-sensitive hashing object.
             remainder_bits: Number of bits for the fingerprint remainder. 
                             Determines the exact matching FPR (1 / 2^remainder_bits).
+            max_memory: Maximum memory usage in bytes. If set, the quotient size
+                        is derived from the memory budget.
         """
-        super().__init__(dim, lsh)
+        super().__init__(dim, lsh, max_memory=max_memory)
         
-        # Calculate the required quotient (q) size such that 2^q can safely fit 'dim' elements
-        # Adding 1 to ensure the load factor stays safely under 100%
-        self.quotient: int = max(3, math.ceil(math.log2(dim)) + 1)
+        if max_memory is not None:
+            # Quotient filter: number of slots = 2^quotient, each slot ~1 byte + 3 flag bits.
+            # Approx 11 bits per slot. So 2^quotient * 11 / 8 ≈ max_memory
+            # quotient = floor(log2(max_memory * 8 / 11))
+            slots_from_memory = max_memory * 8 // 11
+            self.quotient: int = max(3, int(math.log2(max(slots_from_memory, 8))))
+        else:
+            # Calculate the required quotient (q) size such that 2^q can safely fit 'dim' elements
+            # Adding 1 to ensure the load factor stays safely under 100%
+            self.quotient: int = max(3, math.ceil(math.log2(dim)) + 1)
         
         # Initialize the underlying filter
         self.filter = QuotientFilter(quotient=self.quotient)

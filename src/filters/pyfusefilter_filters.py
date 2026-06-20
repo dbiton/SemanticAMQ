@@ -7,8 +7,8 @@ from pyfusefilter import Xor8, Xor16, Fuse8, Fuse16
 
 
 class PyFuseFilter(Filter):
-    def __init__(self, dim: int, lsh: Optional[LSH] = None):
-        super().__init__(dim, lsh)
+    def __init__(self, dim: int, lsh: Optional[LSH] = None, max_memory: Optional[int] = None):
+        super().__init__(dim, lsh, max_memory=max_memory)
         self.filter: Xor8 | Xor16 | Fuse8 | Fuse16
         self.epsilon: float = 0.0  # Overridden by subclasses
 
@@ -47,8 +47,8 @@ class PyFuseFilter(Filter):
 
 
 class Xor8Filter(PyFuseFilter):
-    def __init__(self, dim: int, lsh: Optional[LSH] = None):
-        super().__init__(dim, lsh)
+    def __init__(self, dim: int, lsh: Optional[LSH] = None, max_memory: Optional[int] = None):
+        super().__init__(dim, lsh, max_memory=max_memory)
         self.filter = Xor8(0)
         self.epsilon = 1.0 / 256.0  # 8-bit fingerprint error rate (1/2^8)
 
@@ -72,8 +72,8 @@ class Xor8Filter(PyFuseFilter):
 
 
 class Xor16Filter(PyFuseFilter):
-    def __init__(self, dim: int, lsh: Optional[LSH] = None):
-        super().__init__(dim, lsh)
+    def __init__(self, dim: int, lsh: Optional[LSH] = None, max_memory: Optional[int] = None):
+        super().__init__(dim, lsh, max_memory=max_memory)
         self.filter = Xor16(0)
         self.epsilon = 1.0 / 65536.0  # 16-bit fingerprint error rate (1/2^16)
 
@@ -96,8 +96,8 @@ class Xor16Filter(PyFuseFilter):
 
 
 class Fuse8Filter(PyFuseFilter):
-    def __init__(self, dim: int, lsh: Optional[LSH] = None):
-        super().__init__(dim, lsh)
+    def __init__(self, dim: int, lsh: Optional[LSH] = None, max_memory: Optional[int] = None):
+        super().__init__(dim, lsh, max_memory=max_memory)
         self.filter = Fuse8(0)
         self.epsilon = 1.0 / 256.0  # 8-bit fingerprint error rate (1/2^8)
 
@@ -120,8 +120,8 @@ class Fuse8Filter(PyFuseFilter):
 
 
 class Fuse16Filter(PyFuseFilter):
-    def __init__(self, dim: int, lsh: Optional[LSH] = None):
-        super().__init__(dim, lsh)
+    def __init__(self, dim: int, lsh: Optional[LSH] = None, max_memory: Optional[int] = None):
+        super().__init__(dim, lsh, max_memory=max_memory)
         self.filter = Fuse16(0)
         self.epsilon = 1.0 / 65536.0  # 16-bit fingerprint error rate (1/2^16)
 
