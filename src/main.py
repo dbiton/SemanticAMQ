@@ -13,6 +13,7 @@ from filters.lsh_bloom import LSHBloom
 from filters.bloom_filter import BloomFilter
 from filters.naive_filter import NaiveFilter
 from lsh import CrossPolytopeLSH, SimHashLSH, LSH
+from filters.set_filter import SetFilter
 from util.fetch_datasets import load_embeds
 
 def plot_results(results_list, folder: str):
@@ -181,21 +182,22 @@ def compute_static_actual_results(construct_vectors: np.ndarray, query_vectors: 
     return actual_results
 
 
-dynamic_filters = [CuckooFilter, BloomFilter]
+dynamic_filters = [CuckooFilter, SetFilter]#, BloomFilter]
 static_filters  = [Xor8Filter, Xor16Filter, Fuse8Filter, Fuse16Filter]
 lsh_families: List[LSH] = [CrossPolytopeLSH, SimHashLSH]
 
 
 def static_evaluation():
-    num_vectors = 10000
+    num_vectors = 1000
     dim = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
     count_steps = 9
     bits = 64
     percentage_construct = 10
+    max_L = 256
 
-    dataset_name = 'peS2o'
+    dataset_name = 'ELI5'
     dataset = load_embeds(dataset_name, num_vectors)
     vectors = dataset[0]
     
@@ -217,7 +219,7 @@ def static_evaluation():
                 print(f"Evaluating {config_label} @ {percentage:.1f}% ...")
 
                 # Initialize LSH with varying size
-                lsh_instance = lsh_cls.build_optimized(dim, distance_threshold, None, 64)
+                lsh_instance = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
 
                 filter_instance = filter_cls(dim=dim, lsh=lsh_instance)
                 print(f"filter_instance: {type(filter_instance).__name__}, lsh_instance: {type(lsh_instance).__name__}")
@@ -258,13 +260,14 @@ def static_evaluation():
 
 
 def dynamic_evaluation():
-    num_vectors = 10000
-    percentage_construct = 10
+    num_vectors = 1000
+    percentage_construct = 25
     dim = 384
     min_percentage_duplicates = 1
-    max_percentage_duplicates = 16
+    max_percentage_duplicates = 9
     count_steps = 10
     bits = 64
+    max_L = 256
 
     dataset_name = 'ELI5'
     dataset = load_embeds(dataset_name, num_vectors)
@@ -287,7 +290,7 @@ def dynamic_evaluation():
                 print(f"Evaluating {config_label} @ {percentage:.1f}% ...")
 
                 # Initialize LSH with varying size
-                lsh_instance = lsh_cls.build_optimized(dim, distance_threshold, None, 64)
+                lsh_instance = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
 
                 filter_instance = filter_cls(dim=dim, lsh=lsh_instance)
                 print(f"filter_instance: {type(filter_instance).__name__}, lsh_instance: {type(lsh_instance).__name__}")
@@ -334,6 +337,6 @@ def throughput_evaluation():
     pass
 
 if __name__ == "__main__":
-    dynamic_evaluation()
     static_evaluation()
+    dynamic_evaluation()
     throughput_evaluation()
