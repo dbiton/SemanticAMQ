@@ -207,9 +207,14 @@ dynamic_filters = [CuckooFilter, SetFilter]#, BloomFilter]
 static_filters  = [Xor8Filter, Xor16Filter, Fuse8Filter, Fuse16Filter]
 lsh_families: List[LSH] = [CrossPolytopeLSH, SimHashLSH]
 
+def calculate_memory_budget(num_vectors: int, bits_per_element: float = 12.0, overhead_bytes: int = 4096) -> int:
+    # Calculate bytes required for the elements
+    element_bytes = (num_vectors * bits_per_element) / 8.0
+    # Return the ceiling of the calculation plus fixed overhead
+    return int(np.ceil(element_bytes)) + overhead_bytes
 
 def static_evaluation():
-    num_vectors = 1000
+    num_vectors = 10000
     dim = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
@@ -217,7 +222,7 @@ def static_evaluation():
     bits = 64
     percentage_construct = 10
     max_L = 256
-    memory_budget = 10 * 1024 * 1024  # 10 MB
+    memory_budget = calculate_memory_budget(num_vectors, bits_per_element=12.0, overhead_bytes=4096)
 
     dataset_name = 'ELI5'
     dataset = load_embeds(dataset_name, num_vectors)
@@ -285,7 +290,7 @@ def static_evaluation():
 
 
 def dynamic_evaluation():
-    num_vectors = 1000
+    num_vectors = 10000
     percentage_construct = 25
     dim = 384
     min_percentage_duplicates = 1
@@ -297,9 +302,10 @@ def dynamic_evaluation():
     dataset_name = 'ELI5'
     dataset = load_embeds(dataset_name, num_vectors)
     vectors = dataset[0]
-    count_construct = num_vectors * percentage_construct // 100
-    vectors_construct = vectors[:count_construct]
-    vectors_query = vectors[count_construct:]
+    num_construct = num_vectors * percentage_construct // 100
+    vectors_construct = vectors[:num_construct]
+    vectors_query = vectors[num_construct:]
+    memory_budget = calculate_memory_budget(num_construct, bits_per_element=12.0, overhead_bytes=4096)
 
     results_list = []
     for percentage in np.linspace(min_percentage_duplicates, max_percentage_duplicates, count_steps):
@@ -325,7 +331,7 @@ def dynamic_evaluation():
                 print(f"filter_instance: {type(filter_instance).__name__}, lsh_instance: {type(lsh_instance).__name__}")
                                
                 filter_instance.construct(vectors_construct)  # Insert the first vector as the initial reference
-                predicted_results = [False] * count_construct  # First part is all False since they are the construct set
+                predicted_results = [False] * num_construct  # First part is all False since they are the construct set
 
                 for v in vectors_query:
                     is_dup = filter_instance.query(np.array([v]))[0]
