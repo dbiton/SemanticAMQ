@@ -1,4 +1,5 @@
-from typing import List
+from filters.filter import Filter
+from typing import Any, List
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -14,7 +15,9 @@ from filters.bloom_filter import BloomFilter
 from filters.naive_filter import NaiveFilter
 from lsh import CrossPolytopeLSH, SimHashLSH, LSH
 from filters.set_filter import SetFilter
+from filters.gcs_filter import GCSFilter
 from util.fetch_datasets import load_embeds
+from filters.quotient_filter import QuotientFilterWrapper
 
 # max_memory (bytes) can be passed to any filter constructor to constrain memory usage.
 # Filters that accept max_memory: BloomFilter, ScalableBloomFilter, CuckooFilter,
@@ -203,8 +206,8 @@ def compute_static_actual_results(construct_vectors: np.ndarray, query_vectors: 
     return actual_results
 
 
-dynamic_filters = [CuckooFilter, SetFilter]#, VacuumFilter]#, BloomFilter]
-static_filters  = [Xor8Filter, Xor16Filter, Fuse8Filter, Fuse16Filter]#, GCSFilter]
+dynamic_filters = [CuckooFilter, BloomFilter, QuotientFilterWrapper]
+static_filters  = [Xor8Filter, Fuse8Filter, GCSFilter]
 lsh_families: List[LSH] = [CrossPolytopeLSH, SimHashLSH]
 
 def calculate_memory_budget(num_vectors: int, bits_per_element: float = 12.0, overhead_bytes: int = 4096) -> int:
@@ -212,6 +215,63 @@ def calculate_memory_budget(num_vectors: int, bits_per_element: float = 12.0, ov
     element_bytes = (num_vectors * bits_per_element) / 8.0
     # Return the ceiling of the calculation plus fixed overhead
     return int(np.ceil(element_bytes)) + overhead_bytes
+
+def run_static(filter: Filter, vectors_construct: np.ndarray, vectors_query: np.ndarray, distance_threshold: float, actual_results: list[bool]) -> dict[str, Any]:
+    filter.construct(vectors_construct)
+    predicted_results = filter.query(vectors_query)
+
+    # Now `predicted_results` and `actual_results` are both length len(vectors_query)
+    tp = sum(1 for p, a in zip(predicted_results, actual_results) if     p and     a)
+    fp = sum(1 for p, a in zip(predicted_results, actual_results) if     p and not a)
+    fn = sum(1 for p, a in zip(predicted_results, actual_results) if not p and     a)
+    tn = sum(1 for p, a in zip(predicted_results, actual_results) if not p and not a)
+
+    fpr       = fp / (fp + tn)                    if (fp + tn) > 0 else 0
+    fnr       = fn / (fn + tp)                    if (fn + tp) > 0 else 0
+    precision = tp / (tp + fp)                    if (tp + fp) > 0 else 0
+    recall    = tp / (tp + fn)                    if (tp + fn) > 0 else 0
+    f1_score  = (2 * precision * recall
+                    / (precision + recall))          if (precision + recall) > 0 else 0
+    result = {
+        'Threshold':  distance_threshold,
+        'FPR':        fpr,
+        'FNR':        fnr,
+        'Precision':  precision,
+        'Recall':     recall,
+        'F1-Score':   f1_score,
+    }
+    return result
+
+def run_dynamic(filter: Filter, vectors_construct: np.ndarray, vectors_query: np.ndarray, distance_threshold: float, actual_results: list[bool]) -> dict[str, Any]:
+    filter.construct(vectors_construct)  # Insert the first vector as the initial reference
+    predicted_results = [False]
+
+    for v in vectors_query:
+        is_dup = filter.query(np.array([v]))[0]
+        predicted_results.append(is_dup)
+        if not is_dup:
+            filter.insert(np.array([v]))
+
+    tp = sum(1 for p, a in zip(predicted_results, actual_results) if     p and     a)
+    fp = sum(1 for p, a in zip(predicted_results, actual_results) if     p and not a)
+    fn = sum(1 for p, a in zip(predicted_results, actual_results) if not p and     a)
+    tn = sum(1 for p, a in zip(predicted_results, actual_results) if not p and not a)
+
+    fpr       = fp / (fp + tn)                    if (fp + tn) > 0 else 0
+    fnr       = fn / (fn + tp)                    if (fn + tp) > 0 else 0
+    precision = tp / (tp + fp)                    if (tp + fp) > 0 else 0
+    recall    = tp / (tp + fn)                    if (tp + fn) > 0 else 0
+    f1_score  = (2 * precision * recall
+                    / (precision + recall))          if (precision + recall) > 0 else 0
+    result = {
+        'Threshold':  distance_threshold,
+        'FPR':        fpr,
+        'FNR':        fnr,
+        'Precision':  precision,
+        'Recall':     recall,
+        'F1-Score':   f1_score,
+    }
+    return result
 
 def static_evaluation():
     num_vectors = 10000
@@ -254,33 +314,10 @@ def static_evaluation():
                     filter_instance = filter_cls(dim=dim, lsh=lsh_instance)
                 print(f"filter_instance: {type(filter_instance).__name__}, lsh_instance: {type(lsh_instance).__name__}")
                 
-                # Construct on the base set, query on the remainder
-                filter_instance.construct(vectors_construct)
-                predicted_results = filter_instance.query(vectors_query)
+                result = run_static(filter_instance, vectors_construct, vectors_query, distance_threshold, actual_results)
+                result['Config'] = config_label
+                result['Percentage'] = percentage
 
-                # Now `predicted_results` and `actual_results` are both length len(vectors_query)
-                tp = sum(1 for p, a in zip(predicted_results, actual_results) if     p and     a)
-                fp = sum(1 for p, a in zip(predicted_results, actual_results) if     p and not a)
-                fn = sum(1 for p, a in zip(predicted_results, actual_results) if not p and     a)
-                tn = sum(1 for p, a in zip(predicted_results, actual_results) if not p and not a)
-
-                fpr       = fp / (fp + tn)                    if (fp + tn) > 0 else 0
-                fnr       = fn / (fn + tp)                    if (fn + tp) > 0 else 0
-                precision = tp / (tp + fp)                    if (tp + fp) > 0 else 0
-                recall    = tp / (tp + fn)                    if (tp + fn) > 0 else 0
-                f1_score  = (2 * precision * recall
-                             / (precision + recall))          if (precision + recall) > 0 else 0
-                result = {
-                    'Config':     config_label,
-                    'Percentage': percentage,
-                    'Threshold':  distance_threshold,
-                    'Bits':       bits,
-                    'FPR':        fpr,
-                    'FNR':        fnr,
-                    'Precision':  precision,
-                    'Recall':     recall,
-                    'F1-Score':   f1_score,
-                }
                 print(result)
                 results_list.append(result)
 
@@ -330,37 +367,9 @@ def dynamic_evaluation():
                     filter_instance = filter_cls(dim=dim, lsh=lsh_instance)
                 print(f"filter_instance: {type(filter_instance).__name__}, lsh_instance: {type(lsh_instance).__name__}")
                                
-                filter_instance.construct(vectors_construct)  # Insert the first vector as the initial reference
-                predicted_results = [False] * num_construct  # First part is all False since they are the construct set
-
-                for v in vectors_query:
-                    is_dup = filter_instance.query(np.array([v]))[0]
-                    predicted_results.append(is_dup)
-                    if not is_dup:
-                        filter_instance.insert(np.array([v]))
-
-                tp = sum(1 for p, a in zip(predicted_results, actual_results) if     p and     a)
-                fp = sum(1 for p, a in zip(predicted_results, actual_results) if     p and not a)
-                fn = sum(1 for p, a in zip(predicted_results, actual_results) if not p and     a)
-                tn = sum(1 for p, a in zip(predicted_results, actual_results) if not p and not a)
-
-                fpr       = fp / (fp + tn)                    if (fp + tn) > 0 else 0
-                fnr       = fn / (fn + tp)                    if (fn + tp) > 0 else 0
-                precision = tp / (tp + fp)                    if (tp + fp) > 0 else 0
-                recall    = tp / (tp + fn)                    if (tp + fn) > 0 else 0
-                f1_score  = (2 * precision * recall
-                             / (precision + recall))          if (precision + recall) > 0 else 0
-                result = {
-                    'Config':     config_label,
-                    'Percentage': percentage,
-                    'Threshold':  distance_threshold,
-                    'Bits':       bits,
-                    'FPR':        fpr,
-                    'FNR':        fnr,
-                    'Precision':  precision,
-                    'Recall':     recall,
-                    'F1-Score':   f1_score,
-                }
+                result = run_dynamic(filter_instance, vectors_construct, vectors_query, distance_threshold, actual_results)
+                result['Config'] = config_label
+                result['Percentage'] = percentage
                 print(result)
                 results_list.append(result)
 
