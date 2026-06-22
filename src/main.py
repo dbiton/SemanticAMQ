@@ -203,8 +203,8 @@ def compute_static_actual_results(construct_vectors: np.ndarray, query_vectors: 
     return actual_results
 
 
-dynamic_filters = [CuckooFilter, SetFilter]#, BloomFilter]
-static_filters  = [Xor8Filter, Xor16Filter, Fuse8Filter, Fuse16Filter]
+dynamic_filters = [CuckooFilter, SetFilter]#, VacuumFilter]#, BloomFilter]
+static_filters  = [Xor8Filter, Xor16Filter, Fuse8Filter, Fuse16Filter]#, GCSFilter]
 lsh_families: List[LSH] = [CrossPolytopeLSH, SimHashLSH]
 
 def calculate_memory_budget(num_vectors: int, bits_per_element: float = 12.0, overhead_bytes: int = 4096) -> int:
@@ -368,8 +368,272 @@ def dynamic_evaluation():
     plot_results(results_list, "dynamic")
     return results_list
 
+
+def plot_throughput_results(results_list, folder: str, ylabel: str, title_suffix: str):
+    """
+    Plots throughput results as a function of filter size (number of elements).
+    Colors represent the Filter, and markers represent the LSH.
+    """
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    import seaborn as sns
+
+    df = pd.DataFrame(results_list)
+
+    # Split 'Config' into separate 'Filter' and 'LSH' columns
+    df[['Filter', 'LSH']] = df['Config'].str.split(' + ', regex=False, expand=True)
+
+    # Set styling
+    sns.set_theme(style="whitegrid")
+
+    # Create a consistent color mapping for Filters
+    unique_filters = df['Filter'].unique()
+    palette = sns.color_palette("husl", len(unique_filters))
+    color_map = dict(zip(unique_filters, palette))
+
+    # Create a consistent marker mapping for LSH families
+    unique_lshs = df['LSH'].unique()
+    available_markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'X']
+    marker_map = dict(zip(unique_lshs, available_markers[:len(unique_lshs)]))
+
+    configs = df['Config'].unique()
+
+    # Main throughput plot
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    sns.lineplot(
+        data=df,
+        x='FilterSize',
+        y='Throughput',
+        hue='Filter',       # Color mapped to Filter
+        style='LSH',        # Marker mapped to LSH
+        markers=marker_map, # Apply specific markers
+        dashes=False,       # Keep lines solid, just change markers
+        palette=color_map,  # Apply specific colors
+        ax=ax,
+        legend=False        # Disable legend for the individual plots
+    )
+
+    ax.set_xlabel('Number of Elements in Filter', fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(f'Throughput vs Filter Size ({title_suffix})', fontsize=13)
+
+    filename = f'throughput_{title_suffix.lower().replace(" ", "_")}_plot.png'
+    plt.savefig(f"plots/{folder}/{filename}", bbox_inches='tight', dpi=300)
+    plt.close()
+    print(f"Saved plots/{folder}/{filename}")
+
+    # Generate a separate plot just for the legend
+    fig_leg, ax_leg = plt.subplots(figsize=(10, 2))
+    ax_leg.axis('off')
+
+    handles = []
+    for config in configs:
+        filt, lsh = config.split(' + ')
+        handles.append(
+            plt.Line2D([0], [0], color=color_map[filt], lw=2, marker=marker_map[lsh])
+        )
+
+    ax_leg.legend(
+        handles,
+        configs,
+        loc='center',
+        ncol=min(3, len(configs)),
+        title="Configuration (Color = Filter, Marker = LSH)",
+        title_fontsize=12,
+        fontsize=10,
+        frameon=True
+    )
+
+    plt.savefig(f"plots/{folder}/throughput_legend_only.png", bbox_inches='tight', dpi=300)
+    plt.close()
+    print(f"Saved plots/{folder}/throughput_legend_only.png")
+
+
 def throughput_evaluation():
-    pass
+    """
+    Evaluates three throughput metrics as a function of filter size:
+      1. Query throughput (checks/second): How fast can we check membership?
+      2. Construction throughput (elements/second): How fast can we build the filter?
+      3. Insertion throughput (elements/second): How fast can we dynamically insert?
+      
+    Tests all LSH options (CrossPolytopeLSH, SimHashLSH) for each metric.
+    """
+    import time
+
+    dim = 384
+    max_L = 256
+    memory_budget = 10 * 1024 * 1024  # 10 MB
+    query_batch_size = 100  # How many vectors to query per measurement
+    num_trials = 3          # Number of timing trials per measurement
+
+    # Filter sizes to test (number of elements stored in the filter)
+    filter_sizes = [100, 500, 1000, 2500, 5000, 10000]
+
+    dataset_name = 'ELI5'
+    dataset = load_embeds(dataset_name, max(filter_sizes) + query_batch_size)
+    vectors = dataset[0]
+
+    # Use a fixed distance threshold (roughly mid-range from existing evaluations)
+    distance_threshold = calculate_distance_threshold(vectors, 5.0)
+
+    # ────────────────────────────────────────────────────────────────────
+    # 1. Query Throughput
+    # ────────────────────────────────────────────────────────────────────
+    print("\n=== Query Throughput Evaluation ===")
+    query_results = []
+
+    for filter_cls in static_filters + dynamic_filters:
+        for lsh_cls in lsh_families:
+            config_label = f"{filter_cls.__name__} + {lsh_cls.__name__}"
+            print(f"  Evaluating {config_label} ...")
+
+            lsh_instance = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
+
+            for size in filter_sizes:
+                # Prepare vectors: first `size` for construction, next `query_batch_size` for queries
+                construct_vecs = vectors[:size]
+                query_vecs = vectors[size:size + query_batch_size]
+
+                # Build the filter
+                try:
+                    filter_instance = filter_cls(dim=dim, lsh=lsh_instance, max_memory=memory_budget)
+                except Exception:
+                    filter_instance = filter_cls(dim=dim, lsh=lsh_instance)
+
+                filter_instance.construct(construct_vecs)
+
+                # Warm up the query once, then time repeated queries
+                filter_instance.query(query_vecs)
+
+                trial_times = []
+                for _ in range(num_trials):
+                    start = time.perf_counter()
+                    filter_instance.query(query_vecs)
+                    end = time.perf_counter()
+                    trial_times.append(end - start)
+
+                avg_time = np.mean(trial_times)
+                throughput = query_batch_size / avg_time if avg_time > 0 else 0.0
+
+                query_results.append({
+                    'Config': config_label,
+                    'FilterSize': size,
+                    'Throughput': throughput,
+                })
+
+                print(f"    Size={size}: {throughput:.1f} queries/sec")
+
+    plot_throughput_results(query_results, "throughput", "Queries per Second", "Query")
+
+    # ────────────────────────────────────────────────────────────────────
+    # 2. Construction Throughput
+    # ────────────────────────────────────────────────────────────────────
+    print("\n=== Construction Throughput Evaluation ===")
+    construct_results = []
+
+    for filter_cls in static_filters + dynamic_filters:
+        for lsh_cls in lsh_families:
+            config_label = f"{filter_cls.__name__} + {lsh_cls.__name__}"
+            print(f"  Evaluating {config_label} ...")
+
+            lsh_instance = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
+
+            for size in filter_sizes:
+                construct_vecs = vectors[:size]
+
+                # Time the construction (create fresh filter each time)
+                trial_times = []
+                for _ in range(num_trials):
+                    try:
+                        filter_instance = filter_cls(dim=dim, lsh=lsh_instance, max_memory=memory_budget)
+                    except Exception:
+                        filter_instance = filter_cls(dim=dim, lsh=lsh_instance)
+
+                    start = time.perf_counter()
+                    filter_instance.construct(construct_vecs)
+                    end = time.perf_counter()
+                    trial_times.append(end - start)
+
+                avg_time = np.mean(trial_times)
+                throughput = size / avg_time if avg_time > 0 else 0.0
+
+                construct_results.append({
+                    'Config': config_label,
+                    'FilterSize': size,
+                    'Throughput': throughput,
+                })
+
+                print(f"    Size={size}: {throughput:.1f} elements/sec")
+
+    plot_throughput_results(construct_results, "throughput", "Elements per Second", "Construction")
+
+    # ────────────────────────────────────────────────────────────────────
+    # 3. Insertion Throughput (dynamic filters only)
+    # ────────────────────────────────────────────────────────────────────
+    print("\n=== Insertion Throughput Evaluation ===")
+    insert_results = []
+
+    for filter_cls in dynamic_filters:
+        for lsh_cls in lsh_families:
+            config_label = f"{filter_cls.__name__} + {lsh_cls.__name__}"
+            print(f"  Evaluating {config_label} ...")
+
+            lsh_instance = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
+
+            for size in filter_sizes:
+                if size == 0:
+                    continue
+                # Build the filter with some initial elements, then measure insertion of a batch
+                construct_vecs = vectors[:size]
+                insert_vecs = vectors[size:size + query_batch_size]
+
+                try:
+                    filter_instance = filter_cls(dim=dim, lsh=lsh_instance, max_memory=memory_budget)
+                except Exception:
+                    filter_instance = filter_cls(dim=dim, lsh=lsh_instance)
+
+                filter_instance.construct(construct_vecs)
+
+                # Warm-up insert
+                filter_instance.insert(insert_vecs[:1])
+
+                # Re-build to get a clean filter again
+                try:
+                    filter_instance = filter_cls(dim=dim, lsh=lsh_instance, max_memory=memory_budget)
+                except Exception:
+                    filter_instance = filter_cls(dim=dim, lsh=lsh_instance)
+                filter_instance.construct(construct_vecs)
+
+                trial_times = []
+                for _ in range(num_trials):
+                    # Each trial needs its own fresh copy
+                    try:
+                        filt = filter_cls(dim=dim, lsh=lsh_instance, max_memory=memory_budget)
+                    except Exception:
+                        filt = filter_cls(dim=dim, lsh=lsh_instance)
+                    filt.construct(construct_vecs)
+
+                    start = time.perf_counter()
+                    filt.insert(insert_vecs)
+                    end = time.perf_counter()
+                    trial_times.append(end - start)
+
+                avg_time = np.mean(trial_times)
+                throughput = query_batch_size / avg_time if avg_time > 0 else 0.0
+
+                insert_results.append({
+                    'Config': config_label,
+                    'FilterSize': size,
+                    'Throughput': throughput,
+                })
+
+                print(f"    Size={size}: {throughput:.1f} inserts/sec")
+
+    plot_throughput_results(insert_results, "throughput", "Elements per Second (Insertions)", "Insertion")
+
+    return query_results, construct_results, insert_results
+
 
 if __name__ == "__main__":
     static_evaluation()
