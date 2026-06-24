@@ -96,8 +96,8 @@ class GCSFilter(Filter):
         combined = hash(f"{key}:gcs:0x9E3779B9")
         return abs(combined) % modulus
 
-    def construct(self, vectors: np.ndarray) -> None:
-        hashes = self._normalize_hashes(self.lsh.hash(vectors)) if self.lsh else [[str(v)] for v in vectors]
+    def construct(self, vectors: np.ndarray, is_hashed: bool = False) -> None:
+        hashes = self._normalize_hashes(vectors) if is_hashed else (self._normalize_hashes(self.lsh.hash(vectors)) if self.lsh else [[str(v)] for v in vectors])
         keys = list({key for signature_keys in hashes for key in signature_keys})
         self._n = len(keys)
 
@@ -138,14 +138,14 @@ class GCSFilter(Filter):
         self._encoded_data = writer.data
         self._constructed = True
 
-    def query(self, vectors: np.ndarray) -> List[bool]:
+    def query(self, vectors: np.ndarray, is_hashed: bool = False) -> List[bool]:
         if not self._constructed:
             raise ValueError("GCSFilter has not been constructed.")
 
         if self._n == 0:
             return [False] * len(vectors)
 
-        hashes = self._normalize_hashes(self.lsh.hash(vectors)) if self.lsh else [[str(v)] for v in vectors]
+        hashes = self._normalize_hashes(vectors) if is_hashed else (self._normalize_hashes(self.lsh.hash(vectors)) if self.lsh else [[str(v)] for v in vectors])
         results = []
 
         for signature_keys in hashes:

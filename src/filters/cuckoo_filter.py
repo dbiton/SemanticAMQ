@@ -62,52 +62,52 @@ class CuckooFilter(Filter):
         # Formula: (2 * slots_per_bucket) / 2^bits where slots_per_bucket = 4
         return float(8.0 / (2 ** bits))
 
-    def insert(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray, is_hashed: bool = False) -> None:
         """
         Insert vectors into the Cuckoo filter after construction.
 
         Cuckoo filters support dynamic insertion.
         """
-        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        hashes = self._normalize_hashes(vectors) if is_hashed else self._normalize_hashes(self.lsh.hash(vectors))
         for signature_keys in hashes:
             for key in signature_keys:
                 self.filter.insert(key)
 
-    def construct(self, vectors: np.ndarray) -> None:
+    def construct(self, vectors: np.ndarray, is_hashed: bool = False) -> None:
         """Populate the filter from a batch of vectors."""
         # Re-create so that construct() is idempotent.
         self.filter = _CuckooFilter(
             capacity=self._capacity, fingerprint_size=self._fingerprint_size
         )
-        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        hashes = self._normalize_hashes(vectors) if is_hashed else self._normalize_hashes(self.lsh.hash(vectors))
         for signature_keys in hashes:
             for key in signature_keys:
                 self.filter.insert(key)
 
-    def query(self, vectors: np.ndarray) -> List[bool]:
+    def query(self, vectors: np.ndarray, is_hashed: bool = False) -> List[bool]:
         """Return a per-vector list of membership booleans."""
-        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        hashes = self._normalize_hashes(vectors) if is_hashed else self._normalize_hashes(self.lsh.hash(vectors))
         return [any(self.filter.contains(key) for key in signature_keys) for signature_keys in hashes]
 
-    def add(self, vectors: np.ndarray) -> None:
+    def add(self, vectors: np.ndarray, is_hashed: bool = False) -> None:
         """
         Add vectors to the Cuckoo filter after construction.
-        
+
         Cuckoo filters support dynamic insertion.
         """
-        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        hashes = self._normalize_hashes(vectors) if is_hashed else self._normalize_hashes(self.lsh.hash(vectors))
         for signature_keys in hashes:
             for key in signature_keys:
                 self.filter.insert(key)
 
-    def delete(self, vectors: np.ndarray) -> List[bool]:
+    def delete(self, vectors: np.ndarray, is_hashed: bool = False) -> List[bool]:
         """
         Remove vectors from the filter.
 
         Returns a boolean list indicating whether each vector was present
         (and successfully deleted) before the call.
         """
-        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        hashes = self._normalize_hashes(vectors) if is_hashed else self._normalize_hashes(self.lsh.hash(vectors))
         results: List[bool] = []
         for signature_keys in hashes:
             deleted_any = False
@@ -118,14 +118,14 @@ class CuckooFilter(Filter):
             results.append(deleted_any)
         return results
 
-    def remove(self, vectors: np.ndarray) -> List[bool]:
+    def remove(self, vectors: np.ndarray, is_hashed: bool = False) -> List[bool]:
         """
         Alias for delete(); removes vectors from the filter.
 
         Returns a boolean list indicating whether each vector was present
         (and successfully deleted) before the call.
         """
-        return self.delete(vectors)
+        return self.delete(vectors, is_hashed=is_hashed)
 
     def get_bytesize(self) -> int:
         """

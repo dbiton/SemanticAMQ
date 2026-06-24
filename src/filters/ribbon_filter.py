@@ -107,7 +107,7 @@ class RibbonFilter(Filter):
 
         return fp, rows
 
-    def construct(self, vectors) -> None:
+    def construct(self, vectors, is_hashed: bool = False) -> None:
         """
         Build the ribbon filter from a batch of vectors.
 
@@ -117,10 +117,10 @@ class RibbonFilter(Filter):
 
         Retries with increased slot count if the hypergraph is not peelable.
         """
-        if self.lsh is None:
+        if not is_hashed and self.lsh is None:
             raise ValueError("RibbonFilter requires an LSH instance for construction.")
 
-        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        hashes = self._normalize_hashes(vectors) if is_hashed else self._normalize_hashes(self.lsh.hash(vectors))
         keys: List[str] = []
         for signature_keys in hashes:
             for key in signature_keys:
@@ -266,7 +266,7 @@ class RibbonFilter(Filter):
         self._solution = solution
         return True
 
-    def query(self, vectors) -> List[bool]:
+    def query(self, vectors, is_hashed: bool = False) -> List[bool]:
         """
         Query the ribbon filter for membership of the provided vectors.
 
@@ -275,13 +275,13 @@ class RibbonFilter(Filter):
         """
         if not self._constructed:
             raise ValueError("RibbonFilter has not been constructed.")
-        if self.lsh is None:
+        if not is_hashed and self.lsh is None:
             raise ValueError("RibbonFilter requires an LSH instance for querying.")
 
         if self._num_entries == 0 or self._num_slots == 0:
             return [False] * len(vectors)
 
-        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        hashes = self._normalize_hashes(vectors) if is_hashed else self._normalize_hashes(self.lsh.hash(vectors))
         results: List[bool] = []
 
         for signature_keys in hashes:

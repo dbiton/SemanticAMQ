@@ -134,16 +134,16 @@ class VacuumFilter(Filter):
             buckets.append(b)
         return buckets, fp
 
-    def construct(self, vectors: np.ndarray) -> None:
+    def construct(self, vectors: np.ndarray, is_hashed: bool = False) -> None:
         """Populate the filter from a batch of vectors."""
         self._buckets = [[] for _ in range(self._num_buckets)]
         self._size = 0
         self._all_keys = []
-        self.insert(vectors)
+        self.insert(vectors, is_hashed=is_hashed)
 
-    def insert(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray, is_hashed: bool = False) -> None:
         """Insert vectors into the vacuum filter."""
-        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        hashes = self._normalize_hashes(vectors) if is_hashed else self._normalize_hashes(self.lsh.hash(vectors))
         for signature_keys in hashes:
             for key in signature_keys:
                 self._insert_single(key)
@@ -250,9 +250,9 @@ class VacuumFilter(Filter):
             if failed_at == -1:
                 return  # All keys rebuilt successfully.
 
-    def query(self, vectors: np.ndarray) -> List[bool]:
+    def query(self, vectors: np.ndarray, is_hashed: bool = False) -> List[bool]:
         """Query the vacuum filter for membership of the provided vectors."""
-        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        hashes = self._normalize_hashes(vectors) if is_hashed else self._normalize_hashes(self.lsh.hash(vectors))
         results: List[bool] = []
 
         for signature_keys in hashes:
@@ -272,17 +272,17 @@ class VacuumFilter(Filter):
 
         return results
 
-    def add(self, vectors: np.ndarray) -> None:
+    def add(self, vectors: np.ndarray, is_hashed: bool = False) -> None:
         """Add vectors to the vacuum filter (dynamic insertion supported)."""
-        self.insert(vectors)
+        self.insert(vectors, is_hashed=is_hashed)
 
-    def remove(self, vectors: np.ndarray) -> List[bool]:
+    def remove(self, vectors: np.ndarray, is_hashed: bool = False) -> List[bool]:
         """
         Remove vectors from the vacuum filter.
 
         Returns True per vector if it was present and removed.
         """
-        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        hashes = self._normalize_hashes(vectors) if is_hashed else self._normalize_hashes(self.lsh.hash(vectors))
         results: List[bool] = []
 
         for signature_keys in hashes:

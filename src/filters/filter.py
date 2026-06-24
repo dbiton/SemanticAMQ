@@ -61,27 +61,27 @@ class Filter:
             return [[self._signature_to_key(s) for s in row] for row in hashes]
         raise ValueError(f"Unsupported hash shape: {hashes.shape}")
 
-    def insert(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray, is_hashed: bool = False) -> None:
         raise NotImplementedError("Subclasses must implement the insert method.")
 
-    def construct(self, vectors: np.ndarray) -> None:
+    def construct(self, vectors: np.ndarray, is_hashed: bool = False) -> None:
         raise NotImplementedError("Subclasses must implement the construct method.")
 
-    def query(self, vectors: np.ndarray) -> List[bool]:
+    def query(self, vectors: np.ndarray, is_hashed: bool = False) -> List[bool]:
         raise NotImplementedError("Subclasses must implement the query method.")
 
-    def add(self, vectors: np.ndarray) -> None:
+    def add(self, vectors: np.ndarray, is_hashed: bool = False) -> None:
         """
         Add vectors to an already-constructed filter.
-        
+
         Not all filters support dynamic insertion. Filters that don't should raise NotImplementedError.
         """
         raise NotImplementedError(f"{self.__class__.__name__} does not support dynamic insertion.")
 
-    def remove(self, vectors: np.ndarray) -> List[bool]:
+    def remove(self, vectors: np.ndarray, is_hashed: bool = False) -> List[bool]:
         """
         Remove vectors from the filter.
-        
+
         Returns a list of booleans indicating whether each vector was present and removed.
         Not all filters support removal. Filters that don't should raise NotImplementedError.
         """

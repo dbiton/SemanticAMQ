@@ -56,41 +56,41 @@ class BloomFilter(Filter):
         """
         return float(self._error_rate)
 
-    def construct(self, vectors: np.ndarray) -> None:
+    def construct(self, vectors: np.ndarray, is_hashed: bool = False) -> None:
         """Populate the filter from a batch of vectors."""
         # Re-initialise so that construct() is idempotent.
         self.filter = _BloomFilter(
             capacity=max(self._capacity, len(vectors)),
             error_rate=self._error_rate,
         )
-        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        hashes = self._normalize_hashes(vectors) if is_hashed else self._normalize_hashes(self.lsh.hash(vectors))
         for signature_keys in hashes:
             for key in signature_keys:
                 self.filter.add(key)
 
-    def query(self, vectors: np.ndarray) -> List[bool]:
+    def query(self, vectors: np.ndarray, is_hashed: bool = False) -> List[bool]:
         """Return a per-vector list of membership booleans."""
-        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        hashes = self._normalize_hashes(vectors) if is_hashed else self._normalize_hashes(self.lsh.hash(vectors))
         return [any(key in self.filter for key in signature_keys) for signature_keys in hashes]
 
-    def insert(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray, is_hashed: bool = False) -> None:
         """
         Insert vectors into the filter after construction.
-        
+
         Bloom filters support dynamic insertion; automatically scales capacity if needed.
         """
-        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        hashes = self._normalize_hashes(vectors) if is_hashed else self._normalize_hashes(self.lsh.hash(vectors))
         for signature_keys in hashes:
             for key in signature_keys:
                 self.filter.add(key)
 
-    def add(self, vectors: np.ndarray) -> None:
+    def add(self, vectors: np.ndarray, is_hashed: bool = False) -> None:
         """
         Add vectors to the filter after construction.
-        
+
         Bloom filters support dynamic insertion; automatically scales capacity if needed.
         """
-        hashes = self._normalize_hashes(self.lsh.hash(vectors))
+        hashes = self._normalize_hashes(vectors) if is_hashed else self._normalize_hashes(self.lsh.hash(vectors))
         for signature_keys in hashes:
             for key in signature_keys:
                 self.filter.add(key)
@@ -158,28 +158,28 @@ class ScalableBloomFilter(Filter):
         """
         return float(self._error_rate)
 
-    def construct(self, vectors: np.ndarray) -> None:
+    def construct(self, vectors: np.ndarray, is_hashed: bool = False) -> None:
         """Populate the filter from a batch of vectors."""
         self.filter = _ScalableBloomFilter(
             initial_capacity=self._initial_capacity,
             error_rate=self._error_rate,
         )
-        hashes = self.lsh.hash(vectors)
+        hashes = vectors if is_hashed else self.lsh.hash(vectors)
         for h in hashes:
             self.filter.add(h)
 
-    def query(self, vectors: np.ndarray) -> List[bool]:
+    def query(self, vectors: np.ndarray, is_hashed: bool = False) -> List[bool]:
         """Return a per-vector list of membership booleans."""
-        hashes = self.lsh.hash(vectors)
+        hashes = vectors if is_hashed else self.lsh.hash(vectors)
         return [h in self.filter for h in hashes]
 
-    def add(self, vectors: np.ndarray) -> None:
+    def add(self, vectors: np.ndarray, is_hashed: bool = False) -> None:
         """
         Add vectors to the scalable Bloom filter after construction.
-        
+
         The scalable filter automatically grows as needed.
         """
-        hashes = self.lsh.hash(vectors)
+        hashes = vectors if is_hashed else self.lsh.hash(vectors)
         for h in hashes:
             self.filter.add(h)
 
