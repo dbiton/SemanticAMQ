@@ -4,7 +4,6 @@ from filters.filter import Filter
 import numpy as np
 from scipy.integrate import quad as integrate
 from typing import List, Optional
-import sys
 
 
 def _false_positive_probability(threshold, b, r):
@@ -89,6 +88,8 @@ class LSHBloom(Filter):
         else:
             fp_optimal = fp
 
+        self._b = b
+        self._fp_optimal = fp_optimal
         self.lsh = MinHashLSHBloom(threshold=threshold, num_perm=num_perm, n=n, fp=fp_optimal)
 
     def _get_minhash(self, vector: np.ndarray) -> MinHash:
@@ -147,15 +148,8 @@ class LSHBloom(Filter):
         )
 
     def get_bytesize(self) -> int:
-        """
-        Returns the approximate memory size in bytes of the LSH Bloom Filter.
-        
-        Estimates based on the MinHash object size and the underlying LSH Bloom structure.
-        """
-        # Get approximate size from the LSH object
-        lsh_size = sys.getsizeof(self.lsh)
-        # Add estimated size for MinHash structures (rough estimate)
-        # Each MinHash uses num_perm permutations of hash values (4 bytes each)
-        minhash_size = self.num_perm * 4  # rough estimate per minhash
-        # Estimate total size including internal Bloom filter
-        return lsh_size + minhash_size + 2048  # 2KB additional overhead
+        # Bloom filter bits only — excludes MinHash (LSH) structures.
+        # b bands, each sized for n elements at fp_optimal error rate.
+        fp = max(self._fp_optimal, 1e-300)
+        bits_per_bloom = -self.n * math.log(fp) / (math.log(2) ** 2)
+        return int(math.ceil(self._b * bits_per_bloom / 8))
