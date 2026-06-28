@@ -2,6 +2,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+import seaborn as sns
+
 from filters.cuckoo_filter import CuckooFilter
 from filters.gcs_filter import GCSFilter
 from filters.kmeb_filter import KMEBFilter
@@ -12,7 +14,7 @@ from runner import Runner
 from typing import List
 from util.fetch_datasets import load_embeds
 
-MAX_WORKERS = 1
+MAX_WORKERS = 6
 
 dynamic_filters = [CuckooFilter, QuotientFilterWrapper]
 static_filters  = [Xor8Filter, Fuse8Filter, GCSFilter, KMEBFilter]
