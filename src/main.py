@@ -1,5 +1,6 @@
 from filters.filter import Filter
 from typing import Any, List
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -10,12 +11,11 @@ import sys
 # Your specific imports
 from filters.pyfusefilter_filters import Xor8Filter, Xor16Filter, Fuse8Filter, Fuse16Filter
 from filters.cuckoo_filter import CuckooFilter
-from filters.lsh_bloom import LSHBloom
-from filters.bloom_filter import BloomFilter
 from filters.naive_filter import NaiveFilter
 from lsh import CrossPolytopeLSH, SimHashLSH, LSH
 from filters.set_filter import SetFilter
 from filters.gcs_filter import GCSFilter
+from filters.kmeb_filter import KMEBFilter
 from util.fetch_datasets import load_embeds
 from filters.quotient_filter import QuotientFilterWrapper
 
@@ -206,9 +206,35 @@ def compute_static_actual_results(construct_vectors: np.ndarray, query_vectors: 
     return actual_results
 
 
-dynamic_filters = [CuckooFilter, BloomFilter, QuotientFilterWrapper]
-static_filters  = [Xor8Filter, Fuse8Filter, GCSFilter]
-lsh_families: List[LSH] = [CrossPolytopeLSH, SimHashLSH]
+dynamic_filters = [CuckooFilter, QuotientFilterWrapper]
+static_filters  = [Xor8Filter, Fuse8Filter, GCSFilter, KMEBFilter]
+lsh_families: List[LSH] = [CrossPolytopeLSH]
+
+def _static_worker(filter_cls, lsh_cls, dim, distance_threshold, max_L, memory_budget,
+                   vectors_construct, vectors_query, actual_results, percentage):
+    config_label = f"{filter_cls.__name__} + {lsh_cls.__name__}"
+    lsh_instance = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
+    try:
+        filter_instance = filter_cls(dim=dim, lsh=lsh_instance, max_memory=memory_budget)
+    except Exception:
+        filter_instance = filter_cls(dim=dim, lsh=lsh_instance)
+    result = run_static(filter_instance, vectors_construct, vectors_query, distance_threshold, actual_results)
+    result['Config'] = config_label
+    result['Percentage'] = percentage
+    return result
+
+def _dynamic_worker(filter_cls, lsh_cls, dim, distance_threshold, max_L, memory_budget,
+                    vectors_construct, vectors_query, actual_results, percentage):
+    config_label = f"{filter_cls.__name__} + {lsh_cls.__name__}"
+    lsh_instance = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
+    try:
+        filter_instance = filter_cls(dim=dim, lsh=lsh_instance, max_memory=memory_budget)
+    except Exception:
+        filter_instance = filter_cls(dim=dim, lsh=lsh_instance)
+    result = run_dynamic(filter_instance, vectors_construct, vectors_query, distance_threshold, actual_results)
+    result['Config'] = config_label
+    result['Percentage'] = percentage
+    return result
 
 def calculate_memory_budget(num_vectors: int, bits_per_element: float = 12.0, overhead_bytes: int = 4096) -> int:
     # Calculate bytes required for the elements
@@ -274,12 +300,11 @@ def run_dynamic(filter: Filter, vectors_construct: np.ndarray, vectors_query: np
     return result
 
 def static_evaluation():
-    num_vectors = 10000
+    num_vectors = 1000
     dim = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
     count_steps = 9
-    bits = 64
     percentage_construct = 10
     max_L = 256
     memory_budget = calculate_memory_budget(num_vectors, bits_per_element=12.0, overhead_bytes=4096)
@@ -287,39 +312,33 @@ def static_evaluation():
     dataset_name = 'ELI5'
     dataset = load_embeds(dataset_name, num_vectors)
     vectors = dataset[0]
-    
+
     split_index = int(num_vectors * percentage_construct / 100)
     vectors_construct = vectors[:split_index]
     vectors_query = vectors[split_index:]
 
-    results_list = []
-    for percentage in np.linspace(min_percentage_duplicates, max_percentage_duplicates, count_steps):
-        distance_threshold = calculate_distance_threshold(vectors, percentage)
+    futures_meta = {}
+    with ProcessPoolExecutor(max_workers=20) as executor:
+        for percentage in np.linspace(min_percentage_duplicates, max_percentage_duplicates, count_steps):
+            distance_threshold = calculate_distance_threshold(vectors, percentage)
+            actual_results = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
 
-        # ── Ground-truth labels strictly for the static query set ───────────
-        actual_results = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
-        # ────────────────────────────────────────────────────────────────────
+            for filter_cls in static_filters + dynamic_filters:
+                for lsh_cls in lsh_families:
+                    future = executor.submit(
+                        _static_worker,
+                        filter_cls, lsh_cls, dim, distance_threshold, max_L, memory_budget,
+                        vectors_construct, vectors_query, actual_results, percentage,
+                    )
+                    futures_meta[future] = f"{filter_cls.__name__} + {lsh_cls.__name__} @ {percentage:.1f}%"
 
-        for filter_cls in static_filters + dynamic_filters:
-            for lsh_cls in lsh_families:
-                config_label = f"{filter_cls.__name__} + {lsh_cls.__name__}"
-                print(f"Evaluating {config_label} @ {percentage:.1f}% ...")
-
-                # Initialize LSH with varying size
-                lsh_instance = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
-                try:
-                    filter_instance = filter_cls(dim=dim, lsh=lsh_instance, max_memory=memory_budget)
-                except Exception as e:
-                    print(f"Error occurred while initializing {filter_cls.__name__}: {e}")
-                    filter_instance = filter_cls(dim=dim, lsh=lsh_instance)
-                print(f"filter_instance: {type(filter_instance).__name__}, lsh_instance: {type(lsh_instance).__name__}")
-                
-                result = run_static(filter_instance, vectors_construct, vectors_query, distance_threshold, actual_results)
-                result['Config'] = config_label
-                result['Percentage'] = percentage
-
-                print(result)
-                results_list.append(result)
+        results_list = []
+        for future in as_completed(futures_meta):
+            label = futures_meta[future]
+            result = future.result()
+            print(f"Completed: {label}")
+            print(result)
+            results_list.append(result)
 
     print("Evaluation completed.")
     plot_results(results_list, "static")
@@ -327,13 +346,12 @@ def static_evaluation():
 
 
 def dynamic_evaluation():
-    num_vectors = 10000
+    num_vectors = 1000
     percentage_construct = 25
     dim = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
     count_steps = 10
-    bits = 64
     max_L = 256
 
     dataset_name = 'ELI5'
@@ -344,34 +362,28 @@ def dynamic_evaluation():
     vectors_query = vectors[num_construct:]
     memory_budget = calculate_memory_budget(num_construct, bits_per_element=12.0, overhead_bytes=4096)
 
-    results_list = []
-    for percentage in np.linspace(min_percentage_duplicates, max_percentage_duplicates, count_steps):
-        distance_threshold = calculate_distance_threshold(vectors, percentage)
+    futures_meta = {}
+    with ProcessPoolExecutor(max_workers=20) as executor:
+        for percentage in np.linspace(min_percentage_duplicates, max_percentage_duplicates, count_steps):
+            distance_threshold = calculate_distance_threshold(vectors, percentage)
+            actual_results = compute_actual_results(vectors, distance_threshold)
 
-        # ── Ground-truth labels for this threshold ──────────────────────────
-        actual_results = compute_actual_results(vectors, distance_threshold)
-        # ────────────────────────────────────────────────────────────────────
+            for filter_cls in dynamic_filters:
+                for lsh_cls in lsh_families:
+                    future = executor.submit(
+                        _dynamic_worker,
+                        filter_cls, lsh_cls, dim, distance_threshold, max_L, memory_budget,
+                        vectors_construct, vectors_query, actual_results, percentage,
+                    )
+                    futures_meta[future] = f"{filter_cls.__name__} + {lsh_cls.__name__} @ {percentage:.1f}%"
 
-        for filter_cls in dynamic_filters:
-            for lsh_cls in lsh_families:
-                config_label = f"{filter_cls.__name__} + {lsh_cls.__name__}"
-                print(f"Evaluating {config_label} @ {percentage:.1f}% ...")
-
-                # Initialize LSH with varying size
-                lsh_instance = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
-
-                try:
-                    filter_instance = filter_cls(dim=dim, lsh=lsh_instance, max_memory=memory_budget)
-                except Exception as e:
-                    print(f"Error occurred while initializing {filter_cls.__name__}: {e}")
-                    filter_instance = filter_cls(dim=dim, lsh=lsh_instance)
-                print(f"filter_instance: {type(filter_instance).__name__}, lsh_instance: {type(lsh_instance).__name__}")
-                               
-                result = run_dynamic(filter_instance, vectors_construct, vectors_query, distance_threshold, actual_results)
-                result['Config'] = config_label
-                result['Percentage'] = percentage
-                print(result)
-                results_list.append(result)
+        results_list = []
+        for future in as_completed(futures_meta):
+            label = futures_meta[future]
+            result = future.result()
+            print(f"Completed: {label}")
+            print(result)
+            results_list.append(result)
 
     print("Evaluation completed.")
     plot_results(results_list, "dynamic")
@@ -647,4 +659,4 @@ def throughput_evaluation():
 if __name__ == "__main__":
     static_evaluation()
     dynamic_evaluation()
-    throughput_evaluation()
+    # throughput_evaluation()
