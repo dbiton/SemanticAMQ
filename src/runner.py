@@ -34,11 +34,14 @@ def _compute_metrics(
     }
 
 
-def _instantiate_filter(filter_cls: Any, dim: int, lsh: Any, memory_budget: int) -> Any:
+def _instantiate_filter(filter_cls: Any, dim: int, lsh: Any, memory_budget: int, distance_threshold: float) -> Any:
     try:
         return filter_cls(dim=dim, lsh=lsh, max_memory=memory_budget)
     except TypeError:
-        return filter_cls(dim=dim, lsh=lsh)
+        try:
+            return filter_cls(dim=dim, lsh=lsh)
+        except TypeError:
+            return filter_cls(dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold)
 
 
 def static_worker(
@@ -55,7 +58,7 @@ def static_worker(
 ) -> Dict[str, Any]:
     config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
     lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
-    filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget)
+    filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold)
     filter_instance.construct(vectors_construct)
     predicted = filter_instance.query(vectors_query)
     return _compute_metrics(predicted, actual_results, distance_threshold, config, percentage)
