@@ -78,7 +78,7 @@ def dynamic_worker(
 ) -> Dict[str, Any]:
     config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
     lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
-    filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget)
+    filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold)
     filter_instance.construct(vectors_construct)
 
     predicted: List[bool] = []

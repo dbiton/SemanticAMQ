@@ -14,15 +14,15 @@ from runner import Runner
 from typing import List
 from util.fetch_datasets import load_embeds
 
-MAX_WORKERS = 6
+MAX_WORKERS = 1
 
-dynamic_filters = [CuckooFilter, QuotientFilterWrapper]
-static_filters  = [Xor8Filter, Fuse8Filter, GCSFilter, KMEBFilter]
+dynamic_filters = [QuotientFilterWrapper]
+static_filters  = [Xor8Filter, Fuse8Filter, KMEBFilter]
 lsh_families: List[LSH] = [CrossPolytopeLSH]
 
 
 def calculate_memory_budget(num_vectors: int, bits_per_element: float = 12.0, overhead_bytes: int = 4096) -> int:
-    return int(np.ceil(num_vectors * bits_per_element / 8.0)) + overhead_bytes
+    return (int(np.ceil(num_vectors * bits_per_element / 8.0)) + overhead_bytes) // 50
 
 
 def calculate_distance_threshold(vectors: np.ndarray, percentage: float) -> float:
@@ -339,6 +339,6 @@ def throughput_evaluation():
 
 
 if __name__ == "__main__":
-    static_evaluation()
     dynamic_evaluation()
+    static_evaluation()
     # throughput_evaluation()
