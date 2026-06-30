@@ -51,13 +51,12 @@ class LSH(ABC):
         pass
 
     def hash(self, vectors: np.ndarray) -> np.ndarray:
-        raw_hashes = self._compute_raw_hashes(vectors)
-        n_samples = vectors.shape[0]
-        signatures = np.empty((n_samples, self.L), dtype=object)
-        for l in range(self.L):
-            for i in range(n_samples):
-                signatures[i, l] = tuple(raw_hashes[i, l, :])
-        return signatures
+        raw_hashes = self._compute_raw_hashes(vectors)  # (n_samples, L, K)
+        # View each K-element row as a single opaque byte string so numpy's == compares
+        # whole tuples without building Python objects.
+        contiguous = np.ascontiguousarray(raw_hashes)
+        void_dt = np.dtype((np.void, contiguous.dtype.itemsize * self.K))
+        return contiguous.view(void_dt).reshape(vectors.shape[0], self.L)
 
 
 class SimHashLSH(LSH):
@@ -74,67 +73,68 @@ class SimHashLSH(LSH):
 
     def _compute_raw_hashes(self, vectors: np.ndarray) -> np.ndarray:
         projections = np.einsum('nd, lkd -> nlk', vectors, self.hyperplanes)
-        return (projections > 0).astype(int)
+        return (projections > 0).astype(np.uint8)
 
 
 class CrossPolytopeLSH(LSH):
     def __init__(self, dim: int, L: int, K: int):
         super().__init__(dim, L, K)
-        self.rotations = np.zeros((self.L, self.K, self.dim, self.dim))
-        for l in range(self.L):
-            for k in range(self.K):
-                H = np.random.randn(self.dim, self.dim)
-                Q, R = np.linalg.qr(H)
-                self.rotations[l, k] = Q
-    
+        # Generate all L*K orthogonal matrices in one batched QR call.
+        H = np.random.randn(self.L, self.K, self.dim, self.dim)
+        Q, _ = np.linalg.qr(H)
+        self.rotations = Q  # (L, K, dim, dim)
+
     # The close formula is only accurate when d->infinity
     def _get_base_probabilities(self, r1: float, r2: float) -> Tuple[float, float]:
         def estimate_p(r):
             if r <= 0.0: return 1.0
             if r >= 2.0: return 0.0
-            
+
             cos_theta = np.clip(1.0 - (r**2) / 2.0, -1.0, 1.0)
             sin_theta = np.sqrt(1.0 - cos_theta**2)
-            
+
             batch_size = 25000
             max_sims = 250000  # Hard ceiling to prevent infinite loops
-            target_se = 0.0015 # Target Standard Error (0.15%)
-            
+            target_se = 0.0015  # Target Standard Error (0.15%)
+
             matches = 0
             total_sims = 0
-            
+
             while total_sims < max_sims:
                 X = np.random.randn(batch_size, self.dim)
                 Z = np.random.randn(batch_size, self.dim)
                 Y = X * cos_theta + Z * sin_theta
-                
+
                 max_idx_X = np.argmax(np.abs(X), axis=1)
                 max_idx_Y = np.argmax(np.abs(Y), axis=1)
-                
+
                 signs_X = np.sign(X[np.arange(batch_size), max_idx_X])
                 signs_Y = np.sign(Y[np.arange(batch_size), max_idx_Y])
-                
+
                 matches += np.sum((max_idx_X == max_idx_Y) & (signs_X == signs_Y))
                 total_sims += batch_size
-                
-                # Check our statistical bounds
+
                 p_hat = matches / total_sims
                 se = np.sqrt(p_hat * (1.0 - p_hat) / total_sims)
-                
+
                 if se <= target_se:
                     break
-                    
+
             return float(p_hat)
-            
+
         return estimate_p(r1), estimate_p(r2)
 
     def _compute_raw_hashes(self, vectors: np.ndarray) -> np.ndarray:
         n_samples = vectors.shape[0]
-        raw_hashes = np.zeros((n_samples, self.L, self.K), dtype=int)
+        raw_hashes = np.empty((n_samples, self.L, self.K), dtype=np.int32)
+        # Pre-build index grids for advanced indexing inside the L loop.
+        n_idx = np.arange(n_samples)[:, None]  # (n, 1)
+        k_idx = np.arange(self.K)[None, :]     # (1, K)
         for l in range(self.L):
-            for k in range(self.K):
-                rotated = vectors @ self.rotations[l, k].T
-                max_idx = np.argmax(np.abs(rotated), axis=1)
-                signs = np.sign(rotated[np.arange(n_samples), max_idx])
-                raw_hashes[:, l, k] = max_idx * 2 + (signs > 0).astype(int)
+            # einsum: rotated[n,k,i] = sum_j vectors[n,j] * rotations[l,k,i,j]
+            # Equivalent to vectors @ rotations[l,k].T for every k simultaneously.
+            rotated = np.einsum('nj, kij -> nki', vectors, self.rotations[l])
+            max_idx = np.argmax(np.abs(rotated), axis=-1)      # (n, K)
+            selected = rotated[n_idx, k_idx, max_idx]           # (n, K)
+            raw_hashes[:, l, :] = max_idx * 2 + (selected > 0).astype(np.int32)
         return raw_hashes
