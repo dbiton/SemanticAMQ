@@ -138,3 +138,28 @@ class CrossPolytopeLSH(LSH):
             selected = rotated[n_idx, k_idx, max_idx]           # (n, K)
             raw_hashes[:, l, :] = max_idx * 2 + (selected > 0).astype(np.int32)
         return raw_hashes
+
+import faiss
+class FaissSimHashLSH(LSH):
+    def __init__(self, dim: int, L: int, K: int):
+        super().__init__(dim, L, K)
+        # One index with L*K hyperplanes is statistically equivalent to L separate
+        # K-hyperplane tables because all hyperplanes are i.i.d. Gaussian. A single
+        # FAISS call avoids the L-iteration Python loop and its per-call overhead.
+        self._index = faiss.IndexLSH(dim, L * K)
+
+    def _get_base_probabilities(self, r1: float, r2: float) -> Tuple[float, float]:
+        theta1 = np.arccos(np.clip(1.0 - (r1 ** 2) / 2.0, -1.0, 1.0))
+        theta2 = np.arccos(np.clip(1.0 - (r2 ** 2) / 2.0, -1.0, 1.0))
+        p1 = 1.0 - (theta1 / np.pi)
+        p2 = 1.0 - (theta2 / np.pi)
+        return float(p1), float(p2)
+
+    def _compute_raw_hashes(self, vectors: np.ndarray) -> np.ndarray:
+        vecs_f32 = np.ascontiguousarray(vectors, dtype=np.float32)
+        n_samples = vecs_f32.shape[0]
+        # sa_encode packs bits LSB-first within each byte, so bitorder='little'
+        # is required to correctly extract bit i from position i%8 of byte i//8.
+        packed = self._index.sa_encode(vecs_f32)          # (n, ceil(L*K/8))
+        bits = np.unpackbits(packed, axis=1, bitorder='little')[:, : self.L * self.K]
+        return bits.reshape(n_samples, self.L, self.K)

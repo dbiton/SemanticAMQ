@@ -9,16 +9,16 @@ from filters.gcs_filter import GCSFilter
 from filters.kmeb_filter import KMEBFilter
 from filters.pyfusefilter_filters import Fuse8Filter, Xor8Filter
 from filters.quotient_filter import QuotientFilterWrapper
-from lsh import CrossPolytopeLSH, LSH
+from lsh import FaissSimHashLSH, LSH
 from runner import Runner
 from typing import List
 from util.fetch_datasets import load_embeds
 
-MAX_WORKERS = 1
+MAX_WORKERS = 4
 
 dynamic_filters = [QuotientFilterWrapper]
 static_filters  = [Xor8Filter, Fuse8Filter, KMEBFilter]
-lsh_families: List[LSH] = [CrossPolytopeLSH]
+lsh_families: List[LSH] = [FaissSimHashLSH]
 
 
 def calculate_memory_budget(num_vectors: int, bits_per_element: float = 12.0, overhead_bytes: int = 4096) -> int:
@@ -124,7 +124,7 @@ def plot_results(results_list: list, folder: str) -> None:
 
 
 def static_evaluation() -> list:
-    num_vectors              = 1000
+    num_vectors              = 10000
     dim                      = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
@@ -162,7 +162,7 @@ def static_evaluation() -> list:
 
 
 def dynamic_evaluation() -> list:
-    num_vectors              = 1000
+    num_vectors              = 10000
     dim                      = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
