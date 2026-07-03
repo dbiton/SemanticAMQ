@@ -66,7 +66,7 @@ class TestVacuumFilter:
             buckets, fp = filt._get_buckets(key)
             found = False
             for b in buckets:
-                for stored_fp, _ in filt._buckets[b]:
+                for stored_fp in filt._buckets[b]:
                     if stored_fp == fp:
                         found = True
                         break

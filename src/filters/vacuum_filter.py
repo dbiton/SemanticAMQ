@@ -14,7 +14,6 @@ Key properties:
 
 import hashlib
 import struct
-import sys
 import numpy as np
 from typing import List, Optional, Tuple
 from filters.filter import Filter
@@ -68,12 +67,19 @@ class VacuumFilter(Filter):
         self._epsilon = 1.0 / (2 ** fingerprint_size)
 
         slots_per_bucket = 4
-        self._num_buckets = max(
+        num_buckets = max(
             2,
             int(self._capacity / (slots_per_bucket * 0.95)) + 1
         )
+        if max_memory is not None:
+            # get_bytesize() = num_buckets * slots_per_bucket * fingerprint_bytes;
+            # clamp so the "+1" safety margin above can't push it over budget.
+            fp_bytes = max(1, fingerprint_size // 8)
+            max_buckets_for_budget = max(2, max_memory // (slots_per_bucket * fp_bytes))
+            num_buckets = min(num_buckets, max_buckets_for_budget)
+        self._num_buckets = num_buckets
 
-        self._buckets: List[List[Tuple[int, int]]] = [
+        self._buckets: List[List[int]] = [
             [] for _ in range(self._num_buckets)
         ]
         self._max_slots_per_bucket = slots_per_bucket
@@ -93,9 +99,21 @@ class VacuumFilter(Filter):
         return float(self._epsilon * self._max_slots_per_bucket * self._buckets_per_entry)
 
     @staticmethod
-    def _hash_to_int(key: str) -> int:
-        """Deterministic 32-bit hash using SHA-256 (PYTHONHASHSEED-independent)."""
-        digest = hashlib.sha256(key.encode()).digest()
+    def _hash_to_int(key) -> int:
+        """
+        Deterministic 32-bit hash using SHA-256 (PYTHONHASHSEED-independent).
+
+        `key` is normally a str, but LSH signatures can also arrive as raw
+        bytes or numpy.void scalars (e.g. from SimHashLSH/CrossPolytopeLSH
+        with L > 1), so any of those are accepted directly.
+        """
+        if isinstance(key, str):
+            key_bytes = key.encode()
+        elif isinstance(key, bytes):
+            key_bytes = key
+        else:
+            key_bytes = bytes(key)
+        digest = hashlib.sha256(key_bytes).digest()
         return struct.unpack('<I', digest[:4])[0]
 
     @staticmethod
@@ -165,11 +183,10 @@ class VacuumFilter(Filter):
         the slots and cause infinite kick loops.
         """
         buckets, fp = self._get_buckets(key)
-        extra = self._hash_to_int(f"extra:{key}")
 
         # Skip if the fingerprint is already present — query already returns True.
         for b in buckets:
-            for stored_fp, _ in self._buckets[b]:
+            for stored_fp in self._buckets[b]:
                 if stored_fp == fp:
                     return True
 
@@ -177,7 +194,7 @@ class VacuumFilter(Filter):
         for b in buckets:
             bkt = self._buckets[b]
             if len(bkt) < self._max_slots_per_bucket:
-                bkt.append((fp, extra))
+                bkt.append(fp)
                 self._size += 1
                 self._all_keys.append(key)
                 return True
@@ -185,27 +202,27 @@ class VacuumFilter(Filter):
         # Phase 2: iterative cuckoo kicking — bounded by _max_kicks.
         current_fp = fp
         current_bucket = buckets[np.random.randint(len(buckets))]
-        kick_chain: List[Tuple[int, int, int, int]] = []
+        kick_chain: List[Tuple[int, int, int]] = []
 
         for _ in range(self._max_kicks):
             bkt = self._buckets[current_bucket]
             if len(bkt) < self._max_slots_per_bucket:
-                bkt.append((current_fp, 0))
+                bkt.append(current_fp)
                 self._size += 1
                 self._all_keys.append(key)
                 return True
 
             evict_idx = np.random.randint(len(bkt))
-            evicted_fp, evicted_extra = bkt[evict_idx]
-            bkt[evict_idx] = (current_fp, 0)
-            kick_chain.append((current_bucket, evict_idx, evicted_fp, evicted_extra))
+            evicted_fp = bkt[evict_idx]
+            bkt[evict_idx] = current_fp
+            kick_chain.append((current_bucket, evict_idx, evicted_fp))
 
             current_bucket = self._alt_hash(evicted_fp, current_bucket, self._num_buckets)
             current_fp = evicted_fp
 
         # Undo all kicks so the table remains consistent.
-        for b_idx, slot_idx, orig_fp, orig_extra in reversed(kick_chain):
-            self._buckets[b_idx][slot_idx] = (orig_fp, orig_extra)
+        for b_idx, slot_idx, orig_fp in reversed(kick_chain):
+            self._buckets[b_idx][slot_idx] = orig_fp
 
         return False
 
@@ -213,6 +230,15 @@ class VacuumFilter(Filter):
         """Insert a key, expanding the table as needed (iterative, not recursive)."""
         if self._try_insert_no_expand(key):
             return True
+        if self.max_memory is not None and self._size >= self._capacity:
+            # self._capacity is the max_memory-derived entry cap. Once reached,
+            # refuse to grow the table further rather than silently exceeding
+            # the budget via _do_expand().
+            raise ValueError(
+                f"max_memory={self.max_memory} bytes is exhausted: cannot insert "
+                f"beyond {self._capacity} entries at fingerprint_size="
+                f"{self._fingerprint_size} bits."
+            )
         while True:
             self._do_expand()
             if self._try_insert_no_expand(key):
@@ -260,7 +286,7 @@ class VacuumFilter(Filter):
             for key in signature_keys:
                 buckets, fp = self._get_buckets(key)
                 for b in buckets:
-                    for stored_fp, _ in self._buckets[b]:
+                    for stored_fp in self._buckets[b]:
                         if stored_fp == fp:
                             found = True
                             break
@@ -291,7 +317,7 @@ class VacuumFilter(Filter):
                 buckets, fp = self._get_buckets(key)
                 for b in buckets:
                     bucket = self._buckets[b]
-                    for i, (stored_fp, _) in enumerate(bucket):
+                    for i, stored_fp in enumerate(bucket):
                         if stored_fp == fp:
                             bucket.pop(i)
                             self._size -= 1
@@ -310,10 +336,14 @@ class VacuumFilter(Filter):
         return results
 
     def get_bytesize(self) -> int:
-        """Returns the approximate memory size in bytes of the vacuum filter."""
-        bucket_overhead = sys.getsizeof(self._buckets)
-        entries_size = self._size * (self._fingerprint_size // 8 + 4)
-        return bucket_overhead + entries_size
+        """
+        Returns the approximate memory size in bytes of the vacuum filter's
+        allocated table: num_buckets * slots_per_bucket entries of
+        fingerprint_size bits each, matching the fixed-size-table model used
+        by CuckooFilter (this is what the capacity-from-max_memory formula
+        targets, and it doesn't shrink/grow with current fill).
+        """
+        return self._num_buckets * self._max_slots_per_bucket * (self._fingerprint_size // 8)
 
     def __repr__(self) -> str:
         load = self._size / (self._num_buckets * self._max_slots_per_bucket)
