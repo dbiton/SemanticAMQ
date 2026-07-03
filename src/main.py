@@ -129,7 +129,7 @@ def plot_results(results_list: list, folder: str) -> None:
 
 
 def static_evaluation() -> list:
-    num_vectors              = 1000
+    num_vectors              = 10000
     dim                      = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
@@ -172,7 +172,7 @@ def static_evaluation() -> list:
 
 
 def dynamic_evaluation() -> list:
-    num_vectors              = 1000
+    num_vectors              = 10000
     dim                      = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9

@@ -147,3 +147,67 @@ def test_kmeb_filter_respects_max_memory_with_many_vectors():
     f = KMEBFilter(dim=dim, distance_threshold=0.3, max_memory=budget)
     f.construct(make_unit_vectors(500, dim=dim))
     assert f.get_bytesize() <= budget
+
+
+# ---------------------------------------------------------------------------
+# Real-allocation checks.
+#
+# The tests above trust each filter's own get_bytesize(). That is exactly the
+# blind spot that let the memory-usage plots misrepresent reality: a filter
+# could derive its size from a wrong per-slot cost and then report an equally
+# wrong (too small) bytesize, so it silently allocated 2-4x past max_memory
+# while its own accounting claimed it fit. These tests measure the memory each
+# filter *actually* allocates -- independently of get_bytesize() -- and assert
+# both that it honours the budget and that get_bytesize() reports it faithfully.
+# ---------------------------------------------------------------------------
+
+def _real_quotient_backing_bytes(f: QuotientFilterWrapper) -> int:
+    """Ground-truth size of the quotient filter's slot table, read straight from
+    the underlying array.array (2**quotient slots at the platform itemsize),
+    with no reliance on get_bytesize()."""
+    backing = f.filter._filter
+    return backing.itemsize * len(backing)
+
+
+@pytest.mark.parametrize("budget", [50_000, 100_000, 500_000, 1_000_000])
+def test_quotient_filter_real_allocation_within_budget(budget):
+    """The quotient filter's real slot table must fit max_memory, and
+    get_bytesize() must report that real size exactly (never under-count it).
+
+    This fails on the old implementation, which sized the quotient from a
+    ~11-bits-per-slot guess and reported 1 byte/slot, so the real array.array
+    (up to 4 bytes/slot) blew past the budget while get_bytesize() hid it.
+    """
+    lsh = make_light_lsh()
+    f = QuotientFilterWrapper(dim=DIM, lsh=lsh, max_memory=budget)
+    f.construct(make_unit_vectors(100))
+    real = _real_quotient_backing_bytes(f)
+    assert real <= budget, (
+        f"QuotientFilter really allocated {real} bytes, exceeding budget={budget}"
+    )
+    assert f.get_bytesize() == real, (
+        f"get_bytesize()={f.get_bytesize()} does not match real allocation {real}"
+    )
+    assert f.get_bytesize() <= budget
+
+
+@pytest.mark.parametrize(
+    "filter_cls", [Xor8Filter, Xor16Filter, Fuse8Filter, Fuse16Filter]
+)
+def test_pyfuse_bytesize_matches_real_serialized_size(filter_cls):
+    """get_bytesize() must track the fingerprint table's real size.
+
+    Ground truth is the library's serialized byte length. The old hand-tuned
+    slots-per-key factors under-counted the Fuse variants by ~14%, which this
+    5% tolerance rejects.
+    """
+    # Several LSH bands -> enough keys that the fixed header doesn't dominate.
+    lsh = SimHashLSH(dim=DIM, L=8, K=8)
+    f = filter_cls(dim=DIM, lsh=lsh, max_memory=10_000_000)
+    f.construct(make_unit_vectors(500))
+    real = len(f.filter.serialize())
+    reported = f.get_bytesize()
+    assert abs(reported - real) <= 0.05 * real, (
+        f"{filter_cls.__name__} reported {reported} bytes vs real {real} "
+        f"(off by more than 5%)"
+    )
