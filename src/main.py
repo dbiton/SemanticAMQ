@@ -93,7 +93,8 @@ def plot_results(results_list: list, folder: str) -> None:
 
     configs = df['Config'].unique()
 
-    for metric in ('F1-Score', 'Precision', 'Recall'):
+    bounded_metrics = ('F1-Score', 'Precision', 'Recall')
+    for metric in bounded_metrics + ('Memory Usage',):
         fig, ax = plt.subplots(figsize=(8, 6))
         sns.lineplot(
             data=df, x='Percentage', y=metric,
@@ -102,9 +103,10 @@ def plot_results(results_list: list, folder: str) -> None:
             palette=color_map, ax=ax, legend=False,
         )
         ax.set_xlabel('Percentage of Duplicates (%)', fontsize=12)
-        ax.set_ylabel(metric, fontsize=12)
-        ax.set_ylim(-0.05, 1.05)
-        filename = f'{metric.lower().replace("-", "_")}_plot.png'
+        ax.set_ylabel(metric if metric != 'Memory Usage' else 'Memory Usage (bytes)', fontsize=12)
+        if metric in bounded_metrics:
+            ax.set_ylim(-0.05, 1.05)
+        filename = f'{metric.lower().replace("-", "_").replace(" ", "_")}_plot.png'
         plt.savefig(f"plots/{folder}/{filename}", bbox_inches='tight', dpi=300)
         plt.close()
         print(f"Saved plots/{folder}/{filename}")
@@ -127,7 +129,7 @@ def plot_results(results_list: list, folder: str) -> None:
 
 
 def static_evaluation() -> list:
-    num_vectors              = 10000
+    num_vectors              = 1000
     dim                      = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
@@ -170,7 +172,7 @@ def static_evaluation() -> list:
 
 
 def dynamic_evaluation() -> list:
-    num_vectors              = 10000
+    num_vectors              = 1000
     dim                      = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
