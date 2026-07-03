@@ -130,12 +130,16 @@ class CuckooFilter(Filter):
     def get_bytesize(self) -> int:
         """
         Returns the approximate memory size in bytes of the Cuckoo Filter.
-        
+
         Estimates based on capacity, fingerprint size, and typical cuckoo filter overhead.
         Assumes 4 slots per bucket and 2 probes.
         """
-        # Each bucket has 4 slots, each slot stores a fingerprint
-        num_buckets = self._capacity
+        # The underlying cuckoofilter library treats `capacity` as a total slot
+        # count, then rounds up to the next power of 2 and divides by 4 to get
+        # the actual bucket count -- so the real bucket count can differ
+        # substantially from self._capacity. Read it back from the live filter
+        # rather than recomputing it, so this stays accurate after rounding.
+        num_buckets = self.filter.capacity()
         bytes_per_bucket = 4 * self._fingerprint_size  # 4 slots per bucket
         total_bytes = num_buckets * bytes_per_bucket
         # Add overhead for metadata and hash tables (~10%)

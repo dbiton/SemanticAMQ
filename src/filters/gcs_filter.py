@@ -112,6 +112,9 @@ class GCSFilter(Filter):
             bits_per_item = total_bits / self._n
             if bits_per_item < 1.5:
                 raise ValueError("max_memory is too small to store the dataset using GCS.")
+            # Cap to avoid float/int overflow for very generous budgets relative
+            # to n; an FPR of 1/2^62 is already far beyond any practical use.
+            bits_per_item = min(bits_per_item, 62.0)
             # Reverse Golomb math: P = 2^(b - 1.4427)
             self._m = max(2, int(2 ** (bits_per_item - 1.4427)))
 

@@ -42,10 +42,24 @@ class PyFuseFilter(Filter):
     def get_bytesize(self) -> int:
         """
         Returns the approximate memory size in bytes of the PyFuseFilter.
-        
+
         This is a base implementation; subclasses may override for specific estimates.
         """
         return sys.getsizeof(self.filter) + 512  # 512 bytes overhead
+
+    def _enforce_memory_budget(self) -> None:
+        """
+        Raise if the just-constructed filter exceeds max_memory.
+
+        PyFuseFilters are static and size purely from the number of keys, so
+        the only way to honour a memory budget is to refuse to build a filter
+        that would exceed it.
+        """
+        if self.max_memory is not None and self.get_bytesize() > self.max_memory:
+            raise ValueError(
+                f"{self.__class__.__name__}: {self._n_keys} keys require "
+                f"{self.get_bytesize()} bytes, exceeding max_memory={self.max_memory}."
+            )
 
 
 class Xor8Filter(PyFuseFilter):
@@ -63,6 +77,7 @@ class Xor8Filter(PyFuseFilter):
         signature_keys = [key for signature_keys in hashes for key in signature_keys]
         self._n_keys = len(signature_keys)
         self.filter = Xor8(size_or_data=signature_keys)
+        self._enforce_memory_budget()
 
     def query(self, vectors: np.ndarray):
         hashes = self._normalize_hashes(self.lsh.hash(vectors))
@@ -84,6 +99,7 @@ class Xor16Filter(PyFuseFilter):
         signature_keys = [key for signature_keys in hashes for key in signature_keys]
         self._n_keys = len(signature_keys)
         self.filter = Xor16(size_or_data=signature_keys)
+        self._enforce_memory_budget()
 
     def query(self, vectors: np.ndarray) -> List[bool]:
         hashes = self._normalize_hashes(self.lsh.hash(vectors))
@@ -105,6 +121,7 @@ class Fuse8Filter(PyFuseFilter):
         signature_keys = [key for signature_keys in hashes for key in signature_keys]
         self._n_keys = len(signature_keys)
         self.filter = Fuse8(size_or_data=signature_keys)
+        self._enforce_memory_budget()
 
     def query(self, vectors: np.ndarray) -> List[bool]:
         hashes = self._normalize_hashes(self.lsh.hash(vectors))
@@ -126,6 +143,7 @@ class Fuse16Filter(PyFuseFilter):
         signature_keys = [key for signature_keys in hashes for key in signature_keys]
         self._n_keys = len(signature_keys)
         self.filter = Fuse16(size_or_data=signature_keys)
+        self._enforce_memory_budget()
 
     def query(self, vectors: np.ndarray) -> List[bool]:
         hashes = self._normalize_hashes(self.lsh.hash(vectors))

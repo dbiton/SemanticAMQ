@@ -14,7 +14,7 @@ from runner import Runner
 from typing import List
 from util.fetch_datasets import load_embeds
 
-MAX_WORKERS = 4
+MAX_WORKERS = 8
 
 dynamic_filters = [QuotientFilterWrapper]
 static_filters  = [Xor8Filter, Fuse8Filter, KMEBFilter]
@@ -22,7 +22,10 @@ lsh_families: List[LSH] = [FaissSimHashLSH]
 
 
 def calculate_memory_budget(num_vectors: int, bits_per_element: float = 12.0, overhead_bytes: int = 4096) -> int:
-    return (int(np.ceil(num_vectors * bits_per_element / 8.0)) + overhead_bytes) // 50
+    total_bits = num_vectors * bits_per_element
+    filter_bytes = int(np.ceil(total_bits / 8.0))
+    total_bytes = filter_bytes + overhead_bytes
+    return total_bytes
 
 
 def calculate_distance_threshold(vectors: np.ndarray, percentage: float) -> float:
@@ -136,7 +139,6 @@ def static_evaluation() -> list:
     split   = int(num_vectors * percentage_construct / 100)
     vectors_construct = vectors[:split]
     vectors_query     = vectors[split:]
-    memory_budget = calculate_memory_budget(num_vectors, bits_per_element=12.0)
 
     runner = Runner(num_workers=MAX_WORKERS)
 
@@ -144,8 +146,14 @@ def static_evaluation() -> list:
         distance_threshold = calculate_distance_threshold(vectors, percentage)
         actual_results     = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
 
-        for filter_cls in static_filters + dynamic_filters:
-            for lsh_cls in lsh_families:
+        for lsh_cls in lsh_families:
+            # hash() emits one key per LSH band, so a filter actually stores
+            # num_vectors * L keys, not num_vectors. The memory budget must
+            # scale with the L that this distance_threshold requires.
+            L = lsh_cls.build_optimized(dim, distance_threshold, None, max_L).L
+            memory_budget = calculate_memory_budget(num_vectors * L, bits_per_element=12.0)
+
+            for filter_cls in static_filters + dynamic_filters:
                 runner.submit(
                     'static',
                     filter_cls=filter_cls, lsh_cls=lsh_cls,
@@ -174,7 +182,6 @@ def dynamic_evaluation() -> list:
     num_construct = num_vectors * percentage_construct // 100
     vectors_construct = vectors[:num_construct]
     vectors_query     = vectors[num_construct:]
-    memory_budget = calculate_memory_budget(num_construct, bits_per_element=12.0)
 
     runner = Runner(num_workers=MAX_WORKERS)
 
@@ -184,8 +191,14 @@ def dynamic_evaluation() -> list:
         # slice to query positions so ground truth aligns with the query phase.
         actual_results = compute_actual_results(vectors, distance_threshold)[num_construct:]
 
-        for filter_cls in dynamic_filters:
-            for lsh_cls in lsh_families:
+        for lsh_cls in lsh_families:
+            # hash() emits one key per LSH band, so a filter actually stores
+            # num_construct * L keys, not num_construct. The memory budget
+            # must scale with the L that this distance_threshold requires.
+            L = lsh_cls.build_optimized(dim, distance_threshold, None, max_L).L
+            memory_budget = calculate_memory_budget(num_construct * L, bits_per_element=12.0)
+
+            for filter_cls in dynamic_filters:
                 runner.submit(
                     'dynamic',
                     filter_cls=filter_cls, lsh_cls=lsh_cls,
@@ -339,6 +352,6 @@ def throughput_evaluation():
 
 
 if __name__ == "__main__":
-    dynamic_evaluation()
     static_evaluation()
+    dynamic_evaluation()
     # throughput_evaluation()

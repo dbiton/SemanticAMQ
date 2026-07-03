@@ -32,8 +32,10 @@ class QuotientFilterWrapper(Filter):
             # Adding 1 to ensure the load factor stays safely under 100%
             self.quotient: int = max(3, math.ceil(math.log2(dim)) + 1)
         
-        # Initialize the underlying filter
-        self.filter = QuotientFilter(quotient=self.quotient)
+        # Initialize the underlying filter. When a memory budget was given, the
+        # quotient size is a hard cap: disable auto-expansion so overflow raises
+        # instead of silently growing the table past max_memory.
+        self.filter = QuotientFilter(quotient=self.quotient, auto_expand=max_memory is None)
         
         # Exact-matching false positive rate for a quotient filter is roughly 1 / 2^r
         self.epsilon: float = 1.0 / (2**remainder_bits)
@@ -102,8 +104,11 @@ class QuotientFilterWrapper(Filter):
         Each entry in a quotient filter stores quotient (q bits) and remainder,
         plus is_occupied, is_continuation, and is_shifted flags (3 bits each per slot).
         """
-        # The number of slots is 2^quotient
-        num_slots = 2 ** self.quotient
+        # Read the live quotient from the underlying filter rather than
+        # self.quotient: when auto_expand is enabled (no max_memory set), the
+        # underlying filter can grow its quotient at runtime, and self.quotient
+        # would otherwise go stale.
+        num_slots = 2 ** self.filter.quotient
         # Each slot needs bits for: quotient (quotient bits) + remainder (3 bits) + 3 flags (is_occupied, is_continuation, is_shifted)
         # Approximate: 1 byte per entry plus some overhead
         bytes_per_entry = 1

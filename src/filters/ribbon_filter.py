@@ -16,7 +16,6 @@ Key properties:
 - Query time is O(arity) = O(1) — very fast
 """
 
-import sys
 import xxhash
 from collections import deque
 from typing import Optional, List, Tuple
@@ -144,15 +143,29 @@ class RibbonFilter(Filter):
             return
 
         if self.max_memory is not None:
+            # max_memory is a hard cap: num_slots can never be grown past what
+            # the budget allows, even on peel failure or retry.
             bits_available = self.max_memory * 8
-            self._num_slots = max(
-                self._num_entries,
-                int(bits_available / self._bits_per_key)
-            )
-        else:
-            # Ribbon filter: optimal size ≈ n * 1.23 for 3-arity.
-            # Start at 1.30× to avoid most retries.
-            self._num_slots = max(self._num_entries, int(self._num_entries * 1.30) + 1)
+            budget_slots = int(bits_available / self._bits_per_key)
+            if budget_slots < self._num_entries:
+                raise ValueError(
+                    f"max_memory={self.max_memory} bytes allows only {budget_slots} slots, "
+                    f"insufficient to store {self._num_entries} entries at "
+                    f"{self._bits_per_key} bits_per_key."
+                )
+            self._num_slots = budget_slots
+            if not self._try_construct(keys):
+                raise ValueError(
+                    f"max_memory={self.max_memory} bytes ({budget_slots} slots) is "
+                    f"insufficient to build a peelable RibbonFilter for "
+                    f"{self._num_entries} entries."
+                )
+            self._constructed = True
+            return
+
+        # Ribbon filter: optimal size ≈ n * 1.23 for 3-arity.
+        # Start at 1.30× to avoid most retries.
+        self._num_slots = max(self._num_entries, int(self._num_entries * 1.30) + 1)
 
         max_retries = 5
         retry_multiplier = 1.5
@@ -325,12 +338,13 @@ class RibbonFilter(Filter):
         """
         Returns the approximate memory size in bytes of the Ribbon filter.
 
-        The solution vector stores num_slots entries of bits_per_key bits each.
+        The solution vector stores num_slots entries of bits_per_key bits each,
+        packed to that width (the in-memory Python list is a larger, unpacked
+        representation and isn't what this estimate models).
         """
         if not self._constructed:
             return 0
-        solution_bytes = (self._num_slots * self._bits_per_key) // 8
-        return solution_bytes + sys.getsizeof(self._solution)
+        return (self._num_slots * self._bits_per_key) // 8
 
     def __repr__(self) -> str:
         if not self._constructed:

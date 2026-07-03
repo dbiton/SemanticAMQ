@@ -58,9 +58,12 @@ class BloomFilter(Filter):
 
     def construct(self, vectors: np.ndarray, is_hashed: bool = False) -> None:
         """Populate the filter from a batch of vectors."""
-        # Re-initialise so that construct() is idempotent.
+        # Re-initialise so that construct() is idempotent. When max_memory is
+        # set it is a hard cap, so capacity must never grow past it just
+        # because more vectors were supplied than the budget allows.
+        capacity = self._capacity if self.max_memory is not None else max(self._capacity, len(vectors))
         self.filter = _BloomFilter(
-            capacity=max(self._capacity, len(vectors)),
+            capacity=capacity,
             error_rate=self._error_rate,
         )
         hashes = self._normalize_hashes(vectors) if is_hashed else self._normalize_hashes(self.lsh.hash(vectors))
@@ -123,6 +126,8 @@ class ScalableBloomFilter(Filter):
                           capacity is derived from the memory budget.
     """
 
+    _METADATA_OVERHEAD_BYTES = 1024  # kept in sync with get_bytesize()
+
     def __init__(
         self,
         dim: int,
@@ -135,8 +140,11 @@ class ScalableBloomFilter(Filter):
         self._error_rate = error_rate
 
         if max_memory is not None:
-            # Derive initial capacity from the memory budget (same formula as BloomFilter).
-            bits_available = max_memory * 8
+            # Derive initial capacity from the memory budget (same formula as
+            # BloomFilter), reserving room for the metadata overhead that
+            # get_bytesize() adds so the reported size stays within budget.
+            usable_bytes = max(0, max_memory - self._METADATA_OVERHEAD_BYTES)
+            bits_available = usable_bytes * 8
             self._initial_capacity = int(
                 bits_available * (math.log(2) ** 2) / (-math.log(error_rate))
             )
@@ -193,4 +201,4 @@ class ScalableBloomFilter(Filter):
         # Calculate the number of bits needed for initial filter
         bits_needed = -self._initial_capacity * math.log(self._error_rate) / (math.log(2) ** 2)
         # Convert bits to bytes, add some overhead for scalability structure
-        return int(math.ceil(bits_needed / 8)) + 1024  # 1KB overhead for scalability metadata
+        return int(math.ceil(bits_needed / 8)) + self._METADATA_OVERHEAD_BYTES

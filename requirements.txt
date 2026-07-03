@@ -19,3 +19,4 @@ cuckoofilter
 pybloom_live
 h5py
 pyprobables
+pytest
