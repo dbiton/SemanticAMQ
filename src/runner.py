@@ -1,9 +1,49 @@
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterator, List, Union
 
 import numpy as np
+
+from vector_source import VectorSource
+
+# A worker accepts either an in-memory array or a lazy on-disk VectorSource.
+VectorInput = Union[np.ndarray, VectorSource]
+
+# Query stream is consumed in bounded-size blocks so nothing larger than this
+# many rows is ever materialised at once, no matter how long the stream is.
+_QUERY_BATCH = 4096
+
+
+def _to_construct_array(vectors: VectorInput) -> np.ndarray:
+    """
+    Materialise a construct set into a single array.
+
+    Static/immutable filters build from the full batch of keys at once, so the
+    (bounded) construct slice must live in memory here -- but it is read lazily
+    from disk only when the job actually runs, never copied into the job payload.
+    """
+    if isinstance(vectors, VectorSource):
+        return vectors.to_array()
+    return np.asarray(vectors)
+
+
+def _iter_query_batches(vectors: VectorInput, batch_size: int) -> Iterator[np.ndarray]:
+    """Yield the query stream as 2D blocks, lazily for a VectorSource."""
+    if isinstance(vectors, VectorSource):
+        yield from vectors.iter_batches(batch_size)
+    else:
+        arr = np.asarray(vectors)
+        for base in range(0, len(arr), batch_size):
+            yield arr[base:base + batch_size]
+
+
+def _iter_query_vectors(vectors: VectorInput) -> Iterator[np.ndarray]:
+    """Yield the query stream one vector at a time, lazily for a VectorSource."""
+    if isinstance(vectors, VectorSource):
+        yield from vectors
+    else:
+        yield from np.asarray(vectors)
 
 
 def _compute_metrics(
@@ -53,16 +93,22 @@ def static_worker(
     distance_threshold: float,
     max_L: int,
     memory_budget: int,
-    vectors_construct: np.ndarray,
-    vectors_query: np.ndarray,
+    vectors_construct: VectorInput,
+    vectors_query: VectorInput,
     actual_results: List[bool],
     percentage: float,
 ) -> Dict[str, Any]:
     config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
     lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
     filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold)
-    filter_instance.construct(vectors_construct)
-    predicted = filter_instance.query(vectors_query)
+    filter_instance.construct(_to_construct_array(vectors_construct))
+
+    # Stream the query set in bounded blocks so the full stream never has to be
+    # resident (or copied into the job) at once.
+    predicted: List[bool] = []
+    for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
+        predicted.extend(filter_instance.query(block))
+
     # Checked at the end of the run: for static filters, memory is fixed after
     # construct(), but querying can't change it, so this reflects final usage.
     memory_usage = filter_instance.get_bytesize()
@@ -76,18 +122,20 @@ def dynamic_worker(
     distance_threshold: float,
     max_L: int,
     memory_budget: int,
-    vectors_construct: np.ndarray,
-    vectors_query: np.ndarray,
+    vectors_construct: VectorInput,
+    vectors_query: VectorInput,
     actual_results: List[bool],
     percentage: float,
 ) -> Dict[str, Any]:
     config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
     lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
     filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold)
-    filter_instance.construct(vectors_construct)
+    filter_instance.construct(_to_construct_array(vectors_construct))
 
+    # Pull the query stream one vector at a time (dynamic filters insert after
+    # each miss, so this is inherently sequential); disk reads stay chunked.
     predicted: List[bool] = []
-    for v in vectors_query:
+    for v in _iter_query_vectors(vectors_query):
         is_dup = filter_instance.query(np.array([v]))[0]
         predicted.append(is_dup)
         if not is_dup:

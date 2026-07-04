@@ -16,22 +16,11 @@ from datasets.combine import concatenate_datasets
 from scipy.cluster.hierarchy import DisjointSet
 from sklearn.preprocessing import normalize
 
+from util.dataset_paths import dataset_filenames  # re-exported for compatibility
+
 embeds_dir = "datasets"
 
 models: Dict[str, SentenceTransformer] = {}
-
-dataset_filenames = {
-    "MsMarco": "./datasets/embeds_msmarco.pkl",
-    "WildChat": "./datasets/embeds_wildchat.pkl",
-    "ELI5": "./datasets/embeds_eli5.pkl",
-    "NaturalQuestions": "./datasets/embeds_nq.pkl",
-    "StackOverflow": "./datasets/embeds_stackoverflow.pkl",
-    "Quora": "./datasets/embeds_quora_qp.pkl",
-    "MMLU": "./datasets/embeds_mmlu.pkl",
-    "TriviaQA": "./datasets/embeds_triviaqa.pkl",
-    "HotPotQA": "./datasets/embeds_hotpotqa.pkl",
-    "peS2o": "./datasets/embeds_pes2o.pkl",
-}
 
 def load_embeds(dataset_name: str, N: int):
     path = dataset_filenames[dataset_name]

@@ -92,7 +92,7 @@ class QuotientFilterWrapper(Filter):
         hashes = self._normalize_hashes(self.lsh.hash(vectors))
         return [any(self.filter.check(str(key)) for key in signature_keys) for signature_keys in hashes]
 
-    def add(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray) -> None:
         """
         Add vectors to the quotient filter after construction.
         

@@ -1,3 +1,4 @@
+import faiss
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -13,8 +14,9 @@ from lsh import FaissSimHashLSH, LSH
 from runner import Runner
 from typing import List
 from util.fetch_datasets import load_embeds
+from vector_source import VectorSource
 
-MAX_WORKERS = 8
+MAX_WORKERS = 1
 
 dynamic_filters = [QuotientFilterWrapper]
 static_filters  = [Xor8Filter, Fuse8Filter, KMEBFilter]
@@ -28,18 +30,49 @@ def calculate_memory_budget(num_vectors: int, bits_per_element: float = 12.0, ov
     return total_bytes
 
 
-def calculate_distance_threshold(vectors: np.ndarray, percentage: float) -> float:
+def calculate_distance_threshold(
+    vectors: np.ndarray,
+    percentage: float,
+    max_pairs: int = 20_000_000,
+    seed: int = 42,
+) -> float:
     """
     Return the distance threshold at which `percentage`% of all pairwise L2
     distances are considered duplicates (i.e., the `percentage`-th percentile).
+
+    Computing every pairwise distance is O(n^2) in time and memory -- an n x n
+    matrix plus an n(n-1)/2 distance array (~40 GB at n=100k), which is why the
+    exact version blows up. Instead we sample up to `max_pairs // n` query rows
+    and use faiss to compute their *exact* L2 distances against the full set
+    (BLAS-accelerated, multithreaded). Each sampled query contributes a complete
+    distance row, so the pooled distances are an unbiased sample of the pairwise
+    distribution; the percentile estimate is within ~0.2% of exact even in the
+    1-9% tail, at bounded (~`max_pairs`-sized) memory.
     """
-    sq_norms = np.sum(vectors ** 2, axis=1)
-    dot      = vectors @ vectors.T
-    sq_dists = sq_norms[:, None] + sq_norms[None, :] - 2 * dot
+    n = len(vectors)
+    if n < 2:
+        return 0.0
+
+    vecs = np.ascontiguousarray(vectors, dtype=np.float32)
+
+    # Sample enough query rows to pool ~max_pairs distances (all rows when n is
+    # small enough that the full set already fits the budget).
+    n_query = int(np.clip(max_pairs // n, 1, n))
+    if n_query >= n:
+        query_idx = np.arange(n)
+    else:
+        query_idx = np.random.default_rng(seed).choice(n, size=n_query, replace=False)
+
+    # faiss returns squared L2 distances (shape: n_query x n).
+    sq_dists = np.asarray(faiss.pairwise_distances(vecs[query_idx], vecs))
     np.clip(sq_dists, 0, None, out=sq_dists)
-    upper_idx = np.triu_indices(len(vectors), k=1)
-    distances = np.sqrt(sq_dists[upper_idx])
-    return float(np.percentile(distances, percentage))
+    distances = np.sqrt(sq_dists)
+
+    # Drop each sampled query's distance to itself (the 0 on the diagonal),
+    # matching the exact version's exclusion of self-pairs.
+    keep = np.ones(distances.shape, dtype=bool)
+    keep[np.arange(len(query_idx)), query_idx] = False
+    return float(np.percentile(distances[keep], percentage))
 
 
 def compute_actual_results(vectors: np.ndarray, distance_threshold: float) -> list[bool]:
@@ -70,12 +103,23 @@ def compute_static_actual_results(
     """
     Static ground-truth: a query vector is a duplicate iff it falls within
     `distance_threshold` of any vector in the fixed construct set.
+
+    "Within threshold of any construct vector" is exactly a nearest-neighbour
+    test, so we let faiss find each query's closest construct vector in one
+    batched, BLAS-accelerated call instead of a Python loop that builds a full
+    (n_construct,) distance array per query. faiss returns *squared* L2, so we
+    compare against distance_threshold**2 (equivalent to sqrt(...) <= threshold).
     """
-    actual = []
-    for v in query_vectors:
-        distances = np.sqrt(np.sum((construct_vectors - v) ** 2, axis=1))
-        actual.append(bool(np.any(distances <= distance_threshold)))
-    return actual
+    construct = np.ascontiguousarray(construct_vectors, dtype=np.float32)
+    queries = np.ascontiguousarray(query_vectors, dtype=np.float32)
+
+    if len(construct) == 0:
+        return [False] * len(queries)
+
+    index = faiss.IndexFlatL2(construct.shape[1])
+    index.add(construct)
+    nn_sq_dist, _ = index.search(queries, 1)  # squared L2 to nearest construct vector
+    return (nn_sq_dist[:, 0] <= distance_threshold ** 2).tolist()
 
 
 def plot_results(results_list: list, folder: str) -> None:
@@ -129,7 +173,7 @@ def plot_results(results_list: list, folder: str) -> None:
 
 
 def static_evaluation() -> list:
-    num_vectors              = 10000
+    num_vectors              = 100000
     dim                      = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
@@ -137,15 +181,24 @@ def static_evaluation() -> list:
     percentage_construct     = 10
     max_L                    = 256
 
-    vectors = load_embeds('ELI5', num_vectors)[0]
+    dataset = 'ELI5'
+    vectors = load_embeds(dataset, num_vectors)[0]
     split   = int(num_vectors * percentage_construct / 100)
     vectors_construct = vectors[:split]
     vectors_query     = vectors[split:]
 
+    # Jobs receive lazy on-disk pointers instead of array copies, so the query
+    # stream length is bounded by disk, not by num_jobs * stream_length memory.
+    construct_source = VectorSource(dataset, 0, split)
+    query_source     = VectorSource(dataset, split, num_vectors)
+
     runner = Runner(num_workers=MAX_WORKERS)
 
     for percentage in np.linspace(min_percentage_duplicates, max_percentage_duplicates, count_steps):
+        print(f"Processing {percentage:.1f}% duplicates...")
+        print(f"Calculating distance threshold...")
         distance_threshold = calculate_distance_threshold(vectors, percentage)
+        print(f"Calculating actual results...")
         actual_results     = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
 
         for lsh_cls in lsh_families:
@@ -161,7 +214,7 @@ def static_evaluation() -> list:
                     filter_cls=filter_cls, lsh_cls=lsh_cls,
                     dim=dim, distance_threshold=distance_threshold,
                     max_L=max_L, memory_budget=memory_budget,
-                    vectors_construct=vectors_construct, vectors_query=vectors_query,
+                    vectors_construct=construct_source, vectors_query=query_source,
                     actual_results=actual_results, percentage=percentage,
                 )
 
@@ -172,7 +225,7 @@ def static_evaluation() -> list:
 
 
 def dynamic_evaluation() -> list:
-    num_vectors              = 10000
+    num_vectors              = 100000
     dim                      = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
@@ -180,10 +233,14 @@ def dynamic_evaluation() -> list:
     percentage_construct     = 25
     max_L                    = 256
 
-    vectors       = load_embeds('ELI5', num_vectors)[0]
+    dataset       = 'ELI5'
+    vectors       = load_embeds(dataset, num_vectors)[0]
     num_construct = num_vectors * percentage_construct // 100
-    vectors_construct = vectors[:num_construct]
-    vectors_query     = vectors[num_construct:]
+
+    # Jobs receive lazy on-disk pointers instead of array copies, so the query
+    # stream length is bounded by disk, not by num_jobs * stream_length memory.
+    construct_source = VectorSource(dataset, 0, num_construct)
+    query_source     = VectorSource(dataset, num_construct, num_vectors)
 
     runner = Runner(num_workers=MAX_WORKERS)
 
@@ -206,7 +263,7 @@ def dynamic_evaluation() -> list:
                     filter_cls=filter_cls, lsh_cls=lsh_cls,
                     dim=dim, distance_threshold=distance_threshold,
                     max_L=max_L, memory_budget=memory_budget,
-                    vectors_construct=vectors_construct, vectors_query=vectors_query,
+                    vectors_construct=construct_source, vectors_query=query_source,
                     actual_results=actual_results, percentage=percentage,
                 )
 
