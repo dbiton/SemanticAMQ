@@ -8,6 +8,7 @@ import seaborn as sns
 from filters.cuckoo_filter import CuckooFilter
 from filters.gcs_filter import GCSFilter
 from filters.kmeb_filter import KMEBFilter
+from filters.kdball_filter import KDBallFilter
 from filters.pyfusefilter_filters import Fuse8Filter, Xor8Filter
 from filters.quotient_filter import QuotientFilterWrapper
 from lsh import FaissSimHashLSH, LSH
@@ -19,7 +20,7 @@ from vector_source import VectorSource
 MAX_WORKERS = 1
 
 dynamic_filters = [QuotientFilterWrapper]
-static_filters  = [Xor8Filter, Fuse8Filter, KMEBFilter]
+static_filters  = [Xor8Filter, Fuse8Filter, KDBallFilter, KMEBFilter]
 lsh_families: List[LSH] = [FaissSimHashLSH]
 
 
@@ -412,5 +413,5 @@ def throughput_evaluation():
 
 if __name__ == "__main__":
     static_evaluation()
-    dynamic_evaluation()
+    # dynamic_evaluation()
     # throughput_evaluation()
