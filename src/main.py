@@ -1,9 +1,7 @@
 import faiss
-import matplotlib.pyplot as plt
+import time
 import numpy as np
 import pandas as pd
-
-import seaborn as sns
 
 from filters.cuckoo_filter import CuckooFilter
 from filters.gcs_filter import GCSFilter
@@ -13,11 +11,13 @@ from filters.pyfusefilter_filters import Fuse8Filter, Xor8Filter
 from filters.quotient_filter import QuotientFilterWrapper
 from lsh import FaissSimHashLSH, LSH
 from runner import Runner
-from typing import List
+from plots import plot_results, plot_throughput_results, plot_tradeoff_results
+from typing import Tuple, List
 from util.fetch_datasets import load_embeds
 from vector_source import VectorSource
 
 MAX_WORKERS = 1
+DATASET = 'ELI5'
 
 dynamic_filters = [QuotientFilterWrapper]
 static_filters  = [Xor8Filter, Fuse8Filter, KDBallFilter, KMEBFilter]
@@ -123,56 +123,6 @@ def compute_static_actual_results(
     return (nn_sq_dist[:, 0] <= distance_threshold ** 2).tolist()
 
 
-def plot_results(results_list: list, folder: str) -> None:
-    df = pd.DataFrame(results_list)
-    df[['Filter', 'LSH']] = df['Config'].str.split(' + ', regex=False, expand=True)
-
-    sns.set_theme(style="whitegrid")
-
-    unique_filters = df['Filter'].unique()
-    color_map = dict(zip(unique_filters, sns.color_palette("husl", len(unique_filters))))
-
-    unique_lshs     = df['LSH'].unique()
-    available_marks = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'X']
-    marker_map      = dict(zip(unique_lshs, available_marks[:len(unique_lshs)]))
-
-    configs = df['Config'].unique()
-
-    bounded_metrics = ('F1-Score', 'Precision', 'Recall')
-    for metric in bounded_metrics + ('Memory Usage',):
-        fig, ax = plt.subplots(figsize=(8, 6))
-        sns.lineplot(
-            data=df, x='Percentage', y=metric,
-            hue='Filter', style='LSH',
-            markers=marker_map, dashes=False,
-            palette=color_map, ax=ax, legend=False,
-        )
-        ax.set_xlabel('Percentage of Duplicates (%)', fontsize=12)
-        ax.set_ylabel(metric if metric != 'Memory Usage' else 'Memory Usage (bytes)', fontsize=12)
-        if metric in bounded_metrics:
-            ax.set_ylim(-0.05, 1.05)
-        filename = f'{metric.lower().replace("-", "_").replace(" ", "_")}_plot.png'
-        plt.savefig(f"plots/{folder}/{filename}", bbox_inches='tight', dpi=300)
-        plt.close()
-        print(f"Saved plots/{folder}/{filename}")
-
-    fig_leg, ax_leg = plt.subplots(figsize=(10, 2))
-    ax_leg.axis('off')
-    handles = [
-        plt.Line2D([0], [0], color=color_map[filter_name], lw=2, marker=marker_map[lsh_name])
-        for filter_name, lsh_name in (c.split(' + ') for c in configs)
-    ]
-    ax_leg.legend(
-        handles, configs,
-        loc='center', ncol=min(3, len(configs)),
-        title="Configuration (Color = Filter, Marker = LSH)",
-        title_fontsize=12, fontsize=10, frameon=True,
-    )
-    plt.savefig(f"plots/{folder}/legend_only.png", bbox_inches='tight', dpi=300)
-    plt.close()
-    print(f"Saved plots/{folder}/legend_only.png")
-
-
 def static_evaluation() -> list:
     num_vectors              = 100000
     dim                      = 384
@@ -182,16 +132,16 @@ def static_evaluation() -> list:
     percentage_construct     = 10
     max_L                    = 256
 
-    dataset = 'ELI5'
+    dataset = DATASET
     vectors = load_embeds(dataset, num_vectors)[0]
-    split   = int(num_vectors * percentage_construct / 100)
-    vectors_construct = vectors[:split]
-    vectors_query     = vectors[split:]
+    num_construct   = num_vectors * percentage_construct // 100
+    vectors_construct = vectors[:num_construct]
+    vectors_query     = vectors[num_construct:]
 
     # Jobs receive lazy on-disk pointers instead of array copies, so the query
     # stream length is bounded by disk, not by num_jobs * stream_length memory.
-    construct_source = VectorSource(dataset, 0, split)
-    query_source     = VectorSource(dataset, split, num_vectors)
+    construct_source = VectorSource(dataset, 0, num_construct)
+    query_source     = VectorSource(dataset, num_construct, num_vectors)
 
     runner = Runner(num_workers=MAX_WORKERS)
 
@@ -234,7 +184,7 @@ def dynamic_evaluation() -> list:
     percentage_construct     = 25
     max_L                    = 256
 
-    dataset       = 'ELI5'
+    dataset       = DATASET
     vectors       = load_embeds(dataset, num_vectors)[0]
     num_construct = num_vectors * percentage_construct // 100
 
@@ -274,64 +224,16 @@ def dynamic_evaluation() -> list:
     return results
 
 
-def plot_throughput_results(results_list: list, folder: str, ylabel: str, title_suffix: str) -> None:
-    df = pd.DataFrame(results_list)
-    df[['Filter', 'LSH']] = df['Config'].str.split(' + ', regex=False, expand=True)
-
-    sns.set_theme(style="whitegrid")
-
-    unique_filters = df['Filter'].unique()
-    color_map = dict(zip(unique_filters, sns.color_palette("husl", len(unique_filters))))
-
-    unique_lshs     = df['LSH'].unique()
-    available_marks = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'X']
-    marker_map      = dict(zip(unique_lshs, available_marks[:len(unique_lshs)]))
-
-    configs = df['Config'].unique()
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-    sns.lineplot(
-        data=df, x='FilterSize', y='Throughput',
-        hue='Filter', style='LSH',
-        markers=marker_map, dashes=False,
-        palette=color_map, ax=ax, legend=False,
-    )
-    ax.set_xlabel('Number of Elements in Filter', fontsize=12)
-    ax.set_ylabel(ylabel, fontsize=12)
-    ax.set_title(f'Throughput vs Filter Size ({title_suffix})', fontsize=13)
-    filename = f'throughput_{title_suffix.lower().replace(" ", "_")}_plot.png'
-    plt.savefig(f"plots/{folder}/{filename}", bbox_inches='tight', dpi=300)
-    plt.close()
-    print(f"Saved plots/{folder}/{filename}")
-
-    fig_leg, ax_leg = plt.subplots(figsize=(10, 2))
-    ax_leg.axis('off')
-    handles = [
-        plt.Line2D([0], [0], color=color_map[filter_name], lw=2, marker=marker_map[lsh_name])
-        for filter_name, lsh_name in (c.split(' + ') for c in configs)
-    ]
-    ax_leg.legend(
-        handles, configs,
-        loc='center', ncol=min(3, len(configs)),
-        title="Configuration (Color = Filter, Marker = LSH)",
-        title_fontsize=12, fontsize=10, frameon=True,
-    )
-    plt.savefig(f"plots/{folder}/throughput_legend_only.png", bbox_inches='tight', dpi=300)
-    plt.close()
-    print(f"Saved plots/{folder}/throughput_legend_only.png")
-
-
 def throughput_evaluation():
-    import time
-
     dim             = 384
     max_L           = 256
     memory_budget   = 10 * 1024 * 1024
     query_batch     = 100
     num_trials      = 3
     filter_sizes    = [100, 500, 1000, 2500, 5000, 10000]
+    dataset = DATASET
 
-    vectors = load_embeds('ELI5', max(filter_sizes) + query_batch)[0]
+    vectors = load_embeds(dataset, max(filter_sizes) + query_batch)[0]
     distance_threshold = calculate_distance_threshold(vectors, 5.0)
 
     def _build(filter_cls, lsh_instance):
@@ -411,7 +313,98 @@ def throughput_evaluation():
     return query_results, construct_results, insert_results
 
 
+def tradeoff_evaluation() -> Tuple[List, List]:
+    """
+    function that orchestrates the tradeoff benchmarking pipeline by generating ground truth data 
+    and launching workers to sweep across varying sphere counts and memory budgets.
+    """
+    num_vectors = 100000
+    dim = 384
+    max_L = 256
+    percentage_construct = 25
+    target_percentile = 5.0 
+    dataset = DATASET
+
+    # load dataset arrays for ground-truth processing
+    vectors = load_embeds(dataset, num_vectors)[0]
+    num_construct = num_vectors * percentage_construct // 100
+    vectors_construct = vectors[:num_construct]
+    vectors_query = vectors[num_construct:]
+
+    # create construct and query vector objects for workers
+    construct_source = VectorSource(dataset, 0, num_construct)
+    query_source = VectorSource(dataset, num_construct, num_vectors)
+
+    # calculate constant reference distance threshold
+    print(f"Pre-calculating evaluation distance baselines at {target_percentile}%...")
+    distance_threshold = calculate_distance_threshold(vectors, target_percentile)
+
+    # compute static filter resuls
+    print("Calculating actual results (Query vs Construct)...")
+    actual_results = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
+
+    runner = Runner(num_workers=MAX_WORKERS)
+
+    # EXPERIMENT 1: Evaluate Geometric Filter Performance
+    # Tests how the number of spheres (spatial partitioning) impacts 
+    # search accuracy and speed for ball-based filters.
+    sphere_sizes = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+    sphere_filters = [KDBallFilter, KMEBFilter]
+
+    for size in sphere_sizes:
+        for filter_cls in sphere_filters:
+            runner.submit(
+                'tradeoff',
+                filter_cls=filter_cls,
+                lsh_cls=FaissSimHashLSH,
+                dim=dim,
+                distance_threshold=distance_threshold,
+                max_L=max_L,
+                vectors_construct=construct_source,
+                vectors_query=query_source,
+                actual_results=actual_results,
+                max_spheres=size,
+                memory_budget=None
+            )
+
+    print("\nExecuting sphere evaluation...")
+    raw_sphere_results = runner.run()
+    sphere_results = [r for r in raw_sphere_results if r is not None]
+    runner.clear() # clear runner jobs
+    print("Sphere evaluation completed.")
+
+    # EXPERIMENT 2: Benchmark Resource Efficiency
+    # Compares all available filter strategies under strict memory limits 
+    # to identify which methods perform best when storage is constrained.
+    memory_budgets = [500*1024, 1*1024*1024, 2*1024*1024, 4*1024*1024, 8*1024*1024, 16*1024*1024, 32*1024*1024]
+
+    for budget in memory_budgets:
+        for filter_cls in static_filters + dynamic_filters:
+            runner.submit(
+                'tradeoff',
+                filter_cls=filter_cls,
+                lsh_cls=FaissSimHashLSH,
+                dim=dim,
+                distance_threshold=distance_threshold,
+                max_L=max_L,
+                vectors_construct=construct_source,
+                vectors_query=query_source,
+                actual_results=actual_results,
+                max_spheres=None,
+                memory_budget=budget
+            )
+
+    print("\nExecuting memory evaluation...")
+    raw_memory_results = runner.run()
+    memory_results = [r for r in raw_memory_results if r is not None]
+    print("Memory evaluation completed.")
+    plot_tradeoff_results(sphere_results, memory_results)
+
+    return sphere_results, memory_results
+
+
 if __name__ == "__main__":
     static_evaluation()
     # dynamic_evaluation()
     # throughput_evaluation()
+    # tradeoff_evaluation()
