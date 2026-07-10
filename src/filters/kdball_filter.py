@@ -84,7 +84,14 @@ class KDBallFilter(Filter):
     # using a KD-style approach that splits the space into rectangles and creates bounding spheres
     def construct(self, vectors: np.ndarray) -> None:
         # if empty array we return empty filter
-        if len(vectors) == 0:
+        if len(vectors) == 0 or self.max_spheres == 0:
+            self._constructed = True
+            return
+
+        # if we have enough spheres we create one for each vector, essentially creating trivial case
+        elif self.max_spheres >= len(vectors):
+            self.all_spheres = np.array(vectors, dtype=np.float32)
+            self.all_radiuses = np.full(len(vectors), self.distance_threshold, dtype=np.float32)
             self._constructed = True
             return
 

@@ -321,8 +321,8 @@ def tradeoff_evaluation() -> Tuple[List, List]:
     num_vectors = 100000
     dim = 384
     max_L = 256
-    percentage_construct = 25
-    target_percentile = 5.0 
+    percentage_construct = 10
+    target_percentile = 0.2
     dataset = DATASET
 
     # load dataset arrays for ground-truth processing
@@ -348,7 +348,7 @@ def tradeoff_evaluation() -> Tuple[List, List]:
     # EXPERIMENT 1: Evaluate Geometric Filter Performance
     # Tests how the number of spheres (spatial partitioning) impacts 
     # search accuracy and speed for ball-based filters.
-    sphere_sizes = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+    sphere_sizes = [5, 10, 20, 40, 80, 160, 320, 640, 1280, 2560, 5120, 10000]
     sphere_filters = [KDBallFilter, KMEBFilter]
 
     for size in sphere_sizes:
@@ -376,7 +376,7 @@ def tradeoff_evaluation() -> Tuple[List, List]:
     # EXPERIMENT 2: Benchmark Resource Efficiency
     # Compares all available filter strategies under strict memory limits 
     # to identify which methods perform best when storage is constrained.
-    memory_budgets = [500*1024, 1*1024*1024, 2*1024*1024, 4*1024*1024, 8*1024*1024, 16*1024*1024, 32*1024*1024]
+    memory_budgets = [500*1024, 1*1024*1024, 2*1024*1024, 4*1024*1024, 8*1024*1024, 16*1024*1024, 32*1024*1024, 64*1024*1024]
 
     for budget in memory_budgets:
         for filter_cls in static_filters + dynamic_filters:
