@@ -79,3 +79,48 @@ class VectorSource:
             dset = f[_HDF5_DATASET_KEY]
             stop = self._resolve_stop(dset.shape[0])
             return np.asarray(dset[self.start:stop], dtype=np.float32)
+
+
+@dataclass(frozen=True)
+class ArrayVectorSource(VectorSource):
+    """
+    An in-memory, drop-in replacement for VectorSource designed for 
+    dynamically generated or out-of-distribution (OOD) queries.
+
+    Unlike the parent class, this subclass explicitly holds vector data in RAM. 
+    It overrides all disk-bound methods to yield batches directly from the 
+    provided NumPy array, keeping the exact same API for downstream workers.
+
+    Because it holds the array, sending this source to multiple jobs scales 
+    memory with the array size during pickling. However, this trade-off allows 
+    fast generalization testing without polluting the disk with temporary HDF5 files.
+    """
+    array: Optional[np.ndarray] = None
+
+    def __post_init__(self):
+        if self.array is None:
+            raise ValueError("ArrayVectorSource must be initialized with a numpy array.")
+
+    def _resolve_stop(self, dset_len: int) -> int:
+        return dset_len if self.stop is None else min(self.stop, dset_len)
+
+    def __len__(self) -> int:
+        return max(0, self._resolve_stop(self.array.shape[0]) - self.start)
+
+    def iter_batches(self, batch_size: Optional[int] = None) -> Iterator[np.ndarray]:
+        """Yield the slice as consecutive 2D float32 blocks directly from RAM."""
+        batch_size = batch_size or self.chunk_size
+        stop = self._resolve_stop(self.array.shape[0])
+        for base in range(self.start, stop, batch_size):
+            end = min(base + batch_size, stop)
+            yield np.asarray(self.array[base:end], dtype=np.float32)
+
+    def __iter__(self) -> Iterator[np.ndarray]:
+        for block in self.iter_batches():
+            for vector in block:
+                yield vector
+
+    def to_array(self) -> np.ndarray:
+        """Return the requested slice of the in-memory array."""
+        stop = self._resolve_stop(self.array.shape[0])
+        return np.asarray(self.array[self.start:stop], dtype=np.float32)

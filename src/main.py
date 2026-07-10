@@ -14,7 +14,7 @@ from runner import Runner
 from plots import plot_results, plot_throughput_results, plot_tradeoff_results
 from typing import Tuple, List
 from util.fetch_datasets import load_embeds
-from vector_source import VectorSource
+from vector_source import VectorSource, ArrayVectorSource
 
 MAX_WORKERS = 1
 DATASET = 'ELI5'
@@ -315,8 +315,9 @@ def throughput_evaluation():
 
 def tradeoff_evaluation() -> Tuple[List, List]:
     """
-    function that orchestrates the tradeoff benchmarking pipeline by generating ground truth data 
-    and launching workers to sweep across varying sphere counts and memory budgets.
+    function that orchestrates the tradeoff benchmarking pipeline by generating ground truth, 
+    evaluating filter performance across memory/sphere constraints, and optionally 
+    stress-testing generalization robustness using synthetic random distributions.
     """
     num_vectors = 100000
     dim = 384
@@ -324,6 +325,7 @@ def tradeoff_evaluation() -> Tuple[List, List]:
     percentage_construct = 10
     target_percentile = 0.2
     dataset = DATASET
+    random_test = False
 
     # load dataset arrays for ground-truth processing
     vectors = load_embeds(dataset, num_vectors)[0]
@@ -339,9 +341,23 @@ def tradeoff_evaluation() -> Tuple[List, List]:
     print(f"Pre-calculating evaluation distance baselines at {target_percentile}%...")
     distance_threshold = calculate_distance_threshold(vectors, target_percentile)
 
-    # compute static filter resuls
-    print("Calculating actual results (Query vs Construct)...")
-    actual_results = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
+    # means we run test with randomly generated queires for testing generalization
+    if random_test:
+        print("\nPreparing Generalization Test (Random Vectors)...")
+        # generate random samples from a uniform distribution and normalize them for dataset consistency
+        random_queries = np.random.uniform(low=np.min(vectors), high=np.max(vectors), size=(len(vectors_query), dim)).astype(np.float32)
+        random_queries_norms = np.linalg.norm(random_queries, axis=1, keepdims=True)
+        random_queries = random_queries / np.where(random_queries_norms == 0, 1e-10, random_queries_norms)
+
+        print("Calculating actual results for random queries...")
+        actual_results = compute_static_actual_results(vectors_construct, random_queries, distance_threshold)
+        query_source = ArrayVectorSource("random_queries", array=random_queries)
+
+    # else we run the original dataset queries provided
+    else:
+        # compute static filter resuls
+        print("Calculating actual results for test queries...")
+        actual_results = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
 
     runner = Runner(num_workers=MAX_WORKERS)
 
