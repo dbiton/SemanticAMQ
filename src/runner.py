@@ -149,8 +149,8 @@ def dynamic_worker(
 
 
 def _compute_tradeoff_metrics(
-    predictions: np.ndarray,
-    actual: np.ndarray,
+    predicted: List[bool],
+    actual: List[bool],
     config: str,
     max_spheres: int,
     memory_budget: int,
@@ -161,10 +161,10 @@ def _compute_tradeoff_metrics(
     """
     function for computing memory and sphere tradeoff metrics
     """
-    tp = np.sum((predictions == True) & (actual == True))
-    fp = np.sum((predictions == True) & (actual == False))
-    fn = np.sum((predictions == False) & (actual == True))
-    tn = np.sum((predictions == False) & (actual == False))
+    tp = sum(1 for p, a in zip(predicted, actual) if p and a)
+    fp = sum(1 for p, a in zip(predicted, actual) if p and not a)
+    fn = sum(1 for p, a in zip(predicted, actual) if not p and a)
+    tn = sum(1 for p, a in zip(predicted, actual) if not p and not a)
 
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
@@ -205,7 +205,6 @@ def tradeoff_worker(
         config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
         lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
         vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
-        actual = np.array(actual_results, dtype=bool)
 
         construct_start = time.perf_counter() # start construct timer
         filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold, max_spheres)
@@ -213,9 +212,11 @@ def tradeoff_worker(
         construct_latency = time.perf_counter() - construct_start # final construct time
 
         query_start = time.perf_counter() # start qps timer
-        predictions_list = filter_instance.query(vectors_query)
-        predictions = np.array(predictions_list, dtype=bool)
-        query_latency = time.perf_counter() - query_start # final qps time
+        # stream the query set in bounded blocks for efficiency
+        predicted: List[bool] = []
+        for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
+            predicted.extend(filter_instance.query(block))
+        query_latency = time.perf_counter() - query_start # final qps timer
 
         qps = len(vectors_query) / max(query_latency, 1e-9)
         memory_usage = filter_instance.get_bytesize()
@@ -224,7 +225,7 @@ def tradeoff_worker(
         print(f"  [Skipped] {config} failed: {e}")
         return None
 
-    return _compute_tradeoff_metrics(predictions, actual, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
+    return _compute_tradeoff_metrics(predicted, actual_results, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
 
 
 _WORKER_FNS: Dict[str, Any] = {
