@@ -110,8 +110,8 @@ def get_plot_mappings(all_filters: List[str]) -> Tuple[Dict, Dict, Dict]:
     - Markers/Dashes: Unique based on individual config index.
     """
     # colors grouped by base filter
-    available_marks = ['o', 's', '^', 'D', 'v', 'p', '*', 'X', 'h', 'P', 'd', 'H', '<', '>']
-    available_dashes = [(4, 1.5), (1, 1), (3, 1, 1.5, 1), (5, 2, 1, 2), (2, 2), (4, 1, 1, 1, 1, 1), (1, 3), (6, 1), (3, 3, 1, 3)]
+    available_marks = ['s', 'o', '^', 'D', 'v', 'p', '*', 'X', 'h', 'P', 'd', 'H', '<', '>']
+    available_dashes = [(1, 1), (4, 1.5), (3, 1, 1.5, 1), (5, 2, 1, 2), (2, 2), (4, 1, 1, 1, 1, 1), (1, 3), (6, 1), (3, 3, 1, 3)]
     base_names = [c.split(' + ')[0] for c in all_filters]
     unique_bases = list(dict.fromkeys(base_names)) # Preserve order
     base_palette = sns.color_palette("tab10", n_colors=len(unique_bases))
@@ -149,7 +149,7 @@ def plot_tradeoff_results(sphere_results: list, memory_results: list, folder: st
     sns.set_theme(style="whitegrid")
 
     # Generate unified maps for colors, markers, and dash patterns
-    all_filters = list(set(df_spheres['Config'].unique()).union(set(df_memory['Config'].unique())))
+    all_filters = list(dict.fromkeys(list(df_spheres['Config'].unique()) + list(df_memory['Config'].unique())))
     color_map, marker_map, dash_map = get_plot_mappings(all_filters)
 
     # Helper function to place a single legend below individual 1x1 plots
@@ -169,9 +169,9 @@ def plot_tradeoff_results(sphere_results: list, memory_results: list, folder: st
         'markers': marker_map,
         'dashes': dash_map,
         'linewidth': 2.5,
-        'markersize': 8,
+        'markersize': 10,
         'markeredgewidth': 1.5,
-        'alpha': 0.85
+        'alpha': 0.75
     }
 
     # CHART 1: Evaluate how increasing sphere count impacts overall filtering accuracy
