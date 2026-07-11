@@ -364,7 +364,8 @@ def tradeoff_evaluation() -> Tuple[List, List]:
     # EXPERIMENT 1: Evaluate Geometric Filter Performance
     # Tests how the number of spheres (spatial partitioning) impacts 
     # search accuracy and speed for ball-based filters.
-    sphere_sizes = [5, 10, 20, 40, 80, 160, 320, 640, 1280, 2560, 5120, 10000]
+    sphere_sizes = [5, 10, 20, 40, 80, 160, 320, 640, 1280, 2560, 5120, 10240]
+    sphere_sizes = [s for s in sphere_sizes if s < len(vectors_construct)] + [len(vectors_construct)]
     sphere_filters = [KDBallFilter, KMEBFilter]
 
     for size in sphere_sizes:

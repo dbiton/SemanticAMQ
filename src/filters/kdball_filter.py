@@ -109,8 +109,8 @@ class KDBallFilter(Filter):
             p_margin, p_axis, p_split_val, parent_indices = heappop(rectangles)
             p_margin = -p_margin
 
-            # if margin is too small we dont split and finish
-            if p_margin <= 0.0:
+            # if margin is smaller then our threshold we dont split and finish
+            if p_margin <= self.distance_threshold * 2.0:
                 heappush(rectangles, (-p_margin, p_axis, p_split_val, parent_indices))
                 break
 
