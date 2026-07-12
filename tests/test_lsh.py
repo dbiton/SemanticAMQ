@@ -1,7 +1,7 @@
 import math
 import unittest
 import numpy as np
-from typing import Tuple
+from typing import Optional, Tuple
 
 from src.lsh import CrossPolytopeLSH, FaissSimHashLSH, SimHashLSH
 
@@ -31,6 +31,37 @@ def generate_pairs_at_distance(n_pairs: int, dim: int, r: float) -> Tuple[np.nda
     v2 = v1 * cos_theta + v_ortho * sin_theta
     
     return v1, v2
+
+
+def simhash_base_p(r: float) -> float:
+    """Closed-form SimHash base collision probability at distance r (unit vectors)."""
+    return 1.0 - math.acos(max(-1.0, min(1.0, 1.0 - r * r / 2.0))) / math.pi
+
+
+def reference_min_L(p: float, K: int, cap: int) -> int:
+    """Smallest L with 1-(1-p^K)^L >= 0.5, by direct search. Returns cap+1 if none <= cap."""
+    q = 1.0 - p ** K
+    L = 1
+    while q ** L > 0.5:
+        L += 1
+        if L > cap:
+            return cap + 1
+    return L
+
+
+def reference_auto_KL(p: float, max_L: int) -> Optional[Tuple[int, int]]:
+    """Largest K in [1, 255] whose minimal L fits max_L, via exhaustive scan.
+
+    Independent of build_optimized's early-break loop and log-based L formula,
+    so it cross-checks both. Returns None if even K=1 cannot fit.
+    """
+    best = None
+    for K in range(1, 256):
+        L = reference_min_L(p, K, cap=max_L)
+        if L <= max_L:
+            best = (K, L)
+    return best
+
 
 class TestLSHProbabilities(unittest.TestCase):
     
@@ -102,9 +133,9 @@ class TestLSHProbabilities(unittest.TestCase):
         self.assertIsInstance(lsh, SimHashLSH)
         self.assertEqual(lsh.K, K_target)
         
-        # Theoretical probability at threshold should be >= 0.5 (allowing slight float rounding)
+        # SimHash probability is closed-form, so the >= 0.5 guarantee is exact.
         p, _ = lsh.get_criteria(self.build_optimized_threshold_d, self.build_optimized_threshold_d)
-        self.assertGreaterEqual(p, 0.49)
+        self.assertGreaterEqual(p, 0.5 - 1e-9)
 
     def test_simhash_build_optimized_auto_k(self):
         """Test SimHash optimization when K must be automatically discovered."""
@@ -115,9 +146,9 @@ class TestLSHProbabilities(unittest.TestCase):
         self.assertLessEqual(lsh.L, max_L_target)
         self.assertGreaterEqual(lsh.K, 1)
         
-        # Theoretical probability at threshold should be >= 0.5
+        # SimHash probability is closed-form, so the >= 0.5 guarantee is exact.
         p, _ = lsh.get_criteria(self.build_optimized_threshold_d, self.build_optimized_threshold_d)
-        self.assertGreaterEqual(p, 0.49)
+        self.assertGreaterEqual(p, 0.5 - 1e-9)
 
     def test_crosspolytope_build_optimized_explicit_k(self):
         """Test CrossPolytope optimization when K is explicitly provided."""
@@ -128,8 +159,11 @@ class TestLSHProbabilities(unittest.TestCase):
         self.assertEqual(lsh.K, K_target)
         
         p, _ = lsh.get_criteria(self.build_optimized_threshold_d, self.build_optimized_threshold_d)
-        
-        self.assertGreaterEqual(p, 0.49)
+
+        # CrossPolytope's base probability is Monte Carlo estimated (SE ~0.0015) both in
+        # build_optimized and again independently in get_criteria; the AND/OR construction
+        # amplifies that error by roughly L*K*p^(K-1)*(1-p^K)^(L-1), so allow ~0.04 slack.
+        self.assertGreaterEqual(p, 0.46)
 
     def test_crosspolytope_build_optimized_auto_k(self):
         """Test CrossPolytope optimization when K must be automatically discovered."""
@@ -141,9 +175,9 @@ class TestLSHProbabilities(unittest.TestCase):
         self.assertGreaterEqual(lsh.K, 1)
         
         p, _ = lsh.get_criteria(self.build_optimized_threshold_d, self.build_optimized_threshold_d)
-        
-        # Account for Monte Carlo variance
-        self.assertGreaterEqual(p, 0.49)
+
+        # Same Monte Carlo noise amplification as the explicit-K case above.
+        self.assertGreaterEqual(p, 0.46)
 
     def test_build_optimized_zero_probability_error(self):
         """Test that a threshold yielding <= 0% base probability raises a ValueError."""
@@ -158,6 +192,79 @@ class TestLSHProbabilities(unittest.TestCase):
         # combined with a very small max_L allowance.
         with self.assertRaisesRegex(ValueError, "Cannot achieve 50% threshold"):
             SimHashLSH.build_optimized(dim=self.dim, threshold_d=1.5, K=50, max_L=5)
+
+class TestBuildOptimizedSelection(unittest.TestCase):
+    """Validates the exact (K, L) chosen by build_optimized, not just loose bounds.
+
+    Uses SimHash's closed-form base probability so expected values can be computed
+    independently with reference_min_L / reference_auto_KL.
+    """
+
+    def setUp(self):
+        # dim does not affect (K, L) selection for SimHash; keep small for speed.
+        self.dim = 16
+
+    def test_explicit_k_L_is_minimal(self):
+        """For explicit K, L must be the *smallest* table count reaching 50% at the threshold."""
+        for threshold_d in [0.5, 0.7, 1.1, 1.5]:
+            p = simhash_base_p(threshold_d)
+            for K in [1, 2, 8, 20]:
+                expected_L = reference_min_L(p, K, cap=256)
+                with self.subTest(threshold_d=threshold_d, K=K):
+                    if expected_L > 256:
+                        with self.assertRaisesRegex(ValueError, "Cannot achieve 50% threshold"):
+                            SimHashLSH.build_optimized(dim=self.dim, threshold_d=threshold_d, K=K)
+                        continue
+                    lsh = SimHashLSH.build_optimized(dim=self.dim, threshold_d=threshold_d, K=K)
+                    self.assertEqual(lsh.L, expected_L)
+                    p_at, _ = lsh.get_criteria(threshold_d, threshold_d)
+                    self.assertGreaterEqual(p_at, 0.5 - 1e-9)
+                    if lsh.L > 1:
+                        p_one_less = 1.0 - (1.0 - p ** K) ** (lsh.L - 1)
+                        self.assertLess(p_one_less, 0.5, "L is not minimal: L-1 also reaches 50%")
+
+    def test_auto_k_matches_bruteforce(self):
+        """Auto-selected (K, L) must equal the largest K (and its minimal L) fitting max_L."""
+        for threshold_d in [0.3, 0.5, 0.7, 0.9, 1.1, 1.3, 1.5]:
+            p = simhash_base_p(threshold_d)
+            for max_L in [4, 16, 64, 256]:
+                expected = reference_auto_KL(p, max_L)
+                with self.subTest(threshold_d=threshold_d, max_L=max_L):
+                    lsh = SimHashLSH.build_optimized(dim=self.dim, threshold_d=threshold_d, max_L=max_L)
+                    self.assertEqual((lsh.K, lsh.L), expected)
+                    self.assertLessEqual(lsh.L, max_L)
+                    p_at, _ = lsh.get_criteria(threshold_d, threshold_d)
+                    self.assertGreaterEqual(p_at, 0.5 - 1e-9)
+
+    def test_faiss_selects_same_parameters_as_simhash(self):
+        """FaissSimHashLSH shares SimHash's closed form, so it must pick identical (K, L)."""
+        for threshold_d, max_L in [(0.7, 64), (1.1, 256)]:
+            with self.subTest(threshold_d=threshold_d, max_L=max_L):
+                sim = SimHashLSH.build_optimized(dim=self.dim, threshold_d=threshold_d, max_L=max_L)
+                fai = FaissSimHashLSH.build_optimized(dim=self.dim, threshold_d=threshold_d, max_L=max_L)
+                self.assertEqual((fai.K, fai.L), (sim.K, sim.L))
+
+    def test_threshold_zero_uses_single_table(self):
+        """threshold_d=0 gives base probability 1.0: one table suffices; auto-K hits the 255 cap."""
+        lsh_auto = SimHashLSH.build_optimized(dim=self.dim, threshold_d=0.0)
+        self.assertEqual((lsh_auto.K, lsh_auto.L), (255, 1))
+        lsh_explicit = SimHashLSH.build_optimized(dim=self.dim, threshold_d=0.0, K=4)
+        self.assertEqual(lsh_explicit.L, 1)
+
+    def test_auto_k_raises_when_even_k1_exceeds_max_l(self):
+        """If K=1 already needs more than max_L tables, auto mode must raise, not silently clamp."""
+        # At threshold 1.9 the base probability is ~0.20, so K=1 needs L=4 tables.
+        with self.assertRaisesRegex(ValueError, "Cannot achieve 50% threshold"):
+            SimHashLSH.build_optimized(dim=self.dim, threshold_d=1.9, max_L=3)
+
+    def test_returned_instance_is_functional(self):
+        """The built instance must hash with shapes consistent with its selected L."""
+        lsh = SimHashLSH.build_optimized(dim=self.dim, threshold_d=0.7, max_L=32)
+        self.assertEqual(lsh.dim, self.dim)
+        vecs = np.random.randn(10, self.dim)
+        vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+        self.assertEqual(lsh.hash(vecs).shape, (10, lsh.L))
+
 
 class TestFaissSimHashLSH(unittest.TestCase):
 
@@ -233,7 +340,7 @@ class TestFaissSimHashLSH(unittest.TestCase):
         self.assertIsInstance(lsh, FaissSimHashLSH)
         self.assertEqual(lsh.K, K_target)
         p, _ = lsh.get_criteria(self.build_optimized_threshold_d, self.build_optimized_threshold_d)
-        self.assertGreaterEqual(p, 0.49)
+        self.assertGreaterEqual(p, 0.5 - 1e-9)
 
     def test_build_optimized_auto_k(self):
         max_L_target = 150
@@ -244,7 +351,29 @@ class TestFaissSimHashLSH(unittest.TestCase):
         self.assertLessEqual(lsh.L, max_L_target)
         self.assertGreaterEqual(lsh.K, 1)
         p, _ = lsh.get_criteria(self.build_optimized_threshold_d, self.build_optimized_threshold_d)
-        self.assertGreaterEqual(p, 0.49)
+        self.assertGreaterEqual(p, 0.5 - 1e-9)
+
+    def test_build_optimized_empirical_guarantee(self):
+        """End-to-end: an auto-built index must empirically reach ~50% collisions at the
+        threshold distance while staying near 0% well beyond it (the point of maximizing K)."""
+        np.random.seed(42)
+        threshold_d = self.build_optimized_threshold_d
+        lsh = FaissSimHashLSH.build_optimized(dim=self.dim, threshold_d=threshold_d, max_L=64)
+
+        v1, v2 = generate_pairs_at_distance(self.n_samples, self.dim, threshold_d)
+        empirical_at = float(np.mean((lsh.hash(v1) == lsh.hash(v2)).any(axis=1)))
+        theoretical_at, _ = lsh.get_criteria(threshold_d, threshold_d)
+        self.assertGreaterEqual(theoretical_at, 0.5 - 1e-9)
+        self.assertTrue(
+            math.isclose(empirical_at, theoretical_at, abs_tol=self.tolerance),
+            f"at threshold: empirical={empirical_at:.4f} theoretical={theoretical_at:.4f}",
+        )
+        self.assertGreaterEqual(empirical_at, 0.5 - self.tolerance)
+
+        far_d = 1.5
+        f1, f2 = generate_pairs_at_distance(self.n_samples, self.dim, far_d)
+        empirical_far = float(np.mean((lsh.hash(f1) == lsh.hash(f2)).any(axis=1)))
+        self.assertLessEqual(empirical_far, 0.02, "collision rate far beyond threshold should be ~0")
 
     # --- determinism: same index, same hashes ---
 
