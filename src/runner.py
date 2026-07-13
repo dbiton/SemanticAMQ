@@ -4,6 +4,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, Iterator, List, Union
 
 import numpy as np
+import time
 
 from vector_source import VectorSource
 
@@ -76,14 +77,14 @@ def _compute_metrics(
     }
 
 
-def _instantiate_filter(filter_cls: Any, dim: int, lsh: Any, memory_budget: int, distance_threshold: float) -> Any:
-    try:
-        return filter_cls(dim=dim, lsh=lsh, max_memory=memory_budget)
-    except TypeError:
+def _instantiate_filter(filter_cls: Any, dim: int, lsh: Any, memory_budget: int, distance_threshold: float = None, max_spheres: int = None) -> Any:
+    if filter_cls.__name__ not in ["KDBallFilter", "KMEBFilter"]:
         try:
-            return filter_cls(dim=dim, lsh=lsh)
+            return filter_cls(dim=dim, lsh=lsh, max_memory=memory_budget)
         except TypeError:
-            return filter_cls(dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold)
+            return filter_cls(dim=dim, lsh=lsh)
+    else:
+        return filter_cls(dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold, max_spheres=max_spheres)
 
 
 def static_worker(
@@ -147,9 +148,90 @@ def dynamic_worker(
     return _compute_metrics(predicted, actual_results, distance_threshold, config, percentage, memory_usage)
 
 
+def _compute_tradeoff_metrics(
+    predicted: List[bool],
+    actual: List[bool],
+    config: str,
+    max_spheres: int,
+    memory_budget: int,
+    memory_usage: int,
+    construct_time: float,
+    qps: float
+) -> Dict[str, Any]:
+    """
+    function for computing memory and sphere tradeoff metrics
+    """
+    tp = sum(1 for p, a in zip(predicted, actual) if p and a)
+    fp = sum(1 for p, a in zip(predicted, actual) if p and not a)
+    fn = sum(1 for p, a in zip(predicted, actual) if not p and a)
+    tn = sum(1 for p, a in zip(predicted, actual) if not p and not a)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    return {
+        "Config": config,
+        "NumSpheres": max_spheres if max_spheres is not None else 0,
+        "MemoryBudget": memory_budget,
+        "MemoryUsage": memory_usage,
+        "FPR": fp / (fp + tn) if (fp + tn) > 0 else 0.0,
+        "FNR": fn / (fn + tp) if (fn + tp) > 0 else 0.0,
+        "Precision": precision,
+        "Recall": recall,
+        "F1-Score": f1,
+        "ConstructTime": construct_time,
+        "QPS": qps
+    }
+
+
+def tradeoff_worker(
+    filter_cls: Any,
+    lsh_cls: Any,
+    dim: int,
+    distance_threshold: float,
+    max_L: int,
+    vectors_construct: np.ndarray,
+    vectors_query: np.ndarray,
+    actual_results: List[bool],
+    max_spheres: int = None,
+    memory_budget: int = None
+) -> Dict[str, Any]:
+    """
+    function for executing a single benchmarking trial for a specific filter configuration, 
+    measuring initialization time, memory usage, query throughput, and accuracy metrics.
+    """
+    try:
+        config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
+        lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
+        vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
+
+        construct_start = time.perf_counter() # start construct timer
+        filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold, max_spheres)
+        filter_instance.construct(vectors_construct)
+        construct_latency = time.perf_counter() - construct_start # final construct time
+
+        query_start = time.perf_counter() # start qps timer
+        # stream the query set in bounded blocks for efficiency
+        predicted: List[bool] = []
+        for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
+            predicted.extend(filter_instance.query(block))
+        query_latency = time.perf_counter() - query_start # final qps timer
+
+        qps = len(vectors_query) / max(query_latency, 1e-9)
+        memory_usage = filter_instance.get_bytesize()
+
+    except Exception as e:
+        print(f"  [Skipped] {config} failed: {e}")
+        return None
+
+    return _compute_tradeoff_metrics(predicted, actual_results, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
+
+
 _WORKER_FNS: Dict[str, Any] = {
     'static':  static_worker,
     'dynamic': dynamic_worker,
+    'tradeoff': tradeoff_worker,
 }
 
 
@@ -165,6 +247,9 @@ class Runner:
 
     def run(self) -> List[Dict[str, Any]]:
         return self._run_sequential() if self.num_workers == 1 else self._run_parallel()
+    
+    def clear(self) -> None:
+        self._jobs.clear()
 
     def _run_sequential(self) -> List[Dict[str, Any]]:
         results = []

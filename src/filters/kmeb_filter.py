@@ -1,8 +1,6 @@
-from typing import List, Optional
-
+import faiss
 import numpy as np
-from scipy.cluster.vq import kmeans2
-
+from typing import List, Optional
 from filters.filter import Filter
 
 
@@ -32,30 +30,28 @@ class KMEBFilter(Filter):
         dim: int,
         distance_threshold: float,
         max_memory: Optional[int] = None,
-        max_balls: Optional[int] = None,
+        max_spheres: Optional[int] = None,
     ):
-        if max_memory is None and max_balls is None:
-            raise ValueError("Either max_memory or max_balls must be specified.")
-        if max_memory is not None and max_balls is not None:
-            raise ValueError("Only one of max_memory and max_balls can be specified.")
+        if max_memory is None and max_spheres is None:
+            raise ValueError("Either max_memory or max_spheres must be specified.")
 
         super().__init__(dim, lsh=None, max_memory=max_memory)
 
         self.distance_threshold = distance_threshold
-        self.max_balls = (
-            max_balls
-            if max_balls is not None
-            else self._calculate_max_balls(max_memory)
+        self.max_spheres = (
+            max_spheres
+            if max_spheres is not None
+            else self._calculate_max_spheres(max_memory)
         )
 
         self._centroids: Optional[np.ndarray] = None  # shape (K, dim), float32
         self._radii: Optional[np.ndarray] = None      # shape (K,), float32
         self._constructed = False
 
-    def _calculate_max_balls(self, max_memory: int) -> int:
-        # Each ball: dim float32 centroid coordinates + 1 float32 radius
-        bytes_per_ball = (self.dim + 1) * self._BYTES_PER_FLOAT32
-        return max(1, max_memory // bytes_per_ball)
+    def _calculate_max_spheres(self, max_memory: int, gamma: float = 4.0) -> int:
+        bytes_per_sphere = (self.dim + 1) * self._BYTES_PER_FLOAT32
+        # calculate expected memeory size for spheres with gamma factor
+        return max(1, int(max_memory // (bytes_per_sphere * gamma)))
 
     def get_exact_matching_fpr(self) -> float:
         return 0.0
@@ -72,7 +68,7 @@ class KMEBFilter(Filter):
         spread clusters get larger balls, each fitted exactly to their contents.
         """
         n = len(vectors)
-        k = min(self.max_balls, n)
+        k = self.max_spheres
 
         if n == 0 or k == 0:
             self._centroids = np.empty((0, self.dim), dtype=np.float32)
@@ -88,12 +84,14 @@ class KMEBFilter(Filter):
             return
 
         # K-Means minimises within-cluster variance → compact clusters → minimal ball volume
-        # k-means++ initialisation ('+++') avoids bad starting centroids that 'points'/'random'
-        # can produce, giving tighter and more consistent clusters.
-        centroids_f64, labels = kmeans2(
-            vectors.astype(np.float64), k, iter=20, minit="++", seed=42
-        )
-        centroids_f32 = centroids_f64.astype(np.float32)
+        # Faiss K-Means uses fast multi-threaded operation for fast vector clustering
+        vecs_f32 = np.ascontiguousarray(vectors, dtype=np.float32)
+        kmeans = faiss.Kmeans(d=self.dim, k=k, niter=10, seed=42, min_points_per_centroid=1, verbose=False, spherical=False)
+        kmeans.train(vecs_f32)
+        centroids_f32 = kmeans.centroids
+
+        _, labels_matrix = kmeans.index.search(vecs_f32, 1)
+        labels = labels_matrix.flatten()
 
         # Compute each ball's radius in float32 (consistent with query arithmetic).
         # radius_i = cluster covering radius + distance_threshold
