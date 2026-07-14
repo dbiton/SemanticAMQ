@@ -9,27 +9,21 @@ from filters.kmeb_filter import KMEBFilter
 from filters.kdball_filter import KDBallFilter
 from filters.pyfusefilter_filters import Fuse8Filter, Xor8Filter
 from filters.quotient_filter import QuotientFilterWrapper
-from lsh import FaissSimHashLSH, LSH
+from lsh import FaissSimHashLSH, LSH, DummyLSH
 from runner import Runner
 from plots import plot_results, plot_throughput_results, plot_tradeoff_results
 from typing import Tuple, List
 from util.fetch_datasets import load_embeds
 from vector_source import VectorSource, ArrayVectorSource
 
-MAX_WORKERS = 1
+MAX_WORKERS = 4
 DATASET = 'ELI5'
 
-dynamic_filters = [QuotientFilterWrapper]
-static_filters  = [Xor8Filter, Fuse8Filter, KDBallFilter, KMEBFilter]
-lsh_families: List[LSH] = [FaissSimHashLSH]
+dynamic_filters = [KDBallFilter]
+static_filters  = []
 
-
-def calculate_memory_budget(num_vectors: int, bits_per_element: float = 12.0, overhead_bytes: int = 4096) -> int:
-    total_bits = num_vectors * bits_per_element
-    filter_bytes = int(np.ceil(total_bits / 8.0))
-    total_bytes = filter_bytes + overhead_bytes
-    return total_bytes
-
+def calculate_max_memory_budget_bytes(num_vectors: int, dimension: int, bytes_per_element: float) -> int:
+    return num_vectors * dimension * bytes_per_element
 
 def calculate_distance_threshold(
     vectors: np.ndarray,
@@ -124,7 +118,7 @@ def compute_static_actual_results(
 
 
 def static_evaluation() -> list:
-    num_vectors              = 100000
+    num_vectors              = 1_000
     dim                      = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
@@ -134,6 +128,7 @@ def static_evaluation() -> list:
 
     dataset = DATASET
     vectors = load_embeds(dataset, num_vectors)[0]
+    bytes_per_element = vectors.itemsize
     num_construct   = num_vectors * percentage_construct // 100
     vectors_construct = vectors[:num_construct]
     vectors_query     = vectors[num_construct:]
@@ -142,32 +137,25 @@ def static_evaluation() -> list:
     # stream length is bounded by disk, not by num_jobs * stream_length memory.
     construct_source = VectorSource(dataset, 0, num_construct)
     query_source     = VectorSource(dataset, num_construct, num_vectors)
-
+    memory_budget = calculate_max_memory_budget_bytes(num_vectors, dim, bytes_per_element)
     runner = Runner(num_workers=MAX_WORKERS)
-
+    
     for percentage in np.linspace(min_percentage_duplicates, max_percentage_duplicates, count_steps):
         print(f"Processing {percentage:.1f}% duplicates...")
-        print(f"Calculating distance threshold...")
+        print("Calculating distance threshold...")
         distance_threshold = calculate_distance_threshold(vectors, percentage)
-        print(f"Calculating actual results...")
+        print("Calculating actual results...")
         actual_results     = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
 
-        for lsh_cls in lsh_families:
-            # hash() emits one key per LSH band, so a filter actually stores
-            # num_vectors * L keys, not num_vectors. The memory budget must
-            # scale with the L that this distance_threshold requires.
-            L = lsh_cls.build_optimized(dim, distance_threshold, None, max_L).L
-            memory_budget = calculate_memory_budget(num_vectors * L, bits_per_element=12.0)
-
-            for filter_cls in static_filters + dynamic_filters:
-                runner.submit(
-                    'static',
-                    filter_cls=filter_cls, lsh_cls=lsh_cls,
-                    dim=dim, distance_threshold=distance_threshold,
-                    max_L=max_L, memory_budget=memory_budget,
-                    vectors_construct=construct_source, vectors_query=query_source,
-                    actual_results=actual_results, percentage=percentage,
-                )
+        for filter_cls in static_filters + dynamic_filters:
+            runner.submit(
+                'static',
+                filter_cls=filter_cls, lsh_cls=DummyLSH,
+                dim=dim, distance_threshold=distance_threshold,
+                max_L=max_L, memory_budget=memory_budget,
+                vectors_construct=construct_source, vectors_query=query_source,
+                actual_results=actual_results, percentage=percentage,
+            )
 
     results = runner.run()
     print("Static evaluation completed.")
@@ -176,7 +164,7 @@ def static_evaluation() -> list:
 
 
 def dynamic_evaluation() -> list:
-    num_vectors              = 100000
+    num_vectors              = 1_000
     dim                      = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
@@ -186,140 +174,34 @@ def dynamic_evaluation() -> list:
 
     dataset       = DATASET
     vectors       = load_embeds(dataset, num_vectors)[0]
+    bytes_per_element = vectors.itemsize
     num_construct = num_vectors * percentage_construct // 100
 
-    # Jobs receive lazy on-disk pointers instead of array copies, so the query
-    # stream length is bounded by disk, not by num_jobs * stream_length memory.
     construct_source = VectorSource(dataset, 0, num_construct)
     query_source     = VectorSource(dataset, num_construct, num_vectors)
-
     runner = Runner(num_workers=MAX_WORKERS)
 
     for percentage in np.linspace(min_percentage_duplicates, max_percentage_duplicates, count_steps):
         distance_threshold = calculate_distance_threshold(vectors, percentage)
-        # compute_actual_results processes all vectors in sequence;
-        # slice to query positions so ground truth aligns with the query phase.
         actual_results = compute_actual_results(vectors, distance_threshold)[num_construct:]
-
-        for lsh_cls in lsh_families:
-            # hash() emits one key per LSH band, so a filter actually stores
-            # num_construct * L keys, not num_construct. The memory budget
-            # must scale with the L that this distance_threshold requires.
-            L = lsh_cls.build_optimized(dim, distance_threshold, None, max_L).L
-            memory_budget = calculate_memory_budget(num_construct * L, bits_per_element=12.0)
-
-            for filter_cls in dynamic_filters:
-                runner.submit(
-                    'dynamic',
-                    filter_cls=filter_cls, lsh_cls=lsh_cls,
-                    dim=dim, distance_threshold=distance_threshold,
-                    max_L=max_L, memory_budget=memory_budget,
-                    vectors_construct=construct_source, vectors_query=query_source,
-                    actual_results=actual_results, percentage=percentage,
-                )
+        memory_budget = calculate_max_memory_budget_bytes(num_construct, dim, bytes_per_element)
+        for filter_cls in dynamic_filters:
+            runner.submit(
+                'dynamic',
+                filter_cls=filter_cls, lsh_cls=DummyLSH,
+                dim=dim, distance_threshold=distance_threshold,
+                max_L=max_L, memory_budget=memory_budget,
+                vectors_construct=construct_source, vectors_query=query_source,
+                actual_results=actual_results, percentage=percentage,
+            )
 
     results = runner.run()
     print("Dynamic evaluation completed.")
     plot_results(results, "dynamic")
     return results
 
-
-def throughput_evaluation():
-    dim             = 384
-    max_L           = 256
-    memory_budget   = 10 * 1024 * 1024
-    query_batch     = 100
-    num_trials      = 3
-    filter_sizes    = [100, 500, 1000, 2500, 5000, 10000]
-    dataset = DATASET
-
-    vectors = load_embeds(dataset, max(filter_sizes) + query_batch)[0]
-    distance_threshold = calculate_distance_threshold(vectors, 5.0)
-
-    def _build(filter_cls, lsh_instance):
-        try:
-            return filter_cls(dim=dim, lsh=lsh_instance, max_memory=memory_budget)
-        except TypeError:
-            return filter_cls(dim=dim, lsh=lsh_instance)
-
-    # --- Query Throughput ---
-    print("\n=== Query Throughput Evaluation ===")
-    query_results = []
-    for filter_cls in static_filters + dynamic_filters:
-        for lsh_cls in lsh_families:
-            config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
-            print(f"  Evaluating {config} ...")
-            lsh_instance = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
-            for size in filter_sizes:
-                construct_vecs = vectors[:size]
-                query_vecs     = vectors[size:size + query_batch]
-                fi = _build(filter_cls, lsh_instance)
-                fi.construct(construct_vecs)
-                fi.query(query_vecs)  # warm-up
-                times = []
-                for _ in range(num_trials):
-                    t0 = time.perf_counter()
-                    fi.query(query_vecs)
-                    times.append(time.perf_counter() - t0)
-                throughput = query_batch / np.mean(times)
-                query_results.append({'Config': config, 'FilterSize': size, 'Throughput': throughput})
-                print(f"    Size={size}: {throughput:.1f} queries/sec")
-    plot_throughput_results(query_results, "throughput", "Queries per Second", "Query")
-
-    # --- Construction Throughput ---
-    print("\n=== Construction Throughput Evaluation ===")
-    construct_results = []
-    for filter_cls in static_filters + dynamic_filters:
-        for lsh_cls in lsh_families:
-            config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
-            print(f"  Evaluating {config} ...")
-            lsh_instance = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
-            for size in filter_sizes:
-                construct_vecs = vectors[:size]
-                times = []
-                for _ in range(num_trials):
-                    fi = _build(filter_cls, lsh_instance)
-                    t0 = time.perf_counter()
-                    fi.construct(construct_vecs)
-                    times.append(time.perf_counter() - t0)
-                throughput = size / np.mean(times)
-                construct_results.append({'Config': config, 'FilterSize': size, 'Throughput': throughput})
-                print(f"    Size={size}: {throughput:.1f} elements/sec")
-    plot_throughput_results(construct_results, "throughput", "Elements per Second", "Construction")
-
-    # --- Insertion Throughput (dynamic filters only) ---
-    print("\n=== Insertion Throughput Evaluation ===")
-    insert_results = []
-    for filter_cls in dynamic_filters:
-        for lsh_cls in lsh_families:
-            config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
-            print(f"  Evaluating {config} ...")
-            lsh_instance = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
-            for size in filter_sizes:
-                construct_vecs = vectors[:size]
-                insert_vecs    = vectors[size:size + query_batch]
-                times = []
-                for _ in range(num_trials):
-                    fi = _build(filter_cls, lsh_instance)
-                    fi.construct(construct_vecs)
-                    t0 = time.perf_counter()
-                    fi.insert(insert_vecs)
-                    times.append(time.perf_counter() - t0)
-                throughput = query_batch / np.mean(times)
-                insert_results.append({'Config': config, 'FilterSize': size, 'Throughput': throughput})
-                print(f"    Size={size}: {throughput:.1f} inserts/sec")
-    plot_throughput_results(insert_results, "throughput", "Elements per Second (Insertions)", "Insertion")
-
-    return query_results, construct_results, insert_results
-
-
 def tradeoff_evaluation() -> Tuple[List, List]:
-    """
-    function that orchestrates the tradeoff benchmarking pipeline by generating ground truth, 
-    evaluating filter performance across memory/sphere constraints, and optionally 
-    stress-testing generalization robustness using synthetic random distributions.
-    """
-    num_vectors = 100000
+    num_vectors = 1_000
     dim = 384
     max_L = 256
     percentage_construct = 10
@@ -422,6 +304,5 @@ def tradeoff_evaluation() -> Tuple[List, List]:
 
 if __name__ == "__main__":
     static_evaluation()
-    # dynamic_evaluation()
-    # throughput_evaluation()
+    dynamic_evaluation()
     # tradeoff_evaluation()

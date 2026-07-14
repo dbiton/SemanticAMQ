@@ -58,6 +58,13 @@ class LSH(ABC):
         void_dt = np.dtype((np.void, contiguous.dtype.itemsize * self.K))
         return contiguous.view(void_dt).reshape(vectors.shape[0], self.L)
 
+class DummyLSH(LSH):
+    def _get_base_probabilities(self, r1: float, r2: float) -> Tuple[float, float]:
+        return 0.5, 0.5
+
+    def _compute_raw_hashes(self, vectors: np.ndarray) -> np.ndarray:
+        n_samples = vectors.shape[0]
+        return np.zeros((n_samples, self.L, self.K), dtype=np.uint8)
 
 class SimHashLSH(LSH):
     def __init__(self, dim: int, L: int, K: int):

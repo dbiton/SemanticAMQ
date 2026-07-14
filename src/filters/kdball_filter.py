@@ -253,11 +253,12 @@ class KDBallFilter(Filter):
                 self.all_radiuses = np.append(self.all_radiuses, np.float32(self.distance_threshold))
                 self.sphere_counts = np.append(self.sphere_counts, np.int32(1))
 
-
+    def get_volume(self) -> float:
+        return 0.0
+    
     # method for inserting new vectors into filter
     def insert(self, vectors: np.ndarray) -> None:
         self.add(vectors)
-
 
     # method for removing vectors from filter
     def remove(self, vectors: np.ndarray) -> List[bool]:
