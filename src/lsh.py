@@ -10,6 +10,9 @@ class LSH(ABC):
 
     @classmethod
     def build_optimized(cls, dim: int, threshold_d: float, K: Optional[int] = None, max_L: int = 256) -> "LSH":
+        MAX_SAFE_K = 64
+        MAX_TOTAL_BITS = 1_000_000
+    
         dummy = cls(dim=dim, L=1, K=1)
         p_threshold, _ = dummy._get_base_probabilities(threshold_d, threshold_d)
 
@@ -21,10 +24,11 @@ class LSH(ABC):
             return int(np.ceil(np.log(0.5) / np.log1p(-p_k)))
 
         if K is not None:
+            K = min(K, MAX_SAFE_K)
             L = calculate_L(K)
         else:
             best_K, best_L = 1, calculate_L(1)
-            for test_K in range(2, 256):
+            for test_K in range(2, MAX_SAFE_K + 1):
                 test_L = calculate_L(test_K)
                 if test_L > max_L:
                     break
@@ -33,6 +37,9 @@ class LSH(ABC):
 
         if L > max_L:
             raise ValueError(f"Cannot achieve 50% threshold at D={threshold_d} within max_L={max_L}. Requires L={L}.")
+
+        if (L * K) > MAX_TOTAL_BITS:
+            raise ValueError(f"Total projection bits ({L} * {K} = {L * K}) exceeds safe threshold of {MAX_TOTAL_BITS}.")
 
         return cls(dim=dim, L=L, K=K)
 

@@ -14,6 +14,7 @@ from runner import Runner
 from plots import plot_results, plot_throughput_results, plot_tradeoff_results
 from typing import Tuple, List
 from util.fetch_datasets import load_embeds
+from util.fetch_synthetic_datasets import load_synthetic_dataset
 from vector_source import VectorSource, ArrayVectorSource
 
 MAX_WORKERS = 1
@@ -76,7 +77,7 @@ def calculate_distance_threshold(
     return float(np.percentile(distances[keep], percentage))
 
 
-def compute_actual_results(vectors: np.ndarray, distance_threshold: float) -> list[bool]:
+def compute_dynamic_actual_results(vectors: np.ndarray, distance_threshold: float) -> list[bool]:
     """
     Online ground-truth: the first vector is unique; each subsequent vector is a
     duplicate if it falls within `distance_threshold` of any previously accepted
@@ -197,9 +198,9 @@ def dynamic_evaluation() -> list:
 
     for percentage in np.linspace(min_percentage_duplicates, max_percentage_duplicates, count_steps):
         distance_threshold = calculate_distance_threshold(vectors, percentage)
-        # compute_actual_results processes all vectors in sequence;
+        # compute_dynamic_actual_results processes all vectors in sequence;
         # slice to query positions so ground truth aligns with the query phase.
-        actual_results = compute_actual_results(vectors, distance_threshold)[num_construct:]
+        actual_results = compute_dynamic_actual_results(vectors, distance_threshold)[num_construct:]
 
         for lsh_cls in lsh_families:
             # hash() emits one key per LSH band, so a filter actually stores
@@ -315,49 +316,51 @@ def throughput_evaluation():
 
 def tradeoff_evaluation() -> Tuple[List, List]:
     """
-    function that orchestrates the tradeoff benchmarking pipeline by generating ground truth, 
-    evaluating filter performance across memory/sphere constraints, and optionally 
-    stress-testing generalization robustness using synthetic random distributions.
+    A function that orchestrates the tradeoff benchmarking pipeline by generating static ground truth 
+    and evaluating filter performance across varying memory and sphere constraints. It supports 
+    routing between real-world embeddings and synthetic datasets, and optionally stress-tests 
+    generalization robustness using synthetically generated random queries.
     """
     num_vectors = 100000
     dim = 384
     max_L = 256
     percentage_construct = 10
-    target_percentile = 0.2
+    distance_threshold = 0.2
     dataset = DATASET
     random_test = False
+    synthetic_test = False
 
-    # load dataset arrays for ground-truth processing
-    vectors = load_embeds(dataset, num_vectors)[0]
+    # calculate number of vectors for construct and query based on given percentage
     num_construct = num_vectors * percentage_construct // 100
-    vectors_construct = vectors[:num_construct]
-    vectors_query = vectors[num_construct:]
+    num_query = num_vectors - num_construct
 
-    # create construct and query vector objects for workers
-    construct_source = VectorSource(dataset, 0, num_construct)
-    query_source = VectorSource(dataset, num_construct, num_vectors)
-
-    # calculate constant reference distance threshold
-    print(f"Pre-calculating evaluation distance baselines at {target_percentile}%...")
-    distance_threshold = calculate_distance_threshold(vectors, target_percentile)
-
-    # means we run test with randomly generated queires for testing generalization
-    if random_test:
-        print("\nPreparing Generalization Test (Random Vectors)...")
-        # generate random samples from a uniform distribution and normalize them for dataset consistency
-        random_queries = np.random.uniform(low=np.min(vectors), high=np.max(vectors), size=(len(vectors_query), dim)).astype(np.float32)
-        random_queries_norms = np.linalg.norm(random_queries, axis=1, keepdims=True)
-        random_queries = random_queries / np.where(random_queries_norms == 0, 1e-10, random_queries_norms)
-
-        print("Calculating actual results for random queries...")
-        actual_results = compute_static_actual_results(vectors_construct, random_queries, distance_threshold)
-        query_source = ArrayVectorSource("random_queries", array=random_queries)
-
-    # else we run the original dataset queries provided
+    # if we are using synthetic dataset, load it using our saved dataset keys
+    if synthetic_test:
+        print(f"Loading synthetic dataset from '{dataset}' using targeted keys...")
+        # create construct and query vector objects for workers
+        construct_vectors = VectorSource(dataset, 0, num_construct, dataset_key="construct_vectors")
+        query_vectors = VectorSource(dataset, 0, num_query, dataset_key="query_vectors")
+    
+    # else we load regular real dataset, use regular api
     else:
-        # compute static filter resuls
-        print("Calculating actual results for test queries...")
-        actual_results = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
+        print(f"Loading real-world embeddings from dataset: '{dataset}'...")
+        # create construct and query vector objects for workers
+        construct_vectors = VectorSource(dataset, 0, num_construct)
+        query_vectors = VectorSource(dataset, num_construct, num_vectors)
+
+        # means we run test with randomly generated queires for testing generalization
+        if random_test:
+            print("\nPreparing Generalization Test (Random Vectors)...")
+            # generate random samples from a uniform distribution and normalize them for dataset consistency
+            all_vectors = np.vstack((construct_vectors.to_array(), query_vectors.to_array()))
+            random_queries = np.random.uniform(low=np.min(all_vectors), high=np.max(all_vectors), size=(num_query, dim)).astype(np.float32)
+            random_queries_norms = np.linalg.norm(random_queries, axis=1, keepdims=True)
+            random_queries = random_queries / np.where(random_queries_norms == 0, 1e-10, random_queries_norms)
+            query_vectors = ArrayVectorSource("random_queries", array=random_queries)
+
+    # compute actual labels for query vectors for workers
+    print("Calculating actual results for test queries...")
+    actual_results = compute_static_actual_results(construct_vectors.to_array(), query_vectors.to_array(), distance_threshold)
 
     runner = Runner(num_workers=MAX_WORKERS)
 
@@ -365,8 +368,8 @@ def tradeoff_evaluation() -> Tuple[List, List]:
     # Tests how the number of spheres (spatial partitioning) impacts 
     # search accuracy and speed for ball-based filters.
     sphere_sizes = [5, 10, 20, 40, 80, 160, 320, 640, 1280, 2560, 5120, 10240]
-    sphere_sizes = [s for s in sphere_sizes if s < len(vectors_construct)] + [len(vectors_construct)]
-    sphere_filters = [KDBallFilter, KMEBFilter]
+    sphere_sizes = [s for s in sphere_sizes if s < num_construct] + [num_construct]
+    sphere_filters = [KDBallFilter]
 
     for size in sphere_sizes:
         for filter_cls in sphere_filters:
@@ -377,8 +380,8 @@ def tradeoff_evaluation() -> Tuple[List, List]:
                 dim=dim,
                 distance_threshold=distance_threshold,
                 max_L=max_L,
-                vectors_construct=construct_source,
-                vectors_query=query_source,
+                vectors_construct=construct_vectors,
+                vectors_query=query_vectors,
                 actual_results=actual_results,
                 max_spheres=size,
                 memory_budget=None
@@ -404,8 +407,8 @@ def tradeoff_evaluation() -> Tuple[List, List]:
                 dim=dim,
                 distance_threshold=distance_threshold,
                 max_L=max_L,
-                vectors_construct=construct_source,
-                vectors_query=query_source,
+                vectors_construct=construct_vectors,
+                vectors_query=query_vectors,
                 actual_results=actual_results,
                 max_spheres=None,
                 memory_budget=budget

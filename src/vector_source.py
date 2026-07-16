@@ -31,6 +31,7 @@ class VectorSource:
     dataset_name: str
     start: int = 0
     stop: Optional[int] = None
+    dataset_key: str = _HDF5_DATASET_KEY
     chunk_size: int = 4096
 
     def _resolve_stop(self, dset_len: int) -> int:
@@ -39,7 +40,7 @@ class VectorSource:
     def __len__(self) -> int:
         path = dataset_filenames[self.dataset_name]
         with h5py.File(path, "r") as f:
-            dset_len = f[_HDF5_DATASET_KEY].shape[0]
+            dset_len = f[self.dataset_key].shape[0]
         return max(0, self._resolve_stop(dset_len) - self.start)
 
     def iter_batches(self, batch_size: Optional[int] = None) -> Iterator[np.ndarray]:
@@ -51,7 +52,7 @@ class VectorSource:
         batch_size = batch_size or self.chunk_size
         path = dataset_filenames[self.dataset_name]
         with h5py.File(path, "r") as f:
-            dset = f[_HDF5_DATASET_KEY]
+            dset = f[self.dataset_key]
             stop = self._resolve_stop(dset.shape[0])
             for base in range(self.start, stop, batch_size):
                 end = min(base + batch_size, stop)
@@ -76,7 +77,7 @@ class VectorSource:
         """
         path = dataset_filenames[self.dataset_name]
         with h5py.File(path, "r") as f:
-            dset = f[_HDF5_DATASET_KEY]
+            dset = f[self.dataset_key]
             stop = self._resolve_stop(dset.shape[0])
             return np.asarray(dset[self.start:stop], dtype=np.float32)
 

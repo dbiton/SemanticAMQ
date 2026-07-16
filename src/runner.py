@@ -77,8 +77,9 @@ def _compute_metrics(
     }
 
 
-def _instantiate_filter(filter_cls: Any, dim: int, lsh: Any, memory_budget: int, distance_threshold: float = None, max_spheres: int = None) -> Any:
+def _instantiate_filter(filter_cls: Any, dim: int, lsh_cls: Any, max_L: int, memory_budget: int, distance_threshold: float = None, max_spheres: int = None) -> Any:
     if filter_cls.__name__ not in ["KDBallFilter", "KMEBFilter"]:
+        lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
         try:
             return filter_cls(dim=dim, lsh=lsh, max_memory=memory_budget)
         except TypeError:
@@ -100,8 +101,7 @@ def static_worker(
     percentage: float,
 ) -> Dict[str, Any]:
     config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
-    lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
-    filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold)
+    filter_instance = _instantiate_filter(filter_cls, dim, lsh_cls, max_L, memory_budget, distance_threshold)
     filter_instance.construct(_to_construct_array(vectors_construct))
 
     # Stream the query set in bounded blocks so the full stream never has to be
@@ -129,8 +129,7 @@ def dynamic_worker(
     percentage: float,
 ) -> Dict[str, Any]:
     config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
-    lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
-    filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold)
+    filter_instance = _instantiate_filter(filter_cls, dim, lsh_cls, max_L, memory_budget, distance_threshold)
     filter_instance.construct(_to_construct_array(vectors_construct))
 
     # Pull the query stream one vector at a time (dynamic filters insert after
@@ -203,11 +202,10 @@ def tradeoff_worker(
     """
     try:
         config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
-        lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
         vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
 
         construct_start = time.perf_counter() # start construct timer
-        filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold, max_spheres)
+        filter_instance = _instantiate_filter(filter_cls, dim, lsh_cls, max_L, memory_budget, distance_threshold, max_spheres)
         filter_instance.construct(vectors_construct)
         construct_latency = time.perf_counter() - construct_start # final construct time
 
