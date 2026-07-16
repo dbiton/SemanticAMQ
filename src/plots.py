@@ -21,17 +21,36 @@ def plot_results(results_list: list, folder: str) -> None:
 
     configs = df['Config'].unique()
 
-    bounded_metrics = ('F1-Score', 'Precision', 'Recall')
+    memory_budgets = sorted(df['Memory Budget'].unique()) if 'Memory Budget' in df.columns else []
+    if len(memory_budgets) > 1:
+        df['Memory Budget (MB)'] = (df['Memory Budget'] / (1024 * 1024)).round(2)
+        df['Percentage'] = df['Percentage'].round(2)
+        pct_palette = sns.color_palette("viridis", n_colors=df['Percentage'].nunique())
+
+    ylabels = {'Memory Usage': 'Memory Usage (bytes)', 'FPR': 'False Positive Rate (FPR)'}
+    bounded_metrics = ('F1-Score', 'Precision', 'Recall', 'FPR')
     for metric in bounded_metrics + ('Memory Usage',):
         fig, ax = plt.subplots(figsize=(8, 6))
-        sns.lineplot(
-            data=df, x='Percentage', y=metric,
-            hue='Filter', style='LSH',
-            markers=marker_map, dashes=False,
-            palette=color_map, ax=ax, legend=False,
-        )
-        ax.set_xlabel('Percentage of Duplicates (%)', fontsize=12)
-        ax.set_ylabel(metric if metric != 'Memory Usage' else 'Memory Usage (bytes)', fontsize=12)
+        if len(memory_budgets) > 1:
+            # One curve per duplicate percentage, coloured dark-to-light from
+            # smallest to largest; line style still distinguishes filters.
+            sns.lineplot(
+                data=df, x='Memory Budget (MB)', y=metric,
+                hue='Percentage', style='Filter',
+                markers=True, dashes=False,
+                palette=pct_palette, ax=ax,
+            )
+            ax.legend(fontsize=8, ncol=2)
+            ax.set_xlabel('Memory Budget (MB)', fontsize=12)
+        else:
+            sns.lineplot(
+                data=df, x='Percentage', y=metric,
+                hue='Filter', style='LSH',
+                markers=marker_map, dashes=False,
+                palette=color_map, ax=ax, legend=False,
+            )
+            ax.set_xlabel('Percentage of Duplicates (%)', fontsize=12)
+        ax.set_ylabel(ylabels.get(metric, metric), fontsize=12)
         if metric in bounded_metrics:
             ax.set_ylim(-0.05, 1.05)
         filename = f'{metric.lower().replace("-", "_").replace(" ", "_")}_plot.png'

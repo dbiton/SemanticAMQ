@@ -54,6 +54,7 @@ def _compute_metrics(
     config: str,
     percentage: float,
     memory_usage: int,
+    memory_budget: int,
 ) -> Dict[str, Any]:
     tp = sum(1 for p, a in zip(predicted, actual) if p and a)
     fp = sum(1 for p, a in zip(predicted, actual) if p and not a)
@@ -74,6 +75,7 @@ def _compute_metrics(
         'Recall':       recall,
         'F1-Score':     f1,
         'Memory Usage': memory_usage,
+        'Memory Budget': memory_budget,
     }
 
 
@@ -113,7 +115,7 @@ def static_worker(
     # Checked at the end of the run: for static filters, memory is fixed after
     # construct(), but querying can't change it, so this reflects final usage.
     memory_usage = filter_instance.get_bytesize()
-    return _compute_metrics(predicted, actual_results, distance_threshold, config, percentage, memory_usage)
+    return _compute_metrics(predicted, actual_results, distance_threshold, config, percentage, memory_usage, memory_budget)
 
 
 def dynamic_worker(
@@ -145,7 +147,7 @@ def dynamic_worker(
     # Checked at the end of the run: dynamic filters grow via insert() during
     # the query loop, so memory usage is only meaningful once it's finished.
     memory_usage = filter_instance.get_bytesize()
-    return _compute_metrics(predicted, actual_results, distance_threshold, config, percentage, memory_usage)
+    return _compute_metrics(predicted, actual_results, distance_threshold, config, percentage, memory_usage, memory_budget)
 
 
 def _compute_tradeoff_metrics(

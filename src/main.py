@@ -16,14 +16,18 @@ from typing import Tuple, List
 from util.fetch_datasets import load_embeds
 from vector_source import VectorSource, ArrayVectorSource
 
-MAX_WORKERS = 4
+MAX_WORKERS = 6
 DATASET = 'ELI5'
 
 dynamic_filters = [KDBallFilter]
 static_filters  = []
 
 def calculate_max_memory_budget_bytes(num_vectors: int, dimension: int, bytes_per_element: float) -> int:
-    return num_vectors * dimension * bytes_per_element
+    return num_vectors * dimension * bytes_per_element // 2
+
+def calculate_memory_budgets(max_memory_budget: int, count_steps: int = 10) -> list[int]:
+    """Uniformly spaced budgets from max/count_steps up to the full max budget."""
+    return [int(b) for b in np.linspace(max_memory_budget / count_steps, max_memory_budget, count_steps)]
 
 def calculate_distance_threshold(
     vectors: np.ndarray,
@@ -118,11 +122,12 @@ def compute_static_actual_results(
 
 
 def static_evaluation() -> list:
-    num_vectors              = 1_000
+    num_vectors              = 10_000
     dim                      = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
     count_steps              = 9
+    count_memory_steps       = 10
     percentage_construct     = 10
     max_L                    = 256
 
@@ -137,9 +142,10 @@ def static_evaluation() -> list:
     # stream length is bounded by disk, not by num_jobs * stream_length memory.
     construct_source = VectorSource(dataset, 0, num_construct)
     query_source     = VectorSource(dataset, num_construct, num_vectors)
-    memory_budget = calculate_max_memory_budget_bytes(num_vectors, dim, bytes_per_element)
+    max_memory_budget = calculate_max_memory_budget_bytes(num_vectors, dim, bytes_per_element)
+    memory_budgets    = calculate_memory_budgets(max_memory_budget, count_memory_steps)
     runner = Runner(num_workers=MAX_WORKERS)
-    
+
     for percentage in np.linspace(min_percentage_duplicates, max_percentage_duplicates, count_steps):
         print(f"Processing {percentage:.1f}% duplicates...")
         print("Calculating distance threshold...")
@@ -147,15 +153,16 @@ def static_evaluation() -> list:
         print("Calculating actual results...")
         actual_results     = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
 
-        for filter_cls in static_filters + dynamic_filters:
-            runner.submit(
-                'static',
-                filter_cls=filter_cls, lsh_cls=DummyLSH,
-                dim=dim, distance_threshold=distance_threshold,
-                max_L=max_L, memory_budget=memory_budget,
-                vectors_construct=construct_source, vectors_query=query_source,
-                actual_results=actual_results, percentage=percentage,
-            )
+        for memory_budget in memory_budgets:
+            for filter_cls in static_filters + dynamic_filters:
+                runner.submit(
+                    'static',
+                    filter_cls=filter_cls, lsh_cls=DummyLSH,
+                    dim=dim, distance_threshold=distance_threshold,
+                    max_L=max_L, memory_budget=memory_budget,
+                    vectors_construct=construct_source, vectors_query=query_source,
+                    actual_results=actual_results, percentage=percentage,
+                )
 
     results = runner.run()
     print("Static evaluation completed.")
@@ -164,11 +171,12 @@ def static_evaluation() -> list:
 
 
 def dynamic_evaluation() -> list:
-    num_vectors              = 1_000
+    num_vectors              = 10_000
     dim                      = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
     count_steps              = 10
+    count_memory_steps       = 10
     percentage_construct     = 25
     max_L                    = 256
 
@@ -179,21 +187,23 @@ def dynamic_evaluation() -> list:
 
     construct_source = VectorSource(dataset, 0, num_construct)
     query_source     = VectorSource(dataset, num_construct, num_vectors)
+    max_memory_budget = calculate_max_memory_budget_bytes(num_construct, dim, bytes_per_element)
+    memory_budgets    = calculate_memory_budgets(max_memory_budget, count_memory_steps)
     runner = Runner(num_workers=MAX_WORKERS)
 
     for percentage in np.linspace(min_percentage_duplicates, max_percentage_duplicates, count_steps):
         distance_threshold = calculate_distance_threshold(vectors, percentage)
         actual_results = compute_actual_results(vectors, distance_threshold)[num_construct:]
-        memory_budget = calculate_max_memory_budget_bytes(num_construct, dim, bytes_per_element)
-        for filter_cls in dynamic_filters:
-            runner.submit(
-                'dynamic',
-                filter_cls=filter_cls, lsh_cls=DummyLSH,
-                dim=dim, distance_threshold=distance_threshold,
-                max_L=max_L, memory_budget=memory_budget,
-                vectors_construct=construct_source, vectors_query=query_source,
-                actual_results=actual_results, percentage=percentage,
-            )
+        for memory_budget in memory_budgets:
+            for filter_cls in dynamic_filters:
+                runner.submit(
+                    'dynamic',
+                    filter_cls=filter_cls, lsh_cls=DummyLSH,
+                    dim=dim, distance_threshold=distance_threshold,
+                    max_L=max_L, memory_budget=memory_budget,
+                    vectors_construct=construct_source, vectors_query=query_source,
+                    actual_results=actual_results, percentage=percentage,
+                )
 
     results = runner.run()
     print("Dynamic evaluation completed.")
@@ -201,7 +211,7 @@ def dynamic_evaluation() -> list:
     return results
 
 def tradeoff_evaluation() -> Tuple[List, List]:
-    num_vectors = 1_000
+    num_vectors = 10_000
     dim = 384
     max_L = 256
     percentage_construct = 10
