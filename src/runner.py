@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, Iterator, List, Union
 
+import faiss
 import numpy as np
 import time
 
@@ -80,7 +81,7 @@ def _compute_metrics(
 
 
 def _instantiate_filter(filter_cls: Any, dim: int, lsh: Any, memory_budget: int, distance_threshold: float = None, max_spheres: int = None) -> Any:
-    if filter_cls.__name__ not in ["KDBallFilter", "KMEBFilter"]:
+    if filter_cls.__name__ not in ["KDBallFilter", "KMEBFilter", "FirstNFilter"]:
         try:
             return filter_cls(dim=dim, lsh=lsh, max_memory=memory_budget)
         except TypeError:
@@ -148,6 +149,95 @@ def dynamic_worker(
     # the query loop, so memory usage is only meaningful once it's finished.
     memory_usage = filter_instance.get_bytesize()
     return _compute_metrics(predicted, actual_results, distance_threshold, config, percentage, memory_usage, memory_budget)
+
+
+def hnsw_worker(
+    filter_cls: Any,
+    lsh_cls: Any,
+    dim: int,
+    distance_threshold: float,
+    max_L: int,
+    memory_budget: int,
+    vectors_construct: VectorInput,
+    vectors_query: VectorInput,
+    percentage: float,
+    dataset: str = "",
+    hnsw_m: int = 32,
+    ef_search: int = 64,
+) -> Dict[str, Any]:
+    """
+    Measure how much a semantic filter reduces the cost of answering
+    "is any stored vector within distance_threshold of the query?" against an
+    HNSW index that explicitly stores all construct vectors.
+
+    The filter acts like a bloom filter (one-sided error): a negative answer is
+    trusted and the index is skipped; only filter-positive queries are searched
+    in the HNSW index. The same query stream is timed with and without the filter.
+    """
+    config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
+    lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
+
+    construct = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
+
+    # HNSW index storing all vectors explicitly (squared L2 metric)
+    index = faiss.IndexHNSWFlat(dim, hnsw_m)
+    index.hnsw.efSearch = ef_search
+    index.add(construct)
+
+    filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold)
+    filter_instance.construct(construct)
+
+    sq_threshold = distance_threshold ** 2
+
+    # PASS 1 (baseline): every query goes to the HNSW index
+    n_queries = 0
+    baseline_pred: List[bool] = []
+    start = time.perf_counter()
+    for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
+        block = np.ascontiguousarray(block, dtype=np.float32)
+        n_queries += len(block)
+        nn_sq_dist, _ = index.search(block, 1)
+        baseline_pred.extend((nn_sq_dist[:, 0] <= sq_threshold).tolist())
+    time_without = time.perf_counter() - start
+
+    # PASS 2 (filtered): trust filter negatives, search the index only for positives
+    n_index_accesses = 0
+    filtered_pred: List[bool] = []
+    start = time.perf_counter()
+    for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
+        block = np.ascontiguousarray(block, dtype=np.float32)
+        positive_mask = np.array(filter_instance.query(block), dtype=bool)
+        block_pred = np.zeros(len(block), dtype=bool)
+        if positive_mask.any():
+            n_index_accesses += int(positive_mask.sum())
+            nn_sq_dist, _ = index.search(block[positive_mask], 1)
+            block_pred[positive_mask] = nn_sq_dist[:, 0] <= sq_threshold
+        filtered_pred.extend(block_pred.tolist())
+    time_with = time.perf_counter() - start
+
+    # sanity: a correct one-sided filter never loses a baseline positive
+    false_negatives = sum(1 for b, f in zip(baseline_pred, filtered_pred) if b and not f)
+
+    n_q = max(n_queries, 1)
+    return {
+        'Config':                       config,
+        'Dataset':                      dataset,
+        'Percentage':                   percentage,
+        'Threshold':                    distance_threshold,
+        'Memory Budget':                memory_budget,
+        'Filter Memory Usage':          filter_instance.get_bytesize(),
+        'Total Queries':                n_queries,
+        'Time Without Filter (s)':      time_without,
+        'Time With Filter (s)':         time_with,
+        'Latency Without Filter (ms)':  time_without / n_q * 1000,
+        'Latency With Filter (ms)':     time_with / n_q * 1000,
+        'Throughput Without Filter':    n_queries / max(time_without, 1e-9),
+        'Throughput With Filter':       n_queries / max(time_with, 1e-9),
+        'Speedup':                      time_without / max(time_with, 1e-9),
+        'Index Accesses':               n_index_accesses,
+        'Index Access Rate':            n_index_accesses / n_q,
+        'Filter False Negatives':       false_negatives,
+    }
 
 
 def _compute_tradeoff_metrics(
@@ -234,6 +324,7 @@ _WORKER_FNS: Dict[str, Any] = {
     'static':  static_worker,
     'dynamic': dynamic_worker,
     'tradeoff': tradeoff_worker,
+    'hnsw':    hnsw_worker,
 }
 
 

@@ -27,8 +27,8 @@ def plot_results(results_list: list, folder: str) -> None:
         df['Percentage'] = df['Percentage'].round(2)
         pct_palette = sns.color_palette("viridis", n_colors=df['Percentage'].nunique())
 
-    ylabels = {'Memory Usage': 'Memory Usage (bytes)', 'FPR': 'False Positive Rate (FPR)'}
-    bounded_metrics = ('F1-Score', 'Precision', 'Recall', 'FPR')
+    ylabels = {'Memory Usage': 'Memory Usage (bytes)', 'FPR': 'False Positive Rate (FPR)', 'FNR': 'False Negative Rate (FNR)'}
+    bounded_metrics = ('F1-Score', 'Precision', 'Recall', 'FPR', 'FNR')
     for metric in bounded_metrics + ('Memory Usage',):
         fig, ax = plt.subplots(figsize=(8, 6))
         if len(memory_budgets) > 1:
@@ -143,6 +143,62 @@ def get_plot_mappings(all_filters: List[str]) -> Tuple[Dict, Dict, Dict]:
     dash_map = {config: available_dashes[i % len(available_dashes)] for i, config in enumerate(all_filters)}
     
     return color_map, marker_map, dash_map
+
+
+def plot_hnsw_results(results_list: list, folder: str = "plots/hnsw") -> None:
+    """
+    Plots the HNSW filtered-access evaluation aggregated per dataset: mean
+    throughput, mean per-query latency, and mean HNSW index accesses of the
+    query stream, comparing the unfiltered baseline against each filter config
+    placed in front of the index. Bars are means over the duplicate-percentage
+    sweep; whiskers show one standard deviation across it.
+    """
+    os.makedirs(folder, exist_ok=True)
+    df = pd.DataFrame(results_list)
+
+    sns.set_theme(style="whitegrid")
+
+    baseline = 'No Filter'
+    configs  = list(dict.fromkeys(df['Config']))
+    datasets = list(dict.fromkeys(df['Dataset']))
+    # Neutral gray for the unfiltered baseline; fixed (never cycled) categorical
+    # hues for the filter configs so a config keeps its color across plots.
+    series_hues = ['#2a78d6', '#008300', '#e87ba4', '#eda100', '#1baf7a', '#eb6834', '#4a3aa7', '#e34948']
+    palette = {baseline: '#898781', **{c: series_hues[i % len(series_hues)] for i, c in enumerate(configs)}}
+    pipelines = [baseline] + configs
+
+    metrics = [
+        ('Throughput Without Filter', 'Throughput With Filter', 'Mean Throughput (queries/s)', 'throughput'),
+        ('Latency Without Filter (ms)', 'Latency With Filter (ms)', 'Mean Latency per Query (ms)', 'latency'),
+        ('Total Queries', 'Index Accesses', 'Mean HNSW Index Accesses', 'index_accesses'),
+    ]
+    for without_col, with_col, ylabel, name in metrics:
+        # Long form: one row per (dataset, pipeline, run) so the barplot can
+        # average over the duplicate-percentage sweep and draw spread whiskers.
+        # Without the filter every query reaches the index, so 'Total Queries'
+        # doubles as the baseline access count.
+        base_df = df[['Dataset', without_col]].rename(columns={without_col: ylabel})
+        base_df['Pipeline'] = baseline
+        with_df = df[['Dataset', 'Config', with_col]].rename(columns={with_col: ylabel, 'Config': 'Pipeline'})
+        long_df = pd.concat([base_df, with_df], ignore_index=True)
+
+        fig, ax = plt.subplots(figsize=(max(8, 1.6 * len(datasets)), 6))
+        sns.barplot(
+            data=long_df, x='Dataset', y=ylabel, hue='Pipeline',
+            order=datasets, hue_order=pipelines, palette=palette,
+            errorbar='sd', capsize=0.15, err_kws={'linewidth': 1.2}, ax=ax,
+        )
+        ax.set_xlabel('Dataset', fontsize=12)
+        ax.set_ylabel(ylabel, fontsize=12)
+        # above the axes so it can never sit on top of a bar
+        ax.legend(
+            title=None, fontsize=9, loc='lower center',
+            bbox_to_anchor=(0.5, 1.02), ncol=min(3, len(pipelines)), frameon=False,
+        )
+        filename = f'hnsw_{name}_plot.png'
+        plt.savefig(f"{folder}/{filename}", bbox_inches='tight', dpi=300)
+        plt.close()
+        print(f"Saved {folder}/{filename}")
 
 
 def plot_tradeoff_results(sphere_results: list, memory_results: list, folder: str = "plots/tradeoff") -> None:
