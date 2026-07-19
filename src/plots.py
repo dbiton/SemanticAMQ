@@ -126,7 +126,7 @@ def get_plot_mappings(all_filters: List[str]) -> Tuple[Dict, Dict, Dict]:
     return color_map, marker_map, dash_map
 
 
-def plot_tradeoff_results(sphere_results: list, memory_results: list, folder: str = "plots/tradeoff") -> None:
+def plot_tradeoff_results(sphere_results: list, memory_results: list, folder: str = "plots/tradeoff_static") -> None:
     """
     Plots tradeoff evaluation results, comparing FPR, FNR, Precision, F1-Score, QPS, 
     and ConstructTime across both geometric (spheres) and hardware (memory) sweeps.

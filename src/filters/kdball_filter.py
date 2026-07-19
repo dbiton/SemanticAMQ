@@ -29,9 +29,8 @@ class KDBallFilter(Filter):
         max_memory (Optional[int]): The maximum memory limit in bytes allocated for storing spheres.
         max_spheres (int): The maximum number of space partitions (spheres) allowed, automatically
                         calculated based on the memory limit to prevent overflow.
-        all_spheres (np.ndarray): A 2D array of shape (K, dim) storing the centroids of all spheres.
+        all_spheres (np.ndarray): A 2D array of shape (K, D) storing the centroids of all spheres.
         all_radiuses (np.ndarray): A 1D array of shape (K,) storing the bounding radiuses.
-        sphere_counts (np.ndarray): A 1D array of shape (K,) storing the count of membership vectors per sphere.
     """
     _BYTES_PER_FLOAT32 = 4
     _BYTES_PER_FLOAT64 = 8
@@ -42,9 +41,8 @@ class KDBallFilter(Filter):
         # initialize class attributes and call parent class ctor
         super().__init__(dim, lsh=None, max_memory=max_memory)
         self.distance_threshold = distance_threshold
-        self.all_spheres = np.empty((0, dim), dtype=np.float32) # represents matrix of spheres center of shape (K, dim)
+        self.all_spheres = np.empty((0, dim), dtype=np.float32) # represents matrix of spheres center of shape (K, D)
         self.all_radiuses = np.empty((0,), dtype=np.float32) # represents vector of radiuses of shape (K,)
-        self.sphere_counts = np.empty((0,), dtype=np.int32) # represents vector of sphere counts of shape (K,)
         self._constructed = False
 
         # handle memory limit based on max memory limit given
@@ -73,11 +71,115 @@ class KDBallFilter(Filter):
         margins = group_max - group_min
 
         # find the axis with the largest overall margin
-        best_axis = int(margins.argmax())
+        best_axis = int(np.argmax(margins))
         best_margin = float(margins[best_axis])
         best_split_val = float(group_min[best_axis] + (best_margin / 2.0))
 
         return best_margin, best_axis, best_split_val
+    
+
+    # method for merging overlapping spheres by finding the pair that produces the minimal volume increase
+    def _merge_spheres(self) -> None:
+        # define number of spheres and number of dimentions
+        K, D = self.all_spheres.shape
+
+        # calculate global max radius for scaling (needed for computing volume correctly)
+        max_r = max(np.max(self.all_radiuses), 1.0)
+
+        # define best pair of spheres to merge with best minimal combined volume
+        best_volume = np.inf
+        best_pair = (-1, -1)
+        best_r_new = 0.0
+        best_distance = 0.0
+
+        # iterate over each sphere i and compare against all subsequent spheres j
+        for i in range(K - 1):
+            j = i + 1 # next subsequent sphere
+
+            # get current sphere i and subsequent spheres j
+            c_i, r_i = self.all_spheres[i], self.all_radiuses[i]
+            c_j, r_j = self.all_spheres[j:], self.all_radiuses[j:]
+
+            # calculate the new merged sphere radius
+            distance_ci_cj = np.linalg.norm(c_j - c_i, axis=1)
+            r_new = (distance_ci_cj + r_i + r_j) / 2.0
+
+            # scale our radiuses for computing volume with D dimensions
+            r_new_scaled = (r_new / max_r).astype(np.float64)
+            r_i_scaled = (r_i / max_r).astype(np.float64)
+            r_j_scaled = (r_j / max_r).astype(np.float64)
+
+            # calculate the volume of the current merged spheres
+            volumes = (r_new_scaled ** D) - (r_i_scaled ** D + r_j_scaled ** D)
+
+            # get the index and value of the minimum merge volume
+            min_volume_idx = int(np.argmin(volumes))
+            min_volume = volumes[min_volume_idx]
+
+            # if current volume is smaller, update best pair so far
+            if min_volume < best_volume:
+                best_volume = min_volume
+                best_pair = (i, j + min_volume_idx)
+                best_r_new = r_new[min_volume_idx]
+                best_distance = distance_ci_cj[min_volume_idx]
+
+        # get best pair of spheres and their centers and radiuses
+        i, j = best_pair
+        c_i, r_i = self.all_spheres[i], self.all_radiuses[i]
+        c_j, r_j = self.all_spheres[j], self.all_radiuses[j]
+
+        # calculate the new center using the formula we've defined
+        if best_distance > 0.0:
+            best_c_new =  (((r_j - r_i) / (2.0 * best_distance)) + 0.5) * c_j + (((r_i - r_j) / (2.0 * best_distance)) + 0.5) * c_i
+        else:
+            best_c_new = c_i
+
+        # update our spheres and radiuses with new merged pair with minimal volume
+        self.all_spheres[i] = np.float32(best_c_new)
+        self.all_radiuses[i] = np.float32(best_r_new)
+        self.all_spheres = np.delete(self.all_spheres, j, axis=0)
+        self.all_radiuses = np.delete(self.all_radiuses, j)
+        # print(f"Found best volume {best_volume} with radius {best_r_new} and distance {best_distance}.")
+    
+
+    # method for removing spheres contained in other larger spheres
+    def _remove_spheres(self) -> None:
+        # define number of spheres
+        K = self.all_spheres.shape[0]
+
+        # if less then two sphere finsih
+        if K < 2:
+            return
+
+        # represents spheres that are contained in other spheres
+        contained_spheres = []
+
+        # iterate over spheres and find contained spheres
+        for i in range(K):
+            # get current sphere center and radius
+            c_i, r_i = self.all_spheres[i], self.all_radiuses[i]
+
+            # represents all spheres big enough to contain current sphere
+            contained_mask = self.all_radiuses >= r_i
+            contained_mask[i] = False
+
+            # if no other spheres are big enough we skip
+            if not np.any(contained_mask):
+                continue
+
+            # get all potential spheres j that can contain current sphere i
+            c_j, r_j = self.all_spheres[contained_mask], self.all_radiuses[contained_mask]
+            distance_ci_cj = np.linalg.norm(c_j - c_i, axis=1)
+
+            # check if any sphere contains current sphere d(c_i, c_j) + r_i <= r_j
+            if np.any(distance_ci_cj + r_i <= r_j):
+                contained_spheres.append(i)
+
+        # remove all spheres we found that are already contained in other spheres
+        if contained_spheres:
+            self.all_spheres = np.delete(self.all_spheres, contained_spheres, axis=0)
+            self.all_radiuses = np.delete(self.all_radiuses, contained_spheres)
+        # print(f"Found {len(contained_spheres)} contained spheres.")
 
 
     # method for constructing the filter attributes and finding optimal spheres to cover the vector space 
@@ -110,7 +212,7 @@ class KDBallFilter(Filter):
             p_margin = -p_margin
 
             # if margin is smaller then our threshold we dont split and finish
-            if p_margin <= self.distance_threshold * 2.0:
+            if p_margin <= self.distance_threshold:
                 heappush(rectangles, (-p_margin, p_axis, p_split_val, parent_indices))
                 break
 
@@ -132,7 +234,7 @@ class KDBallFilter(Filter):
                 heappush(rectangles, (-r_margin, r_axis, r_split_val, right_indices))
 
         # convert final rectangle groups into spheres
-        sphere_centers, sphere_radiuses, sphere_counts = [], [], []
+        sphere_centers, sphere_radiuses = [], []
 
         # iterate over each group we saved and compute sphere properties like center and radius
         for rectangle in rectangles:
@@ -148,33 +250,36 @@ class KDBallFilter(Filter):
             # center of the sphere is the average vector of this group
             center = sphere_data.mean(axis=0, dtype=np.float32)
 
-            # compute distance from center to every vector in group
-            distances = np.linalg.norm(sphere_data - center, axis=1)
-            max_distance = distances.max() if len(distances) else 0.0
+            # compute the maximum distance from center to any vector in the group
+            max_distance = np.linalg.norm(sphere_data - center, axis=1).max(initial=0.0)
 
             # compute the radius based on max distance and threshold
             radius = np.float32(max_distance + self.distance_threshold)
 
-            # append center, radius and number of vectors to our lists
+            # get min and max coordinates across all dimensions
+            # min_vec, max_vec = sphere_data.min(axis=0), sphere_data.max(axis=0)
+            # center = np.float32((max_vec + min_vec) / 2.0)
+            # radius = np.float32(np.linalg.norm((max_vec - min_vec) / 2.0) + self.distance_threshold)
+
+            # append center and radius to our lists
             sphere_centers.append(center)
             sphere_radiuses.append(radius)
-            sphere_counts.append(len(rectangle_indices))
 
         # initialize arrays with our final spheres properties
         self.all_spheres = np.asarray(sphere_centers, dtype=np.float32)
         self.all_radiuses = np.asarray(sphere_radiuses, dtype=np.float32)
-        self.sphere_counts = np.asarray(sphere_counts, dtype=np.int32)
         self._constructed = True
         # print(f"Number of spheres found: {self.all_spheres.shape[0]}, max_spheres: {self.max_spheres}")
 
 
     # method to query our filter and check if query vectors fall inside our spheres
     def query(self, vectors: np.ndarray) -> List[bool]:
+        # if not initialized call construct
         if not self._constructed:
-            raise ValueError("KDBallFilter has not been constructed.")
+            self.construct(vectors)
 
-        # if no spheres exist return results
-        if len(self.all_spheres) == 0:
+        # if no spheres exist or no vectors given return results
+        if len(self.all_spheres) == 0 or len(vectors) == 0:
             return [False] * len(vectors)
 
         # cast queries to float32 array for better performance
@@ -211,47 +316,24 @@ class KDBallFilter(Filter):
 
         # process each new query vector and add it to filter
         for q in new_vectors:
-            # find the closest sphere index and calculate vector distance from it
-            sphere_distances = np.linalg.norm(self.all_spheres - q, axis=1)
-            best_sphere_idx = int(np.argmin(sphere_distances))
-            best_sphere_dist = sphere_distances[best_sphere_idx]
+            # if we have spheres we check if given query is inside one
+            if len(self.all_spheres) > 0:
+                # calculate the sphere distances from query and get best sphere
+                sphere_distances = np.linalg.norm(self.all_spheres - q, axis=1)
+                best_sphere = int(np.argmin(sphere_distances))
 
-            # define distance limit to consider a vector close enough to an existing sphere
-            distance_limit = self.all_radiuses[best_sphere_idx] + (2.0 * self.distance_threshold)
+                # check if query inside sphere d(c, q) <= r - threshold
+                if sphere_distances[best_sphere] <= (self.all_radiuses[best_sphere] - self.distance_threshold):
+                    continue
 
-            # if vector is inside the existing sphere, we increment sphere counter
-            if best_sphere_dist <= self.all_radiuses[best_sphere_idx]:
-                self.sphere_counts[best_sphere_idx] += 1
+            # create new sphere for the query using threshold as its initial radius
+            self.all_spheres = np.vstack([self.all_spheres, q])
+            self.all_radiuses = np.append(self.all_radiuses, np.float32(self.distance_threshold))
 
-            # if vector is close enough to existing sphere or we reached max spheres we expand it
-            # to include new vector and maintain coverage of existing vectors in sphere
-            elif best_sphere_dist <= distance_limit or len(self.all_spheres) >= self.max_spheres:
-                # get sphere center, radius and count
-                c_old = self.all_spheres[best_sphere_idx]
-                r_old = self.all_radiuses[best_sphere_idx]
-                count = self.sphere_counts[best_sphere_idx]
-
-                # compute the new center including new vector with our current count
-                c_new = ((c_old * count) + q) / (count + 1)
-
-                # calculate the distance from new center to old center and new vector
-                dist_to_c_old = float(np.linalg.norm(c_old - c_new))
-                dist_to_q = float(np.linalg.norm(q - c_new))
-
-                # choose our new radius that cover all existing vectors including new one
-                # r_new >= max(r_old + ||c_old - c_new||, ||q - c_new|| + threshold)
-                r_new = max(r_old + dist_to_c_old, dist_to_q + self.distance_threshold)
-
-                # update our center and radius in existing sphere
-                self.all_spheres[best_sphere_idx] = c_new
-                self.all_radiuses[best_sphere_idx] = r_new
-                self.sphere_counts[best_sphere_idx] += 1
-
-            # else vector is far from our nearest sphere, create a new sphere because we have enough memory
-            else:
-                self.all_spheres = np.vstack([self.all_spheres, q])
-                self.all_radiuses = np.append(self.all_radiuses, np.float32(self.distance_threshold))
-                self.sphere_counts = np.append(self.sphere_counts, np.int32(1))
+            # merge overlapping spheres if max sphere count is exceeded
+            if len(self.all_spheres) > self.max_spheres:
+                self._merge_spheres()
+                self._remove_spheres()
 
 
     # method for inserting new vectors into filter
@@ -261,42 +343,7 @@ class KDBallFilter(Filter):
 
     # method for removing vectors from filter
     def remove(self, vectors: np.ndarray) -> List[bool]:
-        # if not initialized or vectors array is empty we return results
-        if len(self.all_spheres) == 0 or len(vectors) == 0:
-            return [False] * len(vectors)
-
-        # cast queries to float32 array for better performance
-        q = np.asarray(vectors, dtype=np.float32)
-
-        # compute components for the squared distance identity
-        # ||q - c||^2 = ||q||^2 - 2(q·c) + ||c||^2
-        q_sq = np.sum(q ** 2, axis=1, keepdims=True)
-        c_sq = np.sum(self.all_spheres ** 2, axis=1)
-        cross = q @ self.all_spheres.T  
-
-        # combine terms via broadcasting to get the total squared distance matrix
-        sq_distances = np.maximum(q_sq + c_sq[None, :] - 2 * cross, 0.0) # shape (N, K)
-
-        # find the closest sphere index and calculate vector distance from it
-        best_sphere_idx = np.argmin(sq_distances, axis=1)
-        best_sphere_dist = sq_distances[np.arange(len(q)), best_sphere_idx]
-
-        # vectorized comparison against squared radiuses
-        in_any_sphere = best_sphere_dist <= (self.all_radiuses[best_sphere_idx] ** 2)
-
-        # means we have vectors to remove from spheres
-        if np.any(in_any_sphere):
-            # update count of all sphere using bincount
-            self.sphere_counts -= np.bincount(best_sphere_idx[in_any_sphere], minlength=len(self.sphere_counts))
-
-            # remove empty spheres from our memory if their count reached zero
-            non_empty_spheres = self.sphere_counts > 0
-            if not np.all(non_empty_spheres):
-                self.all_spheres = self.all_spheres[non_empty_spheres]
-                self.all_radiuses = self.all_radiuses[non_empty_spheres]
-                self.sphere_counts = self.sphere_counts[non_empty_spheres]
-
-        return in_any_sphere.tolist()
+        raise NotImplementedError("KDBallFilter does not support remove operation.")
 
 
     # method to get exact fpr
@@ -309,4 +356,4 @@ class KDBallFilter(Filter):
         if not self._constructed:
             return 0
         # return the overall spheres size including size of radiuses
-        return self.all_spheres.nbytes + self.all_radiuses.nbytes + self.sphere_counts.nbytes
+        return self.all_spheres.nbytes + self.all_radiuses.nbytes

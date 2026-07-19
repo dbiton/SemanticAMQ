@@ -184,7 +184,7 @@ def _compute_tradeoff_metrics(
     }
 
 
-def tradeoff_worker(
+def tradeoff_static_worker(
     filter_cls: Any,
     lsh_cls: Any,
     dim: int,
@@ -197,8 +197,9 @@ def tradeoff_worker(
     memory_budget: int = None
 ) -> Dict[str, Any]:
     """
-    function for executing a single benchmarking trial for a specific filter configuration, 
-    measuring initialization time, memory usage, query throughput, and accuracy metrics.
+    Function for executing a single benchmarking trial of a static filter,
+    constructing the filter once from the full dataset and measuring
+    construction time, memory usage, query throughput, and accuracy metrics.
     """
     try:
         config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
@@ -226,10 +227,61 @@ def tradeoff_worker(
     return _compute_tradeoff_metrics(predicted, actual_results, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
 
 
+def tradeoff_dynamic_worker(
+    filter_cls: Any,
+    lsh_cls: Any,
+    dim: int,
+    distance_threshold: float,
+    max_L: int,
+    vectors_construct: np.ndarray,
+    vectors_query: np.ndarray,
+    actual_results: List[bool],
+    max_spheres: int = None,
+    memory_budget: int = None
+) -> Dict[str, Any]:
+    """
+    Function for executing a single benchmarking trial of a dynamic filter,
+    where vectors are inserted incrementally while measuring insertion time,
+    memory usage, query throughput, and accuracy metrics.
+    """
+    try:
+        config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
+        vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
+
+        construct_start = time.perf_counter() # start construct timer
+        filter_instance = _instantiate_filter(filter_cls, dim, lsh_cls, max_L, memory_budget, distance_threshold, max_spheres)
+        filter_instance.construct(vectors_construct)
+        construct_latency = time.perf_counter() - construct_start # final construct time
+
+        query_start = time.perf_counter() # start qps timer
+        # stream the query set one vector at a time into the filter
+        # add new vectors to filter dynamically for each miss
+        predicted: List[bool] = []
+        for v in _iter_query_vectors(vectors_query):
+            is_dup = filter_instance.query(np.array([v]))[0]
+            predicted.append(is_dup)
+            if not is_dup:
+                filter_instance.insert(np.array([v]))
+        query_latency = time.perf_counter() - query_start # final qps timer
+
+        qps = len(vectors_query) / max(query_latency, 1e-9)
+        memory_usage = filter_instance.get_bytesize()
+
+    except Exception as e:
+        print(f"  [Skipped] {config} failed: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return None
+
+    return _compute_tradeoff_metrics(predicted, actual_results, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
+
+
 _WORKER_FNS: Dict[str, Any] = {
     'static':  static_worker,
     'dynamic': dynamic_worker,
-    'tradeoff': tradeoff_worker,
+    'tradeoff_static': tradeoff_static_worker,
+    'tradeoff_dynamic': tradeoff_dynamic_worker
 }
 
 
