@@ -81,7 +81,7 @@ def _compute_metrics(
 
 
 def _instantiate_filter(filter_cls: Any, dim: int, lsh: Any, memory_budget: int, distance_threshold: float = None, max_spheres: int = None) -> Any:
-    if filter_cls.__name__ not in ["KDBallFilter", "KMEBFilter", "FirstNFilter"]:
+    if filter_cls.__name__ not in ["KDBallFilter", "KMEBFilter", "FirstNFilter", "GonzalezMEBFilter"]:
         try:
             return filter_cls(dim=dim, lsh=lsh, max_memory=memory_budget)
         except TypeError:

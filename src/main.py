@@ -16,18 +16,19 @@ from runner import Runner
 from plots import plot_results, plot_throughput_results, plot_tradeoff_results, plot_hnsw_results
 from typing import Tuple, List
 from filters.first_n_filter import FirstNFilter
+from filters.gonzales_filter import GonzalezMEBFilter
 from util.dataset_paths import dataset_filenames
 from util.fetch_datasets import load_embeds
 from vector_source import VectorSource, ArrayVectorSource
 
-MAX_WORKERS = 1
+MAX_WORKERS = 6
 DATASET = 'ELI5'
 
-dynamic_filters = [FirstNFilter]
+dynamic_filters = [GonzalezMEBFilter]
 static_filters  = []
 
 def calculate_max_memory_budget_bytes(num_vectors: int, dimension: int, bytes_per_element: float) -> int:
-    return num_vectors * dimension * bytes_per_element // 16
+    return num_vectors * dimension * bytes_per_element // 128
 
 def calculate_memory_budgets(max_memory_budget: int, count_steps: int = 10) -> list[int]:
     """Uniformly spaced budgets from max/count_steps up to the full max budget."""
@@ -126,7 +127,7 @@ def compute_static_actual_results(
 
 
 def static_evaluation() -> list:
-    num_vectors              = 10_000
+    num_vectors              = 100_000
     dim                      = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
@@ -183,11 +184,9 @@ def hnsw_evaluation() -> list:
     per-query latency and HNSW index accesses per dataset, with and without the
     filter, averaged over the duplicate-percentage sweep.
     """
-    num_vectors              = 10_000
+    num_vectors              = 100_000
     dim                      = 384
-    min_percentage_duplicates = 1
-    max_percentage_duplicates = 9
-    count_steps              = 9
+    percentage_duplicates    = 25
     count_memory_steps       = 1
     percentage_construct     = 10
     max_L                    = 256
@@ -207,20 +206,19 @@ def hnsw_evaluation() -> list:
         max_memory_budget = calculate_max_memory_budget_bytes(num_construct, dim, bytes_per_element)
         memory_budgets    = calculate_memory_budgets(max_memory_budget, count_memory_steps)
 
-        for percentage in np.linspace(min_percentage_duplicates, max_percentage_duplicates, count_steps):
-            print(f"{dataset}: processing {percentage:.1f}% duplicates...")
-            distance_threshold = calculate_distance_threshold(vectors, percentage)
+        print(f"{dataset}: processing...")
+        distance_threshold = calculate_distance_threshold(vectors, percentage_duplicates)
 
-            for memory_budget in memory_budgets:
-                for filter_cls in static_filters + dynamic_filters:
-                    runner.submit(
-                        'hnsw',
-                        filter_cls=filter_cls, lsh_cls=DummyLSH,
-                        dim=dim, distance_threshold=distance_threshold,
-                        max_L=max_L, memory_budget=memory_budget,
-                        vectors_construct=construct_source, vectors_query=query_source,
-                        percentage=percentage, dataset=dataset,
-                    )
+        for memory_budget in memory_budgets:
+            for filter_cls in static_filters + dynamic_filters:
+                runner.submit(
+                    'hnsw',
+                    filter_cls=filter_cls, lsh_cls=DummyLSH,
+                    dim=dim, distance_threshold=distance_threshold,
+                    max_L=max_L, memory_budget=memory_budget,
+                    vectors_construct=construct_source, vectors_query=query_source,
+                    percentage=percentage_duplicates, dataset=dataset,
+                )
 
     results = runner.run()
     print("HNSW evaluation completed.")
@@ -243,7 +241,7 @@ def hnsw_evaluation() -> list:
 
 
 def dynamic_evaluation() -> list:
-    num_vectors              = 10_000
+    num_vectors              = 100_000
     dim                      = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
@@ -283,7 +281,7 @@ def dynamic_evaluation() -> list:
     return results
 
 def tradeoff_evaluation() -> Tuple[List, List]:
-    num_vectors = 10_000
+    num_vectors = 100_000
     dim = 384
     max_L = 256
     percentage_construct = 10
@@ -384,7 +382,7 @@ def tradeoff_evaluation() -> Tuple[List, List]:
     return sphere_results, memory_results
 
 if __name__ == "__main__":
-    static_evaluation()
-    dynamic_evaluation()
+    # static_evaluation()
+    # dynamic_evaluation()
     hnsw_evaluation()
     # tradeoff_evaluation()
