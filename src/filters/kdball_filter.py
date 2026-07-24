@@ -76,110 +76,6 @@ class KDBallFilter(Filter):
         best_split_val = float(group_min[best_axis] + (best_margin / 2.0))
 
         return best_margin, best_axis, best_split_val
-    
-
-    # method for merging overlapping spheres by finding the pair that produces the minimal volume increase
-    def _merge_spheres(self) -> None:
-        # define number of spheres and number of dimentions
-        K, D = self.all_spheres.shape
-
-        # calculate global max radius for scaling (needed for computing volume correctly)
-        max_r = max(np.max(self.all_radiuses), 1.0)
-
-        # define best pair of spheres to merge with best minimal combined volume
-        best_volume = np.inf
-        best_pair = (-1, -1)
-        best_r_new = 0.0
-        best_distance = 0.0
-
-        # iterate over each sphere i and compare against all subsequent spheres j
-        for i in range(K - 1):
-            j = i + 1 # next subsequent sphere
-
-            # get current sphere i and subsequent spheres j
-            c_i, r_i = self.all_spheres[i], self.all_radiuses[i]
-            c_j, r_j = self.all_spheres[j:], self.all_radiuses[j:]
-
-            # calculate the new merged sphere radius
-            distance_ci_cj = np.linalg.norm(c_j - c_i, axis=1)
-            r_new = (distance_ci_cj + r_i + r_j) / 2.0
-
-            # scale our radiuses for computing volume with D dimensions
-            r_new_scaled = (r_new / max_r).astype(np.float64)
-            r_i_scaled = (r_i / max_r).astype(np.float64)
-            r_j_scaled = (r_j / max_r).astype(np.float64)
-
-            # calculate the volume of the current merged spheres
-            volumes = (r_new_scaled ** D) - (r_i_scaled ** D + r_j_scaled ** D)
-
-            # get the index and value of the minimum merge volume
-            min_volume_idx = int(np.argmin(volumes))
-            min_volume = volumes[min_volume_idx]
-
-            # if current volume is smaller, update best pair so far
-            if min_volume < best_volume:
-                best_volume = min_volume
-                best_pair = (i, j + min_volume_idx)
-                best_r_new = r_new[min_volume_idx]
-                best_distance = distance_ci_cj[min_volume_idx]
-
-        # get best pair of spheres and their centers and radiuses
-        i, j = best_pair
-        c_i, r_i = self.all_spheres[i], self.all_radiuses[i]
-        c_j, r_j = self.all_spheres[j], self.all_radiuses[j]
-
-        # calculate the new center using the formula we've defined
-        if best_distance > 0.0:
-            best_c_new =  (((r_j - r_i) / (2.0 * best_distance)) + 0.5) * c_j + (((r_i - r_j) / (2.0 * best_distance)) + 0.5) * c_i
-        else:
-            best_c_new = c_i
-
-        # update our spheres and radiuses with new merged pair with minimal volume
-        self.all_spheres[i] = np.float32(best_c_new)
-        self.all_radiuses[i] = np.float32(best_r_new)
-        self.all_spheres = np.delete(self.all_spheres, j, axis=0)
-        self.all_radiuses = np.delete(self.all_radiuses, j)
-        # print(f"Found best volume {best_volume} with radius {best_r_new} and distance {best_distance}.")
-    
-
-    # method for removing spheres contained in other larger spheres
-    def _remove_spheres(self) -> None:
-        # define number of spheres
-        K = self.all_spheres.shape[0]
-
-        # if less then two sphere finsih
-        if K < 2:
-            return
-
-        # represents spheres that are contained in other spheres
-        contained_spheres = []
-
-        # iterate over spheres and find contained spheres
-        for i in range(K):
-            # get current sphere center and radius
-            c_i, r_i = self.all_spheres[i], self.all_radiuses[i]
-
-            # represents all spheres big enough to contain current sphere
-            contained_mask = self.all_radiuses >= r_i
-            contained_mask[i] = False
-
-            # if no other spheres are big enough we skip
-            if not np.any(contained_mask):
-                continue
-
-            # get all potential spheres j that can contain current sphere i
-            c_j, r_j = self.all_spheres[contained_mask], self.all_radiuses[contained_mask]
-            distance_ci_cj = np.linalg.norm(c_j - c_i, axis=1)
-
-            # check if any sphere contains current sphere d(c_i, c_j) + r_i <= r_j
-            if np.any(distance_ci_cj + r_i <= r_j):
-                contained_spheres.append(i)
-
-        # remove all spheres we found that are already contained in other spheres
-        if contained_spheres:
-            self.all_spheres = np.delete(self.all_spheres, contained_spheres, axis=0)
-            self.all_radiuses = np.delete(self.all_radiuses, contained_spheres)
-        # print(f"Found {len(contained_spheres)} contained spheres.")
 
 
     # method for constructing the filter attributes and finding optimal spheres to cover the vector space 
@@ -302,48 +198,17 @@ class KDBallFilter(Filter):
 
     # method for adding new vectors into filter
     def add(self, vectors: np.ndarray) -> None:
-        # if filter is not initialized we call construct
-        if not self._constructed:
-            self.construct(vectors)
-            return
-
-        # if vectors array is empty we return
-        if len(vectors) == 0:
-            return
-
-        # cast new vector queries to float32 array for better performance
-        new_vectors = np.asarray(vectors, dtype=np.float32)
-
-        # process each new query vector and add it to filter
-        for q in new_vectors:
-            # if we have spheres we check if given query is inside one
-            if len(self.all_spheres) > 0:
-                # calculate the sphere distances from query and get best sphere
-                sphere_distances = np.linalg.norm(self.all_spheres - q, axis=1)
-                best_sphere = int(np.argmin(sphere_distances))
-
-                # check if query inside sphere d(c, q) <= r - threshold
-                if sphere_distances[best_sphere] <= (self.all_radiuses[best_sphere] - self.distance_threshold):
-                    continue
-
-            # create new sphere for the query using threshold as its initial radius
-            self.all_spheres = np.vstack([self.all_spheres, q])
-            self.all_radiuses = np.append(self.all_radiuses, np.float32(self.distance_threshold))
-
-            # merge overlapping spheres if max sphere count is exceeded
-            if len(self.all_spheres) > self.max_spheres:
-                self._merge_spheres()
-                self._remove_spheres()
+        raise NotImplementedError("KDBallFilter is a static filter.")
 
 
     # method for inserting new vectors into filter
     def insert(self, vectors: np.ndarray) -> None:
-        self.add(vectors)
+        raise NotImplementedError("KDBallFilter is a static filter.")
 
 
     # method for removing vectors from filter
     def remove(self, vectors: np.ndarray) -> List[bool]:
-        raise NotImplementedError("KDBallFilter does not support remove operation.")
+        raise NotImplementedError("KDBallFilter is a static filter.")
 
 
     # method to get exact fpr

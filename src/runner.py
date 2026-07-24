@@ -78,7 +78,7 @@ def _compute_metrics(
 
 
 def _instantiate_filter(filter_cls: Any, dim: int, lsh_cls: Any, max_L: int, memory_budget: int, distance_threshold: float = None, max_spheres: int = None) -> Any:
-    if filter_cls.__name__ not in ["KDBallFilter", "KMEBFilter"]:
+    if filter_cls.__name__ not in ["KDBallFilter", "KMEBFilter", "GonzalezMEBFilter"]:
         lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
         try:
             return filter_cls(dim=dim, lsh=lsh, max_memory=memory_budget)
@@ -253,25 +253,22 @@ def tradeoff_dynamic_worker(
         filter_instance.construct(vectors_construct)
         construct_latency = time.perf_counter() - construct_start # final construct time
 
-        query_start = time.perf_counter() # start qps timer
-        # stream the query set one vector at a time into the filter
-        # add new vectors to filter dynamically for each miss
+        query_start = time.perf_counter() # start throughput timer
         predicted: List[bool] = []
-        for v in _iter_query_vectors(vectors_query):
-            is_dup = filter_instance.query(np.array([v]))[0]
-            predicted.append(is_dup)
-            if not is_dup:
-                filter_instance.insert(np.array([v]))
-        query_latency = time.perf_counter() - query_start # final qps timer
+        for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
+            block_preds = filter_instance.query(block)
+            predicted.extend(block_preds)
+
+            misses = [block[i] for i, is_dup in enumerate(block_preds) if not is_dup]
+            if misses:
+                filter_instance.insert(np.array(misses, dtype=np.float32))
+        query_latency = time.perf_counter() - query_start # final throughput timer
 
         qps = len(vectors_query) / max(query_latency, 1e-9)
         memory_usage = filter_instance.get_bytesize()
 
     except Exception as e:
         print(f"  [Skipped] {config} failed: {e}")
-        import traceback
-
-        traceback.print_exc()
         return None
 
     return _compute_tradeoff_metrics(predicted, actual_results, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
