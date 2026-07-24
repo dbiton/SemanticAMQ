@@ -186,7 +186,7 @@ def hnsw_evaluation() -> list:
     """
     num_vectors              = 100_000
     dim                      = 384
-    percentage_duplicates    = 25
+    percentage_duplicates    = 50
     count_memory_steps       = 1
     percentage_construct     = 10
     max_L                    = 256

@@ -24,7 +24,6 @@ from filters.gcs_filter import GCSFilter
 from filters.quotient_filter import QuotientFilterWrapper
 from filters.ribbon_filter import RibbonFilter
 from filters.pyfusefilter_filters import Xor8Filter, Xor16Filter, Fuse8Filter, Fuse16Filter
-from filters.kmeb_filter import KMEBFilter
 from filters.vacuum_filter import VacuumFilter
 
 DIM = 16
@@ -138,16 +137,6 @@ def test_scalable_bloom_filter_respects_budget_within_initial_capacity():
     f = ScalableBloomFilter(dim=DIM, lsh=lsh, max_memory=budget, error_rate=0.01)
     f.construct(make_unit_vectors(50))
     assert f.get_bytesize() <= budget
-
-
-def test_kmeb_filter_respects_max_memory_with_many_vectors():
-    """Cross-check against tests/test_kmeb_filter.py under a heavier load."""
-    dim = 16
-    budget = (dim + 1) * 4 * 8  # exactly 8 balls
-    f = KMEBFilter(dim=dim, distance_threshold=0.3, max_memory=budget)
-    f.construct(make_unit_vectors(500, dim=dim))
-    assert f.get_bytesize() <= budget
-
 
 # ---------------------------------------------------------------------------
 # Real-allocation checks.
