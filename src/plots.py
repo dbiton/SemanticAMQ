@@ -150,8 +150,10 @@ def plot_hnsw_results(results_list: list, folder: str = "plots/hnsw") -> None:
     Plots the HNSW filtered-access evaluation aggregated per dataset: mean
     throughput, mean per-query latency, and mean HNSW index accesses of the
     query stream, comparing the unfiltered baseline against each filter config
-    placed in front of the index. Bars are means over the duplicate-percentage
-    sweep; whiskers show one standard deviation across it.
+    placed in front of the index. Bars are means over the memory-budget sweep;
+    whiskers show one standard deviation across it. Also plots index accesses,
+    latency, and throughput (with filter) as a function of memory budget,
+    one line per dataset.
     """
     os.makedirs(folder, exist_ok=True)
     df = pd.DataFrame(results_list)
@@ -199,6 +201,46 @@ def plot_hnsw_results(results_list: list, folder: str = "plots/hnsw") -> None:
         plt.savefig(f"{folder}/{filename}", bbox_inches='tight', dpi=300)
         plt.close()
         print(f"Saved {folder}/{filename}")
+
+    vs_memory_metrics = [
+        ('Index Accesses', 'Index Accesses', 'index_accesses'),
+        ('Latency With Filter (ms)', 'Mean Latency per Query (ms)', 'latency'),
+        ('Throughput With Filter', 'Mean Throughput (queries/s)', 'throughput'),
+    ]
+    for col, ylabel, name in vs_memory_metrics:
+        _plot_metric_vs_memory(df, datasets, col, ylabel, name, folder)
+
+
+def _plot_metric_vs_memory(
+    df: pd.DataFrame, datasets: List[str], col: str, ylabel: str, name: str, folder: str,
+) -> None:
+    """
+    Plots a filtered-pipeline metric as a function of the filter's memory
+    budget, with one line per dataset (styled by config when more than one
+    is swept).
+    """
+    if 'Memory Budget' not in df.columns or df['Memory Budget'].nunique() <= 1:
+        return
+
+    plot_df = df.copy()
+    plot_df['Memory Budget (MB)'] = plot_df['Memory Budget'] / (1024 * 1024)
+    configs = list(dict.fromkeys(plot_df['Config']))
+    palette = dict(zip(datasets, sns.color_palette("husl", len(datasets))))
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    sns.lineplot(
+        data=plot_df, x='Memory Budget (MB)', y=col,
+        hue='Dataset', style='Config' if len(configs) > 1 else None,
+        hue_order=datasets, palette=palette,
+        markers=True, dashes=False, ax=ax,
+    )
+    ax.set_xlabel('Memory Budget (MB)', fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.legend(fontsize=9, loc='best')
+    filename = f'hnsw_{name}_vs_memory_plot.png'
+    plt.savefig(f"{folder}/{filename}", bbox_inches='tight', dpi=300)
+    plt.close()
+    print(f"Saved {folder}/{filename}")
 
 
 def plot_tradeoff_results(sphere_results: list, memory_results: list, folder: str = "plots/tradeoff") -> None:

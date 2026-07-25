@@ -7,8 +7,6 @@ import pandas as pd
 
 from filters.cuckoo_filter import CuckooFilter
 from filters.gcs_filter import GCSFilter
-from filters.kmeb_filter import KMEBFilter
-from filters.kdball_filter import KDBallFilter
 from filters.pyfusefilter_filters import Fuse8Filter, Xor8Filter
 from filters.quotient_filter import QuotientFilterWrapper
 from lsh import FaissSimHashLSH, LSH, DummyLSH
@@ -28,11 +26,12 @@ dynamic_filters = [GonzalezMEBFilter]
 static_filters  = []
 
 def calculate_max_memory_budget_bytes(num_vectors: int, dimension: int, bytes_per_element: float) -> int:
-    return num_vectors * dimension * bytes_per_element // 128
+    return num_vectors * dimension * bytes_per_element * 4
 
-def calculate_memory_budgets(max_memory_budget: int, count_steps: int = 10) -> list[int]:
-    """Uniformly spaced budgets from max/count_steps up to the full max budget."""
-    return [int(b) for b in np.linspace(max_memory_budget / count_steps, max_memory_budget, count_steps)]
+def calculate_memory_budgets(max_memory_budget: int, count_steps: int = 10, include_zero: bool = False) -> list[int]:
+    """Uniformly spaced budgets from max/count_steps (or 0 if `include_zero`) up to the full max budget."""
+    start = 0 if include_zero else max_memory_budget / count_steps
+    return [int(b) for b in np.linspace(start, max_memory_budget, count_steps)]
 
 def calculate_distance_threshold(
     vectors: np.ndarray,
@@ -179,15 +178,16 @@ def hnsw_evaluation() -> list:
     """
     Measure how much a semantic filter reduces accesses to an HNSW index that
     explicitly stores all construct vectors, across every dataset present on
-    disk. The filter is one-sided (bloom-like): filter negatives skip the index
-    entirely; positives are confirmed against it. Reports mean throughput, mean
-    per-query latency and HNSW index accesses per dataset, with and without the
-    filter, averaged over the duplicate-percentage sweep.
+    disk and across a sweep of filter memory budgets from 0 up to the full
+    max memory budget. The filter is one-sided (bloom-like): filter negatives
+    skip the index entirely; positives are confirmed against it. Reports mean
+    throughput, mean per-query latency and HNSW index accesses per dataset,
+    with and without the filter, averaged over the memory-budget sweep.
     """
     num_vectors              = 100_000
     dim                      = 384
     percentage_duplicates    = 50
-    count_memory_steps       = 1
+    count_memory_steps       = 10
     percentage_construct     = 10
     max_L                    = 256
 
@@ -204,10 +204,10 @@ def hnsw_evaluation() -> list:
         construct_source = VectorSource(dataset, 0, num_construct)
         query_source     = VectorSource(dataset, num_construct, n)
         max_memory_budget = calculate_max_memory_budget_bytes(num_construct, dim, bytes_per_element)
-        memory_budgets    = calculate_memory_budgets(max_memory_budget, count_memory_steps)
+        memory_budgets    = calculate_memory_budgets(max_memory_budget, count_memory_steps, include_zero=True)
 
         print(f"{dataset}: processing...")
-        distance_threshold = calculate_distance_threshold(vectors, percentage_duplicates)
+        distance_threshold = 0.1
 
         for memory_budget in memory_budgets:
             for filter_cls in static_filters + dynamic_filters:
@@ -233,7 +233,7 @@ def hnsw_evaluation() -> list:
         'Index Accesses', 'Total Queries', 'Speedup',
     ]
     summary = df.groupby(['Dataset', 'Config'])[mean_cols].mean().reset_index()
-    print("\n=== Mean per dataset (averaged over the duplicate-percentage sweep) ===")
+    print("\n=== Mean per dataset (averaged over the memory-budget sweep) ===")
     print(summary.to_string(index=False))
 
     plot_hnsw_results(results)

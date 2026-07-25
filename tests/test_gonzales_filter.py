@@ -32,6 +32,19 @@ def _neighbors(v: np.ndarray, r: float, n: int = 5, seed: int = 1) -> np.ndarray
     return (v[:, None, :] + unit_noise).reshape(-1, v.shape[1])
 
 
+def _uniform_ball(v: np.ndarray, r: float, n: int = 20, seed: int = 2) -> np.ndarray:
+    """Return n points drawn uniformly from the *volume* of the r-ball around
+    each row of v (radii scaled by u**(1/dim), not just uniform direction)."""
+    rng = np.random.default_rng(seed)
+    dim = v.shape[1]
+    directions = rng.standard_normal((len(v), n, dim)).astype(np.float64)
+    directions /= np.linalg.norm(directions, axis=2, keepdims=True)
+    u = rng.uniform(0, 1, (len(v), n, 1))
+    radii = (r * 0.95) * u ** (1.0 / dim)
+    points = v[:, None, :] + (directions * radii).astype(np.float32)
+    return points.reshape(-1, dim)
+
+
 # ---------------------------------------------------------------------------
 # Initialisation
 # ---------------------------------------------------------------------------
@@ -98,6 +111,37 @@ class TestGonzalezConstruct(unittest.TestCase):
         f.construct(vecs)
         self.assertEqual(len(f.all_spheres), 5)
         np.testing.assert_allclose(f.all_radiuses, R, atol=1e-5)
+
+    def test_all_spheres_contain_original_vectors_in_trivial_case(self):
+        """When max_spheres >= n, each sphere center must literally be one
+        of the original vectors, not a cluster average."""
+        vecs = _rand(6, seed=17)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=20)
+        f.construct(vecs)
+        stored = f.all_spheres
+        self.assertEqual(len(stored), len(vecs))
+        for v in vecs:
+            self.assertTrue(any(np.allclose(v, s) for s in stored),
+                            f"original vector {v} not found among stored centers")
+
+    def test_all_vectors_within_radius_of_some_sphere_in_nontrivial_case(self):
+        """When max_spheres < n, stored centers are cluster MEB centers
+        rather than the original vectors — but every original vector must
+        still fall within the radius of at least one stored sphere."""
+        vecs = _rand(100, seed=23)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=10)
+        f.construct(vecs)
+        self.assertLess(len(f.all_spheres), len(vecs),
+                        "expected clustering to collapse spheres below vector count")
+
+        centers = f.all_spheres
+        radii = f.all_radiuses
+        dists = np.linalg.norm(vecs[:, None, :] - centers[None, :, :], axis=2)
+        within = dists <= radii[None, :] + 1e-5
+        uncovered = np.flatnonzero(~np.any(within, axis=1))
+        self.assertEqual(len(uncovered), 0,
+                         f"{len(uncovered)} vectors not within radius of any stored sphere: "
+                         f"{uncovered.tolist()}")
 
     def test_radii_at_least_distance_threshold(self):
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=10)
@@ -233,6 +277,32 @@ class TestGonzalezQuery(unittest.TestCase):
         f.construct(vecs)
         self.assertTrue(all(f.query(vecs)))
         self.assertTrue(all(f.query(neighbors)))
+
+    def test_single_point_just_outside_threshold_rejected(self):
+        """A filter built from a single point should reject a query that
+        sits just beyond distance_threshold from it."""
+        vec = _rand(1, seed=42)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=1)
+        f.construct(vec)
+        self.assertTrue(f.query(vec)[0])
+
+        direction = np.random.default_rng(43).standard_normal((1, DIM)).astype(np.float32)
+        direction /= np.linalg.norm(direction)
+        just_outside = vec + direction * (R + 0.05)
+        self.assertFalse(f.query(just_outside)[0])
+
+    def test_uniform_points_around_stored_vectors_recalled(self):
+        """Points sampled uniformly from within the distance_threshold ball
+        around each stored vector must always be recalled."""
+        vecs = _rand(15, seed=11)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        f.construct(vecs)
+
+        samples = _uniform_ball(vecs, r=R, n=30)
+        results = f.query(samples)
+        fn = sum(1 for r_ in results if not r_)
+        self.assertEqual(fn, 0,
+                         f"{fn}/{len(samples)} uniformly sampled points not recalled")
 
     def test_larger_threshold_increases_recall(self):
         stored = _rand(10, seed=0)
