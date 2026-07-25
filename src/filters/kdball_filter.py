@@ -34,6 +34,8 @@ class KDBallFilter(Filter):
     """
     _BYTES_PER_FLOAT32 = 4
     _BYTES_PER_FLOAT64 = 8
+    _MAX_NEIGHBORS = 50
+    _BATCH_SIZE = 2048
 
 
     # constructor of our KDBallFilter class, initializes class attributes and max amount of spheres
@@ -57,6 +59,40 @@ class KDBallFilter(Filter):
         return max(1, int(max_memory // (bytes_per_sphere * gamma)))
 
 
+    # method for computing pairwise squared euclidean distances between two arrays of vectors efficiently
+    def _compute_squared_distances(self, a: np.ndarray, a_sq: np.ndarray, b: np.ndarray, b_sq: np.ndarray) -> np.ndarray:
+        a_b_cross = a @ b.T
+        sq_distances = a_sq[:, None] - 2.0 * a_b_cross + b_sq[None, :]
+
+        return np.maximum(sq_distances, 0.0)
+
+
+    # method that finds the k-nearest sphere centers for given vectors using partitioned distance queries
+    def _get_nearest_centers(self, vectors: np.ndarray, sq_norms: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+        num_spheres = len(self.all_spheres)
+        
+        if num_spheres == 0:
+            return np.empty((len(vectors), 0), dtype=np.float32), np.empty((len(vectors), 0), dtype=np.int64)
+
+        k = min(k, num_spheres)
+        centers = self.all_spheres
+        sq_centers = np.sum(centers**2, axis=1)
+        sq_distances = self._compute_squared_distances(vectors, sq_norms, centers, sq_centers)
+
+        if k == num_spheres:
+            center_indices = np.argsort(sq_distances, axis=1)
+
+        else:
+            center_indices = np.argpartition(sq_distances, k - 1, axis=1)[:, :k]
+            top_k_dists = np.take_along_axis(sq_distances, center_indices, axis=1)
+            sorted_top_k = np.argsort(top_k_dists, axis=1)
+            center_indices = np.take_along_axis(center_indices, sorted_top_k, axis=1)
+
+        center_sq_dists = np.take_along_axis(sq_distances, center_indices, axis=1)
+
+        return center_sq_dists, center_indices
+
+
     # method for finding the widest margin in high dimensional space for giving us best split best on given vector group
     def _find_widest_margin(self, vector_group: np.ndarray) -> Tuple[float, int, float]:
         # if less then two vectors we dont split
@@ -76,6 +112,107 @@ class KDBallFilter(Filter):
         best_split_val = float(group_min[best_axis] + (best_margin / 2.0))
 
         return best_margin, best_axis, best_split_val
+
+
+    # method for merging overlapping spheres by finding the pair that produces the minimal volume increase
+    def _merge_spheres(self) -> None:
+        while len(self.all_spheres) > self.max_spheres:
+            current_num_spheres = len(self.all_spheres)
+            pairs_to_merge = current_num_spheres - self.max_spheres
+            centers = self.all_spheres
+            sq_centers = np.sum(self.all_spheres**2, axis=1)
+
+            max_neighbors = min(self._MAX_NEIGHBORS, current_num_spheres)
+            neighbor_dists, neighbor_indices = self._get_nearest_centers(centers, sq_centers, max_neighbors)
+
+            pair_idx_i = np.repeat(np.arange(current_num_spheres), max_neighbors - 1)
+            pair_idx_j = neighbor_indices[:, 1:].ravel()
+            pair_distances = np.sqrt(np.maximum(neighbor_dists[:, 1:].ravel(), 0.0))
+
+            valid_pairs = pair_idx_i < pair_idx_j
+            pair_idx_i, pair_idx_j = pair_idx_i[valid_pairs], pair_idx_j[valid_pairs]
+            pair_distances = pair_distances[valid_pairs]
+
+            if len(pair_idx_i) == 0:
+                break
+
+            max_radius = max(np.max(self.all_radiuses), 1.0)
+            pair_radius_i, pair_radius_j = self.all_radiuses[pair_idx_i], self.all_radiuses[pair_idx_j]
+            pair_merged_radius = (pair_distances + pair_radius_i + pair_radius_j) / 2.0
+
+            scaled_merged = (pair_merged_radius / max_radius).astype(np.float64)
+            scaled_i = (pair_radius_i / max_radius).astype(np.float64)
+            scaled_j = (pair_radius_j / max_radius).astype(np.float64)
+            pair_volumes = (scaled_merged ** self.dim) - (scaled_i ** self.dim + scaled_j ** self.dim)
+            sorted_pair_indices = np.argsort(pair_volumes)
+
+            sphere_merged_indices = np.zeros(current_num_spheres, dtype=bool)
+            merged_centers, merged_radiuses = [], []
+            merges_done = 0
+
+            for best_pair_idx in sorted_pair_indices:
+                if merges_done >= pairs_to_merge or pair_volumes[best_pair_idx] == np.inf:
+                    break
+
+                idx_i, idx_j = int(pair_idx_i[best_pair_idx]), int(pair_idx_j[best_pair_idx])
+
+                if sphere_merged_indices[idx_i] or sphere_merged_indices[idx_j]:
+                    continue
+
+                center_i, radius_i = self.all_spheres[idx_i], self.all_radiuses[idx_i]
+                center_j, radius_j = self.all_spheres[idx_j], self.all_radiuses[idx_j]
+                dist_ij = pair_distances[best_pair_idx]
+
+                if dist_ij > 0.0:
+                    weight_j = ((radius_j - radius_i) / (2.0 * dist_ij)) + 0.5
+                    weight_i = ((radius_i - radius_j) / (2.0 * dist_ij)) + 0.5
+                    new_center = weight_j * center_j + weight_i * center_i
+                else:
+                    new_center = center_i
+
+                merged_centers.append(new_center)
+                merged_radiuses.append(pair_merged_radius[best_pair_idx])
+                sphere_merged_indices[idx_i], sphere_merged_indices[idx_j] = True, True
+                merges_done += 1
+
+            if not merged_centers:
+                break
+
+            self.all_spheres = np.vstack([self.all_spheres[~sphere_merged_indices], np.array(merged_centers, dtype=np.float32)])
+            self.all_radiuses = np.concatenate([self.all_radiuses[~sphere_merged_indices], np.array(merged_radiuses, dtype=np.float32)])
+
+
+    # method for removing spheres contained in other larger spheres
+    def _remove_spheres(self) -> None:
+        num_spheres = len(self.all_spheres)
+
+        if num_spheres < 2:
+            return
+
+        contained_spheres = np.zeros(num_spheres, dtype=bool)
+        center_sq_norms = np.sum(self.all_spheres**2, axis=1)
+
+        for i in range(0, num_spheres, self._BATCH_SIZE):
+            end = min(i + self._BATCH_SIZE, num_spheres)
+
+            container_centers = self.all_spheres[i:end]
+            container_radiuses = self.all_radiuses[i:end]
+            container_sq_norms = np.sum(container_centers**2, axis=1)
+
+            pairwise_sq_distances = self._compute_squared_distances(
+                self.all_spheres, center_sq_norms, container_centers, container_sq_norms
+            )
+            pairwise_distances = np.sqrt(np.maximum(pairwise_sq_distances, 0.0))
+
+            is_contained_sphere = (pairwise_distances + self.all_radiuses[:, None]) <= container_radiuses[None, :]
+            match_rows, match_cols = np.arange(i, end), np.arange(end - i)
+            is_contained_sphere[match_rows, match_cols] = False
+
+            contained_spheres |= np.any(is_contained_sphere, axis=1)
+
+        if np.any(contained_spheres):
+            self.all_spheres = self.all_spheres[~contained_spheres]
+            self.all_radiuses = self.all_radiuses[~contained_spheres]
 
 
     # method for constructing the filter attributes and finding optimal spheres to cover the vector space 
@@ -141,21 +278,19 @@ class KDBallFilter(Filter):
                 continue
 
             # get rectangle vectors for calculating sphere properties
-            sphere_data = vectors[rectangle_indices]
+            sphere_vectors = vectors[rectangle_indices]
+            sphere_vectors_sq = np.sum(sphere_vectors**2, axis=1)
 
             # center of the sphere is the average vector of this group
-            center = sphere_data.mean(axis=0, dtype=np.float32)
+            center = sphere_vectors.mean(axis=0, dtype=np.float32)
+            center_sq = np.array([np.sum(center**2)], dtype=np.float32)
 
             # compute the maximum distance from center to any vector in the group
-            max_distance = np.linalg.norm(sphere_data - center, axis=1).max(initial=0.0)
+            sq_distances = self._compute_squared_distances(sphere_vectors, sphere_vectors_sq, center[None, :], center_sq)
+            max_distance = np.sqrt(sq_distances.max())
 
             # compute the radius based on max distance and threshold
             radius = np.float32(max_distance + self.distance_threshold)
-
-            # get min and max coordinates across all dimensions
-            # min_vec, max_vec = sphere_data.min(axis=0), sphere_data.max(axis=0)
-            # center = np.float32((max_vec + min_vec) / 2.0)
-            # radius = np.float32(np.linalg.norm((max_vec - min_vec) / 2.0) + self.distance_threshold)
 
             # append center and radius to our lists
             sphere_centers.append(center)
@@ -170,45 +305,71 @@ class KDBallFilter(Filter):
 
     # method to query our filter and check if query vectors fall inside our spheres
     def query(self, vectors: np.ndarray) -> List[bool]:
-        # if not initialized call construct
+        # check if filter is not initialized
         if not self._constructed:
-            self.construct(vectors)
+            raise ValueError("KDBallFilter has not been constructed.")
 
         # if no spheres exist or no vectors given return results
         if len(self.all_spheres) == 0 or len(vectors) == 0:
             return [False] * len(vectors)
 
-        # cast queries to float32 array for better performance
-        q = np.asarray(vectors, dtype=np.float32)
+        # cast queries to float32 array and compute squared norm
+        q = np.ascontiguousarray(vectors, dtype=np.float32)
+        q_sq = np.sum(q**2, axis=1)
 
-        # compute components for the squared distance identity
-        # ||q - c||^2 = ||q||^2 - 2(q·c) + ||c||^2
-        q_sq = np.sum(q ** 2, axis=1, keepdims=True)        
-        c_sq = np.sum(self.all_spheres ** 2, axis=1)          
-        cross = q @ self.all_spheres.T                     
-
-        # combine terms via broadcasting to get the total squared distance matrix
-        sq_distances = np.maximum(q_sq + c_sq[None, :] - 2 * cross, 0.0) # shape (N, K)
+        # get sphere centers and compute squared norm
+        c = self.all_spheres
+        c_sq = np.sum(self.all_spheres**2, axis=1)
 
         # vectorized comparison against squared radiuses
-        in_any_sphere = np.any(sq_distances <= self.all_radiuses[None, :] ** 2, axis=1)
+        sq_distances = self._compute_squared_distances(q, q_sq, c, c_sq)
+        in_any_sphere = np.any(sq_distances <= self.all_radiuses[None, :]**2, axis=1)
 
         return in_any_sphere.tolist()
 
 
     # method for adding new vectors into filter
     def add(self, vectors: np.ndarray) -> None:
-        raise NotImplementedError("KDBallFilter is a static filter.")
+        if not self._constructed:
+            self.construct(vectors)
+            return
+
+        if len(vectors) == 0:
+            return
+
+        for i in range(0, len(vectors), self._BATCH_SIZE):
+            vector_batch = vectors[i:i + self._BATCH_SIZE]
+            vector_batch = np.ascontiguousarray(vector_batch, dtype=np.float32)
+            sq_vector_batch = np.sum(vector_batch**2, axis=1)
+            
+            if len(self.all_spheres) > 0:
+                max_neighbors = min(self._MAX_NEIGHBORS, len(self.all_spheres))
+                neighbor_sq_dists, neighbor_indices = self._get_nearest_centers(vector_batch, sq_vector_batch, max_neighbors)
+                neighbor_distances = np.sqrt(np.maximum(neighbor_sq_dists, 0.0))
+                neighbor_radiuses = self.all_radiuses[neighbor_indices]
+
+                is_already_covered = np.any(neighbor_distances <= (neighbor_radiuses - self.distance_threshold), axis=1)
+                vector_batch = vector_batch[~is_already_covered]
+
+            if len(vector_batch) == 0:
+                continue
+
+            self.all_spheres = np.vstack([self.all_spheres, vector_batch])
+            self.all_radiuses = np.append(self.all_radiuses, np.full(len(vector_batch), self.distance_threshold, dtype=np.float32))
+
+            if len(self.all_spheres) > self.max_spheres:
+                self._merge_spheres()
+                self._remove_spheres()
 
 
     # method for inserting new vectors into filter
     def insert(self, vectors: np.ndarray) -> None:
-        raise NotImplementedError("KDBallFilter is a static filter.")
+        self.add(vectors)
 
 
     # method for removing vectors from filter
     def remove(self, vectors: np.ndarray) -> List[bool]:
-        raise NotImplementedError("KDBallFilter is a static filter.")
+        raise NotImplementedError("KDBallFilter does not support remove operation.")
 
 
     # method to get exact fpr

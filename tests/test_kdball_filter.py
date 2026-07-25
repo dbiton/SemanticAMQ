@@ -195,8 +195,8 @@ class TestKDBallMemory(unittest.TestCase):
         k, dim = 6, self.dim
         f = KDBallFilter(dim=dim, distance_threshold=R, max_spheres=k)
         f.construct(_rand(100, dim))
-        # k centroids * dim float32 + k radiuses * float32 + k counts * int32
-        self.assertEqual(f.get_bytesize(), k * dim * 4 + k * 4 + k * 4)
+        # k centroids * dim float32 + k radiuses * float32
+        self.assertEqual(f.get_bytesize(), k * dim * 4 + k * 4)
 
 
 # ---------------------------------------------------------------------------
