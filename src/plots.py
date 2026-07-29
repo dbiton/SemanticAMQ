@@ -74,6 +74,62 @@ def plot_results(results_list: list, folder: str) -> None:
     plt.close()
     print(f"Saved plots/{folder}/legend_only.png")
 
+    _plot_radius_stats(df, len(memory_budgets) > 1, folder)
+
+
+_RADIUS_COLUMNS = ['Radius Mean', 'Radius Max', 'Radius Min', 'Radius Std']
+
+
+def _plot_radius_error_bars(
+    df: pd.DataFrame, x_col: str, xlabel: str, out_folder: str, filename: str, group_col: str = None,
+) -> None:
+    """
+    Single combined plot of sphere-radius statistics reported by geometric
+    filters like GonzalezMEBFilter: Mean is drawn as a line with error bars
+    of +/- one Std, Max/Min as dashed bounding lines around it. Values at a
+    given x are averaged first (over whatever else was swept, e.g. duplicate
+    percentage) since error bars need one point per x, not seaborn's implicit
+    per-point aggregation. `group_col`, if given, draws one such triple per
+    distinct value (e.g. one per dataset), each in its own color.
+    """
+    if not set(_RADIUS_COLUMNS).issubset(df.columns) or df['Radius Mean'].isna().all():
+        return
+    plot_df = df.dropna(subset=['Radius Mean'])
+    if plot_df.empty:
+        return
+
+    groups = list(dict.fromkeys(plot_df[group_col])) if group_col else [None]
+    palette = (dict(zip(groups, sns.color_palette("husl", len(groups))))
+               if group_col else {None: '#2a78d6'})
+
+    fig, ax = plt.subplots(figsize=(9 if group_col else 8, 6))
+    for group in groups:
+        sub = plot_df if group is None else plot_df[plot_df[group_col] == group]
+        agg = sub.groupby(x_col)[_RADIUS_COLUMNS].mean().sort_index()
+        if agg.empty:
+            continue
+        color = palette[group]
+        prefix = f"{group} - " if group is not None else ""
+        ax.errorbar(
+            agg.index, agg['Radius Mean'], yerr=agg['Radius Std'],
+            fmt='-o', color=color, capsize=4, linewidth=2, label=f"{prefix}Mean ± Std",
+        )
+        ax.plot(agg.index, agg['Radius Max'], color=color, alpha=0.6, marker='^', linestyle='--', label=f"{prefix}Max")
+        ax.plot(agg.index, agg['Radius Min'], color=color, alpha=0.6, marker='v', linestyle='--', label=f"{prefix}Min")
+
+    ax.set_xlabel(xlabel, fontsize=12)
+    ax.set_ylabel('Sphere Radius', fontsize=12)
+    ax.legend(fontsize=9, loc='best')
+    plt.savefig(f"{out_folder}/{filename}", bbox_inches='tight', dpi=300)
+    plt.close()
+    print(f"Saved {out_folder}/{filename}")
+
+
+def _plot_radius_stats(df: pd.DataFrame, vs_memory: bool, folder: str) -> None:
+    x_col = 'Memory Budget (MB)' if vs_memory else 'Percentage'
+    xlabel = 'Memory Budget (MB)' if vs_memory else 'Percentage of Duplicates (%)'
+    _plot_radius_error_bars(df, x_col, xlabel, f"plots/{folder}", 'radius_stats_plot.png')
+
 
 def plot_throughput_results(results_list: list, folder: str, ylabel: str, title_suffix: str) -> None:
     df = pd.DataFrame(results_list)
@@ -210,6 +266,21 @@ def plot_hnsw_results(results_list: list, folder: str = "plots/hnsw") -> None:
     for col, ylabel, name in vs_memory_metrics:
         _plot_metric_vs_memory(df, datasets, col, ylabel, name, folder)
 
+    _plot_radius_stats_hnsw(df, datasets, folder)
+    _plot_fpvr_vs_memory(df, datasets, folder)
+
+
+def _plot_radius_stats_hnsw(df: pd.DataFrame, datasets: List[str], folder: str) -> None:
+    if 'Memory Budget' not in df.columns or df['Memory Budget'].nunique() <= 1:
+        return
+    plot_df = df.copy()
+    plot_df['Memory Budget (MB)'] = plot_df['Memory Budget'] / (1024 * 1024)
+    group_col = 'Dataset' if len(datasets) > 1 else None
+    _plot_radius_error_bars(
+        plot_df, 'Memory Budget (MB)', 'Memory Budget (MB)', folder, 'hnsw_radius_stats_plot.png',
+        group_col=group_col,
+    )
+
 
 def _plot_metric_vs_memory(
     df: pd.DataFrame, datasets: List[str], col: str, ylabel: str, name: str, folder: str,
@@ -238,6 +309,53 @@ def _plot_metric_vs_memory(
     ax.set_ylabel(ylabel, fontsize=12)
     ax.legend(fontsize=9, loc='best')
     filename = f'hnsw_{name}_vs_memory_plot.png'
+    plt.savefig(f"{folder}/{filename}", bbox_inches='tight', dpi=300)
+    plt.close()
+    print(f"Saved {folder}/{filename}")
+
+
+def _plot_fpvr_vs_memory(df: pd.DataFrame, datasets: List[str], folder: str) -> None:
+    """
+    Plots the volume-based False Positive Volume Ratio (FPVR = log(V_filter /
+    V_original)) against memory budget, one line per dataset (styled by
+    config when more than one is swept). FPVR estimates how many (natural-log)
+    times larger a geometric filter's covered hypersphere volume is than the
+    true duplicate region, using hypersphere-volume lower/upper bounds as a
+    ground-truth-free stand-in for false-positive rate (hnsw_worker has no
+    per-query labels to compute FPR directly). Kept in log space -- exponentiating
+    to a raw ratio can overflow to +inf in high dimensions -- so values are
+    always >= 0 and plotted on a linear axis. The lower/upper bound is drawn
+    as a shaded band per series.
+    """
+    required = {'FPVR Lower', 'FPVR Upper', 'Memory Budget'}
+    if not required.issubset(df.columns) or df['Memory Budget'].nunique() <= 1:
+        return
+
+    plot_df = df.dropna(subset=['FPVR Lower', 'FPVR Upper']).copy()
+    if plot_df.empty:
+        return
+    plot_df['Memory Budget (MB)'] = plot_df['Memory Budget'] / (1024 * 1024)
+    configs = list(dict.fromkeys(plot_df['Config']))
+    palette = dict(zip(datasets, sns.color_palette("husl", len(datasets))))
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    for dataset in datasets:
+        color = palette[dataset]
+        for config in configs:
+            sub = plot_df[(plot_df['Dataset'] == dataset) & (plot_df['Config'] == config)]
+            sub = sub.sort_values('Memory Budget (MB)')
+            if sub.empty:
+                continue
+            label = dataset if len(configs) <= 1 else f"{dataset} ({config})"
+            mid = (sub['FPVR Lower'] + sub['FPVR Upper']) / 2
+            ax.plot(sub['Memory Budget (MB)'], mid, color=color, marker='o', label=label)
+            ax.fill_between(sub['Memory Budget (MB)'], sub['FPVR Lower'], sub['FPVR Upper'],
+                             color=color, alpha=0.2, linewidth=0)
+
+    ax.set_xlabel('Memory Budget (MB)', fontsize=12)
+    ax.set_ylabel('False Positive Volume Ratio (log[V_filter / V_original])', fontsize=12)
+    ax.legend(fontsize=9, loc='best')
+    filename = 'hnsw_fpvr_vs_memory_plot.png'
     plt.savefig(f"{folder}/{filename}", bbox_inches='tight', dpi=300)
     plt.close()
     print(f"Saved {folder}/{filename}")

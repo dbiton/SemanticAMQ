@@ -15,6 +15,7 @@ from plots import plot_results, plot_throughput_results, plot_tradeoff_results, 
 from typing import Tuple, List
 from filters.first_n_filter import FirstNFilter
 from filters.gonzales_filter import GonzalezMEBFilter
+from hyperspheres_volume import estimate_hypersphere_volume
 from util.dataset_paths import dataset_filenames
 from util.fetch_datasets import load_embeds
 from vector_source import VectorSource, ArrayVectorSource
@@ -26,7 +27,7 @@ dynamic_filters = [GonzalezMEBFilter]
 static_filters  = []
 
 def calculate_max_memory_budget_bytes(num_vectors: int, dimension: int, bytes_per_element: float) -> int:
-    return num_vectors * dimension * bytes_per_element * 4
+    return num_vectors * dimension * bytes_per_element * 6
 
 def calculate_memory_budgets(max_memory_budget: int, count_steps: int = 10, include_zero: bool = False) -> list[int]:
     """Uniformly spaced budgets from max/count_steps (or 0 if `include_zero`) up to the full max budget."""
@@ -126,7 +127,7 @@ def compute_static_actual_results(
 
 
 def static_evaluation() -> list:
-    num_vectors              = 100_000
+    num_vectors              = 1_000
     dim                      = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
@@ -184,7 +185,7 @@ def hnsw_evaluation() -> list:
     throughput, mean per-query latency and HNSW index accesses per dataset,
     with and without the filter, averaged over the memory-budget sweep.
     """
-    num_vectors              = 100_000
+    num_vectors              = 1_000
     dim                      = 384
     percentage_duplicates    = 50
     count_memory_steps       = 10
@@ -209,6 +210,17 @@ def hnsw_evaluation() -> list:
         print(f"{dataset}: processing...")
         distance_threshold = 0.1
 
+        # Volume of the true duplicate region (union of distance_threshold-balls
+        # around every construct vector) is a pure-geometry quantity: independent
+        # of the filter and memory budget, so it's computed once per dataset
+        # here and reused across the whole sweep (see FPVR in hnsw_worker).
+        vectors_construct = vectors[:num_construct]
+        orig_vol_log_low, orig_vol_log_high = estimate_hypersphere_volume(
+            vectors_construct,
+            np.full(len(vectors_construct), distance_threshold),
+            return_log=True,
+        )
+
         for memory_budget in memory_budgets:
             for filter_cls in static_filters + dynamic_filters:
                 runner.submit(
@@ -218,6 +230,7 @@ def hnsw_evaluation() -> list:
                     max_L=max_L, memory_budget=memory_budget,
                     vectors_construct=construct_source, vectors_query=query_source,
                     percentage=percentage_duplicates, dataset=dataset,
+                    orig_vol_log_low=orig_vol_log_low, orig_vol_log_high=orig_vol_log_high,
                 )
 
     results = runner.run()

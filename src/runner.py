@@ -7,6 +7,7 @@ import faiss
 import numpy as np
 import time
 
+from hyperspheres_volume import estimate_hypersphere_volume
 from vector_source import VectorSource
 
 # A worker accepts either an in-memory array or a lazy on-disk VectorSource.
@@ -80,6 +81,22 @@ def _compute_metrics(
     }
 
 
+def _radius_stats(filter_instance: Any) -> Dict[str, float]:
+    """
+    Mean/max/min/std of per-sphere radii. Only geometric filters (e.g.
+    GonzalezMEBFilter) expose `all_radiuses`; everything else reports NaN so
+    the radius plots simply skip that series.
+    """
+    radii = getattr(filter_instance, 'all_radiuses', None)
+    if radii is None or len(radii) == 0:
+        return {'Radius Mean': float('nan'), 'Radius Max': float('nan'),
+                'Radius Min': float('nan'), 'Radius Std': float('nan')}
+    return {
+        'Radius Mean': float(np.mean(radii)), 'Radius Max': float(np.max(radii)),
+        'Radius Min': float(np.min(radii)), 'Radius Std': float(np.std(radii)),
+    }
+
+
 def _instantiate_filter(filter_cls: Any, dim: int, lsh: Any, memory_budget: int, distance_threshold: float = None, max_spheres: int = None) -> Any:
     if filter_cls.__name__ not in ["KDBallFilter", "KMEBFilter", "FirstNFilter", "GonzalezMEBFilter"]:
         try:
@@ -116,7 +133,9 @@ def static_worker(
     # Checked at the end of the run: for static filters, memory is fixed after
     # construct(), but querying can't change it, so this reflects final usage.
     memory_usage = filter_instance.get_bytesize()
-    return _compute_metrics(predicted, actual_results, distance_threshold, config, percentage, memory_usage, memory_budget)
+    metrics = _compute_metrics(predicted, actual_results, distance_threshold, config, percentage, memory_usage, memory_budget)
+    metrics.update(_radius_stats(filter_instance))
+    return metrics
 
 
 def dynamic_worker(
@@ -151,6 +170,33 @@ def dynamic_worker(
     return _compute_metrics(predicted, actual_results, distance_threshold, config, percentage, memory_usage, memory_budget)
 
 
+def _fpvr_bounds(
+    orig_log_low: Any, orig_log_high: Any, filt_log_low: float, filt_log_high: float,
+) -> tuple:
+    """
+    Bounds on log(V_filter / V_original): how many (natural-log) times larger
+    a filter's covered hypersphere volume is than the true duplicate region
+    (the union of distance_threshold-balls around every construct vector).
+
+    Kept in log space rather than exponentiated to a raw ratio: in high
+    dimensions the log-volume gap can be large enough that exp() overflows to
+    +inf, which is a legitimate value but useless for plotting/comparison.
+
+    Every per-point true-duplicate ball is provably contained in the filter
+    ball of its cluster (radius = MEB_radius + distance_threshold), so the
+    ratio is always >= 1, i.e. log-ratio >= 0. Bounds combine the loosest
+    pairing of the two (lower/upper) volume-bound estimates; the lower bound
+    is floored at 0.0 to absorb bound looseness.
+    """
+    if (orig_log_low is None or orig_log_high is None
+            or np.isnan(filt_log_low) or np.isinf(filt_log_low)):
+        return float('nan'), float('nan')
+
+    log_ratio_lower = max(filt_log_low - orig_log_high, 0.0)
+    log_ratio_upper = max(filt_log_high - orig_log_low, log_ratio_lower)
+    return log_ratio_lower, log_ratio_upper
+
+
 def hnsw_worker(
     filter_cls: Any,
     lsh_cls: Any,
@@ -164,6 +210,8 @@ def hnsw_worker(
     dataset: str = "",
     hnsw_m: int = 32,
     ef_search: int = 64,
+    orig_vol_log_low: float = None,
+    orig_vol_log_high: float = None,
 ) -> Dict[str, Any]:
     """
     Measure how much a semantic filter reduces the cost of answering
@@ -173,6 +221,16 @@ def hnsw_worker(
     The filter acts like a bloom filter (one-sided error): a negative answer is
     trusted and the index is skipped; only filter-positive queries are searched
     in the HNSW index. The same query stream is timed with and without the filter.
+
+    orig_vol_log_low/orig_vol_log_high are the caller-precomputed log-volume
+    bounds of the union of true-duplicate balls (radius distance_threshold
+    around every construct vector) -- geometry-only, so they depend on the
+    dataset and threshold but not on the filter or memory budget, and are
+    reused across the whole memory-budget sweep instead of being recomputed
+    per job. Combined with the filter's own covering-sphere volume (returned
+    by construct(), when the filter is geometric), they produce the FPVR
+    (False Positive Volume Ratio) bounds below -- a ground-truth-free proxy
+    for false-positive rate, since this worker has no per-query labels.
     """
     config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
     lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
@@ -185,7 +243,12 @@ def hnsw_worker(
     index.add(construct)
 
     filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold)
-    filter_instance.construct(construct)
+    construct_result = filter_instance.construct(construct)
+    if isinstance(construct_result, tuple) and len(construct_result) == 2:
+        filt_vol_log_low, filt_vol_log_high = construct_result
+    else:
+        filt_vol_log_low, filt_vol_log_high = float('nan'), float('nan')
+    fpvr_lower, fpvr_upper = _fpvr_bounds(orig_vol_log_low, orig_vol_log_high, filt_vol_log_low, filt_vol_log_high)
 
     sq_threshold = distance_threshold ** 2
 
@@ -237,6 +300,13 @@ def hnsw_worker(
         'Index Accesses':               n_index_accesses,
         'Index Access Rate':            n_index_accesses / n_q,
         'Filter False Negatives':       false_negatives,
+        'Original Volume Log Low':      orig_vol_log_low,
+        'Original Volume Log High':     orig_vol_log_high,
+        'Filter Volume Log Low':        filt_vol_log_low,
+        'Filter Volume Log High':       filt_vol_log_high,
+        'FPVR Lower':                   fpvr_lower,
+        'FPVR Upper':                   fpvr_upper,
+        **_radius_stats(filter_instance),
     }
 
 
