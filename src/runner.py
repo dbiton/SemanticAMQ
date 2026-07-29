@@ -7,6 +7,9 @@ import faiss
 import numpy as np
 import time
 
+from scipy.special import logsumexp
+
+from filters.gonzales_filter import GonzalezMEBFilter
 from hyperspheres_volume import estimate_hypersphere_volume
 from vector_source import VectorSource
 
@@ -390,12 +393,171 @@ def tradeoff_worker(
     return _compute_tradeoff_metrics(predicted, actual_results, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
 
 
+_ABLATION_STAGE_NAMES = ["initial", "ball", "boundary", "tighten", "feedback"]
+_LN10 = float(np.log(10.0))
+
+
+def _log10_J(radii: np.ndarray, dim: int, tau: float = 0.0) -> float:
+    """log10 sum_i (r_i + tau)^d, safe for d in the hundreds where r^d over/underflows float64."""
+    r = np.asarray(radii, dtype=np.float64) + float(tau)
+    if r.size == 0:
+        return float('-inf')
+    with np.errstate(divide='ignore'):
+        logr = np.log(r)
+    return float(logsumexp(dim * logr)) / _LN10
+
+
+def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, float]:
+    predicted = np.asarray(predicted, dtype=bool)
+    tp = int(np.sum(predicted & actual))
+    fp = int(np.sum(predicted & ~actual))
+    fn = int(np.sum(~predicted & actual))
+    tn = int(np.sum(~predicted & ~actual))
+    return {
+        'fpr': fp / (fp + tn) if (fp + tn) > 0 else 0.0,
+        'fnr': fn / (fn + tp) if (fn + tp) > 0 else 0.0,
+    }
+
+
+def ablation_worker(
+    dim: int,
+    dataset: str,
+    k: int,
+    tau: float,
+    seed: int,
+    vectors_construct: VectorInput,
+    vectors_query: VectorInput,
+    actual_results: List[bool],
+    feedback_fraction: float = 0.1,
+) -> List[Dict[str, Any]]:
+    """
+    Run GonzalezMEBFilter's cumulative construction ladder (levels 1-4:
+    initial cover, ball refinement, boundary refinement, radius tightening)
+    plus an opt-in feedback pass (level 5), at a fixed (k, tau, seed). Returns
+    one row per stage matching the ablation-figure schema consumed by
+    plot_ablation.py's generate_ablation_figures: dataset, k, stage,
+    stage_index, tau, log10_J, log10_J_tau, fpr, fnr, stage_time_s,
+    cum_time_s, n_balls, seed.
+
+    Levels 1-4 are each built from scratch via set_complexity(level) so the
+    FPR/FNR of each stage's *actual* cover can be measured directly --
+    GonzalezMEBFilter only retains the final buffer, not per-level snapshots.
+    This mirrors the class's own "cumulative, ablatable ladder" design and
+    costs at most a small constant factor over a single full run (per its
+    docstring), since get_stats() already reports each level's own wall time
+    even in a partial (level < 4) run. `tau` doubles as the constructor's
+    distance_threshold (governing the level-1 k-means++ stopping criterion)
+    since it's the same semantic threshold the filter is queried and
+    evaluated at.
+    """
+    construct_arr = _to_construct_array(vectors_construct)
+    query_arr = _to_construct_array(vectors_query)
+    actual = np.asarray(actual_results, dtype=bool)
+    if len(query_arr) != len(actual):
+        raise ValueError(
+            f"vectors_query ({len(query_arr)}) and actual_results ({len(actual)}) length mismatch"
+        )
+
+    # Reserve a witness slice for level-5 feedback; measure FPR/FNR on the
+    # rest -- a held-out workload disjoint from the points feedback saw.
+    n_q = len(query_arr)
+    n_witness = max(1, int(round(n_q * feedback_fraction))) if n_q > 0 else 0
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n_q)
+    witness_idx, eval_idx = perm[:n_witness], perm[n_witness:]
+    witness_q, witness_actual = query_arr[witness_idx], actual[witness_idx]
+    eval_q, eval_actual = query_arr[eval_idx], actual[eval_idx]
+
+    rows: List[Dict[str, Any]] = []
+    filt = None
+    for level in range(1, 5):
+        filt = GonzalezMEBFilter(dim=dim, distance_threshold=tau, max_spheres=k, seed=seed)
+        filt.set_complexity(level)
+        filt.construct(construct_arr)
+        levels = filt.get_stats(taus=[tau])["levels"]
+        stage = levels[-1]
+        cum_time = sum(s["wall_time"] for s in levels)
+
+        predicted = filt.query(eval_q, tau=tau)
+        rates = _confusion_rates(predicted, eval_actual)
+
+        rows.append({
+            "dataset": dataset, "k": k, "stage": _ABLATION_STAGE_NAMES[level - 1],
+            "stage_index": level, "tau": tau,
+            "log10_J": stage["log_J"] / _LN10,
+            "log10_J_tau": stage["log_J_tau"][tau] / _LN10,
+            "fpr": rates["fpr"], "fnr": rates["fnr"],
+            "stage_time_s": stage["wall_time"], "cum_time_s": cum_time,
+            "n_balls": stage["ball_count"], "seed": seed,
+        })
+
+    if rows[-1]["fnr"] != 0:
+        raise ValueError(
+            f"Zero-false-negative invariant violated at level 4 "
+            f"(dataset={dataset}, k={k}, tau={tau}, seed={seed}): fnr={rows[-1]['fnr']}"
+        )
+
+    # level 5: feedback refinement, seeded from the level-4 cover already built
+    if n_witness > 0:
+        witness_pred = np.asarray(filt.query(witness_q, tau=tau), dtype=bool)
+        fp_witnesses = witness_q[witness_pred & ~witness_actual]
+    else:
+        fp_witnesses = np.empty((0, dim), dtype=np.float32)
+
+    feedback_time = 0.0
+    if len(fp_witnesses) > 0:
+        feedback = filt.refine_with_feedback(fp_witnesses, thresholds=tau)
+        feedback_time = feedback["elapsed_seconds"]
+
+    predicted = filt.query(eval_q, tau=tau)
+    rates = _confusion_rates(predicted, eval_actual)
+    if rates["fnr"] != 0:
+        raise ValueError(
+            f"Zero-false-negative invariant violated at level 5/feedback "
+            f"(dataset={dataset}, k={k}, tau={tau}, seed={seed}): fnr={rates['fnr']}"
+        )
+
+    radii = filt.all_radiuses
+    rows.append({
+        "dataset": dataset, "k": k, "stage": "feedback", "stage_index": 5, "tau": tau,
+        "log10_J": _log10_J(radii, dim),
+        "log10_J_tau": _log10_J(radii, dim, tau=tau),
+        "fpr": rates["fpr"], "fnr": rates["fnr"],
+        "stage_time_s": feedback_time, "cum_time_s": rows[-1]["cum_time_s"] + feedback_time,
+        "n_balls": len(radii), "seed": seed,
+    })
+    return rows
+
+
 _WORKER_FNS: Dict[str, Any] = {
     'static':  static_worker,
     'dynamic': dynamic_worker,
     'tradeoff': tradeoff_worker,
     'hnsw':    hnsw_worker,
+    'ablation': ablation_worker,
 }
+
+
+def _describe_job(kwargs: Dict[str, Any]) -> str:
+    if 'filter_cls' in kwargs and 'lsh_cls' in kwargs:
+        return f"{kwargs['filter_cls'].__name__} + {kwargs['lsh_cls'].__name__}"
+    if {'dataset', 'k', 'tau', 'seed'} <= kwargs.keys():
+        return f"{kwargs['dataset']} k={kwargs['k']} tau={kwargs['tau']} seed={kwargs['seed']}"
+    return "job"
+
+
+def _describe_result(result: Any) -> str:
+    if isinstance(result, list):
+        if not result:
+            return "0 rows"
+        first = result[0]
+        return (f"{first.get('dataset', '?')} k={first.get('k', '?')} tau={first.get('tau', '?')} "
+                f"seed={first.get('seed', '?')} ({len(result)} rows)")
+    if isinstance(result, dict):
+        config = result.get('Config', '?')
+        pct = result.get('Percentage')
+        return f"{config} @ {pct:.1f}%" if pct is not None else str(config)
+    return str(result)
 
 
 class Runner:
@@ -420,7 +582,7 @@ class Runner:
             fn = _WORKER_FNS[job['mode']]
             kwargs = {k: v for k, v in job.items() if k != 'mode'}
             result = fn(**kwargs)
-            print(f"Completed: {result['Config']} @ {result['Percentage']:.1f}%")
+            print(f"Completed: {_describe_result(result)}")
             results.append(result)
         return results
 
@@ -431,7 +593,7 @@ class Runner:
                 fn = _WORKER_FNS[job['mode']]
                 kwargs = {k: v for k, v in job.items() if k != 'mode'}
                 f = executor.submit(fn, **kwargs)
-                futures[f] = f"{kwargs['filter_cls'].__name__} + {kwargs['lsh_cls'].__name__}"
+                futures[f] = _describe_job(kwargs)
             results = []
             for f in as_completed(futures):
                 result = f.result()

@@ -12,6 +12,7 @@ from filters.quotient_filter import QuotientFilterWrapper
 from lsh import FaissSimHashLSH, LSH, DummyLSH
 from runner import Runner
 from plots import plot_results, plot_throughput_results, plot_tradeoff_results, plot_hnsw_results
+from plot_ablation import generate_ablation_figures
 from typing import Tuple, List
 from filters.first_n_filter import FirstNFilter
 from filters.gonzales_filter import GonzalezMEBFilter
@@ -253,6 +254,78 @@ def hnsw_evaluation() -> list:
     return results
 
 
+# Registry name -> canonical dataset key used by the ablation figure (must
+# match plot_ablation.DATASETS exactly).
+_ABLATION_DATASET_KEYS = {"ELI5": "eli5", "MMLU": "mmlu", "WildChat": "wildchat"}
+
+
+def evaluate_ablation() -> pd.DataFrame:
+    """
+    Generate the per-stage construction-ladder data for GonzalezMEBFilter
+    (initial cover -> ball refine -> boundary refine -> radius tighten ->
+    feedback) across the 3 datasets the ablation figure needs, write it to
+    results/ablation.csv, and render the figure panels via
+    plot_ablation.generate_ablation_figures -- the same pattern
+    static_evaluation()/hnsw_evaluation() use with plot_results/plot_hnsw_results,
+    just without discarding the in-memory results in favor of a re-read.
+    """
+    num_vectors           = 3_000
+    dim                   = 384
+    percentage_construct  = 20
+    k_values              = [64, 128, 256, 512]
+    tau_values            = [0.20, 0.35, 0.50]
+    seeds                 = [0, 1, 2]
+    feedback_fraction     = 0.10
+    output_csv            = "results/ablation.csv"
+
+    datasets = [d for d in _ABLATION_DATASET_KEYS if os.path.exists(dataset_filenames[d])]
+    missing = [d for d in _ABLATION_DATASET_KEYS if d not in datasets]
+    if missing:
+        print(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
+    if set(datasets) != set(_ABLATION_DATASET_KEYS):
+        raise RuntimeError(
+            "evaluate_ablation needs all 3 datasets "
+            f"({', '.join(_ABLATION_DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
+        )
+
+    runner = Runner(num_workers=MAX_WORKERS)
+
+    for dataset in datasets:
+        vectors = load_embeds(dataset, num_vectors)[0]
+        n = len(vectors)  # a dataset may hold fewer than num_vectors
+        num_construct = n * percentage_construct // 100
+        vectors_construct = vectors[:num_construct]
+        vectors_query = vectors[num_construct:]
+
+        construct_source = VectorSource(dataset, 0, num_construct)
+        query_source = VectorSource(dataset, num_construct, n)
+
+        for tau in tau_values:
+            print(f"{dataset}: computing ground truth at tau={tau:g}...")
+            actual_results = compute_static_actual_results(vectors_construct, vectors_query, tau)
+            for k in k_values:
+                for seed in seeds:
+                    runner.submit(
+                        'ablation',
+                        dim=dim, dataset=_ABLATION_DATASET_KEYS[dataset],
+                        k=k, tau=tau, seed=seed,
+                        vectors_construct=construct_source, vectors_query=query_source,
+                        actual_results=actual_results, feedback_fraction=feedback_fraction,
+                    )
+
+    job_results = runner.run()
+    print("Ablation evaluation completed.")
+
+    df = pd.DataFrame([row for job_rows in job_results for row in job_rows])
+
+    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+    df.to_csv(output_csv, index=False)
+    print(f"Wrote {output_csv}")
+
+    generate_ablation_figures(df)
+    return df
+
+
 def dynamic_evaluation() -> list:
     num_vectors              = 100_000
     dim                      = 384
@@ -397,5 +470,6 @@ def tradeoff_evaluation() -> Tuple[List, List]:
 if __name__ == "__main__":
     # static_evaluation()
     # dynamic_evaluation()
-    hnsw_evaluation()
+    # hnsw_evaluation()
     # tradeoff_evaluation()
+    evaluate_ablation()
