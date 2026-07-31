@@ -361,6 +361,54 @@ def _plot_fpvr_vs_memory(df: pd.DataFrame, datasets: List[str], folder: str) -> 
     print(f"Saved {folder}/{filename}")
 
 
+def plot_equal_memory_results(results_list: list, folder: str = "plots/equal_memory") -> None:
+    """
+    Plots the equal-memory comparison: every filter is evaluated at the same
+    fixed set of memory budgets (see main.py::equal_memory_evaluation), each
+    having independently picked its best available configuration on a
+    calibration workload. One grouped bar chart per metric (FPR, FNR,
+    latency, throughput), x-axis = memory budget, one bar per filter config.
+    """
+    os.makedirs(folder, exist_ok=True)
+    df = pd.DataFrame(results_list)
+
+    sns.set_theme(style="whitegrid")
+
+    df['Memory Budget (MB)'] = (df['Memory Budget'] / (1024 * 1024)).round(3)
+    configs = list(dict.fromkeys(df['Config']))
+    color_map, _, _ = get_plot_mappings(configs)
+    budget_order = sorted(df['Memory Budget (MB)'].unique())
+
+    metrics = [
+        ('FPR', 'False Positive Rate (FPR)', 'fpr'),
+        ('FNR', 'False Negative Rate (FNR)', 'fnr'),
+        ('Latency (ms)', 'Query Latency (ms)', 'latency'),
+        ('Throughput (qps)', 'Query Throughput (queries/s)', 'throughput'),
+    ]
+    for col, ylabel, name in metrics:
+        fig, ax = plt.subplots(figsize=(max(8, 1.8 * len(budget_order)), 6))
+        sns.barplot(
+            data=df, x='Memory Budget (MB)', y=col, hue='Config',
+            order=budget_order, hue_order=configs, palette=color_map, ax=ax,
+        )
+        ax.set_xlabel('Memory Budget (MB)', fontsize=12)
+        ax.set_ylabel(ylabel, fontsize=12)
+        if col in ('FPR', 'FNR'):
+            ax.set_ylim(-0.05, 1.05)
+        ax.legend(
+            title=None, fontsize=9, loc='lower center',
+            bbox_to_anchor=(0.5, 1.02), ncol=min(3, len(configs)), frameon=False,
+        )
+        filename = f'equal_memory_{name}_plot.png'
+        plt.savefig(f"{folder}/{filename}", bbox_inches='tight', dpi=300)
+        plt.close()
+        print(f"Saved {folder}/{filename}")
+
+    csv_path = f"{folder}/equal_memory_evaluations.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"Saved {csv_path}")
+
+
 def plot_tradeoff_results(sphere_results: list, memory_results: list, folder: str = "plots/tradeoff") -> None:
     """
     Plots tradeoff evaluation results, comparing FPR, FNR, Precision, F1-Score, QPS, 

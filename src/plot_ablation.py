@@ -37,10 +37,10 @@ DEMO = False
 # Fixed dataset styling -- must match every other figure in the paper.
 # --------------------------------------------------------------------------- #
 
-DATASETS = ["msmarco", "pes2o", "wildchat"]
-DATASET_LABELS = {"msmarco": "MS MARCO", "pes2o": "peS2o", "wildchat": "WildChat"}
-DATASET_COLORS = {"msmarco": "#0072B2", "pes2o": "#E69F00", "wildchat": "#009E73"}
-DATASET_HATCHES = {"msmarco": "", "pes2o": "//", "wildchat": ".."}
+DATASETS = ['eli5', 'mmlu', 'wildchat']
+DATASET_LABELS = {"eli5": "ELI5", "mmlu": "MMLU", "wildchat": "WildChat"}
+DATASET_COLORS = {"eli5": "#0072B2", "mmlu": "#E69F00", "wildchat": "#009E73"}
+DATASET_HATCHES = {"eli5": "", "mmlu": "//", "wildchat": ".."}
 
 STAGES = ["initial", "ball", "boundary", "tighten", "feedback"]
 STAGE_LABELS = {
@@ -150,7 +150,7 @@ def _synthesize_demo_data() -> pd.DataFrame:
     # Per-dataset base scale for the objective (log10 space) and a per-stage
     # fractional reduction schedule, so every dataset improves monotonically
     # stage over stage while keeping distinct absolute magnitudes.
-    base_log10_j = {"msmarco": 145.0, "pes2o": 132.0, "wildchat": 118.0}
+    base_log10_j = {"eli5": 145.0, "mmlu": 132.0, "wildchat": 118.0}
     stage_reduction = {
         "initial": 0.000,
         "ball": 0.030,
@@ -299,6 +299,17 @@ def aggregate(df: pd.DataFrame, value_col: str, cfg: Config, use_tau: bool = Fal
     sel = df[df["k"] == cfg.k]
     if use_tau:
         sel = sel[sel["tau"] == cfg.tau]
+
+    bad_raw = sel[~np.isfinite(sel[value_col])]
+    if len(bad_raw):
+        cols = [c for c in ("dataset", "k", "tau", "stage", "seed", value_col) if c in bad_raw.columns]
+        raise ValueError(
+            f"Non-finite {value_col!r} values at k={cfg.k}"
+            + (f", tau={cfg.tau}" if use_tau else "") + f":\n{bad_raw[cols].to_string(index=False)}\n"
+            "This usually means k >= the construct-set size for that dataset (every ball "
+            "becomes a zero-radius singleton, so log10_J is -inf) -- lower k or shrink the "
+            "construct-set-relative k sweep in the data-generation step."
+        )
 
     grouped = sel.groupby(["dataset", "stage"])[value_col]
     agg = grouped.agg(mean="mean", sem="sem", n="count").reset_index()

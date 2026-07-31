@@ -11,11 +11,17 @@ from filters.pyfusefilter_filters import Fuse8Filter, Xor8Filter
 from filters.quotient_filter import QuotientFilterWrapper
 from lsh import FaissSimHashLSH, LSH, DummyLSH
 from runner import Runner
-from plots import plot_results, plot_throughput_results, plot_tradeoff_results, plot_hnsw_results
+from plots import plot_results, plot_throughput_results, plot_tradeoff_results, plot_hnsw_results, plot_equal_memory_results
 from plot_ablation import generate_ablation_figures
+from plot_query_performance import generate_query_performance_figures
+from plot_equal_memory import generate_equal_memory_figures
 from typing import Tuple, List
 from filters.first_n_filter import FirstNFilter
 from filters.gonzales_filter import GonzalezMEBFilter
+from filters.dsbf_filter import DSBFFilter
+from filters.covering_lsh_fallback_filter import CoveringLSHFallbackFilter
+from filters.lsbf_filter import LSBFFilter
+from filters.dsh_filter import DSHFilter
 from hyperspheres_volume import estimate_hypersphere_volume
 from util.dataset_paths import dataset_filenames
 from util.fetch_datasets import load_embeds
@@ -24,7 +30,7 @@ from vector_source import VectorSource, ArrayVectorSource
 MAX_WORKERS = 6
 DATASET = 'ELI5'
 
-dynamic_filters = [GonzalezMEBFilter]
+dynamic_filters = [GonzalezMEBFilter, DSBFFilter, CoveringLSHFallbackFilter, LSBFFilter, DSHFilter]
 static_filters  = []
 
 def calculate_max_memory_budget_bytes(num_vectors: int, dimension: int, bytes_per_element: float) -> int:
@@ -176,6 +182,85 @@ def static_evaluation() -> list:
     return results
 
 
+EQUAL_MEMORY_BUDGETS_BYTES = [64 * 1024, 256 * 1024, 1 * 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024]
+
+
+def equal_memory_evaluation() -> list:
+    """
+    Equal-memory comparison: every registered filter (GonzalezMEBFilter --
+    the paper's own method -- plus the four LSH/Bloom baselines) is given the
+    exact same memory budget from EQUAL_MEMORY_BUDGETS_BYTES (clipped to a
+    dataset-scaled maximum via calculate_max_memory_budget_bytes, so a small
+    dataset never gets a budget wildly larger than its own raw vector size).
+
+    For each budget, every filter's best available "valid configuration" is
+    chosen on a calibration workload disjoint from both the construct set and
+    the final query set (see runner.py::_build_calibrated_filter -- filters
+    with a discrete config dial, e.g. DSBFFilter's vote_threshold or
+    LSBFFilter's verify flag, pick whichever candidate scores best on
+    calibration; filters without one just use their single memory-budget-
+    derived default). FPR, FNR, query latency and query throughput are then
+    measured on the held-out query set and plotted one series per budget.
+    """
+    num_vectors             = 10_000
+    dim                     = 384
+    percentage_construct    = 40
+    percentage_calibration  = 20
+    duplicate_percentage    = 5.0
+    max_L                   = 256
+
+    dataset = DATASET
+    vectors = load_embeds(dataset, num_vectors)[0]
+    bytes_per_element = vectors.itemsize
+    num_construct   = num_vectors * percentage_construct // 100
+    num_calibration = num_vectors * percentage_calibration // 100
+    vectors_construct   = vectors[:num_construct]
+    vectors_calibration = vectors[num_construct:num_construct + num_calibration]
+    vectors_query       = vectors[num_construct + num_calibration:]
+
+    # Jobs receive lazy on-disk pointers instead of array copies (same
+    # reasoning as static_evaluation).
+    construct_source   = VectorSource(dataset, 0, num_construct)
+    calibration_source = VectorSource(dataset, num_construct, num_construct + num_calibration)
+    query_source        = VectorSource(dataset, num_construct + num_calibration, num_vectors)
+
+    print("Calculating distance threshold...")
+    distance_threshold = calculate_distance_threshold(vectors, duplicate_percentage)
+    print("Calculating calibration/query ground truth...")
+    actual_calibration = compute_static_actual_results(vectors_construct, vectors_calibration, distance_threshold)
+    actual_query       = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
+
+    max_memory_budget = calculate_max_memory_budget_bytes(num_vectors, dim, bytes_per_element)
+    memory_budgets = sorted({min(b, max_memory_budget) for b in EQUAL_MEMORY_BUDGETS_BYTES})
+
+    runner = Runner(num_workers=MAX_WORKERS)
+    for memory_budget in memory_budgets:
+        print(f"Submitting jobs for memory_budget={memory_budget} bytes...")
+        for filter_cls in static_filters + dynamic_filters:
+            runner.submit(
+                'equal_memory',
+                filter_cls=filter_cls, lsh_cls=DummyLSH,
+                dim=dim, distance_threshold=distance_threshold, max_L=max_L,
+                memory_budget=memory_budget,
+                vectors_construct=construct_source, vectors_calibration=calibration_source,
+                vectors_query=query_source,
+                actual_calibration=actual_calibration, actual_query=actual_query,
+                dataset=dataset,
+            )
+
+    results = runner.run()
+    print("Equal-memory evaluation completed.")
+    plot_equal_memory_results(results)
+
+    results_df = pd.DataFrame(results)
+    os.makedirs("results", exist_ok=True)
+    results_df.to_csv("results/equal_memory.csv", index=False)
+    print("Saved results/equal_memory.csv")
+    generate_equal_memory_figures(df=results_df)
+
+    return results
+
+
 def hnsw_evaluation() -> list:
     """
     Measure how much a semantic filter reduces accesses to an HNSW index that
@@ -269,7 +354,7 @@ def evaluate_ablation() -> pd.DataFrame:
     static_evaluation()/hnsw_evaluation() use with plot_results/plot_hnsw_results,
     just without discarding the in-memory results in favor of a re-read.
     """
-    num_vectors           = 3_000
+    num_vectors           = 1000
     dim                   = 384
     percentage_construct  = 20
     k_values              = [64, 128, 256, 512]
@@ -288,6 +373,31 @@ def evaluate_ablation() -> pd.DataFrame:
             f"({', '.join(_ABLATION_DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
         )
 
+    # k >= a dataset's construct-set size makes GonzalezMEBFilter fall back to
+    # one zero-radius ball per point (log10_J = -inf, unplottable), so clamp
+    # the sweep to what the *smallest* construct set can support -- keeps the
+    # same k values present for every dataset, which the figure requires.
+    construct_sizes = {d: len(load_embeds(d, num_vectors)[0]) * percentage_construct // 100 for d in datasets}
+    min_construct = min(construct_sizes.values())
+    usable_k_values = [k for k in k_values if k < min_construct]
+    dropped_k = sorted(set(k_values) - set(usable_k_values))
+    if dropped_k:
+        print(
+            f"Dropping k values >= smallest construct set ({min_construct} vectors, "
+            f"from {min(construct_sizes, key=construct_sizes.get)}): {dropped_k}"
+        )
+    if not usable_k_values:
+        raise RuntimeError(
+            f"No k value in {k_values} is smaller than the smallest construct set "
+            f"({min_construct} vectors). Raise num_vectors/percentage_construct or lower k_values."
+        )
+    k_values = usable_k_values
+
+    # A single, sweep-independent construction tightness knob (see
+    # ablation_worker's docstring for why tau can't double as this and stay
+    # tau-independent for log10_J). The sweep's median is a reasonable default.
+    construct_tau = float(np.median(tau_values))
+
     runner = Runner(num_workers=MAX_WORKERS)
 
     for dataset in datasets:
@@ -300,18 +410,20 @@ def evaluate_ablation() -> pd.DataFrame:
         construct_source = VectorSource(dataset, 0, num_construct)
         query_source = VectorSource(dataset, num_construct, n)
 
-        for tau in tau_values:
-            print(f"{dataset}: computing ground truth at tau={tau:g}...")
-            actual_results = compute_static_actual_results(vectors_construct, vectors_query, tau)
-            for k in k_values:
-                for seed in seeds:
-                    runner.submit(
-                        'ablation',
-                        dim=dim, dataset=_ABLATION_DATASET_KEYS[dataset],
-                        k=k, tau=tau, seed=seed,
-                        vectors_construct=construct_source, vectors_query=query_source,
-                        actual_results=actual_results, feedback_fraction=feedback_fraction,
-                    )
+        print(f"{dataset}: computing ground truth for tau in {tau_values}...")
+        actual_results_by_tau = {
+            tau: compute_static_actual_results(vectors_construct, vectors_query, tau)
+            for tau in tau_values
+        }
+        for k in k_values:
+            for seed in seeds:
+                runner.submit(
+                    'ablation',
+                    dim=dim, dataset=_ABLATION_DATASET_KEYS[dataset],
+                    k=k, tau_values=tau_values, seed=seed, construct_tau=construct_tau,
+                    vectors_construct=construct_source, vectors_query=query_source,
+                    actual_results_by_tau=actual_results_by_tau, feedback_fraction=feedback_fraction,
+                )
 
     job_results = runner.run()
     print("Ablation evaluation completed.")
@@ -322,7 +434,90 @@ def evaluate_ablation() -> pd.DataFrame:
     df.to_csv(output_csv, index=False)
     print(f"Wrote {output_csv}")
 
-    generate_ablation_figures(df)
+    # plot_ablation's own K default may not survive the k-clamping above;
+    # the largest surviving budget is the closest match to the original intent.
+    generate_ablation_figures(df, k=max(k_values))
+    return df
+
+
+def evaluate_query_performance() -> pd.DataFrame:
+    """
+    Measure single-query vs. batched-query latency/throughput of a
+    GonzalezMEBFilter cover as a function of filter size k, across the same
+    3 datasets used by evaluate_ablation(). Mirrors evaluate_ablation()'s
+    structure: one job per (dataset, k, seed), flattened into a long-format
+    DataFrame, written to results/query_performance.csv, then rendered via
+    plot_query_performance.generate_query_performance_figures.
+    """
+    num_vectors           = 100_000
+    dim                   = 384
+    percentage_construct  = 20
+    k_values              = [16, 32, 64, 128, 256, 512, 1024]
+    query_tau             = 0.35
+    seeds                 = [0, 1, 2]
+    single_query_limit    = 2000
+    output_csv            = "results/query_performance.csv"
+
+    datasets = [d for d in _ABLATION_DATASET_KEYS if os.path.exists(dataset_filenames[d])]
+    missing = [d for d in _ABLATION_DATASET_KEYS if d not in datasets]
+    if missing:
+        print(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
+    if set(datasets) != set(_ABLATION_DATASET_KEYS):
+        raise RuntimeError(
+            "evaluate_query_performance needs all 3 datasets "
+            f"({', '.join(_ABLATION_DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
+        )
+
+    # k >= a dataset's construct-set size makes GonzalezMEBFilter fall back to
+    # one zero-radius ball per point, so clamp the sweep the same way
+    # evaluate_ablation() does (kept defensive even though the 100K-row
+    # datasets comfortably support k=1024 at 20% construct).
+    construct_sizes = {d: len(load_embeds(d, num_vectors)[0]) * percentage_construct // 100 for d in datasets}
+    min_construct = min(construct_sizes.values())
+    usable_k_values = [k for k in k_values if k < min_construct]
+    dropped_k = sorted(set(k_values) - set(usable_k_values))
+    if dropped_k:
+        print(
+            f"Dropping k values >= smallest construct set ({min_construct} vectors, "
+            f"from {min(construct_sizes, key=construct_sizes.get)}): {dropped_k}"
+        )
+    if not usable_k_values:
+        raise RuntimeError(
+            f"No k value in {k_values} is smaller than the smallest construct set "
+            f"({min_construct} vectors). Raise num_vectors/percentage_construct or lower k_values."
+        )
+    k_values = usable_k_values
+
+    runner = Runner(num_workers=MAX_WORKERS)
+
+    for dataset in datasets:
+        vectors = load_embeds(dataset, num_vectors)[0]
+        n = len(vectors)  # a dataset may hold fewer than num_vectors
+        num_construct = n * percentage_construct // 100
+
+        construct_source = VectorSource(dataset, 0, num_construct)
+        query_source = VectorSource(dataset, num_construct, n)
+
+        for k in k_values:
+            for seed in seeds:
+                runner.submit(
+                    'query_performance',
+                    dim=dim, dataset=_ABLATION_DATASET_KEYS[dataset],
+                    k=k, seed=seed, construct_tau=query_tau, query_tau=query_tau,
+                    vectors_construct=construct_source, vectors_query=query_source,
+                    single_query_limit=single_query_limit,
+                )
+
+    job_results = runner.run()
+    print("Query performance evaluation completed.")
+
+    df = pd.DataFrame([row for job_rows in job_results for row in job_rows])
+
+    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+    df.to_csv(output_csv, index=False)
+    print(f"Wrote {output_csv}")
+
+    generate_query_performance_figures(df)
     return df
 
 
@@ -470,6 +665,8 @@ def tradeoff_evaluation() -> Tuple[List, List]:
 if __name__ == "__main__":
     # static_evaluation()
     # dynamic_evaluation()
+    equal_memory_evaluation()
     # hnsw_evaluation()
     # tradeoff_evaluation()
-    evaluate_ablation()
+    # evaluate_ablation()
+    # evaluate_query_performance()

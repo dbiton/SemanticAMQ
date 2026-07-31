@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, Iterator, List, Union
 
@@ -100,8 +101,14 @@ def _radius_stats(filter_instance: Any) -> Dict[str, float]:
     }
 
 
+_DIRECT_TAU_FILTERS = {
+    "FirstNFilter", "GonzalezMEBFilter",
+    "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", "DSHFilter",
+}
+
+
 def _instantiate_filter(filter_cls: Any, dim: int, lsh: Any, memory_budget: int, distance_threshold: float = None, max_spheres: int = None) -> Any:
-    if filter_cls.__name__ not in ["KDBallFilter", "KMEBFilter", "FirstNFilter", "GonzalezMEBFilter"]:
+    if filter_cls.__name__ not in _DIRECT_TAU_FILTERS:
         try:
             return filter_cls(dim=dim, lsh=lsh, max_memory=memory_budget)
         except TypeError:
@@ -171,6 +178,142 @@ def dynamic_worker(
     # the query loop, so memory usage is only meaningful once it's finished.
     memory_usage = filter_instance.get_bytesize()
     return _compute_metrics(predicted, actual_results, distance_threshold, config, percentage, memory_usage, memory_budget)
+
+
+def _f1_score(predicted: np.ndarray, actual: np.ndarray) -> float:
+    if len(predicted) == 0:
+        return 0.0
+    tp = int(np.sum(predicted & actual))
+    fp = int(np.sum(predicted & ~actual))
+    fn = int(np.sum(~predicted & actual))
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    return 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+
+# Filters exposing a cheap, purely post-construction query-time dial: rebuild
+# is unnecessary, so every candidate can be scored against the calibration
+# set on the *same* constructed instance.
+_POST_CONSTRUCTION_CONFIG_DIALS = {
+    "DSBFFilter": lambda f: [("vote_threshold", t) for t in range(1, f.num_tables + 1)],
+}
+
+# Filters whose "configuration" choice changes memory layout at construction
+# time (so each candidate needs its own build): mapped to the constructor
+# kwarg(s) swept, one full (filter_cls, kwargs) build per candidate.
+_CONSTRUCTION_TIME_CONFIG_DIALS = {
+    "LSBFFilter": [{"verify": True}, {"verify": False}],
+}
+
+
+def _build_calibrated_filter(
+    filter_cls: Any,
+    dim: int,
+    lsh: Any,
+    memory_budget: int,
+    distance_threshold: float,
+    construct_arr: np.ndarray,
+    calib_arr: np.ndarray,
+    calib_actual: np.ndarray,
+) -> Any:
+    """
+    Build filter_cls at memory_budget and, for filters that expose a
+    discrete "valid configuration" choice (see the two dial registries
+    above), pick whichever candidate scores best (F1) on a held-out
+    calibration workload -- distinct from both the construct set and the
+    final evaluation query set. Filters without a registered dial just use
+    their single memory-budget-derived default construction.
+    """
+    name = filter_cls.__name__
+
+    if name in _CONSTRUCTION_TIME_CONFIG_DIALS:
+        best_f1, best_instance = -1.0, None
+        for kwargs in _CONSTRUCTION_TIME_CONFIG_DIALS[name]:
+            candidate = filter_cls(
+                dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold, **kwargs
+            )
+            candidate.construct(construct_arr)
+            f1 = (
+                _f1_score(np.asarray(candidate.query(calib_arr), dtype=bool), calib_actual)
+                if len(calib_arr) > 0 else 0.0
+            )
+            if f1 > best_f1:
+                best_f1, best_instance = f1, candidate
+        return best_instance
+
+    filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold)
+    filter_instance.construct(construct_arr)
+
+    if name in _POST_CONSTRUCTION_CONFIG_DIALS and len(calib_arr) > 0:
+        best_attr, best_value, best_f1 = None, None, -1.0
+        for attr, value in _POST_CONSTRUCTION_CONFIG_DIALS[name](filter_instance):
+            setattr(filter_instance, attr, value)
+            f1 = _f1_score(np.asarray(filter_instance.query(calib_arr), dtype=bool), calib_actual)
+            if f1 > best_f1:
+                best_attr, best_value, best_f1 = attr, value, f1
+        if best_attr is not None:
+            setattr(filter_instance, best_attr, best_value)
+
+    return filter_instance
+
+
+def equal_memory_worker(
+    filter_cls: Any,
+    lsh_cls: Any,
+    dim: int,
+    distance_threshold: float,
+    max_L: int,
+    memory_budget: int,
+    vectors_construct: VectorInput,
+    vectors_calibration: VectorInput,
+    vectors_query: VectorInput,
+    actual_calibration: List[bool],
+    actual_query: List[bool],
+    dataset: str = "",
+) -> Dict[str, Any]:
+    """
+    Equal-memory comparison: every filter is given the same memory_budget,
+    the best available "valid configuration" of each (see
+    _build_calibrated_filter) is selected on a calibration workload disjoint
+    from both the construct set and the final query set, and FPR/FNR/latency/
+    throughput are then measured on that held-out query set.
+    """
+    config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
+    lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
+    construct_arr = _to_construct_array(vectors_construct)
+    calib_arr = _to_construct_array(vectors_calibration)
+    calib_actual = np.asarray(actual_calibration, dtype=bool)
+
+    filter_instance = _build_calibrated_filter(
+        filter_cls, dim, lsh, memory_budget, distance_threshold,
+        construct_arr, calib_arr, calib_actual,
+    )
+
+    predicted: List[bool] = []
+    start = time.perf_counter()
+    for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
+        predicted.extend(filter_instance.query(block))
+    elapsed = time.perf_counter() - start
+
+    predicted_arr = np.asarray(predicted, dtype=bool)
+    actual_arr = np.asarray(actual_query, dtype=bool)
+    tp = int(np.sum(predicted_arr & actual_arr))
+    fp = int(np.sum(predicted_arr & ~actual_arr))
+    fn = int(np.sum(~predicted_arr & actual_arr))
+    tn = int(np.sum(~predicted_arr & ~actual_arr))
+    n_q = max(len(actual_arr), 1)
+
+    return {
+        'Config': config,
+        'Dataset': dataset,
+        'Memory Budget': memory_budget,
+        'Memory Usage': filter_instance.get_bytesize(),
+        'Threshold': distance_threshold,
+        'FPR': fp / (fp + tn) if (fp + tn) > 0 else 0.0,
+        'FNR': fn / (fn + tp) if (fn + tp) > 0 else 0.0,
+        'Latency (ms)': elapsed / n_q * 1000,
+        'Throughput (qps)': n_q / max(elapsed, 1e-9),
+    }
 
 
 def _fpvr_bounds(
@@ -423,21 +566,33 @@ def ablation_worker(
     dim: int,
     dataset: str,
     k: int,
-    tau: float,
+    tau_values: List[float],
     seed: int,
+    construct_tau: float,
     vectors_construct: VectorInput,
     vectors_query: VectorInput,
-    actual_results: List[bool],
+    actual_results_by_tau: Dict[float, List[bool]],
     feedback_fraction: float = 0.1,
 ) -> List[Dict[str, Any]]:
     """
-    Run GonzalezMEBFilter's cumulative construction ladder (levels 1-4:
-    initial cover, ball refinement, boundary refinement, radius tightening)
-    plus an opt-in feedback pass (level 5), at a fixed (k, tau, seed). Returns
-    one row per stage matching the ablation-figure schema consumed by
-    plot_ablation.py's generate_ablation_figures: dataset, k, stage,
-    stage_index, tau, log10_J, log10_J_tau, fpr, fnr, stage_time_s,
-    cum_time_s, n_balls, seed.
+    Build ONE GonzalezMEBFilter cover per (dataset, k, seed) via the
+    cumulative construction ladder (levels 1-4: initial cover, ball
+    refinement, boundary refinement, radius tightening), then evaluate that
+    same cover at every tau in `tau_values`. Returns one row per
+    (stage, tau) matching the schema plot_ablation.generate_ablation_figures
+    expects: dataset, k, stage, stage_index, tau, log10_J, log10_J_tau, fpr,
+    fnr, stage_time_s, cum_time_s, n_balls, seed.
+
+    log10_J is a pure geometric quantity of the cover (sum r_i^d, no tau
+    involved) -- panel (a) aggregates it "at the selected k" only, without
+    conditioning on tau, so it must be genuinely tau-independent for a given
+    (dataset, k, stage, seed); it would be wrong to rebuild the cover per tau
+    (that bakes tau into the radii and turns different-tau rows into
+    apples-to-oranges "replicates"). `construct_tau` is therefore a single,
+    sweep-independent threshold used only for the level-1 k-means++ stopping
+    criterion (a construction-tightness knob) -- distinct from the evaluated
+    tau's, which only affect log10_J_tau/fpr/fnr (computed post hoc from the
+    same radii) and the feedback branch below.
 
     Levels 1-4 are each built from scratch via set_complexity(level) so the
     FPR/FNR of each stage's *actual* cover can be measured directly --
@@ -445,87 +600,155 @@ def ablation_worker(
     This mirrors the class's own "cumulative, ablatable ladder" design and
     costs at most a small constant factor over a single full run (per its
     docstring), since get_stats() already reports each level's own wall time
-    even in a partial (level < 4) run. `tau` doubles as the constructor's
-    distance_threshold (governing the level-1 k-means++ stopping criterion)
-    since it's the same semantic threshold the filter is queried and
-    evaluated at.
+    even in a partial (level < 4) run.
+
+    Level 5 (feedback) *is* legitimately tau-specific -- which points count
+    as a witnessed false positive depends on tau -- so it branches once per
+    tau off a deep copy of the level-4 cover.
     """
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
-    actual = np.asarray(actual_results, dtype=bool)
-    if len(query_arr) != len(actual):
-        raise ValueError(
-            f"vectors_query ({len(query_arr)}) and actual_results ({len(actual)}) length mismatch"
-        )
-
-    # Reserve a witness slice for level-5 feedback; measure FPR/FNR on the
-    # rest -- a held-out workload disjoint from the points feedback saw.
     n_q = len(query_arr)
+    for t, actual in actual_results_by_tau.items():
+        if len(actual) != n_q:
+            raise ValueError(
+                f"vectors_query ({n_q}) and actual_results_by_tau[{t}] ({len(actual)}) length mismatch"
+            )
+
+    # Single witness/eval split, shared across every tau for this (k, seed) --
+    # a held-out workload disjoint from the points feedback saw.
     n_witness = max(1, int(round(n_q * feedback_fraction))) if n_q > 0 else 0
     rng = np.random.default_rng(seed)
     perm = rng.permutation(n_q)
     witness_idx, eval_idx = perm[:n_witness], perm[n_witness:]
-    witness_q, witness_actual = query_arr[witness_idx], actual[witness_idx]
-    eval_q, eval_actual = query_arr[eval_idx], actual[eval_idx]
+    witness_q, eval_q = query_arr[witness_idx], query_arr[eval_idx]
+    actual_by_tau = {t: np.asarray(a, dtype=bool) for t, a in actual_results_by_tau.items()}
 
     rows: List[Dict[str, Any]] = []
     filt = None
     for level in range(1, 5):
-        filt = GonzalezMEBFilter(dim=dim, distance_threshold=tau, max_spheres=k, seed=seed)
+        filt = GonzalezMEBFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed)
         filt.set_complexity(level)
         filt.construct(construct_arr)
-        levels = filt.get_stats(taus=[tau])["levels"]
+        levels = filt.get_stats(taus=tau_values)["levels"]
         stage = levels[-1]
         cum_time = sum(s["wall_time"] for s in levels)
+        log10_J = stage["log_J"] / _LN10
 
-        predicted = filt.query(eval_q, tau=tau)
-        rates = _confusion_rates(predicted, eval_actual)
+        for t in tau_values:
+            predicted = filt.query(eval_q, tau=t)
+            rates = _confusion_rates(predicted, actual_by_tau[t][eval_idx])
+            rows.append({
+                "dataset": dataset, "k": k, "stage": _ABLATION_STAGE_NAMES[level - 1],
+                "stage_index": level, "tau": t,
+                "log10_J": log10_J,
+                "log10_J_tau": stage["log_J_tau"][t] / _LN10,
+                "fpr": rates["fpr"], "fnr": rates["fnr"],
+                "stage_time_s": stage["wall_time"], "cum_time_s": cum_time,
+                "n_balls": stage["ball_count"], "seed": seed,
+            })
 
+    bad = [r for r in rows if r["fnr"] != 0]
+    if bad:
+        raise ValueError(
+            f"Zero-false-negative invariant violated (dataset={dataset}, k={k}, seed={seed}): "
+            f"{bad[:3]}"
+        )
+
+    # level 5: feedback, branched per tau off a copy of the level-4 cover
+    level4_cum_time = {r["tau"]: r["cum_time_s"] for r in rows if r["stage"] == "tighten"}
+    for t in tau_values:
+        filt_t = copy.deepcopy(filt)
+        witness_actual_t = actual_by_tau[t][witness_idx]
+        eval_actual_t = actual_by_tau[t][eval_idx]
+
+        feedback_time = 0.0
+        if n_witness > 0:
+            witness_pred = np.asarray(filt_t.query(witness_q, tau=t), dtype=bool)
+            fp_witnesses = witness_q[witness_pred & ~witness_actual_t]
+            if len(fp_witnesses) > 0:
+                feedback = filt_t.refine_with_feedback(fp_witnesses, thresholds=t)
+                feedback_time = feedback["elapsed_seconds"]
+
+        predicted = filt_t.query(eval_q, tau=t)
+        rates = _confusion_rates(predicted, eval_actual_t)
+        if rates["fnr"] != 0:
+            raise ValueError(
+                f"Zero-false-negative invariant violated at level 5/feedback "
+                f"(dataset={dataset}, k={k}, tau={t}, seed={seed}): fnr={rates['fnr']}"
+            )
+
+        radii = filt_t.all_radiuses
+        base_cum_time = level4_cum_time[t]
         rows.append({
-            "dataset": dataset, "k": k, "stage": _ABLATION_STAGE_NAMES[level - 1],
-            "stage_index": level, "tau": tau,
-            "log10_J": stage["log_J"] / _LN10,
-            "log10_J_tau": stage["log_J_tau"][tau] / _LN10,
+            "dataset": dataset, "k": k, "stage": "feedback", "stage_index": 5, "tau": t,
+            "log10_J": _log10_J(radii, dim),
+            "log10_J_tau": _log10_J(radii, dim, tau=t),
             "fpr": rates["fpr"], "fnr": rates["fnr"],
-            "stage_time_s": stage["wall_time"], "cum_time_s": cum_time,
-            "n_balls": stage["ball_count"], "seed": seed,
+            "stage_time_s": feedback_time, "cum_time_s": base_cum_time + feedback_time,
+            "n_balls": len(radii), "seed": seed,
         })
+    return rows
 
-    if rows[-1]["fnr"] != 0:
-        raise ValueError(
-            f"Zero-false-negative invariant violated at level 4 "
-            f"(dataset={dataset}, k={k}, tau={tau}, seed={seed}): fnr={rows[-1]['fnr']}"
-        )
 
-    # level 5: feedback refinement, seeded from the level-4 cover already built
-    if n_witness > 0:
-        witness_pred = np.asarray(filt.query(witness_q, tau=tau), dtype=bool)
-        fp_witnesses = witness_q[witness_pred & ~witness_actual]
-    else:
-        fp_witnesses = np.empty((0, dim), dtype=np.float32)
+def query_performance_worker(
+    dim: int,
+    dataset: str,
+    k: int,
+    seed: int,
+    construct_tau: float,
+    query_tau: float,
+    vectors_construct: VectorInput,
+    vectors_query: VectorInput,
+    single_query_limit: int = 2000,
+) -> List[Dict[str, Any]]:
+    """
+    Build one GonzalezMEBFilter cover (max_spheres=k, default complexity=4,
+    i.e. the full construction ladder) per (dataset, k, seed), then time
+    querying that same cover two ways: one query vector at a time
+    (_iter_query_vectors) vs. _QUERY_BATCH-sized blocks (_iter_query_batches).
+    GonzalezMEBFilter.query() is fully vectorized with no separate
+    single-query code path -- "single vs batched" is purely how many rows
+    the caller passes per call. Single-mode timing is capped at
+    single_query_limit queries since it pays one Python-level call per query;
+    batched mode already covers the full stream cheaply and is left uncapped.
+    Returns one row per mode ("single"/"batched").
+    """
+    construct_arr = _to_construct_array(vectors_construct)
 
-    feedback_time = 0.0
-    if len(fp_witnesses) > 0:
-        feedback = filt.refine_with_feedback(fp_witnesses, thresholds=tau)
-        feedback_time = feedback["elapsed_seconds"]
+    filt = GonzalezMEBFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed)
+    filt.construct(construct_arr)
 
-    predicted = filt.query(eval_q, tau=tau)
-    rates = _confusion_rates(predicted, eval_actual)
-    if rates["fnr"] != 0:
-        raise ValueError(
-            f"Zero-false-negative invariant violated at level 5/feedback "
-            f"(dataset={dataset}, k={k}, tau={tau}, seed={seed}): fnr={rates['fnr']}"
-        )
+    rows: List[Dict[str, Any]] = []
 
-    radii = filt.all_radiuses
+    n_single = 0
+    start = time.perf_counter()
+    for v in _iter_query_vectors(vectors_query):
+        if n_single >= single_query_limit:
+            break
+        filt.query(v[np.newaxis, :], tau=query_tau)
+        n_single += 1
+    elapsed_single = time.perf_counter() - start
     rows.append({
-        "dataset": dataset, "k": k, "stage": "feedback", "stage_index": 5, "tau": tau,
-        "log10_J": _log10_J(radii, dim),
-        "log10_J_tau": _log10_J(radii, dim, tau=tau),
-        "fpr": rates["fpr"], "fnr": rates["fnr"],
-        "stage_time_s": feedback_time, "cum_time_s": rows[-1]["cum_time_s"] + feedback_time,
-        "n_balls": len(radii), "seed": seed,
+        "dataset": dataset, "k": k, "seed": seed, "mode": "single",
+        "n_queries": n_single,
+        "latency_ms": elapsed_single / max(n_single, 1) * 1000,
+        "throughput_qps": n_single / max(elapsed_single, 1e-9),
     })
+
+    n_batched = 0
+    start = time.perf_counter()
+    for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
+        filt.query(block, tau=query_tau)
+        n_batched += len(block)
+    elapsed_batched = time.perf_counter() - start
+    rows.append({
+        "dataset": dataset, "k": k, "seed": seed, "mode": "batched",
+        "n_queries": n_batched,
+        "latency_ms": elapsed_batched / max(n_batched, 1) * 1000,
+        "throughput_qps": n_batched / max(elapsed_batched, 1e-9),
+    })
+
     return rows
 
 
@@ -535,14 +758,18 @@ _WORKER_FNS: Dict[str, Any] = {
     'tradeoff': tradeoff_worker,
     'hnsw':    hnsw_worker,
     'ablation': ablation_worker,
+    'query_performance': query_performance_worker,
+    'equal_memory': equal_memory_worker,
 }
 
 
 def _describe_job(kwargs: Dict[str, Any]) -> str:
     if 'filter_cls' in kwargs and 'lsh_cls' in kwargs:
         return f"{kwargs['filter_cls'].__name__} + {kwargs['lsh_cls'].__name__}"
-    if {'dataset', 'k', 'tau', 'seed'} <= kwargs.keys():
-        return f"{kwargs['dataset']} k={kwargs['k']} tau={kwargs['tau']} seed={kwargs['seed']}"
+    if {'dataset', 'k', 'tau_values', 'seed'} <= kwargs.keys():
+        return f"{kwargs['dataset']} k={kwargs['k']} tau_values={kwargs['tau_values']} seed={kwargs['seed']}"
+    if {'dataset', 'k', 'seed'} <= kwargs.keys():
+        return f"{kwargs['dataset']} k={kwargs['k']} seed={kwargs['seed']} (query_performance)"
     return "job"
 
 
