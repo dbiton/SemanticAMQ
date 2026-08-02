@@ -182,9 +182,6 @@ def static_evaluation() -> list:
     return results
 
 
-EQUAL_MEMORY_BUDGETS_BYTES = [64 * 1024, 256 * 1024, 1 * 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024]
-
-
 def equal_memory_evaluation() -> list:
     """
     Equal-memory comparison: every registered filter (GonzalezMEBFilter --
@@ -208,6 +205,7 @@ def equal_memory_evaluation() -> list:
     percentage_calibration  = 20
     duplicate_percentage    = 5.0
     max_L                   = 256
+    count_memory_steps        = 10
 
     dataset = DATASET
     vectors = load_embeds(dataset, num_vectors)[0]
@@ -231,7 +229,7 @@ def equal_memory_evaluation() -> list:
     actual_query       = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
 
     max_memory_budget = calculate_max_memory_budget_bytes(num_vectors, dim, bytes_per_element)
-    memory_budgets = sorted({min(b, max_memory_budget) for b in EQUAL_MEMORY_BUDGETS_BYTES})
+    memory_budgets = np.linspace(0, max_memory_budget, count_memory_steps + 1, dtype=int)[1:]
 
     runner = Runner(num_workers=MAX_WORKERS)
     for memory_budget in memory_budgets:
