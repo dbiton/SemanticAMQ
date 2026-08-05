@@ -115,7 +115,7 @@ class TestGonzalezConstruct(unittest.TestCase):
         vecs = _rand(6, seed=17)
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=20)
         f.construct(vecs)
-        stored = f.all_spheres
+        stored = f.all_centers
         self.assertEqual(len(stored), len(vecs))
         for v in vecs:
             self.assertTrue(any(np.allclose(v, s) for s in stored),
@@ -131,7 +131,7 @@ class TestGonzalezConstruct(unittest.TestCase):
         self.assertLess(len(f.all_spheres), len(vecs),
                         "expected clustering to collapse spheres below vector count")
 
-        centers = f.all_spheres
+        centers = f.all_centers
         radii = f.all_radiuses
         dists = np.linalg.norm(vecs[:, None, :] - centers[None, :, :], axis=2)
         within = dists <= radii[None, :] + 1e-5
@@ -189,6 +189,7 @@ class TestGonzalezConstruct(unittest.TestCase):
         first = _rand(10, seed=0)
         second = _rand(10, seed=7) + 50.0
         f.construct(first)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=10)
         f.construct(second)
         self.assertTrue(all(f.query(second)))
         self.assertFalse(any(f.query(first)))
@@ -413,8 +414,9 @@ class TestGonzalezMemory(unittest.TestCase):
         f = GonzalezMEBFilter(dim=self.dim, distance_threshold=R, max_spheres=6)
         f.construct(_rand(100, self.dim))
         k = len(f.all_spheres)
-        # k centers × dim float32 + k radii × float32
-        self.assertEqual(f.get_bytesize(), k * self.dim * 4 + k * 4)
+        minimal_pairs_heap = sys.getsizeof(f._minimal_pairs)
+        # k spheres × float32 + k centers × dim float32 + k radii × float32 + k indices count × float32 + min-heap
+        self.assertEqual(f.get_bytesize(), k * 4 + k * self.dim * 4 + k * 4 + k * 4 + minimal_pairs_heap)
 
     def test_bytesize_within_max_memory_budget(self):
         budget = (self.dim + 1) * 4 * 4 * 8

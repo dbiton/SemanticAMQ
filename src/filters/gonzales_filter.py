@@ -1,3 +1,4 @@
+import sys, heapq
 import numpy as np
 from typing import List, Tuple, Optional
 from filters.filter import Filter
@@ -28,7 +29,8 @@ class GonzalezMEBFilter(Filter):
         max_memory (Optional[int]): The maximum memory limit in bytes allocated for storing spheres.
         max_spheres (int): The maximum number of space partitions (spheres) allowed, automatically
                            calculated based on the memory limit to prevent overflow.
-        all_spheres (np.ndarray): A 2D array of shape (K, D) storing the centroids of all spheres.
+        all_spheres (np.ndarray): A 1D array of shape (K,) containing the active indices of the spheres.
+        all_centers (np.ndarray): A 2D array of shape (K, D) storing the centroids of all spheres.
         all_radiuses (np.ndarray): A 1D array of shape (K,) storing the bounding radiuses.
     """
     _BYTES_PER_FLOAT32 = 4
@@ -37,16 +39,30 @@ class GonzalezMEBFilter(Filter):
     _MAX_NEIGHBORS = 50
     _BATCH_SIZE = 2048
 
-
     def __init__(self, dim: int, distance_threshold: float, max_memory: Optional[int] = None, max_spheres: Optional[int] = None):
         super().__init__(dim, lsh=None, max_memory=max_memory)
         self.distance_threshold = distance_threshold
-        self.all_spheres = np.empty((0, dim), dtype=np.float32)
-        self.all_radiuses = np.empty((0,), dtype=np.float32)
+        self.max_spheres = (max_spheres if max_spheres is not None 
+                    else self._calculate_max_spheres(self.max_memory))
+        self._num_spheres = 0
+        self._all_spheres = np.arange(self.max_spheres, dtype=np.int32)
+        self._all_centers = np.empty((self.max_spheres, dim), dtype=np.float32)
+        self._all_radiuses = np.empty((self.max_spheres,), dtype=np.float32)
+        self._indices_count = np.zeros((self.max_spheres,), dtype=np.int32)
+        self._minimal_pairs = []
         self._constructed = False
 
-        self.max_spheres = (max_spheres if max_spheres is not None 
-                           else self._calculate_max_spheres(self.max_memory))
+    @property
+    def all_spheres(self) -> np.ndarray:
+        return self._all_spheres[:self._num_spheres]
+
+    @property
+    def all_centers(self) -> np.ndarray:
+        return self._all_centers[self.all_spheres]
+
+    @property
+    def all_radiuses(self) -> np.ndarray:
+        return self._all_radiuses[self.all_spheres]
 
 
     def _calculate_max_spheres(self, max_memory: int, gamma: float = 4.0) -> int:
@@ -55,41 +71,40 @@ class GonzalezMEBFilter(Filter):
 
 
     def _log_volume_bounds(self) -> Tuple[float, float]:
-        if len(self.all_spheres) == 0:
+        if len(self.all_centers) == 0:
             return -np.inf, -np.inf
-        return estimate_hypersphere_volume(self.all_spheres, self.all_radiuses, return_log=True)
+        return estimate_hypersphere_volume(self.all_centers, self.all_radiuses, return_log=True)
 
 
     def _compute_squared_distances(self, a: np.ndarray, a_sq: np.ndarray, b: np.ndarray, b_sq: np.ndarray) -> np.ndarray:
         a_b_cross = a @ b.T
         sq_distances = a_sq[:, None] - 2.0 * a_b_cross + b_sq[None, :]
-
         return np.maximum(sq_distances, 0.0)
 
 
-    def _get_nearest_centers(self, vectors: np.ndarray, sq_norms: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        num_spheres = len(self.all_spheres)
-        
-        if num_spheres == 0:
-            return np.empty((len(vectors), 0), dtype=np.float32), np.empty((len(vectors), 0), dtype=np.int64)
+    def _get_new_index(self) -> int:
+        if self._num_spheres == len(self._all_centers):
+            old_cap = len(self._all_centers)
+            new_cap = old_cap * 2
 
-        k = min(k, num_spheres)
-        centers = self.all_spheres
-        sq_centers = np.sum(centers**2, axis=1)
-        sq_distances = self._compute_squared_distances(vectors, sq_norms, centers, sq_centers)
+            new_spheres = np.empty((new_cap,), dtype=np.int32)
+            new_spheres[:old_cap] = self._all_spheres
+            new_spheres[old_cap:] = np.arange(old_cap, new_cap, dtype=np.int32)
+            self._all_spheres = new_spheres
 
-        if k == num_spheres:
-            center_indices = np.argsort(sq_distances, axis=1)
+            new_centers = np.empty((new_cap, self.dim), dtype=np.float32)
+            new_centers[:old_cap] = self._all_centers
+            self._all_centers = new_centers
 
-        else:
-            center_indices = np.argpartition(sq_distances, k - 1, axis=1)[:, :k]
-            top_k_dists = np.take_along_axis(sq_distances, center_indices, axis=1)
-            sorted_top_k = np.argsort(top_k_dists, axis=1)
-            center_indices = np.take_along_axis(center_indices, sorted_top_k, axis=1)
+            new_radiuses = np.empty((new_cap,), dtype=np.float32)
+            new_radiuses[:old_cap] = self._all_radiuses
+            self._all_radiuses = new_radiuses
 
-        center_sq_dists = np.take_along_axis(sq_distances, center_indices, axis=1)
+            new_indices_count = np.zeros(new_cap, dtype=np.int32)
+            new_indices_count[:old_cap] = self._indices_count
+            self._indices_count = new_indices_count
 
-        return center_sq_dists, center_indices
+        return self._all_spheres[self._num_spheres]
 
 
     def _gonzalez_clustering(self, vectors: np.ndarray, sq_norms: np.ndarray, k: int) -> np.ndarray:
@@ -130,103 +145,85 @@ class GonzalezMEBFilter(Filter):
         return center.astype(np.float32), radius.astype(np.float32)
 
 
+    def _add_sphere(self, center: np.ndarray, radius: float) -> None:
+        current_spheres = self.all_spheres
+
+        if self._num_spheres > 0:
+            current_centers = self._all_centers[current_spheres]
+            current_radiuses = self._all_radiuses[current_spheres]
+            center_sq = np.sum(center**2, keepdims=True)
+            current_centers_sq = np.sum(current_centers**2, axis=1)
+
+            sq_center_distances = self._compute_squared_distances(
+                center[None, :], center_sq, current_centers, current_centers_sq)[0]
+            center_distances = np.sqrt(sq_center_distances)
+
+            if np.any(center_distances + radius <= current_radiuses):
+                return
+
+            contained_indices = (center_distances + current_radiuses) <= radius
+            if np.any(contained_indices):
+                contained_spheres = current_spheres[contained_indices]
+                current_spheres = current_spheres[~contained_indices]
+                self._all_spheres[:self._num_spheres] = np.concatenate([current_spheres, contained_spheres])
+                self._num_spheres -= len(contained_spheres)
+                self._indices_count[contained_spheres] += 1
+                current_radiuses = current_radiuses[~contained_indices]
+                center_distances = center_distances[~contained_indices]
+
+        sphere_idx = self._get_new_index()
+        sphere_count = self._indices_count[sphere_idx]
+        self._all_centers[sphere_idx] = center
+        self._all_radiuses[sphere_idx] = radius
+        self._num_spheres += 1
+
+        if len(current_spheres) > 0:
+            max_neighbors = min(self._MAX_NEIGHBORS, len(current_spheres))
+            if max_neighbors == len(current_spheres):
+                neighbors_indices = np.arange(len(current_spheres))
+            else:
+                neighbors_indices = np.argpartition(center_distances, max_neighbors - 1)[:max_neighbors]
+
+            closest_neighbors = current_spheres[neighbors_indices]
+            neighbors_center_dists = center_distances[neighbors_indices]
+            neighbors_radiuses = current_radiuses[neighbors_indices]
+            merged_radius = (neighbors_radiuses + neighbors_center_dists + radius) / 2.0
+
+            # log(R_merged^D - (R_1^D + R_2^D)) = D*log(R_merged) + log(1 - ((R_1/R_merged)^D + (R_2/R_merged)^D))
+            merged_volumes = self.dim * np.log(merged_radius) + np.log(1.0 - ((radius / merged_radius) ** self.dim + (neighbors_radiuses / merged_radius) ** self.dim))
+
+            for volume, neighbor_idx in zip(merged_volumes, closest_neighbors):
+                neighbor_count = self._indices_count[neighbor_idx]
+                heapq.heappush(self._minimal_pairs, (volume, sphere_idx, sphere_count, neighbor_idx, neighbor_count))
+
+
     def _merge_spheres(self) -> None:
-        while len(self.all_spheres) > self.max_spheres:
-            current_num_spheres = len(self.all_spheres)
-            pairs_to_merge = current_num_spheres - self.max_spheres
-            centers = self.all_spheres
-            sq_centers = np.sum(self.all_spheres**2, axis=1)
+        while self._num_spheres > self.max_spheres and self._minimal_pairs:
+            vol, i, i_count, j, j_count = heapq.heappop(self._minimal_pairs)
 
-            max_neighbors = min(self._MAX_NEIGHBORS, current_num_spheres)
-            neighbor_dists, neighbor_indices = self._get_nearest_centers(centers, sq_centers, max_neighbors)
+            if self._indices_count[i] != i_count or self._indices_count[j] != j_count:
+                continue
 
-            pair_idx_i = np.repeat(np.arange(current_num_spheres), max_neighbors - 1)
-            pair_idx_j = neighbor_indices[:, 1:].ravel()
-            pair_distances = np.sqrt(np.maximum(neighbor_dists[:, 1:].ravel(), 0.0))
+            center_i, radius_i = self._all_centers[i], self._all_radiuses[i]
+            center_j, radius_j = self._all_centers[j], self._all_radiuses[j]
 
-            valid_pairs = pair_idx_i < pair_idx_j
-            pair_idx_i, pair_idx_j = pair_idx_i[valid_pairs], pair_idx_j[valid_pairs]
-            pair_distances = pair_distances[valid_pairs]
+            centers_diff = center_i - center_j
+            distance_ij = float(np.sqrt(np.dot(centers_diff, centers_diff)))
+            new_radius = (distance_ij + radius_i + radius_j) / 2.0
 
-            if len(pair_idx_i) == 0:
-                break
+            if distance_ij > 0.0:
+                weight_j = ((radius_j - radius_i) / (2.0 * distance_ij)) + 0.5
+                weight_i = ((radius_i - radius_j) / (2.0 * distance_ij)) + 0.5
+                new_center = weight_j * center_j + weight_i * center_i
+            else:
+                new_center = center_i
 
-            max_radius = max(np.max(self.all_radiuses), 1.0)
-            pair_radius_i, pair_radius_j = self.all_radiuses[pair_idx_i], self.all_radiuses[pair_idx_j]
-            pair_merged_radius = (pair_distances + pair_radius_i + pair_radius_j) / 2.0
+            current_spheres = self.all_spheres[(self.all_spheres != i) & (self.all_spheres != j)]
+            self._all_spheres[:self._num_spheres] = np.concatenate([current_spheres, [i, j]])
+            self._indices_count[[i, j]] += 1
+            self._num_spheres -= 2
 
-            scaled_merged = (pair_merged_radius / max_radius).astype(np.float64)
-            scaled_i = (pair_radius_i / max_radius).astype(np.float64)
-            scaled_j = (pair_radius_j / max_radius).astype(np.float64)
-            pair_volumes = (scaled_merged ** self.dim) - (scaled_i ** self.dim + scaled_j ** self.dim)
-            sorted_pair_indices = np.argsort(pair_volumes)
-
-            sphere_merged_indices = np.zeros(current_num_spheres, dtype=bool)
-            merged_centers, merged_radiuses = [], []
-            merges_done = 0
-
-            for best_pair_idx in sorted_pair_indices:
-                if merges_done >= pairs_to_merge or pair_volumes[best_pair_idx] == np.inf:
-                    break
-
-                idx_i, idx_j = int(pair_idx_i[best_pair_idx]), int(pair_idx_j[best_pair_idx])
-
-                if sphere_merged_indices[idx_i] or sphere_merged_indices[idx_j]:
-                    continue
-
-                center_i, radius_i = self.all_spheres[idx_i], self.all_radiuses[idx_i]
-                center_j, radius_j = self.all_spheres[idx_j], self.all_radiuses[idx_j]
-                dist_ij = pair_distances[best_pair_idx]
-
-                if dist_ij > 0.0:
-                    weight_j = ((radius_j - radius_i) / (2.0 * dist_ij)) + 0.5
-                    weight_i = ((radius_i - radius_j) / (2.0 * dist_ij)) + 0.5
-                    new_center = weight_j * center_j + weight_i * center_i
-                else:
-                    new_center = center_i
-
-                merged_centers.append(new_center)
-                merged_radiuses.append(pair_merged_radius[best_pair_idx])
-                sphere_merged_indices[idx_i], sphere_merged_indices[idx_j] = True, True
-                merges_done += 1
-
-            if not merged_centers:
-                break
-
-            self.all_spheres = np.vstack([self.all_spheres[~sphere_merged_indices], np.array(merged_centers, dtype=np.float32)])
-            self.all_radiuses = np.concatenate([self.all_radiuses[~sphere_merged_indices], np.array(merged_radiuses, dtype=np.float32)])
-
-
-    def _remove_spheres(self) -> None:
-        num_spheres = len(self.all_spheres)
-
-        if num_spheres < 2:
-            return
-
-        contained_spheres = np.zeros(num_spheres, dtype=bool)
-        center_sq_norms = np.sum(self.all_spheres**2, axis=1)
-
-        for i in range(0, num_spheres, self._BATCH_SIZE):
-            end = min(i + self._BATCH_SIZE, num_spheres)
-
-            container_centers = self.all_spheres[i:end]
-            container_radiuses = self.all_radiuses[i:end]
-            container_sq_norms = np.sum(container_centers**2, axis=1)
-
-            pairwise_sq_distances = self._compute_squared_distances(
-                self.all_spheres, center_sq_norms, container_centers, container_sq_norms
-            )
-            pairwise_distances = np.sqrt(np.maximum(pairwise_sq_distances, 0.0))
-
-            is_contained_sphere = (pairwise_distances + self.all_radiuses[:, None]) <= container_radiuses[None, :]
-            match_rows, match_cols = np.arange(i, end), np.arange(end - i)
-            is_contained_sphere[match_rows, match_cols] = False
-
-            contained_spheres |= np.any(is_contained_sphere, axis=1)
-
-        if np.any(contained_spheres):
-            self.all_spheres = self.all_spheres[~contained_spheres]
-            self.all_radiuses = self.all_radiuses[~contained_spheres]
+            self._add_sphere(new_center, new_radius)
 
 
     def construct(self, vectors: np.ndarray) -> Tuple[float, float]:
@@ -237,8 +234,8 @@ class GonzalezMEBFilter(Filter):
         vectors = np.ascontiguousarray(vectors, dtype=np.float32)
 
         if self.max_spheres >= len(vectors):
-            self.all_spheres = np.array(vectors, dtype=np.float32)
-            self.all_radiuses = np.full(len(vectors), self.distance_threshold, dtype=np.float32)
+            for vec in vectors:
+                self._add_sphere(vec, self.distance_threshold)
             self._constructed = True
             return self._log_volume_bounds()
 
@@ -250,32 +247,26 @@ class GonzalezMEBFilter(Filter):
         for idx, cluster_id in enumerate(assignment):
             clusters[cluster_id].append(idx)
 
-        centers, radiuses = [], []
-
         for cluster_id in clusters:
             center, radius = self._minimum_enclosing_ball(vectors[cluster_id], sq_norms[cluster_id])
-            centers.append(center)
-            radiuses.append(radius + self.distance_threshold)
-
-        self.all_spheres = np.array(centers, dtype=np.float32)
-        self.all_radiuses = np.array(radiuses, dtype=np.float32)
+            self._add_sphere(center, radius + self.distance_threshold)
         self._constructed = True
-        
-        return self._log_volume_bounds()
 
+        return self._log_volume_bounds()
+    
 
     def query(self, vectors: np.ndarray) -> List[bool]:
         if not self._constructed:
             raise ValueError("GonzalezMEBFilter has not been constructed.")
 
-        if len(self.all_spheres) == 0 or len(vectors) == 0:
+        if len(self.all_centers) == 0 or len(vectors) == 0:
             return [False] * len(vectors)
 
         q = np.ascontiguousarray(vectors, dtype=np.float32)
         q_sq = np.sum(q**2, axis=1)
 
-        c = self.all_spheres
-        c_sq = np.sum(self.all_spheres**2, axis=1)
+        c = self.all_centers
+        c_sq = np.sum(self.all_centers**2, axis=1)
 
         sq_distances = self._compute_squared_distances(q, q_sq, c, c_sq)
         in_any_sphere = np.any(sq_distances <= self.all_radiuses[None, :]**2, axis=1)
@@ -295,25 +286,19 @@ class GonzalezMEBFilter(Filter):
             vector_batch = vectors[i:i + self._BATCH_SIZE]
             vector_batch = np.ascontiguousarray(vector_batch, dtype=np.float32)
             sq_vector_batch = np.sum(vector_batch**2, axis=1)
-            
-            if len(self.all_spheres) > 0:
-                max_neighbors = min(self._MAX_NEIGHBORS, len(self.all_spheres))
-                neighbor_sq_dists, neighbor_indices = self._get_nearest_centers(vector_batch, sq_vector_batch, max_neighbors)
-                neighbor_distances = np.sqrt(np.maximum(neighbor_sq_dists, 0.0))
-                neighbor_radiuses = self.all_radiuses[neighbor_indices]
 
-                is_already_covered = np.any(neighbor_distances <= (neighbor_radiuses - self.distance_threshold), axis=1)
+            if self._num_spheres > 0:
+                sq_centers = np.sum(self.all_centers**2, axis=1)
+                sq_batch_distances = self._compute_squared_distances(vector_batch, sq_vector_batch, self.all_centers, sq_centers)
+                batch_distances = np.sqrt(sq_batch_distances)
+
+                is_already_covered = np.any(batch_distances <= (self.all_radiuses[None, :] - self.distance_threshold), axis=1)
                 vector_batch = vector_batch[~is_already_covered]
 
-            if len(vector_batch) == 0:
-                continue
+            for vec in vector_batch:
+                self._add_sphere(vec, self.distance_threshold)
 
-            self.all_spheres = np.vstack([self.all_spheres, vector_batch])
-            self.all_radiuses = np.append(self.all_radiuses, np.full(len(vector_batch), self.distance_threshold, dtype=np.float32))
-
-            if len(self.all_spheres) > self.max_spheres:
-                self._merge_spheres()
-                self._remove_spheres()
+            self._merge_spheres()
 
 
     def insert(self, vectors: np.ndarray) -> None:
@@ -335,4 +320,5 @@ class GonzalezMEBFilter(Filter):
     def get_bytesize(self) -> int:
         if not self._constructed:
             return 0
-        return self.all_spheres.nbytes + self.all_radiuses.nbytes
+        return (self._all_spheres.nbytes + self._all_centers.nbytes + self._all_radiuses.nbytes + 
+                self._indices_count.nbytes + sys.getsizeof(self._minimal_pairs))

@@ -194,9 +194,11 @@ class TestKDBallMemory(unittest.TestCase):
     def test_bytesize_after_construct(self):
         k, dim = 6, self.dim
         f = KDBallFilter(dim=dim, distance_threshold=R, max_spheres=k)
-        f.construct(_rand(100, dim))
-        # k centroids * dim float32 + k radiuses * float32
-        self.assertEqual(f.get_bytesize(), k * dim * 4 + k * 4)
+        f.construct(_rand(100, self.dim))
+        k = len(f.all_spheres)
+        minimal_pairs_heap = sys.getsizeof(f._minimal_pairs)
+        # k spheres × float32 + k centers × dim float32 + k radii × float32 + k indices count × float32 + min-heap
+        self.assertEqual(f.get_bytesize(), k * 4 + k * self.dim * 4 + k * 4 + k * 4 + minimal_pairs_heap)
 
 
 # ---------------------------------------------------------------------------
