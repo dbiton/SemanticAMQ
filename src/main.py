@@ -5,7 +5,6 @@ import pandas as pd
 
 from filters.cuckoo_filter import CuckooFilter
 from filters.gcs_filter import GCSFilter
-from filters.kmeb_filter import KMEBFilter
 from filters.kdball_filter import KDBallFilter
 from filters.gonzales_filter import GonzalezMEBFilter
 from filters.pyfusefilter_filters import Fuse8Filter, Xor8Filter
@@ -393,7 +392,7 @@ def tradeoff_static_evaluation() -> Tuple[List, List]:
                 vectors_construct=construct_vectors,
                 vectors_query=query_vectors,
                 actual_results=actual_results,
-                max_spheres=size,
+                max_shapes=size,
                 memory_budget=None
             )
 
@@ -422,7 +421,7 @@ def tradeoff_static_evaluation() -> Tuple[List, List]:
                 vectors_construct=construct_vectors,
                 vectors_query=query_vectors,
                 actual_results=actual_results,
-                max_spheres=None,
+                max_shapes=None,
                 memory_budget=budget
             )
 
@@ -506,7 +505,7 @@ def tradeoff_dynamic_evaluation() -> Tuple[List, List]:
                 vectors_construct=construct_vectors,
                 vectors_query=query_vectors,
                 actual_results=actual_results,
-                max_spheres=size,
+                max_shapes=size,
                 memory_budget=None
             )
 
@@ -535,7 +534,7 @@ def tradeoff_dynamic_evaluation() -> Tuple[List, List]:
                 vectors_construct=construct_vectors,
                 vectors_query=query_vectors,
                 actual_results=actual_results,
-                max_spheres=None,
+                max_shapes=None,
                 memory_budget=budget
             )
 

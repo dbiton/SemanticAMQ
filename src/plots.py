@@ -126,19 +126,24 @@ def get_plot_mappings(all_filters: List[str]) -> Tuple[Dict, Dict, Dict]:
     return color_map, marker_map, dash_map
 
 
-def plot_tradeoff_results(sphere_results: list, memory_results: list, folder: str = "plots/tradeoff_static") -> None:
+def plot_tradeoff_results(shapes_results: list, memory_results: list, folder: str = "plots/tradeoff_static") -> None:
     """
     Plots tradeoff evaluation results, comparing FPR, FNR, Precision, F1-Score, QPS, 
-    and ConstructTime across both geometric (spheres) and hardware (memory) sweeps.
+    and ConstructTime across both geometric (shapes) and hardware (memory) sweeps.
     """
     os.makedirs(folder, exist_ok=True)
     
     # Initialize DataFrames and inject Mode labels
-    df_spheres = pd.DataFrame(sphere_results) if sphere_results else pd.DataFrame()
+    df_shapes = pd.DataFrame(shapes_results) if shapes_results else pd.DataFrame()
     df_memory = pd.DataFrame(memory_results) if memory_results else pd.DataFrame()
-    
-    if not df_spheres.empty and 'Mode' not in df_spheres.columns:
-        df_spheres.insert(0, 'Mode', 'sphere_test')
+
+    # Check if both dataframes are empty, is so finish
+    if df_shapes.empty and df_memory.empty:
+        print("Both shapes results and memory results are empty. No plots generated.")
+        return
+
+    if not df_shapes.empty and 'Mode' not in df_shapes.columns:
+        df_shapes.insert(0, 'Mode', 'shape_test')
     if not df_memory.empty and 'Mode' not in df_memory.columns:
         df_memory.insert(0, 'Mode', 'memory_test')
 
@@ -149,7 +154,11 @@ def plot_tradeoff_results(sphere_results: list, memory_results: list, folder: st
     sns.set_theme(style="whitegrid")
 
     # Generate unified maps for colors, markers, and dash patterns
-    all_filters = list(dict.fromkeys(list(df_spheres['Config'].unique()) + list(df_memory['Config'].unique())))
+    shapes_configs = list(df_shapes['Config'].unique()) if not df_shapes.empty and 'Config' in df_shapes.columns else []
+    memory_configs = list(df_memory['Config'].unique()) if not df_memory.empty and 'Config' in df_memory.columns else []
+    all_filters = list(dict.fromkeys(shapes_configs + memory_configs))
+
+    # Plot filter colors, markers, and dash patterns
     color_map, marker_map, dash_map = get_plot_mappings(all_filters)
 
     # Helper function to place a single legend below individual 1x1 plots
@@ -174,24 +183,24 @@ def plot_tradeoff_results(sphere_results: list, memory_results: list, folder: st
         'alpha': 0.75
     }
 
-    # CHART 1: Evaluate how increasing sphere count impacts overall filtering accuracy
-    if not df_spheres.empty:
+    # CHART 1: Evaluate how increasing shape count impacts overall filtering accuracy
+    if not df_shapes.empty:
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
         (ax1, ax2), (ax3, ax4) = axes
         
         metrics = [
-            ('FPR', 'False Positive Rate (FPR)', ax1, 'FPR across Sphere Count'),
-            ('FNR', 'False Negative Rate (FNR)', ax2, 'FNR across Sphere Count'),
-            ('Precision', 'Precision', ax3, 'Precision across Sphere Count'),
-            ('F1-Score', 'F1-Score', ax4, 'F1-Score across Sphere Count')
+            ('FPR', 'False Positive Rate (FPR)', ax1, 'FPR across shape Count'),
+            ('FNR', 'False Negative Rate (FNR)', ax2, 'FNR across shape Count'),
+            ('Precision', 'Precision', ax3, 'Precision across shape Count'),
+            ('F1-Score', 'F1-Score', ax4, 'F1-Score across shape Count')
         ]
         
         for col, ylabel, ax, title in metrics:
             sns.lineplot(
-                data=df_spheres, x='NumSpheres', y=col, hue='Config', style='Config',
+                data=df_shapes, x='NumShapes', y=col, hue='Config', style='Config',
                 ax=ax, **plot_kwargs
             )
-            ax.set_xlabel('Number of Spheres', fontsize=12, fontweight='bold')
+            ax.set_xlabel('Number of Shapes', fontsize=12, fontweight='bold')
             ax.set_ylabel(ylabel, fontsize=12, fontweight='bold')
             ax.set_ylim(-0.05, 1.05)
             ax.set_title(title, fontsize=13)
@@ -201,10 +210,10 @@ def plot_tradeoff_results(sphere_results: list, memory_results: list, folder: st
         handles, labels = ax1.get_legend_handles_labels()
         fig.legend(handles, labels, loc='lower center', bbox_to_anchor=(0.5, 0.02), ncol=min(3, len(labels)), fontsize=12, frameon=True)
         
-        plt.suptitle('Filter Accuracy Metrics across Sphere Allocations', fontsize=16, y=0.96)
+        plt.suptitle('Filter Accuracy Metrics across Shape Allocations', fontsize=16, y=0.96)
         fig.subplots_adjust(bottom=0.12, top=0.92, hspace=0.3)
         
-        filename1 = "accuracy_vs_spheres_plot.png"
+        filename1 = "accuracy_vs_shapes_plot.png"
         plt.savefig(f"{folder}/{filename1}", bbox_inches='tight', dpi=300)
         plt.close()
         print(f"Saved {folder}/{filename1}")
@@ -244,19 +253,19 @@ def plot_tradeoff_results(sphere_results: list, memory_results: list, folder: st
         plt.close()
         print(f"Saved {folder}/{filename2}")
 
-    # CHART 3: Compare query performance scaling across different sphere densities
-    if not df_spheres.empty and 'QPS' in df_spheres.columns:
+    # CHART 3: Compare query performance scaling across different shape densities
+    if not df_shapes.empty and 'QPS' in df_shapes.columns:
         fig, ax = plt.subplots(figsize=(10, 6))
         sns.lineplot(
-            data=df_spheres, x='NumSpheres', y='QPS', hue='Config', style='Config',
+            data=df_shapes, x='NumShapes', y='QPS', hue='Config', style='Config',
             ax=ax, **plot_kwargs
         )
-        ax.set_xlabel('Number of Spheres', fontsize=12, fontweight='bold')
+        ax.set_xlabel('Number of Shapes', fontsize=12, fontweight='bold')
         ax.set_ylabel('Queries per Second (QPS)', fontsize=12, fontweight='bold')
-        ax.set_title('Query Throughput across Sphere Count', fontsize=13)
+        ax.set_title('Query Throughput across Shape Count', fontsize=13)
         _add_bottom_legend(ax)
         
-        filename3 = "qps_vs_spheres_plot.png"
+        filename3 = "qps_vs_shapes_plot.png"
         plt.savefig(f"{folder}/{filename3}", bbox_inches='tight', dpi=300)
         plt.close()
         print(f"Saved {folder}/{filename3}")
@@ -278,19 +287,19 @@ def plot_tradeoff_results(sphere_results: list, memory_results: list, folder: st
         plt.close()
         print(f"Saved {folder}/{filename4}")
         
-    # CHART 5: Benchmark filter construction time relative to sphere complexity
-    if not df_spheres.empty and 'ConstructTime' in df_spheres.columns:
+    # CHART 5: Benchmark filter construction time relative to shape complexity
+    if not df_shapes.empty and 'ConstructTime' in df_shapes.columns:
         fig, ax = plt.subplots(figsize=(10, 6))
         sns.lineplot(
-            data=df_spheres, x='NumSpheres', y='ConstructTime', hue='Config', style='Config',
+            data=df_shapes, x='NumShapes', y='ConstructTime', hue='Config', style='Config',
             ax=ax, **plot_kwargs
         )
-        ax.set_xlabel('Number of Spheres', fontsize=12, fontweight='bold')
+        ax.set_xlabel('Number of Shapes', fontsize=12, fontweight='bold')
         ax.set_ylabel('Construct Time (Seconds)', fontsize=12, fontweight='bold')
-        ax.set_title('Filter Build Time across Sphere Count', fontsize=13)
+        ax.set_title('Filter Build Time across Shape Count', fontsize=13)
         _add_bottom_legend(ax)
         
-        filename5 = "construct_time_vs_spheres_plot.png"
+        filename5 = "construct_time_vs_shapes_plot.png"
         plt.savefig(f"{folder}/{filename5}", bbox_inches='tight', dpi=300)
         plt.close()
         print(f"Saved {folder}/{filename5}")
@@ -313,8 +322,8 @@ def plot_tradeoff_results(sphere_results: list, memory_results: list, folder: st
         print(f"Saved {folder}/{filename6}")
 
     # Final Result: Combine and save all experimental metrics for documentation
-    if not df_spheres.empty and not df_memory.empty:
-        final_df = pd.concat([df_spheres, df_memory], ignore_index=True)
+    if not df_shapes.empty and not df_memory.empty:
+        final_df = pd.concat([df_shapes, df_memory], ignore_index=True)
         
         # Save to current folder
         filename7 = "tradeoff_evaluations.csv"

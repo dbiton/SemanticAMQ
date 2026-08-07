@@ -39,10 +39,10 @@ class GonzalezMEBFilter(Filter):
     _MAX_NEIGHBORS = 50
     _BATCH_SIZE = 2048
 
-    def __init__(self, dim: int, distance_threshold: float, max_memory: Optional[int] = None, max_spheres: Optional[int] = None):
+    def __init__(self, dim: int, distance_threshold: float, max_memory: Optional[int] = None, max_shapes: Optional[int] = None):
         super().__init__(dim, lsh=None, max_memory=max_memory)
         self.distance_threshold = distance_threshold
-        self.max_spheres = (max_spheres if max_spheres is not None 
+        self.max_spheres = (max_shapes if max_shapes is not None 
                     else self._calculate_max_spheres(self.max_memory))
         self._num_spheres = 0
         self._all_spheres = np.arange(self.max_spheres, dtype=np.int32)
@@ -187,7 +187,7 @@ class GonzalezMEBFilter(Filter):
             closest_neighbors = current_spheres[neighbors_indices]
             neighbors_center_dists = center_distances[neighbors_indices]
             neighbors_radiuses = current_radiuses[neighbors_indices]
-            merged_radius = (neighbors_radiuses + neighbors_center_dists + radius) / 2.0
+            merged_radius = np.maximum((neighbors_radiuses + neighbors_center_dists + radius) / 2.0, 1e-6)
 
             # log(R_merged^D - (R_1^D + R_2^D)) = D*log(R_merged) + log(1 - ((R_1/R_merged)^D + (R_2/R_merged)^D))
             merged_volumes = self.dim * np.log(merged_radius) + np.log(1.0 - ((radius / merged_radius) ** self.dim + (neighbors_radiuses / merged_radius) ** self.dim))

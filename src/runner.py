@@ -77,15 +77,15 @@ def _compute_metrics(
     }
 
 
-def _instantiate_filter(filter_cls: Any, dim: int, lsh_cls: Any, max_L: int, memory_budget: int, distance_threshold: float = None, max_spheres: int = None) -> Any:
-    if filter_cls.__name__ not in ["KDBallFilter", "KMEBFilter", "GonzalezMEBFilter"]:
+def _instantiate_filter(filter_cls: Any, dim: int, lsh_cls: Any, max_L: int, memory_budget: int, distance_threshold: float = None, max_shapes: int = None) -> Any:
+    if filter_cls.__name__ not in ["KDBallFilter", "GonzalezMEBFilter"]:
         lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
         try:
             return filter_cls(dim=dim, lsh=lsh, max_memory=memory_budget)
         except TypeError:
             return filter_cls(dim=dim, lsh=lsh)
     else:
-        return filter_cls(dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold, max_spheres=max_spheres)
+        return filter_cls(dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold, max_shapes=max_shapes)
 
 
 def static_worker(
@@ -151,7 +151,7 @@ def _compute_tradeoff_metrics(
     predicted: List[bool],
     actual: List[bool],
     config: str,
-    max_spheres: int,
+    max_shapes: int,
     memory_budget: int,
     memory_usage: int,
     construct_time: float,
@@ -171,7 +171,7 @@ def _compute_tradeoff_metrics(
 
     return {
         "Config": config,
-        "NumSpheres": max_spheres if max_spheres is not None else 0,
+        "NumShapes": max_shapes if max_shapes is not None else 0,
         "MemoryBudget": memory_budget,
         "MemoryUsage": memory_usage,
         "FPR": fp / (fp + tn) if (fp + tn) > 0 else 0.0,
@@ -193,7 +193,7 @@ def tradeoff_static_worker(
     vectors_construct: np.ndarray,
     vectors_query: np.ndarray,
     actual_results: List[bool],
-    max_spheres: int = None,
+    max_shapes: int = None,
     memory_budget: int = None
 ) -> Dict[str, Any]:
     """
@@ -206,7 +206,7 @@ def tradeoff_static_worker(
         vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
 
         construct_start = time.perf_counter() # start construct timer
-        filter_instance = _instantiate_filter(filter_cls, dim, lsh_cls, max_L, memory_budget, distance_threshold, max_spheres)
+        filter_instance = _instantiate_filter(filter_cls, dim, lsh_cls, max_L, memory_budget, distance_threshold, max_shapes)
         filter_instance.construct(vectors_construct)
         construct_latency = time.perf_counter() - construct_start # final construct time
 
@@ -224,7 +224,7 @@ def tradeoff_static_worker(
         print(f"  [Skipped] {config} failed: {e}")
         return None
 
-    return _compute_tradeoff_metrics(predicted, actual_results, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
+    return _compute_tradeoff_metrics(predicted, actual_results, config, max_shapes, memory_budget, memory_usage, construct_latency, qps)
 
 
 def tradeoff_dynamic_worker(
@@ -236,7 +236,7 @@ def tradeoff_dynamic_worker(
     vectors_construct: np.ndarray,
     vectors_query: np.ndarray,
     actual_results: List[bool],
-    max_spheres: int = None,
+    max_shapes: int = None,
     memory_budget: int = None
 ) -> Dict[str, Any]:
     """
@@ -249,7 +249,7 @@ def tradeoff_dynamic_worker(
         vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
 
         construct_start = time.perf_counter() # start construct timer
-        filter_instance = _instantiate_filter(filter_cls, dim, lsh_cls, max_L, memory_budget, distance_threshold, max_spheres)
+        filter_instance = _instantiate_filter(filter_cls, dim, lsh_cls, max_L, memory_budget, distance_threshold, max_shapes)
         filter_instance.construct(vectors_construct)
         construct_latency = time.perf_counter() - construct_start # final construct time
 
@@ -271,7 +271,7 @@ def tradeoff_dynamic_worker(
         print(f"  [Skipped] {config} failed: {e}")
         return None
 
-    return _compute_tradeoff_metrics(predicted, actual_results, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
+    return _compute_tradeoff_metrics(predicted, actual_results, config, max_shapes, memory_budget, memory_usage, construct_latency, qps)
 
 
 _WORKER_FNS: Dict[str, Any] = {
