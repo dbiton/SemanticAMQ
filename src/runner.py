@@ -763,28 +763,9 @@ def scaling_worker(
     actual_results: List[bool],
     single_query_limit: int = 2000,
 ) -> Dict[str, Any]:
-    """
-    Build one GonzalezMEBFilter cover at a FIXED max_spheres=k over an
-    indexed set of n = len(vectors_construct) vectors, per (dataset, n,
-    seed) -- n is the swept variable, k is held constant across the whole
-    sweep. This isolates representation size from construction cost: the
-    filter's stored buffer is exactly k spheres regardless of how many
-    points it was built from, so query-time memory and query latency are
-    expected to stay flat as n grows, while construction time -- and
-    possibly FPR, as the indexed geometry becomes more complex -- are
-    expected to grow with n. See evaluate_scaling()'s docstring for the
-    full experimental rationale.
-
-    Measures: construction wall time, single-query latency (timed the same
-    way query_performance_worker's "single" mode is -- one Python-level
-    query() call per vector, capped at single_query_limit since that mode
-    pays a per-call cost that batching amortizes away), query-time memory
-    (get_bytesize() after construction, since the filter's buffer is fixed
-    once built), and FPR against actual_results (ground truth computed by
-    the caller at tau_mid over this same n-sized construct set, since
-    "duplicate" is defined relative to the indexed set -- the caller who
-    varies n must also recompute actual_results per n).
-    """
+    """Build one GonzalezMEBFilter at fixed k over n = len(vectors_construct)
+    vectors; reports construction time, single-query latency, memory, and FPR
+    against actual_results (ground truth for this n, from the caller)."""
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
     n = len(construct_arr)
@@ -827,21 +808,9 @@ def stream_absorption_worker(
     checkpoints: List[int],
     merge_criterion: str = "log_space",
 ) -> List[Dict[str, Any]]:
-    """
-    Simulate pure online streaming insertion (no rebuilds) over vectors_stream,
-    one vector at a time via GonzalezMEBFilter.add(), and at each position in
-    checkpoints record the ABSORPTION RATE over the window since the previous
-    checkpoint: the fraction of arrivals in that window that already landed
-    inside an existing ball's raw radius (tau=0 -- genuine geometric coverage,
-    not the tau-inflated duplicate test) *before* being inserted.
-
-    This is the panel that argues the paper's central claim: if SAMQ's
-    representation size tracks the geometric complexity of the indexed set
-    rather than its cardinality n, absorption should plateau near 1 as the
-    stream grows -- most new arrivals are already covered by the existing k
-    spheres, so a longer stream stops requiring the cover to change. Returns
-    one row per checkpoint.
-    """
+    """Stream vectors_stream through GonzalezMEBFilter.add() one at a time; at
+    each checkpoint, report the fraction of arrivals since the last checkpoint
+    that already landed inside an existing ball (tau=0) before insertion."""
     stream_arr = _to_construct_array(vectors_stream)
     n = len(stream_arr)
 
@@ -893,32 +862,15 @@ def stream_rebuild_worker(
     merge_criterion: str = "log_space",
 ) -> List[Dict[str, Any]]:
     """
-    Simulate one rebuild policy over vectors_stream and, at each position in
-    checkpoints, measure FPR against a FIXED held-out negative set (assumed by
-    the caller to be true negatives against the *entire* eventual stream, so
-    they stay valid negatives at every partial checkpoint -- see
-    evaluate_streaming()) plus the amortized wall-clock cost per insertion
-    (including any full rebuilds) spent so far. Returns one row per
-    checkpoint.
+    Simulate one rebuild policy over vectors_stream; at each checkpoint,
+    report FPR against a fixed negative set plus the amortized wall-clock
+    cost per insertion (including rebuilds) spent so far.
 
-    Since J = sum r_i^d is monotone non-decreasing under the streaming
-    merge policy (Algorithm 2), "when do you rebuild" is a real question with
-    a real cost/quality trade-off; these three policies span it:
-
-      "streaming": pure online growth -- GonzalezMEBFilter.add() per arrival,
-        never rebuilt from scratch. Cheapest per insertion, but the greedy
-        pairwise-merge policy can drift from the k-ball cover an offline
-        construct() would have found for the vectors seen so far.
-      "periodic": like "streaming", except every T arrivals the cover is
-        replaced by a from-scratch construct() over every vector seen so far
-        (the full construction ladder), resetting any drift. T trades cost
-        for quality; "streaming" is the T -> infinity limit and "oracle" is
-        the T = 1 limit.
-      "oracle": at every checkpoint (only -- rebuilding at every arrival
-        would be prohibitively expensive and is never actually measured),
-        replace the cover with a from-scratch construct() over every vector
-        seen so far: the best achievable k-ball cover for that many points,
-        i.e. an upper bound on streaming quality at that position.
+      "streaming": GonzalezMEBFilter.add() per arrival, never rebuilt.
+      "periodic": like "streaming", but every T arrivals the cover is fully
+        reconstructed from scratch.
+      "oracle": reconstructed from scratch at every checkpoint -- the best
+        achievable cover for that many points.
     """
     stream_arr = _to_construct_array(vectors_stream)
     negative_arr = _to_construct_array(vectors_negative)
@@ -950,9 +902,6 @@ def stream_rebuild_worker(
     if policy not in ("streaming", "periodic"):
         raise ValueError(f"Unknown policy {policy!r}; expected 'streaming', 'periodic', or 'oracle'")
 
-    # "streaming" / "periodic": one persistent filter, grown incrementally,
-    # periodically replaced wholesale by a from-scratch construct() when the
-    # policy is "periodic" and a T-boundary is hit.
     rebuild_every = T if (policy == "periodic" and T is not None) else None
     filt = GonzalezMEBFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
                              merge_criterion=merge_criterion)

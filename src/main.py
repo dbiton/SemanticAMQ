@@ -11,12 +11,13 @@ from filters.pyfusefilter_filters import Fuse8Filter, Xor8Filter
 from filters.quotient_filter import QuotientFilterWrapper
 from lsh import FaissSimHashLSH, LSH, DummyLSH
 from runner import Runner
-from plots import plot_results, plot_throughput_results, plot_tradeoff_results, plot_hnsw_results, plot_equal_memory_results
-from plot_ablation import generate_ablation_figures
-from plot_query_performance import generate_query_performance_figures
-from plot_equal_memory import generate_equal_memory_figures
-from plot_scaling import generate_scaling_figures
-from plot_streaming import generate_streaming_figures
+from plots.legacy import plot_results, plot_throughput_results, plot_tradeoff_results, plot_hnsw_results, plot_equal_memory_results
+from plots.plot_ablation import generate_ablation_figures
+from plots.plot_query_performance import generate_query_performance_figures
+from plots.plot_equal_memory import generate_equal_memory_figures
+from plots.plot_scaling import generate_scaling_figures
+from plots.plot_streaming import generate_streaming_figures
+from plots.plot_common import DATASETS, DATASET_LABELS
 from typing import Tuple, List
 from filters.first_n_filter import FirstNFilter
 from filters.gonzales_filter import GonzalezMEBFilter
@@ -31,6 +32,11 @@ from vector_source import VectorSource, ArrayVectorSource
 
 MAX_WORKERS = 6
 DATASET = 'ELI5'
+
+# Registry name -> canonical dataset key, shared by every long-format
+# evaluation (ablation, query_performance, scaling, streaming). Derived from
+# plot_common so the dataset trio has one source of truth.
+DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
 
 dynamic_filters = [GonzalezMEBFilter, DSBFFilter, CoveringLSHFallbackFilter, LSBFFilter, DSHFilter]
 static_filters  = []
@@ -398,11 +404,6 @@ def hnsw_evaluation() -> list:
     return results
 
 
-# Registry name -> canonical dataset key used by the ablation figure (must
-# match plot_ablation.DATASETS exactly).
-_ABLATION_DATASET_KEYS = {"ELI5": "eli5", "MMLU": "mmlu", "WildChat": "wildchat"}
-
-
 def evaluate_ablation() -> pd.DataFrame:
     """
     Generate the per-stage construction-ladder data for GonzalezMEBFilter
@@ -422,14 +423,14 @@ def evaluate_ablation() -> pd.DataFrame:
     feedback_fraction     = 0.10
     output_csv            = "results/ablation.csv"
 
-    datasets = [d for d in _ABLATION_DATASET_KEYS if os.path.exists(dataset_filenames[d])]
-    missing = [d for d in _ABLATION_DATASET_KEYS if d not in datasets]
+    datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
+    missing = [d for d in DATASET_KEYS if d not in datasets]
     if missing:
         print(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
-    if set(datasets) != set(_ABLATION_DATASET_KEYS):
+    if set(datasets) != set(DATASET_KEYS):
         raise RuntimeError(
             "evaluate_ablation needs all 3 datasets "
-            f"({', '.join(_ABLATION_DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
+            f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
         )
 
     # k >= a dataset's construct-set size makes GonzalezMEBFilter fall back to
@@ -478,7 +479,7 @@ def evaluate_ablation() -> pd.DataFrame:
             for seed in seeds:
                 runner.submit(
                     'ablation',
-                    dim=dim, dataset=_ABLATION_DATASET_KEYS[dataset],
+                    dim=dim, dataset=DATASET_KEYS[dataset],
                     k=k, tau_values=tau_values, seed=seed, construct_tau=construct_tau,
                     vectors_construct=construct_source, vectors_query=query_source,
                     actual_results_by_tau=actual_results_by_tau, feedback_fraction=feedback_fraction,
@@ -517,14 +518,14 @@ def evaluate_query_performance() -> pd.DataFrame:
     single_query_limit    = 2000
     output_csv            = "results/query_performance.csv"
 
-    datasets = [d for d in _ABLATION_DATASET_KEYS if os.path.exists(dataset_filenames[d])]
-    missing = [d for d in _ABLATION_DATASET_KEYS if d not in datasets]
+    datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
+    missing = [d for d in DATASET_KEYS if d not in datasets]
     if missing:
         print(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
-    if set(datasets) != set(_ABLATION_DATASET_KEYS):
+    if set(datasets) != set(DATASET_KEYS):
         raise RuntimeError(
             "evaluate_query_performance needs all 3 datasets "
-            f"({', '.join(_ABLATION_DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
+            f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
         )
 
     # k >= a dataset's construct-set size makes GonzalezMEBFilter fall back to
@@ -561,7 +562,7 @@ def evaluate_query_performance() -> pd.DataFrame:
             for seed in seeds:
                 runner.submit(
                     'query_performance',
-                    dim=dim, dataset=_ABLATION_DATASET_KEYS[dataset],
+                    dim=dim, dataset=DATASET_KEYS[dataset],
                     k=k, seed=seed, construct_tau=query_tau, query_tau=query_tau,
                     vectors_construct=construct_source, vectors_query=query_source,
                     single_query_limit=single_query_limit,
@@ -580,30 +581,11 @@ def evaluate_query_performance() -> pd.DataFrame:
     return df
 
 
-# Registry name -> canonical dataset key used by the scaling figure (must
-# match plot_scaling.DATASETS exactly).
-_SCALING_DATASET_KEYS = {"ELI5": "eli5", "MMLU": "mmlu", "WildChat": "wildchat"}
-
-
 def evaluate_scaling() -> pd.DataFrame:
     """
-    Isolate SAMQ's representation size from its construction cost: fix the
-    filter size k and increase the number of indexed embeddings n, on the 3
-    datasets the scaling figure needs (eli5, mmlu, wildchat). Since a
-    GonzalezMEBFilter's stored buffer is exactly k spheres regardless of how
-    many points it was built from, query-time memory and query latency are
-    expected to stay flat as n grows; construction time -- and possibly FPR,
-    as the indexed geometry becomes more complex -- are expected to grow
-    with n. This supports the claim that SAMQ's representation size is
-    independent of n, without claiming its accuracy is independent of the
-    geometry introduced by additional points.
-
-    A fixed, disjoint query holdout is reused across every n (ground truth
-    is recomputed per n, since "duplicate" is defined relative to the
-    current indexed set). Mirrors evaluate_ablation()/
-    evaluate_query_performance()'s structure otherwise: one job per
-    (dataset, n, seed), flattened into a long-format DataFrame, written to
-    results/scaling.csv, then rendered via plot_scaling.generate_scaling_figures.
+    Fix filter size k and sweep indexed-set size n: memory and query latency
+    should stay flat, construction time and FPR may grow with n. One job per
+    (dataset, n, seed); a fixed query holdout is reused across every n.
     """
     num_vectors_pool = 100_000
     dim              = 384
@@ -615,19 +597,17 @@ def evaluate_scaling() -> pd.DataFrame:
     single_query_limit = 2000
     output_csv       = "results/scaling.csv"
 
-    datasets = [d for d in _SCALING_DATASET_KEYS if os.path.exists(dataset_filenames[d])]
-    missing = [d for d in _SCALING_DATASET_KEYS if d not in datasets]
+    datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
+    missing = [d for d in DATASET_KEYS if d not in datasets]
     if missing:
         print(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
-    if set(datasets) != set(_SCALING_DATASET_KEYS):
+    if set(datasets) != set(DATASET_KEYS):
         raise RuntimeError(
             "evaluate_scaling needs all 3 datasets "
-            f"({', '.join(_SCALING_DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
+            f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
         )
 
-    # n must leave room for the fixed query holdout, and k is fixed across
-    # the whole sweep so it must stay below every n (else GonzalezMEBFilter
-    # falls back to one zero-radius ball per point at the smallest n).
+    # n must leave room for the query holdout, and k must stay below every n.
     pool_sizes = {d: len(load_embeds(d, num_vectors_pool)[0]) for d in datasets}
     max_usable_n = min(pool_sizes.values()) - query_holdout
     usable_n_values = [n for n in n_values if n <= max_usable_n]
@@ -670,7 +650,7 @@ def evaluate_scaling() -> pd.DataFrame:
             for seed in seeds:
                 runner.submit(
                     'scaling',
-                    dim=dim, dataset=_SCALING_DATASET_KEYS[dataset],
+                    dim=dim, dataset=DATASET_KEYS[dataset],
                     k=k_fixed, seed=seed, tau_mid=tau_mid,
                     vectors_construct=construct_source_n, vectors_query=query_source,
                     actual_results=actual_results_n, single_query_limit=single_query_limit,
@@ -689,29 +669,15 @@ def evaluate_scaling() -> pd.DataFrame:
     return df
 
 
-# Registry name -> canonical dataset key used by the streaming figure (must
-# match plot_streaming.DATASETS exactly; shares the trio evaluate_scaling() uses).
-_STREAMING_DATASET_KEYS = {"ELI5": "eli5", "MMLU": "mmlu", "WildChat": "wildchat"}
-# Panels (b)/(c)/(d) collapse to one representative dataset to keep the
-# rebuild-policy and merge-criterion sweeps (each of which pays for several
-# full from-scratch construct() calls) tractable.
+# Panels (b)/(c)/(d) collapse to one representative dataset.
 _STREAMING_REPRESENTATIVE_DATASET = "ELI5"
 
 
 def _build_streaming_negative_set(
     dataset: str, stream_vectors: np.ndarray, candidate_pool: np.ndarray, tau_mid: float, n_negative: int,
 ) -> np.ndarray:
-    """
-    A "fixed held-out negative set" only stays valid at every checkpoint if
-    it's a true negative against the *entire* eventual stream, not just
-    whatever prefix has arrived so far -- otherwise a query that's actually a
-    duplicate of a not-yet-arrived stream point would look like a false
-    positive the moment that point arrives, even though the filter is
-    correct. compute_static_actual_results(stream_vectors, candidate_pool, ...)
-    against the FULL stream is therefore the strictest (and only sufficient)
-    check: not-a-duplicate-of-the-full-stream implies not-a-duplicate-of-any-
-    prefix-of-the-stream.
-    """
+    """A negative that's true against the FULL stream stays true against any
+    prefix of it, so this stays valid at every streaming checkpoint."""
     is_duplicate = compute_static_actual_results(stream_vectors, candidate_pool, tau_mid)
     negatives = candidate_pool[~np.asarray(is_duplicate, dtype=bool)]
     if len(negatives) < n_negative:
@@ -724,57 +690,39 @@ def _build_streaming_negative_set(
 
 def evaluate_streaming() -> None:
     """
-    Streaming evaluation: does SAMQ's representation size track the
-    geometric complexity of the indexed set rather than its cardinality n,
-    and what does the streaming (online, never-rebuilt) merge policy cost in
-    quality relative to periodically or always rebuilding from scratch?
-    Produces the data for 4 figures, each written to its own results CSV and
-    rendered via plot_streaming.generate_streaming_figures:
-
-      (a) Absorption rate vs. stream position, 3 datasets (stream_absorption_worker):
-          the fraction of arrivals that already land inside an existing ball
-          BEFORE insertion. If this plateaus near 1, the "representation size
-          is independent of n" claim stops being asymptotic and becomes
-          empirical.
-      (b)+(d) FPR / amortized cost vs. stream position and rebuild policy, one
-          representative dataset (stream_rebuild_worker): "streaming" (never
-          rebuilt) vs. "periodic" (rebuilt every T arrivals, swept over
-          several T to also produce panel (d)'s cost/quality Pareto frontier)
-          vs. "oracle" (rebuilt from scratch at every checkpoint -- the best
-          achievable cover for that many points).
-      (c) Final FPR vs. k, one line per merge criterion, one representative
-          dataset (stream_merge_criterion_worker): compares the 4 pairwise-
-          merge cost functions GonzalezMEBFilter.MERGE_CRITERIA supports.
-
-    A single, fixed, cross-checkpoint-valid negative set (see
-    _build_streaming_negative_set) is reused by panels (b)/(c)/(d).
+    Fix filter size k and stream vectors in one at a time. Produces:
+      (a) absorption rate vs. stream position, 3 datasets;
+      (b) FPR vs. stream position, one line per rebuild policy;
+      (c) final FPR vs. k, one line per merge criterion;
+      (d) rebuild-policy cost/quality Pareto.
+    Panels (b)-(d) use one representative dataset and a fixed negative set
+    (see _build_streaming_negative_set) so the sweeps stay tractable.
     """
-    num_vectors_pool = 10_000
     dim              = 384
-    n_stream         = 8_000
-    n_negative       = 500
+    n_stream         = 100
+    n_negative       = 100
+    # Derived from n_stream/n_negative so a smaller test stream can't starve
+    # the candidate pool the way an independent constant did.
+    num_vectors_pool = n_stream + 20 * n_negative
     k_fixed          = 128
     k_values         = [16, 32, 64, 128, 256, 512]
-    tau_mid          = 0.35
+    duplicate_percentage = 2.0  # calibrates tau_mid; see calculate_nn_distance_threshold
     seeds            = [0, 1, 2]
     merge_criteria   = GonzalezMEBFilter.MERGE_CRITERIA
-    # T -> n_stream/40 .. n_stream/2: dense enough near "oracle" (small T) to
-    # resolve the Pareto frontier's knee, sparse enough near "streaming"
-    # (large T) that it stays cheap.
     T_values = sorted(set(max(1, n_stream // d) for d in (40, 20, 10, 5, 2)))
     T_representative = T_values[len(T_values) // 2]
     checkpoints = sorted(set(
         int(round(x)) for x in np.logspace(np.log10(50), np.log10(n_stream), num=10)
     ))
 
-    datasets = [d for d in _STREAMING_DATASET_KEYS if os.path.exists(dataset_filenames[d])]
-    missing = [d for d in _STREAMING_DATASET_KEYS if d not in datasets]
+    datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
+    missing = [d for d in DATASET_KEYS if d not in datasets]
     if missing:
         print(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
-    if set(datasets) != set(_STREAMING_DATASET_KEYS):
+    if set(datasets) != set(DATASET_KEYS):
         raise RuntimeError(
             "evaluate_streaming needs all 3 datasets "
-            f"({', '.join(_STREAMING_DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
+            f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
         )
     if _STREAMING_REPRESENTATIVE_DATASET not in datasets:
         raise RuntimeError(
@@ -782,58 +730,58 @@ def evaluate_streaming() -> None:
             "is not on disk."
         )
 
+    rep_dataset = _STREAMING_REPRESENTATIVE_DATASET
+    rep_key = DATASET_KEYS[rep_dataset]
+    rep_vectors = load_embeds(rep_dataset, num_vectors_pool)[0]
+    n_stream_eff = min(n_stream, len(rep_vectors))
+    stream_vectors = rep_vectors[:n_stream_eff]
+    stream_source = VectorSource(rep_dataset, 0, n_stream_eff)
+
+    print(f"{rep_dataset}: calibrating tau_mid against the stream...")
+    tau_mid = calculate_nn_distance_threshold(stream_vectors, duplicate_percentage)
+    print(f"tau_mid={tau_mid:.4f}")
+
     runner_a = Runner(num_workers=MAX_WORKERS)
     for dataset in datasets:
-        vectors = load_embeds(dataset, num_vectors_pool)[0]
-        stream_source = VectorSource(dataset, 0, min(n_stream, len(vectors)))
+        if dataset == rep_dataset:
+            ds_stream_source = stream_source
+        else:
+            ds_vectors = load_embeds(dataset, num_vectors_pool)[0]
+            ds_stream_source = VectorSource(dataset, 0, min(n_stream, len(ds_vectors)))
         for seed in seeds:
             runner_a.submit(
                 'stream_absorption',
-                dim=dim, dataset=_STREAMING_DATASET_KEYS[dataset], k=k_fixed, seed=seed, tau_mid=tau_mid,
-                vectors_stream=stream_source, checkpoints=checkpoints,
+                dim=dim, dataset=DATASET_KEYS[dataset], k=k_fixed, seed=seed, tau_mid=tau_mid,
+                vectors_stream=ds_stream_source, checkpoints=checkpoints,
             )
     absorption_rows = runner_a.run()
     print("Streaming absorption evaluation completed.")
     df_absorption = pd.DataFrame([row for job_rows in absorption_rows for row in job_rows])
-    os.makedirs("results", exist_ok=True)
-    df_absorption.to_csv("results/streaming_absorption.csv", index=False)
-    print("Wrote results/streaming_absorption.csv")
+    df_absorption["metric"] = "absorption"
 
-    # Panels (b)/(c)/(d): representative dataset only (see module docstring).
-    rep_dataset = _STREAMING_REPRESENTATIVE_DATASET
-    rep_key = _STREAMING_DATASET_KEYS[rep_dataset]
-    vectors = load_embeds(rep_dataset, num_vectors_pool)[0]
-    n_stream_eff = min(n_stream, len(vectors))
-    stream_vectors = vectors[:n_stream_eff]
-    stream_source = VectorSource(rep_dataset, 0, n_stream_eff)
-
-    candidate_pool = vectors[n_stream_eff:n_stream_eff + 20 * n_negative]
+    n_candidates_available = len(rep_vectors) - n_stream_eff
+    if n_candidates_available < n_negative:
+        raise RuntimeError(
+            f"{rep_dataset}: only {n_candidates_available} vectors left after the "
+            f"{n_stream_eff}-vector stream (need at least {n_negative} to build the negative "
+            f"set); raise num_vectors_pool or lower n_stream/n_negative."
+        )
+    candidate_pool = rep_vectors[n_stream_eff:n_stream_eff + min(20 * n_negative, n_candidates_available)]
     print(f"{rep_dataset}: building fixed streaming negative set...")
     negative_vectors = _build_streaming_negative_set(rep_dataset, stream_vectors, candidate_pool, tau_mid, n_negative)
 
     runner_b = Runner(num_workers=MAX_WORKERS)
     for seed in seeds:
-        runner_b.submit(
-            'stream_rebuild',
-            dim=dim, dataset=rep_key, k=k_fixed, seed=seed, tau_mid=tau_mid, policy='streaming',
-            vectors_stream=stream_source, vectors_negative=negative_vectors, checkpoints=checkpoints,
-        )
-        runner_b.submit(
-            'stream_rebuild',
-            dim=dim, dataset=rep_key, k=k_fixed, seed=seed, tau_mid=tau_mid, policy='oracle',
-            vectors_stream=stream_source, vectors_negative=negative_vectors, checkpoints=checkpoints,
-        )
-        for T in T_values:
+        for policy, T in [("streaming", None), ("oracle", None)] + [("periodic", t) for t in T_values]:
             runner_b.submit(
                 'stream_rebuild',
-                dim=dim, dataset=rep_key, k=k_fixed, seed=seed, tau_mid=tau_mid, policy='periodic', T=T,
+                dim=dim, dataset=rep_key, k=k_fixed, seed=seed, tau_mid=tau_mid, policy=policy, T=T,
                 vectors_stream=stream_source, vectors_negative=negative_vectors, checkpoints=checkpoints,
             )
     rebuild_rows = runner_b.run()
     print("Streaming rebuild-policy evaluation completed.")
     df_rebuild = pd.DataFrame([row for job_rows in rebuild_rows for row in job_rows])
-    df_rebuild.to_csv("results/streaming_rebuild.csv", index=False)
-    print("Wrote results/streaming_rebuild.csv")
+    df_rebuild["metric"] = "rebuild"
 
     runner_c = Runner(num_workers=MAX_WORKERS)
     for k in k_values:
@@ -847,13 +795,15 @@ def evaluate_streaming() -> None:
     merge_criterion_rows = runner_c.run()
     print("Streaming merge-criterion evaluation completed.")
     df_merge_criteria = pd.DataFrame(merge_criterion_rows)
-    df_merge_criteria.to_csv("results/streaming_merge_criteria.csv", index=False)
-    print("Wrote results/streaming_merge_criteria.csv")
+    df_merge_criteria["metric"] = "merge_criterion"
 
-    generate_streaming_figures(
-        df_absorption=df_absorption, df_rebuild=df_rebuild, df_merge_criteria=df_merge_criteria,
-        k_fixed=k_fixed, T_representative=T_representative,
-    )
+    output_csv = "results/streaming.csv"
+    df = pd.concat([df_absorption, df_rebuild, df_merge_criteria], ignore_index=True)
+    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+    df.to_csv(output_csv, index=False)
+    print(f"Wrote {output_csv}")
+
+    generate_streaming_figures(df, k_fixed=k_fixed, T_representative=T_representative)
 
 
 def dynamic_evaluation() -> list:

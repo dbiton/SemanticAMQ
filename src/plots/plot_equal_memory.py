@@ -23,7 +23,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 
-from plot_ablation import apply_style
+from plots.plot_ablation import apply_style
 
 # --------------------------------------------------------------------------- #
 # CONFIG

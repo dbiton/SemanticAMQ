@@ -259,28 +259,11 @@ class GonzalezMEBFilter(Filter):
                              cj: np.ndarray, rj: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Vectorized (bucket, key, merged_radius) for merging ball(s) (ci, ri) with
-        ball(s) (cj, rj); shapes broadcast normally, last axis of ci/cj is the
-        coordinate axis. bucket 0 = strictly beneficial merge (cost < 0), sorted by
-        key ascending = most beneficial first; bucket 1 = neutral/harmful merge
-        (cost >= 0), sorted by key ascending = least harmful first.
-
-        The cost function itself is pluggable via self.merge_criterion (see
-        MERGE_CRITERIA and the per-criterion helpers below) -- geometry (r_merged)
-        is identical across criteria, only what "cheapest merge" means differs:
-
-          log_space (default): safe log-domain Delta of the true covering
-            objective J = sum r_i^d, robust at d ~ hundreds where r^d itself
-            over/underflows float64.
-          r_pow_d: the same J = sum r_i^d objective but computed by literally
-            materializing r^d -- included as a baseline to show *why*
-            log_space exists. At d = 384, any radius past ~1.9 already
-            overflows float64, so once balls reach realistic sizes this
-            criterion degrades to comparing mostly-inf costs, i.e. merge
-            choices become close to arbitrary.
-          sum_radii: linear objective J = sum r_i (ignores dimensionality
-            entirely).
-          min_radius_increase: greedy local heuristic, cost = growth of the
-            merged radius beyond the larger of the two constituent balls.
+        ball(s) (cj, rj). bucket 0 = beneficial merge (cost < 0), key ascending
+        = most beneficial first; bucket 1 = neutral/harmful, key ascending =
+        least harmful first. Cost function is pluggable via self.merge_criterion
+        (see MERGE_CRITERIA and the _merge_cost_* helpers below); geometry
+        (r_merged) is identical across criteria.
         """
         diff = ci - cj
         delta = np.sqrt(np.maximum(np.sum(diff * diff, axis=-1), 0.0))
@@ -309,14 +292,9 @@ class GonzalezMEBFilter(Filter):
         M = np.maximum(np.maximum(ri, rj), r_merged)
 
         def a_of(r):
-            # When r <= 0 (e.g. a freshly-inserted zero-radius singleton), the
-            # ratio is discarded by the outer np.where below -- but numpy still
-            # eagerly evaluates exp() for that branch, so the dummy substitute
-            # for r must not itself blow up the log-ratio. Substituting 1.0
-            # did: 1.0 is routinely >> M (radii are usually << 1 for
-            # normalized embeddings), making log(1.0) - log(M) large and
-            # positive, and exp(dim * that) overflow. Substituting M instead
-            # makes the discarded branch compute exp(0) = 1, always safe.
+            # r<=0 (zero-radius ball) substitutes M for r, not 1.0: numpy still
+            # eagerly evaluates the discarded branch, and 1.0 >> M would overflow
+            # exp(); M makes it exp(0) = 1 instead, always safe.
             with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
                 safe_M = np.where(M > 0, M, 1.0)
                 safe_r = np.where(r > 0, r, safe_M)

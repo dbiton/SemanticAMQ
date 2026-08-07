@@ -21,6 +21,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 
+from plots.plot_common import DATASETS, DATASET_LABELS, DATASET_COLORS, DATASET_HATCHES, apply_style as _apply_style, save_figure, save_dataset_legend
+
 # --------------------------------------------------------------------------- #
 # CONFIG
 # --------------------------------------------------------------------------- #
@@ -32,15 +34,6 @@ TAU: Optional[float] = None  # None => median tau present in the data
 DPI = 400
 EMIT_PDF = False
 DEMO = False
-
-# --------------------------------------------------------------------------- #
-# Fixed dataset styling -- must match every other figure in the paper.
-# --------------------------------------------------------------------------- #
-
-DATASETS = ['eli5', 'mmlu', 'wildchat']
-DATASET_LABELS = {"eli5": "ELI5", "mmlu": "MMLU", "wildchat": "WildChat"}
-DATASET_COLORS = {"eli5": "#0072B2", "mmlu": "#E69F00", "wildchat": "#009E73"}
-DATASET_HATCHES = {"eli5": "", "mmlu": "//", "wildchat": ".."}
 
 STAGES = ["initial", "ball", "boundary", "tighten", "feedback"]
 STAGE_LABELS = {
@@ -70,32 +63,7 @@ class Config:
 # --------------------------------------------------------------------------- #
 
 def apply_style() -> None:
-    plt.rcParams.update(
-        {
-            "figure.figsize": (1.70, 1.50),
-            "figure.dpi": DPI,
-            "savefig.dpi": DPI,
-            "font.family": "serif",
-            "font.serif": ["Linux Libertine O", "Libertine", "DejaVu Serif"],
-            "mathtext.fontset": "stix",
-            "axes.labelsize": 7,
-            "xtick.labelsize": 6,
-            "ytick.labelsize": 6,
-            "axes.titlesize": 7,
-            "axes.spines.top": False,
-            "axes.spines.right": False,
-            "axes.linewidth": 0.5,
-            "xtick.direction": "out",
-            "ytick.direction": "out",
-            "xtick.major.size": 2,
-            "ytick.major.size": 2,
-            "xtick.major.width": 0.5,
-            "ytick.major.width": 0.5,
-            "xtick.minor.size": 0,
-            "ytick.minor.size": 0,
-            "legend.frameon": False,
-        }
-    )
+    _apply_style(DPI)
 
 
 def _style_axes(ax: plt.Axes) -> None:
@@ -616,40 +584,7 @@ def panel_construction_time(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 
 def save_legend(cfg: Config) -> None:
-    apply_style()
-    fig, ax = plt.subplots(figsize=(4.2, 0.25))
-    ax.axis("off")
-
-    handles = [
-        plt.Rectangle(
-            (0, 0),
-            1,
-            1,
-            facecolor=DATASET_COLORS[d],
-            hatch=DATASET_HATCHES[d],
-            edgecolor="black",
-            linewidth=0.4,
-        )
-        for d in DATASETS
-    ]
-    labels = [DATASET_LABELS[d] for d in DATASETS]
-
-    fig.legend(
-        handles,
-        labels,
-        loc="center",
-        ncol=3,
-        frameon=False,
-        fontsize=7,
-    )
-    fig.patch.set_alpha(0.0)
-
-    path = os.path.join(cfg.outdir, "ablation-legend.png")
-    fig.savefig(path, dpi=cfg.dpi, bbox_inches="tight", pad_inches=0.01, transparent=True)
-    if cfg.emit_pdf:
-        fig.savefig(path.replace(".png", ".pdf"), bbox_inches="tight", pad_inches=0.01, transparent=True)
-    plt.close(fig)
-    print(f"Wrote {path}")
+    save_dataset_legend(cfg.outdir, cfg.dpi, cfg.emit_pdf, filename="ablation-legend.png")
 
 
 # --------------------------------------------------------------------------- #
@@ -657,13 +592,7 @@ def save_legend(cfg: Config) -> None:
 # --------------------------------------------------------------------------- #
 
 def _save(fig: plt.Figure, filename: str, cfg: Config) -> None:
-    os.makedirs(cfg.outdir, exist_ok=True)
-    path = os.path.join(cfg.outdir, filename)
-    fig.savefig(path, bbox_inches="tight", pad_inches=0.01, dpi=cfg.dpi)
-    if cfg.emit_pdf:
-        fig.savefig(path.replace(".png", ".pdf"), bbox_inches="tight", pad_inches=0.01)
-    plt.close(fig)
-    print(f"Wrote {path}")
+    save_figure(fig, filename, cfg.outdir, cfg.dpi, cfg.emit_pdf)
 
 
 # --------------------------------------------------------------------------- #
