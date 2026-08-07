@@ -80,14 +80,19 @@ class GonzalezMEBFilter(Filter):
     _FEEDBACK_MAX_CANDIDATE_BALLS = 50
     _FEEDBACK_MAX_MERGE_CANDIDATES = 20
     _LEVEL_NAMES = {1: "initial_cover", 2: "ball_refine", 3: "boundary_refine", 4: "radius_tighten"}
+    MERGE_CRITERIA = ("log_space", "r_pow_d", "sum_radii", "min_radius_increase")
 
     def __init__(self, dim: int, distance_threshold: float, max_memory: Optional[int] = None,
-                 max_spheres: Optional[int] = None, seed: int = _DEFAULT_SEED):
+                 max_spheres: Optional[int] = None, seed: int = _DEFAULT_SEED,
+                 merge_criterion: str = "log_space"):
         super().__init__(dim, lsh=None, max_memory=max_memory)
         self.distance_threshold = distance_threshold
         self.max_spheres = (max_spheres if max_spheres is not None
                             else self._calculate_max_spheres(self.max_memory))
         self._seed = seed
+        if merge_criterion not in self.MERGE_CRITERIA:
+            raise ValueError(f"Unknown merge_criterion {merge_criterion!r}; expected one of {self.MERGE_CRITERIA}")
+        self.merge_criterion = merge_criterion
         self._constructed = False
         self._complexity_level = self._DEFAULT_COMPLEXITY
 
@@ -255,11 +260,27 @@ class GonzalezMEBFilter(Filter):
         """
         Vectorized (bucket, key, merged_radius) for merging ball(s) (ci, ri) with
         ball(s) (cj, rj); shapes broadcast normally, last axis of ci/cj is the
-        coordinate axis. bucket 0 = strictly beneficial merge (Delta < 0), sorted by
+        coordinate axis. bucket 0 = strictly beneficial merge (cost < 0), sorted by
         key ascending = most beneficial first; bucket 1 = neutral/harmful merge
-        (Delta >= 0), sorted by key ascending = least harmful first. Never
-        materializes r^d: Delta = M^d * (a_ij - a_i - a_j) with M = max(r_i, r_j,
-        r_ij) and a_x = exp(d * log(r_x / M)) (safe underflow to 0).
+        (cost >= 0), sorted by key ascending = least harmful first.
+
+        The cost function itself is pluggable via self.merge_criterion (see
+        MERGE_CRITERIA and the per-criterion helpers below) -- geometry (r_merged)
+        is identical across criteria, only what "cheapest merge" means differs:
+
+          log_space (default): safe log-domain Delta of the true covering
+            objective J = sum r_i^d, robust at d ~ hundreds where r^d itself
+            over/underflows float64.
+          r_pow_d: the same J = sum r_i^d objective but computed by literally
+            materializing r^d -- included as a baseline to show *why*
+            log_space exists. At d = 384, any radius past ~1.9 already
+            overflows float64, so once balls reach realistic sizes this
+            criterion degrades to comparing mostly-inf costs, i.e. merge
+            choices become close to arbitrary.
+          sum_radii: linear objective J = sum r_i (ignores dimensionality
+            entirely).
+          min_radius_increase: greedy local heuristic, cost = growth of the
+            merged radius beyond the larger of the two constituent balls.
         """
         diff = ci - cj
         delta = np.sqrt(np.maximum(np.sum(diff * diff, axis=-1), 0.0))
@@ -267,12 +288,39 @@ class GonzalezMEBFilter(Filter):
         contain_i_in_j = delta + ri <= rj
         r_general = (delta + ri + rj) / 2.0
         r_merged = np.where(contain_i_in_j, rj, np.where(contain_j_in_i, ri, r_general))
+
+        if self.merge_criterion == "log_space":
+            bucket, key = self._merge_cost_log_space(ri, rj, r_merged)
+        elif self.merge_criterion == "r_pow_d":
+            bucket, key = self._merge_cost_r_pow_d(ri, rj, r_merged)
+        elif self.merge_criterion == "sum_radii":
+            bucket, key = self._merge_cost_sum_radii(ri, rj, r_merged)
+        elif self.merge_criterion == "min_radius_increase":
+            bucket, key = self._merge_cost_min_radius_increase(ri, rj, r_merged)
+        else:
+            raise ValueError(f"Unknown merge_criterion {self.merge_criterion!r}")
+
+        return bucket, key, r_merged
+
+    def _merge_cost_log_space(self, ri: np.ndarray, rj: np.ndarray,
+                              r_merged: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Delta = M^d * (a_ij - a_i - a_j) with M = max(r_i, r_j, r_ij) and
+        a_x = exp(d * log(r_x / M)) (safe underflow to 0); never materializes r^d."""
         M = np.maximum(np.maximum(ri, rj), r_merged)
 
         def a_of(r):
-            with np.errstate(divide='ignore', invalid='ignore'):
-                ratio = np.where((r > 0) & (M > 0), np.exp(self.dim * (np.log(np.where(r > 0, r, 1.0))
-                                                                        - np.log(np.where(M > 0, M, 1.0)))), 0.0)
+            # When r <= 0 (e.g. a freshly-inserted zero-radius singleton), the
+            # ratio is discarded by the outer np.where below -- but numpy still
+            # eagerly evaluates exp() for that branch, so the dummy substitute
+            # for r must not itself blow up the log-ratio. Substituting 1.0
+            # did: 1.0 is routinely >> M (radii are usually << 1 for
+            # normalized embeddings), making log(1.0) - log(M) large and
+            # positive, and exp(dim * that) overflow. Substituting M instead
+            # makes the discarded branch compute exp(0) = 1, always safe.
+            with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                safe_M = np.where(M > 0, M, 1.0)
+                safe_r = np.where(r > 0, r, safe_M)
+                ratio = np.where((r > 0) & (M > 0), np.exp(self.dim * (np.log(safe_r) - np.log(safe_M))), 0.0)
             return ratio
 
         a_i, a_j, a_ij = a_of(ri), a_of(rj), a_of(r_merged)
@@ -283,7 +331,39 @@ class GonzalezMEBFilter(Filter):
         log_abs = np.where(diff_a != 0, log_abs, -np.inf)
         bucket = np.where(sign < 0, 0, 1).astype(np.int8)
         key = np.where(sign < 0, -log_abs, log_abs)
-        return bucket, key, r_merged
+        return bucket, key
+
+    def _merge_cost_r_pow_d(self, ri: np.ndarray, rj: np.ndarray,
+                            r_merged: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Delta = r_merged^d - r_i^d - r_j^d, computed directly (no log-domain
+        protection) -- overflows to +-inf well within realistic radii at d ~ 384,
+        intentionally, as a naive baseline."""
+        with np.errstate(over='ignore', invalid='ignore'):
+            delta = r_merged ** self.dim - ri ** self.dim - rj ** self.dim
+        delta = np.where(np.isnan(delta), np.inf, delta)
+        sign = np.sign(delta)
+        bucket = np.where(sign < 0, 0, 1).astype(np.int8)
+        key = np.where(sign < 0, -delta, delta)
+        return bucket, key
+
+    def _merge_cost_sum_radii(self, ri: np.ndarray, rj: np.ndarray,
+                              r_merged: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Delta = r_merged - r_i - r_j under the linear objective J = sum r_i."""
+        delta = r_merged - ri - rj
+        sign = np.sign(delta)
+        bucket = np.where(sign < 0, 0, 1).astype(np.int8)
+        key = np.where(sign < 0, -delta, delta)
+        return bucket, key
+
+    def _merge_cost_min_radius_increase(self, ri: np.ndarray, rj: np.ndarray,
+                                        r_merged: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Cost = growth of the merged radius past the larger constituent ball;
+        always >= 0 by construction of r_merged, so bucket is always 1 (never
+        "strictly beneficial") -- smallest growth first."""
+        delta = r_merged - np.maximum(ri, rj)
+        bucket = np.ones_like(delta, dtype=np.int8)
+        key = delta
+        return bucket, key
 
     def _all_pairs_merge_keys(self, centers: np.ndarray, radii: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         c64 = centers.astype(np.float64)

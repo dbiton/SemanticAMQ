@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Any, Dict, Iterator, List, Union
+from typing import Any, Dict, Iterator, List, Optional, Union
 
 import faiss
 import numpy as np
@@ -752,6 +752,272 @@ def query_performance_worker(
     return rows
 
 
+def scaling_worker(
+    dim: int,
+    dataset: str,
+    k: int,
+    seed: int,
+    tau_mid: float,
+    vectors_construct: VectorInput,
+    vectors_query: VectorInput,
+    actual_results: List[bool],
+    single_query_limit: int = 2000,
+) -> Dict[str, Any]:
+    """
+    Build one GonzalezMEBFilter cover at a FIXED max_spheres=k over an
+    indexed set of n = len(vectors_construct) vectors, per (dataset, n,
+    seed) -- n is the swept variable, k is held constant across the whole
+    sweep. This isolates representation size from construction cost: the
+    filter's stored buffer is exactly k spheres regardless of how many
+    points it was built from, so query-time memory and query latency are
+    expected to stay flat as n grows, while construction time -- and
+    possibly FPR, as the indexed geometry becomes more complex -- are
+    expected to grow with n. See evaluate_scaling()'s docstring for the
+    full experimental rationale.
+
+    Measures: construction wall time, single-query latency (timed the same
+    way query_performance_worker's "single" mode is -- one Python-level
+    query() call per vector, capped at single_query_limit since that mode
+    pays a per-call cost that batching amortizes away), query-time memory
+    (get_bytesize() after construction, since the filter's buffer is fixed
+    once built), and FPR against actual_results (ground truth computed by
+    the caller at tau_mid over this same n-sized construct set, since
+    "duplicate" is defined relative to the indexed set -- the caller who
+    varies n must also recompute actual_results per n).
+    """
+    construct_arr = _to_construct_array(vectors_construct)
+    query_arr = _to_construct_array(vectors_query)
+    n = len(construct_arr)
+
+    construct_start = time.perf_counter()
+    filt = GonzalezMEBFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed)
+    filt.construct(construct_arr)
+    construct_time_s = time.perf_counter() - construct_start
+
+    memory_bytes = filt.get_bytesize()
+
+    n_single = min(single_query_limit, len(query_arr))
+    start = time.perf_counter()
+    for v in query_arr[:n_single]:
+        filt.query(v[np.newaxis, :], tau=tau_mid)
+    elapsed_single = time.perf_counter() - start
+    query_latency_us = elapsed_single / max(n_single, 1) * 1e6
+
+    predicted: List[bool] = []
+    for block in _iter_query_batches(query_arr, _QUERY_BATCH):
+        predicted.extend(filt.query(block, tau=tau_mid))
+    rates = _confusion_rates(predicted, np.asarray(actual_results, dtype=bool))
+
+    return {
+        "dataset": dataset, "n": n, "k": k, "seed": seed,
+        "construct_time_s": construct_time_s,
+        "query_latency_us": query_latency_us,
+        "fpr": rates["fpr"],
+        "memory_bytes": memory_bytes,
+    }
+
+
+def stream_absorption_worker(
+    dim: int,
+    dataset: str,
+    k: int,
+    seed: int,
+    tau_mid: float,
+    vectors_stream: VectorInput,
+    checkpoints: List[int],
+    merge_criterion: str = "log_space",
+) -> List[Dict[str, Any]]:
+    """
+    Simulate pure online streaming insertion (no rebuilds) over vectors_stream,
+    one vector at a time via GonzalezMEBFilter.add(), and at each position in
+    checkpoints record the ABSORPTION RATE over the window since the previous
+    checkpoint: the fraction of arrivals in that window that already landed
+    inside an existing ball's raw radius (tau=0 -- genuine geometric coverage,
+    not the tau-inflated duplicate test) *before* being inserted.
+
+    This is the panel that argues the paper's central claim: if SAMQ's
+    representation size tracks the geometric complexity of the indexed set
+    rather than its cardinality n, absorption should plateau near 1 as the
+    stream grows -- most new arrivals are already covered by the existing k
+    spheres, so a longer stream stops requiring the cover to change. Returns
+    one row per checkpoint.
+    """
+    stream_arr = _to_construct_array(vectors_stream)
+    n = len(stream_arr)
+
+    filt = GonzalezMEBFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
+                             merge_criterion=merge_criterion)
+    filt.construct(np.empty((0, dim), dtype=np.float32))
+
+    checkpoint_set = sorted(set(c for c in checkpoints if 0 < c <= n))
+    rows: List[Dict[str, Any]] = []
+    window_hits = 0
+    window_count = 0
+    window_start = 1
+    ci = 0
+
+    for t in range(n):
+        v = stream_arr[t]
+        absorbed = filt.query(v[np.newaxis, :], tau=0.0)[0]
+        window_hits += int(absorbed)
+        window_count += 1
+        filt.add(v[np.newaxis, :])
+
+        pos = t + 1
+        if ci < len(checkpoint_set) and pos == checkpoint_set[ci]:
+            rows.append({
+                "dataset": dataset, "k": k, "seed": seed,
+                "position": pos, "window_start": window_start,
+                "absorption_rate": window_hits / max(window_count, 1),
+                "n_balls": len(filt.all_spheres),
+            })
+            window_start = pos + 1
+            window_hits = 0
+            window_count = 0
+            ci += 1
+
+    return rows
+
+
+def stream_rebuild_worker(
+    dim: int,
+    dataset: str,
+    k: int,
+    seed: int,
+    tau_mid: float,
+    policy: str,
+    vectors_stream: VectorInput,
+    vectors_negative: VectorInput,
+    checkpoints: List[int],
+    T: Optional[int] = None,
+    merge_criterion: str = "log_space",
+) -> List[Dict[str, Any]]:
+    """
+    Simulate one rebuild policy over vectors_stream and, at each position in
+    checkpoints, measure FPR against a FIXED held-out negative set (assumed by
+    the caller to be true negatives against the *entire* eventual stream, so
+    they stay valid negatives at every partial checkpoint -- see
+    evaluate_streaming()) plus the amortized wall-clock cost per insertion
+    (including any full rebuilds) spent so far. Returns one row per
+    checkpoint.
+
+    Since J = sum r_i^d is monotone non-decreasing under the streaming
+    merge policy (Algorithm 2), "when do you rebuild" is a real question with
+    a real cost/quality trade-off; these three policies span it:
+
+      "streaming": pure online growth -- GonzalezMEBFilter.add() per arrival,
+        never rebuilt from scratch. Cheapest per insertion, but the greedy
+        pairwise-merge policy can drift from the k-ball cover an offline
+        construct() would have found for the vectors seen so far.
+      "periodic": like "streaming", except every T arrivals the cover is
+        replaced by a from-scratch construct() over every vector seen so far
+        (the full construction ladder), resetting any drift. T trades cost
+        for quality; "streaming" is the T -> infinity limit and "oracle" is
+        the T = 1 limit.
+      "oracle": at every checkpoint (only -- rebuilding at every arrival
+        would be prohibitively expensive and is never actually measured),
+        replace the cover with a from-scratch construct() over every vector
+        seen so far: the best achievable k-ball cover for that many points,
+        i.e. an upper bound on streaming quality at that position.
+    """
+    stream_arr = _to_construct_array(vectors_stream)
+    negative_arr = _to_construct_array(vectors_negative)
+    n = len(stream_arr)
+    checkpoint_set = sorted(set(c for c in checkpoints if 0 < c <= n))
+
+    rows: List[Dict[str, Any]] = []
+    cumulative_time_s = 0.0
+
+    def _fpr(filt: GonzalezMEBFilter) -> float:
+        predicted = filt.query(negative_arr, tau=tau_mid)
+        return float(np.mean(predicted)) if len(predicted) else 0.0
+
+    if policy == "oracle":
+        for c in checkpoint_set:
+            filt = GonzalezMEBFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
+                                     merge_criterion=merge_criterion)
+            t0 = time.perf_counter()
+            filt.construct(stream_arr[:c])
+            cumulative_time_s += time.perf_counter() - t0
+            rows.append({
+                "dataset": dataset, "policy": policy, "T": T, "k": k, "seed": seed,
+                "position": c, "fpr": _fpr(filt),
+                "cumulative_time_s": cumulative_time_s,
+                "amortized_cost_s": cumulative_time_s / c,
+            })
+        return rows
+
+    if policy not in ("streaming", "periodic"):
+        raise ValueError(f"Unknown policy {policy!r}; expected 'streaming', 'periodic', or 'oracle'")
+
+    # "streaming" / "periodic": one persistent filter, grown incrementally,
+    # periodically replaced wholesale by a from-scratch construct() when the
+    # policy is "periodic" and a T-boundary is hit.
+    rebuild_every = T if (policy == "periodic" and T is not None) else None
+    filt = GonzalezMEBFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
+                             merge_criterion=merge_criterion)
+    t0 = time.perf_counter()
+    filt.construct(np.empty((0, dim), dtype=np.float32))
+    cumulative_time_s += time.perf_counter() - t0
+
+    ci = 0
+    for t in range(n):
+        pos = t + 1
+        t0 = time.perf_counter()
+        if rebuild_every is not None and pos % rebuild_every == 0:
+            filt.construct(stream_arr[:pos])
+        else:
+            filt.add(stream_arr[t][np.newaxis, :])
+        cumulative_time_s += time.perf_counter() - t0
+
+        if ci < len(checkpoint_set) and pos == checkpoint_set[ci]:
+            rows.append({
+                "dataset": dataset, "policy": policy, "T": T, "k": k, "seed": seed,
+                "position": pos, "fpr": _fpr(filt),
+                "cumulative_time_s": cumulative_time_s,
+                "amortized_cost_s": cumulative_time_s / pos,
+            })
+            ci += 1
+
+    return rows
+
+
+def stream_merge_criterion_worker(
+    dim: int,
+    dataset: str,
+    k: int,
+    seed: int,
+    tau_mid: float,
+    merge_criterion: str,
+    vectors_stream: VectorInput,
+    vectors_negative: VectorInput,
+) -> Dict[str, Any]:
+    """
+    Stream the full vectors_stream through GonzalezMEBFilter.add() at a fixed
+    k under a single merge_criterion (see GonzalezMEBFilter.MERGE_CRITERIA),
+    and report the FINAL FPR against a fixed held-out negative set once the
+    whole stream has been absorbed -- one (k, merge_criterion) point for
+    panel (c)'s "final FPR vs k, one line per merge criterion".
+    """
+    stream_arr = _to_construct_array(vectors_stream)
+    negative_arr = _to_construct_array(vectors_negative)
+
+    filt = GonzalezMEBFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
+                             merge_criterion=merge_criterion)
+    filt.construct(np.empty((0, dim), dtype=np.float32))
+    for v in stream_arr:
+        filt.add(v[np.newaxis, :])
+
+    predicted = filt.query(negative_arr, tau=tau_mid)
+    fpr = float(np.mean(predicted)) if len(predicted) else 0.0
+
+    return {
+        "dataset": dataset, "k": k, "seed": seed,
+        "merge_criterion": merge_criterion,
+        "fpr": fpr,
+    }
+
+
 _WORKER_FNS: Dict[str, Any] = {
     'static':  static_worker,
     'dynamic': dynamic_worker,
@@ -760,6 +1026,10 @@ _WORKER_FNS: Dict[str, Any] = {
     'ablation': ablation_worker,
     'query_performance': query_performance_worker,
     'equal_memory': equal_memory_worker,
+    'scaling': scaling_worker,
+    'stream_absorption': stream_absorption_worker,
+    'stream_rebuild': stream_rebuild_worker,
+    'stream_merge_criterion': stream_merge_criterion_worker,
 }
 
 
@@ -768,8 +1038,13 @@ def _describe_job(kwargs: Dict[str, Any]) -> str:
         return f"{kwargs['filter_cls'].__name__} + {kwargs['lsh_cls'].__name__}"
     if {'dataset', 'k', 'tau_values', 'seed'} <= kwargs.keys():
         return f"{kwargs['dataset']} k={kwargs['k']} tau_values={kwargs['tau_values']} seed={kwargs['seed']}"
+    if {'dataset', 'policy', 'k', 'seed'} <= kwargs.keys():
+        extra = f" T={kwargs['T']}" if kwargs.get('T') is not None else ""
+        return f"{kwargs['dataset']} policy={kwargs['policy']}{extra} k={kwargs['k']} seed={kwargs['seed']}"
+    if {'dataset', 'merge_criterion', 'k', 'seed'} <= kwargs.keys():
+        return f"{kwargs['dataset']} merge_criterion={kwargs['merge_criterion']} k={kwargs['k']} seed={kwargs['seed']}"
     if {'dataset', 'k', 'seed'} <= kwargs.keys():
-        return f"{kwargs['dataset']} k={kwargs['k']} seed={kwargs['seed']} (query_performance)"
+        return f"{kwargs['dataset']} k={kwargs['k']} seed={kwargs['seed']}"
     return "job"
 
 

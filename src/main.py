@@ -15,6 +15,8 @@ from plots import plot_results, plot_throughput_results, plot_tradeoff_results, 
 from plot_ablation import generate_ablation_figures
 from plot_query_performance import generate_query_performance_figures
 from plot_equal_memory import generate_equal_memory_figures
+from plot_scaling import generate_scaling_figures
+from plot_streaming import generate_streaming_figures
 from typing import Tuple, List
 from filters.first_n_filter import FirstNFilter
 from filters.gonzales_filter import GonzalezMEBFilter
@@ -34,7 +36,7 @@ dynamic_filters = [GonzalezMEBFilter, DSBFFilter, CoveringLSHFallbackFilter, LSB
 static_filters  = []
 
 def calculate_max_memory_budget_bytes(num_vectors: int, dimension: int, bytes_per_element: float) -> int:
-    return num_vectors * dimension * bytes_per_element * 6
+    return num_vectors * dimension * bytes_per_element // 64
 
 def calculate_memory_budgets(max_memory_budget: int, count_steps: int = 10, include_zero: bool = False) -> list[int]:
     """Uniformly spaced budgets from max/count_steps (or 0 if `include_zero`) up to the full max budget."""
@@ -84,6 +86,49 @@ def calculate_distance_threshold(
     keep = np.ones(distances.shape, dtype=bool)
     keep[np.arange(len(query_idx)), query_idx] = False
     return float(np.percentile(distances[keep], percentage))
+
+
+def calculate_nn_distance_threshold(
+    construct_vectors: np.ndarray,
+    percentage: float,
+    sample_size: int = 5_000,
+    seed: int = 42,
+) -> float:
+    """
+    Return the distance threshold at which `percentage`% of a sample of
+    construct_vectors have their nearest *other* construct vector within that
+    distance.
+
+    Unlike calculate_distance_threshold (which percentiles *random pairwise*
+    distances), this ties the threshold directly to the nearest-neighbour
+    test compute_static_actual_results actually performs. That distinction
+    matters once the construct set is large: with tens of thousands of
+    candidate neighbours, a point's *nearest* neighbour is typically far
+    closer than a *random* pair, so calculate_distance_threshold's percentile
+    silently becomes far more permissive than its nominal `percentage`
+    suggests -- at construct-set sizes in the tens of thousands this pushed
+    the "duplicate" rate to ~100%, collapsing both FPR and FNR to degenerate
+    0/0 default values (no actual negatives -> FPR defaults to 0; predicted
+    matching the near-universal actual positives -> FNR ~0 too) regardless of
+    memory budget. Used by equal_memory_evaluation(), whose construct set is
+    large enough for this gap to matter.
+    """
+    n = len(construct_vectors)
+    if n < 2:
+        return 0.0
+
+    vecs = np.ascontiguousarray(construct_vectors, dtype=np.float32)
+    rng = np.random.default_rng(seed)
+    sample_idx = rng.choice(n, size=sample_size, replace=False) if sample_size < n else np.arange(n)
+
+    index = faiss.IndexFlatL2(vecs.shape[1])
+    index.add(vecs)
+    # k=2: a sampled point's own nearest neighbour within its own reference
+    # set is itself (distance 0) at rank 0, so the *other* nearest neighbour
+    # is rank 1.
+    sq_dist, _ = index.search(vecs[sample_idx], 2)
+    nn_dist = np.sqrt(np.clip(sq_dist[:, 1], 0, None))
+    return float(np.percentile(nn_dist, percentage))
 
 
 def compute_actual_results(vectors: np.ndarray, distance_threshold: float) -> list[bool]:
@@ -199,7 +244,7 @@ def equal_memory_evaluation() -> list:
     derived default). FPR, FNR, query latency and query throughput are then
     measured on the held-out query set and plotted one series per budget.
     """
-    num_vectors             = 10_000
+    num_vectors             = 50_000
     dim                     = 384
     percentage_construct    = 40
     percentage_calibration  = 20
@@ -209,7 +254,6 @@ def equal_memory_evaluation() -> list:
 
     dataset = DATASET
     vectors = load_embeds(dataset, num_vectors)[0]
-    bytes_per_element = vectors.itemsize
     num_construct   = num_vectors * percentage_construct // 100
     num_calibration = num_vectors * percentage_calibration // 100
     vectors_construct   = vectors[:num_construct]
@@ -223,12 +267,29 @@ def equal_memory_evaluation() -> list:
     query_source        = VectorSource(dataset, num_construct + num_calibration, num_vectors)
 
     print("Calculating distance threshold...")
-    distance_threshold = calculate_distance_threshold(vectors, duplicate_percentage)
+    # Nearest-neighbour-based, not calculate_distance_threshold's random-pairwise
+    # percentile: with a 40%-of-100k = 40k-vector construct set, a pairwise
+    # percentile is far more permissive than its nominal percentage once
+    # tested against "nearest of 40k candidates" (see calculate_nn_distance_threshold's
+    # docstring) -- that mismatch was pushing the actual duplicate rate to ~100%,
+    # collapsing both FPR and FNR to degenerate 0/0 values regardless of budget.
+    distance_threshold = calculate_nn_distance_threshold(vectors_construct, duplicate_percentage)
     print("Calculating calibration/query ground truth...")
     actual_calibration = compute_static_actual_results(vectors_construct, vectors_calibration, distance_threshold)
     actual_query       = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
 
-    max_memory_budget = calculate_max_memory_budget_bytes(num_vectors, dim, bytes_per_element)
+    # Scaled off the construct set itself, not calculate_max_memory_budget_bytes:
+    # that helper is tuned for static_evaluation()/dynamic_evaluation()'s much
+    # smaller num_vectors and produces a ceiling of a couple MB here -- far
+    # below the budget at which a covering-ball method can give every
+    # construct point its own sphere (num_construct * bytes_per_sphere,
+    # mirroring GonzalezMEBFilter._calculate_max_spheres's own formula), which
+    # is the point past which more memory stops buying additional accuracy for
+    # any covering-based method. Below that point every filter is forced into
+    # heavy compression and FPR stays pinned regardless of budget; sweeping up
+    # to it is what makes "equal memory" actually vary with the budget.
+    bytes_per_sphere_at_1to1 = (dim + 1) * 4 * 4.0
+    max_memory_budget = int(num_construct * bytes_per_sphere_at_1to1)
     memory_budgets = np.linspace(0, max_memory_budget, count_memory_steps + 1, dtype=int)[1:]
 
     runner = Runner(num_workers=MAX_WORKERS)
@@ -519,6 +580,282 @@ def evaluate_query_performance() -> pd.DataFrame:
     return df
 
 
+# Registry name -> canonical dataset key used by the scaling figure (must
+# match plot_scaling.DATASETS exactly).
+_SCALING_DATASET_KEYS = {"ELI5": "eli5", "MMLU": "mmlu", "WildChat": "wildchat"}
+
+
+def evaluate_scaling() -> pd.DataFrame:
+    """
+    Isolate SAMQ's representation size from its construction cost: fix the
+    filter size k and increase the number of indexed embeddings n, on the 3
+    datasets the scaling figure needs (eli5, mmlu, wildchat). Since a
+    GonzalezMEBFilter's stored buffer is exactly k spheres regardless of how
+    many points it was built from, query-time memory and query latency are
+    expected to stay flat as n grows; construction time -- and possibly FPR,
+    as the indexed geometry becomes more complex -- are expected to grow
+    with n. This supports the claim that SAMQ's representation size is
+    independent of n, without claiming its accuracy is independent of the
+    geometry introduced by additional points.
+
+    A fixed, disjoint query holdout is reused across every n (ground truth
+    is recomputed per n, since "duplicate" is defined relative to the
+    current indexed set). Mirrors evaluate_ablation()/
+    evaluate_query_performance()'s structure otherwise: one job per
+    (dataset, n, seed), flattened into a long-format DataFrame, written to
+    results/scaling.csv, then rendered via plot_scaling.generate_scaling_figures.
+    """
+    num_vectors_pool = 100_000
+    dim              = 384
+    k_fixed          = 256
+    n_values         = [1024, 2048, 4096, 8192, 16384, 32768, 65536]
+    query_holdout    = 10_000
+    tau_mid          = 0.35
+    seeds            = [0, 1, 2, 3, 4]
+    single_query_limit = 2000
+    output_csv       = "results/scaling.csv"
+
+    datasets = [d for d in _SCALING_DATASET_KEYS if os.path.exists(dataset_filenames[d])]
+    missing = [d for d in _SCALING_DATASET_KEYS if d not in datasets]
+    if missing:
+        print(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
+    if set(datasets) != set(_SCALING_DATASET_KEYS):
+        raise RuntimeError(
+            "evaluate_scaling needs all 3 datasets "
+            f"({', '.join(_SCALING_DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
+        )
+
+    # n must leave room for the fixed query holdout, and k is fixed across
+    # the whole sweep so it must stay below every n (else GonzalezMEBFilter
+    # falls back to one zero-radius ball per point at the smallest n).
+    pool_sizes = {d: len(load_embeds(d, num_vectors_pool)[0]) for d in datasets}
+    max_usable_n = min(pool_sizes.values()) - query_holdout
+    usable_n_values = [n for n in n_values if n <= max_usable_n]
+    dropped_n = sorted(set(n_values) - set(usable_n_values))
+    if dropped_n:
+        print(
+            f"Dropping n value(s) that don't leave room for a {query_holdout}-vector "
+            f"query holdout (smallest dataset pool: {min(pool_sizes.values())} vectors, "
+            f"from {min(pool_sizes, key=pool_sizes.get)}): {dropped_n}"
+        )
+    if not usable_n_values:
+        raise RuntimeError(
+            f"No n value in {n_values} leaves room for a {query_holdout}-vector query "
+            f"holdout out of the smallest dataset pool ({min(pool_sizes.values())} vectors). "
+            "Raise num_vectors_pool or lower n_values/query_holdout."
+        )
+    n_values = usable_n_values
+    if k_fixed >= min(n_values):
+        raise RuntimeError(
+            f"k_fixed={k_fixed} must be smaller than every n in {n_values} "
+            "(k stays fixed across the whole sweep)."
+        )
+
+    runner = Runner(num_workers=MAX_WORKERS)
+
+    for dataset in datasets:
+        vectors = load_embeds(dataset, num_vectors_pool)[0]
+        total = len(vectors)  # a dataset may hold fewer than num_vectors_pool
+        query_start = total - query_holdout
+        vectors_query = vectors[query_start:]
+        query_source = VectorSource(dataset, query_start, total)
+
+        for n in n_values:
+            vectors_construct_n = vectors[:n]
+            construct_source_n = VectorSource(dataset, 0, n)
+
+            print(f"{dataset}: computing ground truth at n={n}, tau_mid={tau_mid}...")
+            actual_results_n = compute_static_actual_results(vectors_construct_n, vectors_query, tau_mid)
+
+            for seed in seeds:
+                runner.submit(
+                    'scaling',
+                    dim=dim, dataset=_SCALING_DATASET_KEYS[dataset],
+                    k=k_fixed, seed=seed, tau_mid=tau_mid,
+                    vectors_construct=construct_source_n, vectors_query=query_source,
+                    actual_results=actual_results_n, single_query_limit=single_query_limit,
+                )
+
+    job_results = runner.run()
+    print("Scaling evaluation completed.")
+
+    df = pd.DataFrame(job_results)
+
+    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+    df.to_csv(output_csv, index=False)
+    print(f"Wrote {output_csv}")
+
+    generate_scaling_figures(df, k_fixed=k_fixed)
+    return df
+
+
+# Registry name -> canonical dataset key used by the streaming figure (must
+# match plot_streaming.DATASETS exactly; shares the trio evaluate_scaling() uses).
+_STREAMING_DATASET_KEYS = {"ELI5": "eli5", "MMLU": "mmlu", "WildChat": "wildchat"}
+# Panels (b)/(c)/(d) collapse to one representative dataset to keep the
+# rebuild-policy and merge-criterion sweeps (each of which pays for several
+# full from-scratch construct() calls) tractable.
+_STREAMING_REPRESENTATIVE_DATASET = "ELI5"
+
+
+def _build_streaming_negative_set(
+    dataset: str, stream_vectors: np.ndarray, candidate_pool: np.ndarray, tau_mid: float, n_negative: int,
+) -> np.ndarray:
+    """
+    A "fixed held-out negative set" only stays valid at every checkpoint if
+    it's a true negative against the *entire* eventual stream, not just
+    whatever prefix has arrived so far -- otherwise a query that's actually a
+    duplicate of a not-yet-arrived stream point would look like a false
+    positive the moment that point arrives, even though the filter is
+    correct. compute_static_actual_results(stream_vectors, candidate_pool, ...)
+    against the FULL stream is therefore the strictest (and only sufficient)
+    check: not-a-duplicate-of-the-full-stream implies not-a-duplicate-of-any-
+    prefix-of-the-stream.
+    """
+    is_duplicate = compute_static_actual_results(stream_vectors, candidate_pool, tau_mid)
+    negatives = candidate_pool[~np.asarray(is_duplicate, dtype=bool)]
+    if len(negatives) < n_negative:
+        raise RuntimeError(
+            f"{dataset}: only found {len(negatives)} true negatives against the full stream "
+            f"(needed {n_negative}); shrink n_negative, raise tau_mid, or grow the candidate pool."
+        )
+    return negatives[:n_negative]
+
+
+def evaluate_streaming() -> None:
+    """
+    Streaming evaluation: does SAMQ's representation size track the
+    geometric complexity of the indexed set rather than its cardinality n,
+    and what does the streaming (online, never-rebuilt) merge policy cost in
+    quality relative to periodically or always rebuilding from scratch?
+    Produces the data for 4 figures, each written to its own results CSV and
+    rendered via plot_streaming.generate_streaming_figures:
+
+      (a) Absorption rate vs. stream position, 3 datasets (stream_absorption_worker):
+          the fraction of arrivals that already land inside an existing ball
+          BEFORE insertion. If this plateaus near 1, the "representation size
+          is independent of n" claim stops being asymptotic and becomes
+          empirical.
+      (b)+(d) FPR / amortized cost vs. stream position and rebuild policy, one
+          representative dataset (stream_rebuild_worker): "streaming" (never
+          rebuilt) vs. "periodic" (rebuilt every T arrivals, swept over
+          several T to also produce panel (d)'s cost/quality Pareto frontier)
+          vs. "oracle" (rebuilt from scratch at every checkpoint -- the best
+          achievable cover for that many points).
+      (c) Final FPR vs. k, one line per merge criterion, one representative
+          dataset (stream_merge_criterion_worker): compares the 4 pairwise-
+          merge cost functions GonzalezMEBFilter.MERGE_CRITERIA supports.
+
+    A single, fixed, cross-checkpoint-valid negative set (see
+    _build_streaming_negative_set) is reused by panels (b)/(c)/(d).
+    """
+    num_vectors_pool = 10_000
+    dim              = 384
+    n_stream         = 8_000
+    n_negative       = 500
+    k_fixed          = 128
+    k_values         = [16, 32, 64, 128, 256, 512]
+    tau_mid          = 0.35
+    seeds            = [0, 1, 2]
+    merge_criteria   = GonzalezMEBFilter.MERGE_CRITERIA
+    # T -> n_stream/40 .. n_stream/2: dense enough near "oracle" (small T) to
+    # resolve the Pareto frontier's knee, sparse enough near "streaming"
+    # (large T) that it stays cheap.
+    T_values = sorted(set(max(1, n_stream // d) for d in (40, 20, 10, 5, 2)))
+    T_representative = T_values[len(T_values) // 2]
+    checkpoints = sorted(set(
+        int(round(x)) for x in np.logspace(np.log10(50), np.log10(n_stream), num=10)
+    ))
+
+    datasets = [d for d in _STREAMING_DATASET_KEYS if os.path.exists(dataset_filenames[d])]
+    missing = [d for d in _STREAMING_DATASET_KEYS if d not in datasets]
+    if missing:
+        print(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
+    if set(datasets) != set(_STREAMING_DATASET_KEYS):
+        raise RuntimeError(
+            "evaluate_streaming needs all 3 datasets "
+            f"({', '.join(_STREAMING_DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
+        )
+    if _STREAMING_REPRESENTATIVE_DATASET not in datasets:
+        raise RuntimeError(
+            f"evaluate_streaming's representative dataset {_STREAMING_REPRESENTATIVE_DATASET!r} "
+            "is not on disk."
+        )
+
+    runner_a = Runner(num_workers=MAX_WORKERS)
+    for dataset in datasets:
+        vectors = load_embeds(dataset, num_vectors_pool)[0]
+        stream_source = VectorSource(dataset, 0, min(n_stream, len(vectors)))
+        for seed in seeds:
+            runner_a.submit(
+                'stream_absorption',
+                dim=dim, dataset=_STREAMING_DATASET_KEYS[dataset], k=k_fixed, seed=seed, tau_mid=tau_mid,
+                vectors_stream=stream_source, checkpoints=checkpoints,
+            )
+    absorption_rows = runner_a.run()
+    print("Streaming absorption evaluation completed.")
+    df_absorption = pd.DataFrame([row for job_rows in absorption_rows for row in job_rows])
+    os.makedirs("results", exist_ok=True)
+    df_absorption.to_csv("results/streaming_absorption.csv", index=False)
+    print("Wrote results/streaming_absorption.csv")
+
+    # Panels (b)/(c)/(d): representative dataset only (see module docstring).
+    rep_dataset = _STREAMING_REPRESENTATIVE_DATASET
+    rep_key = _STREAMING_DATASET_KEYS[rep_dataset]
+    vectors = load_embeds(rep_dataset, num_vectors_pool)[0]
+    n_stream_eff = min(n_stream, len(vectors))
+    stream_vectors = vectors[:n_stream_eff]
+    stream_source = VectorSource(rep_dataset, 0, n_stream_eff)
+
+    candidate_pool = vectors[n_stream_eff:n_stream_eff + 20 * n_negative]
+    print(f"{rep_dataset}: building fixed streaming negative set...")
+    negative_vectors = _build_streaming_negative_set(rep_dataset, stream_vectors, candidate_pool, tau_mid, n_negative)
+
+    runner_b = Runner(num_workers=MAX_WORKERS)
+    for seed in seeds:
+        runner_b.submit(
+            'stream_rebuild',
+            dim=dim, dataset=rep_key, k=k_fixed, seed=seed, tau_mid=tau_mid, policy='streaming',
+            vectors_stream=stream_source, vectors_negative=negative_vectors, checkpoints=checkpoints,
+        )
+        runner_b.submit(
+            'stream_rebuild',
+            dim=dim, dataset=rep_key, k=k_fixed, seed=seed, tau_mid=tau_mid, policy='oracle',
+            vectors_stream=stream_source, vectors_negative=negative_vectors, checkpoints=checkpoints,
+        )
+        for T in T_values:
+            runner_b.submit(
+                'stream_rebuild',
+                dim=dim, dataset=rep_key, k=k_fixed, seed=seed, tau_mid=tau_mid, policy='periodic', T=T,
+                vectors_stream=stream_source, vectors_negative=negative_vectors, checkpoints=checkpoints,
+            )
+    rebuild_rows = runner_b.run()
+    print("Streaming rebuild-policy evaluation completed.")
+    df_rebuild = pd.DataFrame([row for job_rows in rebuild_rows for row in job_rows])
+    df_rebuild.to_csv("results/streaming_rebuild.csv", index=False)
+    print("Wrote results/streaming_rebuild.csv")
+
+    runner_c = Runner(num_workers=MAX_WORKERS)
+    for k in k_values:
+        for merge_criterion in merge_criteria:
+            for seed in seeds:
+                runner_c.submit(
+                    'stream_merge_criterion',
+                    dim=dim, dataset=rep_key, k=k, seed=seed, tau_mid=tau_mid, merge_criterion=merge_criterion,
+                    vectors_stream=stream_source, vectors_negative=negative_vectors,
+                )
+    merge_criterion_rows = runner_c.run()
+    print("Streaming merge-criterion evaluation completed.")
+    df_merge_criteria = pd.DataFrame(merge_criterion_rows)
+    df_merge_criteria.to_csv("results/streaming_merge_criteria.csv", index=False)
+    print("Wrote results/streaming_merge_criteria.csv")
+
+    generate_streaming_figures(
+        df_absorption=df_absorption, df_rebuild=df_rebuild, df_merge_criteria=df_merge_criteria,
+        k_fixed=k_fixed, T_representative=T_representative,
+    )
+
+
 def dynamic_evaluation() -> list:
     num_vectors              = 100_000
     dim                      = 384
@@ -663,8 +1000,10 @@ def tradeoff_evaluation() -> Tuple[List, List]:
 if __name__ == "__main__":
     # static_evaluation()
     # dynamic_evaluation()
-    equal_memory_evaluation()
+    # equal_memory_evaluation()
     # hnsw_evaluation()
     # tradeoff_evaluation()
     # evaluate_ablation()
     # evaluate_query_performance()
+    # evaluate_scaling()
+    evaluate_streaming()
