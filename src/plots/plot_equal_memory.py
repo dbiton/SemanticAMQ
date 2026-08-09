@@ -30,7 +30,7 @@ from plots.plot_ablation import apply_style
 # --------------------------------------------------------------------------- #
 
 INPUT_PATH = "results/equal_memory.csv"
-OUTDIR = "figures/"
+OUTDIR = "plots/equal_memory/"
 DPI = 400
 EMIT_PDF = False
 DEMO = False

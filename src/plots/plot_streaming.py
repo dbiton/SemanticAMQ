@@ -19,7 +19,7 @@ from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 from plots.plot_common import DATASETS, DATASET_LABELS, DATASET_COLORS, apply_style, save_figure, save_dataset_legend, mean_ci95
 
 INPUT_PATH = "results/streaming.csv"
-OUTDIR = "figures/"
+OUTDIR = "plots/streaming/"
 K_FIXED: Optional[int] = None
 T_REPRESENTATIVE: Optional[int] = None
 DPI = 300

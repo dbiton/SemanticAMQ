@@ -343,7 +343,7 @@ def _fpvr_bounds(
     return log_ratio_lower, log_ratio_upper
 
 
-def hnsw_worker(
+def system_worker(
     filter_cls: Any,
     lsh_cls: Any,
     dim: int,
@@ -354,19 +354,17 @@ def hnsw_worker(
     vectors_query: VectorInput,
     percentage: float,
     dataset: str = "",
-    hnsw_m: int = 32,
-    ef_search: int = 64,
     orig_vol_log_low: float = None,
     orig_vol_log_high: float = None,
 ) -> Dict[str, Any]:
     """
     Measure how much a semantic filter reduces the cost of answering
-    "is any stored vector within distance_threshold of the query?" against an
-    HNSW index that explicitly stores all construct vectors.
+    "is any stored vector within distance_threshold of the query?" against a
+    flat L2 index that explicitly stores all construct vectors.
 
     The filter acts like a bloom filter (one-sided error): a negative answer is
     trusted and the index is skipped; only filter-positive queries are searched
-    in the HNSW index. The same query stream is timed with and without the filter.
+    in the flat index. The same query stream is timed with and without the filter.
 
     orig_vol_log_low/orig_vol_log_high are the caller-precomputed log-volume
     bounds of the union of true-duplicate balls (radius distance_threshold
@@ -383,9 +381,8 @@ def hnsw_worker(
 
     construct = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
 
-    # HNSW index storing all vectors explicitly (squared L2 metric)
-    index = faiss.IndexHNSWFlat(dim, hnsw_m)
-    index.hnsw.efSearch = ef_search
+    # Flat L2 index storing all vectors explicitly (squared L2 metric)
+    index = faiss.IndexFlatL2(dim)
     index.add(construct)
 
     filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold)
@@ -398,7 +395,7 @@ def hnsw_worker(
 
     sq_threshold = distance_threshold ** 2
 
-    # PASS 1 (baseline): every query goes to the HNSW index
+    # PASS 1 (baseline): every query goes to the flat index
     n_queries = 0
     baseline_pred: List[bool] = []
     start = time.perf_counter()
@@ -971,7 +968,7 @@ _WORKER_FNS: Dict[str, Any] = {
     'static':  static_worker,
     'dynamic': dynamic_worker,
     'tradeoff': tradeoff_worker,
-    'hnsw':    hnsw_worker,
+    'system':  system_worker,
     'ablation': ablation_worker,
     'query_performance': query_performance_worker,
     'equal_memory': equal_memory_worker,

@@ -30,7 +30,7 @@ from plots.plot_common import DATASETS, DATASET_LABELS, DATASET_COLORS, DATASET_
 # --------------------------------------------------------------------------- #
 
 INPUT_PATH = "results/query_performance.csv"
-OUTDIR = "figures/"
+OUTDIR = "plots/query_performance/"
 DPI = 400
 EMIT_PDF = False
 DEMO = False

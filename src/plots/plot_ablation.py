@@ -28,7 +28,7 @@ from plots.plot_common import DATASETS, DATASET_LABELS, DATASET_COLORS, DATASET_
 # --------------------------------------------------------------------------- #
 
 INPUT_PATH = "results/ablation.csv"
-OUTDIR = "figures/"
+OUTDIR = "plots/ablation/"
 K = 256
 TAU: Optional[float] = None  # None => median tau present in the data
 DPI = 400

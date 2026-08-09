@@ -16,7 +16,7 @@ from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 from plots.plot_common import DATASETS, DATASET_COLORS, apply_style, save_figure, save_dataset_legend, mean_ci95
 
 INPUT_PATH = "results/scaling.csv"
-OUTDIR = "figures/"
+OUTDIR = "plots/scaling/"
 K_FIXED: Optional[int] = None  # None => the single k present in the data
 DPI = 300
 EMIT_PDF = False

@@ -11,7 +11,7 @@ from filters.pyfusefilter_filters import Fuse8Filter, Xor8Filter
 from filters.quotient_filter import QuotientFilterWrapper
 from lsh import FaissSimHashLSH, LSH, DummyLSH
 from runner import Runner
-from plots.legacy import plot_results, plot_throughput_results, plot_tradeoff_results, plot_hnsw_results, plot_equal_memory_results
+from plots.legacy import plot_results, plot_throughput_results, plot_tradeoff_results, plot_system_results, plot_equal_memory_results
 from plots.plot_ablation import generate_ablation_figures
 from plots.plot_query_performance import generate_query_performance_figures
 from plots.plot_equal_memory import generate_equal_memory_figures
@@ -185,7 +185,7 @@ def compute_static_actual_results(
 
 
 def static_evaluation() -> list:
-    num_vectors              = 1_000
+    num_vectors              = 100_000
     dim                      = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
@@ -250,7 +250,7 @@ def equal_memory_evaluation() -> list:
     derived default). FPR, FNR, query latency and query throughput are then
     measured on the held-out query set and plotted one series per budget.
     """
-    num_vectors             = 50_000
+    num_vectors             = 100_000
     dim                     = 384
     percentage_construct    = 40
     percentage_calibration  = 20
@@ -326,17 +326,17 @@ def equal_memory_evaluation() -> list:
     return results
 
 
-def hnsw_evaluation() -> list:
+def system_evaluation() -> list:
     """
-    Measure how much a semantic filter reduces accesses to an HNSW index that
+    Measure how much a semantic filter reduces accesses to a flat L2 index that
     explicitly stores all construct vectors, across every dataset present on
     disk and across a sweep of filter memory budgets from 0 up to the full
     max memory budget. The filter is one-sided (bloom-like): filter negatives
     skip the index entirely; positives are confirmed against it. Reports mean
-    throughput, mean per-query latency and HNSW index accesses per dataset,
+    throughput, mean per-query latency and index accesses per dataset,
     with and without the filter, averaged over the memory-budget sweep.
     """
-    num_vectors              = 1_000
+    num_vectors              = 100_000
     dim                      = 384
     percentage_duplicates    = 50
     count_memory_steps       = 10
@@ -364,7 +364,7 @@ def hnsw_evaluation() -> list:
         # Volume of the true duplicate region (union of distance_threshold-balls
         # around every construct vector) is a pure-geometry quantity: independent
         # of the filter and memory budget, so it's computed once per dataset
-        # here and reused across the whole sweep (see FPVR in hnsw_worker).
+        # here and reused across the whole sweep (see FPVR in system_worker).
         vectors_construct = vectors[:num_construct]
         orig_vol_log_low, orig_vol_log_high = estimate_hypersphere_volume(
             vectors_construct,
@@ -375,7 +375,7 @@ def hnsw_evaluation() -> list:
         for memory_budget in memory_budgets:
             for filter_cls in static_filters + dynamic_filters:
                 runner.submit(
-                    'hnsw',
+                    'system',
                     filter_cls=filter_cls, lsh_cls=DummyLSH,
                     dim=dim, distance_threshold=distance_threshold,
                     max_L=max_L, memory_budget=memory_budget,
@@ -385,10 +385,10 @@ def hnsw_evaluation() -> list:
                 )
 
     results = runner.run()
-    print("HNSW evaluation completed.")
+    print("System evaluation completed.")
 
     df = pd.DataFrame(results).sort_values(['Dataset', 'Config', 'Percentage'])
-    print("\n=== HNSW Filtered-Access Evaluation (per run) ===")
+    print("\n=== System Filtered-Access Evaluation (per run) ===")
     print(df.to_string(index=False))
 
     mean_cols = [
@@ -400,7 +400,7 @@ def hnsw_evaluation() -> list:
     print("\n=== Mean per dataset (averaged over the memory-budget sweep) ===")
     print(summary.to_string(index=False))
 
-    plot_hnsw_results(results)
+    plot_system_results(results)
     return results
 
 
@@ -411,10 +411,10 @@ def evaluate_ablation() -> pd.DataFrame:
     feedback) across the 3 datasets the ablation figure needs, write it to
     results/ablation.csv, and render the figure panels via
     plot_ablation.generate_ablation_figures -- the same pattern
-    static_evaluation()/hnsw_evaluation() use with plot_results/plot_hnsw_results,
+    static_evaluation()/system_evaluation() use with plot_results/plot_system_results,
     just without discarding the in-memory results in favor of a re-read.
     """
-    num_vectors           = 1000
+    num_vectors           = 100_000
     dim                   = 384
     percentage_construct  = 20
     k_values              = [64, 128, 256, 512]
@@ -948,12 +948,12 @@ def tradeoff_evaluation() -> Tuple[List, List]:
     return sphere_results, memory_results
 
 if __name__ == "__main__":
-    # static_evaluation()
-    # dynamic_evaluation()
-    # equal_memory_evaluation()
-    # hnsw_evaluation()
-    # tradeoff_evaluation()
-    # evaluate_ablation()
-    # evaluate_query_performance()
-    # evaluate_scaling()
+    static_evaluation()
+    dynamic_evaluation()
+    equal_memory_evaluation()
+    system_evaluation()
+    tradeoff_evaluation()
+    evaluate_ablation()
+    evaluate_query_performance()
+    evaluate_scaling()
     evaluate_streaming()

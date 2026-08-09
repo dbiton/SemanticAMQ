@@ -201,10 +201,10 @@ def get_plot_mappings(all_filters: List[str]) -> Tuple[Dict, Dict, Dict]:
     return color_map, marker_map, dash_map
 
 
-def plot_hnsw_results(results_list: list, folder: str = "plots/hnsw") -> None:
+def plot_system_results(results_list: list, folder: str = "plots/system") -> None:
     """
-    Plots the HNSW filtered-access evaluation aggregated per dataset: mean
-    throughput, mean per-query latency, and mean HNSW index accesses of the
+    Plots the flat-index filtered-access evaluation aggregated per dataset: mean
+    throughput, mean per-query latency, and mean index accesses of the
     query stream, comparing the unfiltered baseline against each filter config
     placed in front of the index. Bars are means over the memory-budget sweep;
     whiskers show one standard deviation across it. Also plots index accesses,
@@ -228,7 +228,7 @@ def plot_hnsw_results(results_list: list, folder: str = "plots/hnsw") -> None:
     metrics = [
         ('Throughput Without Filter', 'Throughput With Filter', 'Mean Throughput (queries/s)', 'throughput'),
         ('Latency Without Filter (ms)', 'Latency With Filter (ms)', 'Mean Latency per Query (ms)', 'latency'),
-        ('Total Queries', 'Index Accesses', 'Mean HNSW Index Accesses', 'index_accesses'),
+        ('Total Queries', 'Index Accesses', 'Mean Index Accesses', 'index_accesses'),
     ]
     for without_col, with_col, ylabel, name in metrics:
         # Long form: one row per (dataset, pipeline, run) so the barplot can
@@ -253,7 +253,7 @@ def plot_hnsw_results(results_list: list, folder: str = "plots/hnsw") -> None:
             title=None, fontsize=9, loc='lower center',
             bbox_to_anchor=(0.5, 1.02), ncol=min(3, len(pipelines)), frameon=False,
         )
-        filename = f'hnsw_{name}_plot.png'
+        filename = f'system_{name}_plot.png'
         plt.savefig(f"{folder}/{filename}", bbox_inches='tight', dpi=300)
         plt.close()
         print(f"Saved {folder}/{filename}")
@@ -266,18 +266,18 @@ def plot_hnsw_results(results_list: list, folder: str = "plots/hnsw") -> None:
     for col, ylabel, name in vs_memory_metrics:
         _plot_metric_vs_memory(df, datasets, col, ylabel, name, folder)
 
-    _plot_radius_stats_hnsw(df, datasets, folder)
+    _plot_radius_stats_system(df, datasets, folder)
     _plot_fpvr_vs_memory(df, datasets, folder)
 
 
-def _plot_radius_stats_hnsw(df: pd.DataFrame, datasets: List[str], folder: str) -> None:
+def _plot_radius_stats_system(df: pd.DataFrame, datasets: List[str], folder: str) -> None:
     if 'Memory Budget' not in df.columns or df['Memory Budget'].nunique() <= 1:
         return
     plot_df = df.copy()
     plot_df['Memory Budget (MB)'] = plot_df['Memory Budget'] / (1024 * 1024)
     group_col = 'Dataset' if len(datasets) > 1 else None
     _plot_radius_error_bars(
-        plot_df, 'Memory Budget (MB)', 'Memory Budget (MB)', folder, 'hnsw_radius_stats_plot.png',
+        plot_df, 'Memory Budget (MB)', 'Memory Budget (MB)', folder, 'system_radius_stats_plot.png',
         group_col=group_col,
     )
 
@@ -308,7 +308,7 @@ def _plot_metric_vs_memory(
     ax.set_xlabel('Memory Budget (MB)', fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
     ax.legend(fontsize=9, loc='best')
-    filename = f'hnsw_{name}_vs_memory_plot.png'
+    filename = f'system_{name}_vs_memory_plot.png'
     plt.savefig(f"{folder}/{filename}", bbox_inches='tight', dpi=300)
     plt.close()
     print(f"Saved {folder}/{filename}")
@@ -321,7 +321,7 @@ def _plot_fpvr_vs_memory(df: pd.DataFrame, datasets: List[str], folder: str) -> 
     config when more than one is swept). FPVR estimates how many (natural-log)
     times larger a geometric filter's covered hypersphere volume is than the
     true duplicate region, using hypersphere-volume lower/upper bounds as a
-    ground-truth-free stand-in for false-positive rate (hnsw_worker has no
+    ground-truth-free stand-in for false-positive rate (system_worker has no
     per-query labels to compute FPR directly). Kept in log space -- exponentiating
     to a raw ratio can overflow to +inf in high dimensions -- so values are
     always >= 0 and plotted on a linear axis. The lower/upper bound is drawn
@@ -355,7 +355,7 @@ def _plot_fpvr_vs_memory(df: pd.DataFrame, datasets: List[str], folder: str) -> 
     ax.set_xlabel('Memory Budget (MB)', fontsize=12)
     ax.set_ylabel('False Positive Volume Ratio (log[V_filter / V_original])', fontsize=12)
     ax.legend(fontsize=9, loc='best')
-    filename = 'hnsw_fpvr_vs_memory_plot.png'
+    filename = 'system_fpvr_vs_memory_plot.png'
     plt.savefig(f"{folder}/{filename}", bbox_inches='tight', dpi=300)
     plt.close()
     print(f"Saved {folder}/{filename}")
