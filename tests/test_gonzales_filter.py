@@ -52,7 +52,7 @@ def _uniform_ball(v: np.ndarray, r: float, n: int = 20, seed: int = 2) -> np.nda
 class TestGonzalezInit(unittest.TestCase):
 
     def test_max_spheres_stored(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=10)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=10)
         self.assertEqual(f.max_spheres, 10)
 
     def test_max_memory_derives_sphere_count(self):
@@ -67,11 +67,11 @@ class TestGonzalezInit(unittest.TestCase):
 
     def test_max_spheres_overrides_max_memory(self):
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R,
-                              max_memory=10 ** 9, max_spheres=3)
+                              max_memory=10 ** 9, max_shapes=3)
         self.assertEqual(f.max_spheres, 3)
 
     def test_distance_threshold_stored(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=0.5, max_spheres=5)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=0.5, max_shapes=5)
         self.assertAlmostEqual(f.distance_threshold, 0.5)
 
 
@@ -82,14 +82,14 @@ class TestGonzalezInit(unittest.TestCase):
 class TestGonzalezConstruct(unittest.TestCase):
 
     def test_respects_max_spheres(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=8)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=8)
         f.construct(_rand(100))
         self.assertTrue(f._constructed)
         self.assertLessEqual(len(f.all_spheres), 8)
         self.assertEqual(len(f.all_spheres), len(f.all_radiuses))
 
     def test_empty_input(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=5)
         f.construct(np.empty((0, DIM), dtype=np.float32))
         self.assertTrue(f._constructed)
         self.assertEqual(len(f.all_spheres), 0)
@@ -97,14 +97,14 @@ class TestGonzalezConstruct(unittest.TestCase):
     def test_trivial_case_fewer_vectors_than_spheres(self):
         """When n <= max_spheres each vector becomes its own sphere."""
         vecs = _rand(3)
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=20)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=20)
         f.construct(vecs)
         self.assertEqual(len(f.all_spheres), 3)
         np.testing.assert_allclose(f.all_radiuses, R, atol=1e-5)
 
     def test_trivial_case_n_equals_max_spheres(self):
         vecs = _rand(5)
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=5)
         f.construct(vecs)
         self.assertEqual(len(f.all_spheres), 5)
         np.testing.assert_allclose(f.all_radiuses, R, atol=1e-5)
@@ -113,7 +113,7 @@ class TestGonzalezConstruct(unittest.TestCase):
         """When max_spheres >= n, each sphere center must literally be one
         of the original vectors, not a cluster average."""
         vecs = _rand(6, seed=17)
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=20)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=20)
         f.construct(vecs)
         stored = f.all_centers
         self.assertEqual(len(stored), len(vecs))
@@ -126,7 +126,7 @@ class TestGonzalezConstruct(unittest.TestCase):
         rather than the original vectors — but every original vector must
         still fall within the radius of at least one stored sphere."""
         vecs = _rand(100, seed=23)
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=10)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=10)
         f.construct(vecs)
         self.assertLess(len(f.all_spheres), len(vecs),
                         "expected clustering to collapse spheres below vector count")
@@ -141,7 +141,7 @@ class TestGonzalezConstruct(unittest.TestCase):
                          f"{uncovered.tolist()}")
 
     def test_radii_at_least_distance_threshold(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=10)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=10)
         f.construct(_rand(200))
         self.assertTrue(np.all(f.all_radiuses >= R - 1e-5),
                         f"Some radii < distance_threshold: {f.all_radiuses[f.all_radiuses < R]}")
@@ -149,7 +149,7 @@ class TestGonzalezConstruct(unittest.TestCase):
     def test_separated_clusters_get_one_sphere_each(self):
         """Well-separated tight clusters should each collapse to a small sphere."""
         vecs = _clustered(4, 25, spread=0.02, sep=20.0)
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=4)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=4)
         f.construct(vecs)
         self.assertEqual(len(f.all_spheres), 4)
         # tiny intra-cluster radius + R ≈ R
@@ -160,36 +160,36 @@ class TestGonzalezConstruct(unittest.TestCase):
         """If every point is within distance_threshold of a center, Gonzalez
         stops adding centers even when max_spheres allows more."""
         vecs = _clustered(3, 30, spread=0.01, sep=20.0)
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=1.0, max_spheres=50)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=1.0, max_shapes=50)
         f.construct(vecs)
         self.assertLess(len(f.all_spheres), 50)
 
     def test_construct_returns_log_volume_bounds(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=8)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=8)
         low, high = f.construct(_rand(100))
         self.assertTrue(np.isfinite(low))
         self.assertTrue(np.isfinite(high))
         self.assertLessEqual(low, high + 1e-9)
 
     def test_construct_empty_returns_neg_inf_bounds(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=5)
         low, high = f.construct(np.empty((0, DIM), dtype=np.float32))
         self.assertEqual(low, -np.inf)
         self.assertEqual(high, -np.inf)
 
     def test_max_spheres_zero_builds_empty_filter(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=0)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=0)
         f.construct(_rand(50))
         self.assertTrue(f._constructed)
         self.assertEqual(len(f.all_spheres), 0)
         self.assertFalse(any(f.query(_rand(10))))
 
     def test_reconstruct_replaces_previous_state(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=10)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=10)
         first = _rand(10, seed=0)
         second = _rand(10, seed=7) + 50.0
         f.construct(first)
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=10)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=10)
         f.construct(second)
         self.assertTrue(all(f.query(second)))
         self.assertFalse(any(f.query(first)))
@@ -204,7 +204,7 @@ class TestGonzalezQuery(unittest.TestCase):
     def test_stored_vectors_always_recalled(self):
         """Every vector used in construct() must be returned True by query()."""
         vecs = _rand(60)
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=8)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=8)
         f.construct(vecs)
         results = f.query(vecs)
         fn = sum(1 for r in results if not r)
@@ -213,7 +213,7 @@ class TestGonzalezQuery(unittest.TestCase):
     def test_neighbors_within_threshold_recalled(self):
         """Vectors within distance_threshold of a stored vector must be found."""
         vecs = _rand(20)
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=5)
         f.construct(vecs)
         neighbors = _neighbors(vecs, r=R, n=3)
         results = f.query(neighbors)
@@ -223,28 +223,28 @@ class TestGonzalezQuery(unittest.TestCase):
 
     def test_distant_vectors_rejected(self):
         vecs = _rand(30)
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=5)
         f.construct(vecs)
         self.assertFalse(any(f.query(vecs + 1000.0)))
 
     def test_query_before_construct_raises(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=5)
         with self.assertRaises(ValueError):
             f.query(np.zeros((1, DIM), dtype=np.float32))
 
     def test_query_on_empty_filter_returns_all_false(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=5)
         f.construct(np.empty((0, DIM), dtype=np.float32))
         self.assertFalse(any(f.query(_rand(10))))
 
     def test_query_empty_batch_returns_empty_list(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=5)
         f.construct(_rand(20))
         self.assertEqual(f.query(np.empty((0, DIM), dtype=np.float32)), [])
 
     def test_query_returns_list_of_bools(self):
         vecs = _rand(20)
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=4)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=4)
         f.construct(vecs)
         results = f.query(vecs)
         self.assertIsInstance(results, list)
@@ -254,7 +254,7 @@ class TestGonzalezQuery(unittest.TestCase):
         """Batch query must give identical results to per-vector queries."""
         vecs = _rand(50)
         queries = _rand(15, seed=99)
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=6)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=6)
         f.construct(vecs)
         self.assertEqual(f.query(queries),
                          [f.query(q[None, :])[0] for q in queries])
@@ -262,7 +262,7 @@ class TestGonzalezQuery(unittest.TestCase):
     def test_single_sphere_covers_all_stored_and_neighbors(self):
         vecs = _rand(20)
         neighbors = _neighbors(vecs, r=R, n=2)
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=1)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=1)
         f.construct(vecs)
         self.assertTrue(all(f.query(vecs)))
         self.assertTrue(all(f.query(neighbors)))
@@ -271,7 +271,7 @@ class TestGonzalezQuery(unittest.TestCase):
         """A filter built from a single point should reject a query that
         sits just beyond distance_threshold from it."""
         vec = _rand(1, seed=42)
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=1)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=1)
         f.construct(vec)
         self.assertTrue(f.query(vec)[0])
 
@@ -284,7 +284,7 @@ class TestGonzalezQuery(unittest.TestCase):
         """Points sampled uniformly from within the distance_threshold ball
         around each stored vector must always be recalled."""
         vecs = _rand(15, seed=11)
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=5)
         f.construct(vecs)
 
         samples = _uniform_ball(vecs, r=R, n=30)
@@ -297,10 +297,10 @@ class TestGonzalezQuery(unittest.TestCase):
         stored = _rand(10, seed=0)
         queries = _neighbors(stored, r=0.6 * 0.95, n=2)
 
-        f_small = GonzalezMEBFilter(dim=DIM, distance_threshold=0.1, max_spheres=10)
+        f_small = GonzalezMEBFilter(dim=DIM, distance_threshold=0.1, max_shapes=10)
         f_small.construct(stored)
 
-        f_large = GonzalezMEBFilter(dim=DIM, distance_threshold=0.7, max_spheres=10)
+        f_large = GonzalezMEBFilter(dim=DIM, distance_threshold=0.7, max_shapes=10)
         f_large.construct(stored)
 
         recall_small = sum(f_small.query(queries))
@@ -317,7 +317,7 @@ class TestGonzalezAdd(unittest.TestCase):
 
     def test_add_before_construct_constructs(self):
         vecs = _rand(30)
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=5)
         f.add(vecs)
         self.assertTrue(f._constructed)
         self.assertTrue(all(f.query(vecs)))
@@ -325,14 +325,14 @@ class TestGonzalezAdd(unittest.TestCase):
     def test_added_vectors_are_recalled(self):
         base = _rand(20, seed=0)
         extra = _rand(20, seed=5) + 50.0
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=10)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=10)
         f.construct(base)
         f.add(extra)
         self.assertTrue(all(f.query(base)), "base vectors lost after add")
         self.assertTrue(all(f.query(extra)), "added vectors not recalled")
 
     def test_add_far_vector_creates_new_sphere(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=30)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=30)
         f.construct(_rand(5))
         before = len(f.all_spheres)
         f.add(np.full((1, DIM), 500.0, dtype=np.float32))
@@ -340,7 +340,7 @@ class TestGonzalezAdd(unittest.TestCase):
 
     def test_add_duplicate_does_not_create_new_sphere(self):
         vecs = _rand(5)
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=30)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=30)
         f.construct(vecs)
         before = len(f.all_spheres)
         f.add(vecs[:1])
@@ -349,7 +349,7 @@ class TestGonzalezAdd(unittest.TestCase):
     def test_add_never_exceeds_max_spheres(self):
         """Once at capacity, far vectors are merged instead of creating spheres."""
         k = 5
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=k)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=k)
         f.construct(_rand(k))
         self.assertEqual(len(f.all_spheres), k)
         extra = _rand(50, seed=3) * 20.0
@@ -359,7 +359,7 @@ class TestGonzalezAdd(unittest.TestCase):
                         "merged vectors must still be recalled")
 
     def test_add_preserves_no_false_negatives_over_many_batches(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=8)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=8)
         all_vecs = []
         f.construct(_rand(20, seed=0))
         all_vecs.append(_rand(20, seed=0))
@@ -372,7 +372,7 @@ class TestGonzalezAdd(unittest.TestCase):
                         "no-false-negative invariant broken by add()")
 
     def test_add_empty_is_noop(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=5)
         f.construct(_rand(10))
         spheres = f.all_spheres.copy()
         f.add(np.empty((0, DIM), dtype=np.float32))
@@ -380,7 +380,7 @@ class TestGonzalezAdd(unittest.TestCase):
 
     def test_insert_delegates_to_add(self):
         vecs = _rand(10)
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=20)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=20)
         f.insert(vecs)
         self.assertTrue(f._constructed)
         self.assertTrue(all(f.query(vecs)))
@@ -393,7 +393,7 @@ class TestGonzalezAdd(unittest.TestCase):
 class TestGonzalezRemove(unittest.TestCase):
 
     def test_remove_raises_not_implemented(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=5)
         f.construct(_rand(10))
         with self.assertRaises(NotImplementedError):
             f.remove(_rand(2))
@@ -407,11 +407,11 @@ class TestGonzalezMemory(unittest.TestCase):
     dim = 16
 
     def test_bytesize_before_construct_is_zero(self):
-        f = GonzalezMEBFilter(dim=self.dim, distance_threshold=R, max_spheres=10)
+        f = GonzalezMEBFilter(dim=self.dim, distance_threshold=R, max_shapes=10)
         self.assertEqual(f.get_bytesize(), 0)
 
     def test_bytesize_after_construct(self):
-        f = GonzalezMEBFilter(dim=self.dim, distance_threshold=R, max_spheres=6)
+        f = GonzalezMEBFilter(dim=self.dim, distance_threshold=R, max_shapes=6)
         f.construct(_rand(100, self.dim))
         k = len(f.all_spheres)
         minimal_pairs_heap = sys.getsizeof(f._minimal_pairs)
@@ -432,11 +432,11 @@ class TestGonzalezMemory(unittest.TestCase):
 class TestGonzalezInterface(unittest.TestCase):
 
     def test_exact_matching_fpr_is_zero(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=5)
         self.assertEqual(f.get_exact_matching_fpr(), 0.0)
 
     def test_get_volume_is_zero(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_shapes=5)
         self.assertEqual(f.get_volume(), 0.0)
 
 
