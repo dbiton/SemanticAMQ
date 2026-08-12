@@ -1,11 +1,13 @@
 import faiss
 import time
+import inspect
 import numpy as np
 import pandas as pd
 
 from filters.cuckoo_filter import CuckooFilter
 from filters.gcs_filter import GCSFilter
-from filters.kdball_filter import KDBallFilter
+from filters.kdbox_filter import KDBoxFilter
+from filters.gonzalesbox_filter import GonzalezBoxFilter
 from filters.gonzales_filter import GonzalezMEBFilter
 from filters.pyfusefilter_filters import Fuse8Filter, Xor8Filter
 from filters.quotient_filter import QuotientFilterWrapper
@@ -19,7 +21,7 @@ from vector_source import VectorSource, ArrayVectorSource
 MAX_WORKERS = 6
 DATASET = 'ELI5'
 
-dynamic_filters = [KDBallFilter, GonzalezMEBFilter]
+dynamic_filters = [KDBoxFilter, GonzalezBoxFilter, GonzalezMEBFilter]
 static_filters  = [Xor8Filter, Fuse8Filter]
 lsh_families: List[LSH] = [FaissSimHashLSH]
 
@@ -373,15 +375,15 @@ def tradeoff_static_evaluation() -> Tuple[List, List]:
     runner = Runner(num_workers=MAX_WORKERS)
 
     # EXPERIMENT 1: Evaluate Geometric Filter Performance
-    # Tests how the number of spheres (spatial partitioning) impacts 
+    # Tests how the number of shapes (spatial partitioning) impacts 
     # search accuracy and speed for ball-based filters.
-    sphere_sizes = [5, 10, 20, 40, 80, 160, 320, 640, 1000, 1500, 2000, 2300, 2600, 2900, 3200, 3600,
-                     4000, 4400, 4800, 5300, 5800, 6000, 6300, 6800, 7400, 8000, 8700, 9000, 9700, 10000]
-    sphere_sizes = [s for s in sphere_sizes if s < num_construct] + [num_construct]
-    sphere_filters = [KDBallFilter, GonzalezMEBFilter]
+    num_shapes = [5, 10, 20, 40, 80, 160, 320, 640, 1000, 1500, 2000, 2300, 2600, 2900, 3200, 3600,
+                    4000, 4400, 4800, 5300, 5800, 6000, 6300, 6800, 7400, 8000, 8700, 9000, 9700, 10000]
+    num_shapes = [s for s in num_shapes if s < num_construct] + [num_construct]
+    geometric_filters = [f for f in dynamic_filters + static_filters if 'max_shapes' in inspect.signature(f.__init__).parameters]
 
-    for size in sphere_sizes:
-        for filter_cls in sphere_filters:
+    for size in num_shapes:
+        for filter_cls in geometric_filters:
             runner.submit(
                 'tradeoff_static',
                 filter_cls=filter_cls,
@@ -396,11 +398,11 @@ def tradeoff_static_evaluation() -> Tuple[List, List]:
                 memory_budget=None
             )
 
-    print("\nExecuting sphere evaluation...")
-    raw_sphere_results = runner.run()
-    sphere_results = [r for r in raw_sphere_results if r is not None]
+    print("\nExecuting shape size evaluation...")
+    raw_shape_results = runner.run()
+    sphere_results = [r for r in raw_shape_results if r is not None]
     runner.clear() # clear runner jobs
-    print("Sphere evaluation completed.")
+    print("Shape size evaluation completed.")
 
     # EXPERIMENT 2: Benchmark Resource Efficiency
     # Compares all available filter strategies under strict memory limits 
@@ -486,15 +488,15 @@ def tradeoff_dynamic_evaluation() -> Tuple[List, List]:
     runner = Runner(num_workers=MAX_WORKERS)
 
     # EXPERIMENT 1: Evaluate Geometric Filter Performance
-    # Tests how the number of spheres (spatial partitioning) impacts 
+    # Tests how the number of shapes (spatial partitioning) impacts 
     # search accuracy and speed for ball-based filters.
-    sphere_sizes = [5, 10, 20, 40, 80, 160, 320, 640, 1000, 1500, 2000, 2300, 2600, 2900, 3200, 3600,
-                     4000, 4400, 4800, 5300, 5800, 6000, 6300, 6800, 7400, 8000, 8700, 9000, 9700, 10000]
-    sphere_sizes = [s for s in sphere_sizes if s < num_construct] + [num_construct]
-    sphere_filters = [KDBallFilter, GonzalezMEBFilter]
+    num_shapes = [5, 10, 20, 40, 80, 160, 320, 640, 1000, 1500, 2000, 2300, 2600, 2900, 3200, 3600,
+                    4000, 4400, 4800, 5300, 5800, 6000, 6300, 6800, 7400, 8000, 8700, 9000, 9700, 10000]
+    num_shapes = [s for s in num_shapes if s < num_construct] + [num_construct]
+    geometric_filters = [f for f in dynamic_filters + static_filters if 'max_shapes' in inspect.signature(f.__init__).parameters]
 
-    for size in sphere_sizes:
-        for filter_cls in sphere_filters:
+    for size in num_shapes:
+        for filter_cls in geometric_filters:
             runner.submit(
                 'tradeoff_dynamic',
                 filter_cls=filter_cls,
@@ -509,11 +511,11 @@ def tradeoff_dynamic_evaluation() -> Tuple[List, List]:
                 memory_budget=None
             )
 
-    print("\nExecuting sphere evaluation...")
-    raw_sphere_results = runner.run()
-    sphere_results = [r for r in raw_sphere_results if r is not None]
+    print("\nExecuting shape size evaluation...")
+    raw_shape_results = runner.run()
+    sphere_results = [r for r in raw_shape_results if r is not None]
     runner.clear() # clear runner jobs
-    print("Sphere evaluation completed.")
+    print("Shape size evaluation completed.")
 
     # EXPERIMENT 2: Benchmark Resource Efficiency
     # Compares all available filter strategies under strict memory limits 

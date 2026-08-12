@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterator, List, Union
 
 import numpy as np
 import time
+import inspect
 
 from vector_source import VectorSource
 
@@ -78,14 +79,14 @@ def _compute_metrics(
 
 
 def _instantiate_filter(filter_cls: Any, dim: int, lsh_cls: Any, max_L: int, memory_budget: int, distance_threshold: float = None, max_shapes: int = None) -> Any:
-    if filter_cls.__name__ not in ["KDBallFilter", "GonzalezMEBFilter"]:
+    if 'max_shapes' in inspect.signature(filter_cls.__init__).parameters:
+        return filter_cls(dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold, max_shapes=max_shapes)
+    else:
         lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
         try:
             return filter_cls(dim=dim, lsh=lsh, max_memory=memory_budget)
         except TypeError:
             return filter_cls(dim=dim, lsh=lsh)
-    else:
-        return filter_cls(dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold, max_shapes=max_shapes)
 
 
 def static_worker(
