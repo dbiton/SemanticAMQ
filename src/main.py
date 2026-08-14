@@ -400,7 +400,7 @@ def tradeoff_static_evaluation() -> Tuple[List, List]:
 
     print("\nExecuting shape size evaluation...")
     raw_shape_results = runner.run()
-    sphere_results = [r for r in raw_shape_results if r is not None]
+    shape_results = [r for r in raw_shape_results if r is not None]
     runner.clear() # clear runner jobs
     print("Shape size evaluation completed.")
 
@@ -431,9 +431,9 @@ def tradeoff_static_evaluation() -> Tuple[List, List]:
     raw_memory_results = runner.run()
     memory_results = [r for r in raw_memory_results if r is not None]
     print("Memory evaluation completed.")
-    plot_tradeoff_results(sphere_results, memory_results)
+    plot_tradeoff_results(shape_results, memory_results)
 
-    return sphere_results, memory_results
+    return shape_results, memory_results
 
 
 def tradeoff_dynamic_evaluation() -> Tuple[List, List]:
@@ -513,7 +513,7 @@ def tradeoff_dynamic_evaluation() -> Tuple[List, List]:
 
     print("\nExecuting shape size evaluation...")
     raw_shape_results = runner.run()
-    sphere_results = [r for r in raw_shape_results if r is not None]
+    shape_results = [r for r in raw_shape_results if r is not None]
     runner.clear() # clear runner jobs
     print("Shape size evaluation completed.")
 
@@ -544,9 +544,9 @@ def tradeoff_dynamic_evaluation() -> Tuple[List, List]:
     raw_memory_results = runner.run()
     memory_results = [r for r in raw_memory_results if r is not None]
     print("Memory evaluation completed.")
-    plot_tradeoff_results(sphere_results, memory_results, folder="plots/tradeoff_dynamic")
+    plot_tradeoff_results(shape_results, memory_results, folder="plots/tradeoff_dynamic")
 
-    return sphere_results, memory_results
+    return shape_results, memory_results
 
 
 if __name__ == "__main__":

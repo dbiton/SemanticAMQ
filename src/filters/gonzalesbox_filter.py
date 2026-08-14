@@ -118,20 +118,27 @@ class GonzalezBoxFilter(Filter):
         return self._all_boxes[self._num_boxes]
 
 
-    def _find_widest_margin(self, vector_group: np.ndarray) -> Tuple[float, int, float]:
-        if len(vector_group) < 2:
-            return -1.0, None, None
+    def _gonzalez_clustering(self, vectors: np.ndarray, sq_norms: np.ndarray, k: int) -> np.ndarray:
+        n = len(vectors)
+        mean = vectors.mean(axis=0)
+        first = int((sq_norms - 2.0 * (vectors @ mean)).argmax())
 
-        group_min = vector_group.min(axis=0)
-        group_max = vector_group.max(axis=0)
+        c = vectors[first]
+        nearest_sq = np.maximum(sq_norms - 2.0 * (vectors @ c) + c @ c, 0.0)
+        assignment = np.zeros(n, dtype=np.int32)
+        stop_sq = float(self.distance_threshold) ** 2
 
-        margins = group_max - group_min
+        for center_id in range(1, k):
+            far_idx = int(nearest_sq.argmax())
+            if nearest_sq[far_idx] <= stop_sq:
+                break
+            c = vectors[far_idx]
+            new_sq = np.maximum(sq_norms - 2.0 * (vectors @ c) + c @ c, 0.0)
+            closer = new_sq < nearest_sq
+            np.copyto(nearest_sq, new_sq, where=closer)
+            assignment[closer] = center_id
 
-        best_axis = int(np.argmax(margins))
-        best_margin = float(margins[best_axis])
-        best_split_val = float(group_min[best_axis] + (best_margin / 2.0))
-
-        return best_margin, best_axis, best_split_val
+        return assignment
 
 
     def _add_box(self, box_min: np.ndarray, box_max: np.ndarray) -> None:
@@ -205,29 +212,6 @@ class GonzalezBoxFilter(Filter):
             self._num_boxes -= 2
 
             self._add_box(new_min, new_max)
-
-
-    def _gonzalez_clustering(self, vectors: np.ndarray, sq_norms: np.ndarray, k: int) -> np.ndarray:
-        n = len(vectors)
-        mean = vectors.mean(axis=0)
-        first = int((sq_norms - 2.0 * (vectors @ mean)).argmax())
-
-        c = vectors[first]
-        nearest_sq = np.maximum(sq_norms - 2.0 * (vectors @ c) + c @ c, 0.0)
-        assignment = np.zeros(n, dtype=np.int32)
-        stop_sq = float(self.distance_threshold) ** 2
-
-        for center_id in range(1, k):
-            far_idx = int(nearest_sq.argmax())
-            if nearest_sq[far_idx] <= stop_sq:
-                break
-            c = vectors[far_idx]
-            new_sq = np.maximum(sq_norms - 2.0 * (vectors @ c) + c @ c, 0.0)
-            closer = new_sq < nearest_sq
-            np.copyto(nearest_sq, new_sq, where=closer)
-            assignment[closer] = center_id
-
-        return assignment
 
 
     def construct(self, vectors: np.ndarray) -> Tuple[float, float]:
