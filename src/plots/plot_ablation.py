@@ -35,12 +35,10 @@ DPI = 400
 EMIT_PDF = False
 DEMO = False
 
-STAGES = ["initial", "ball", "boundary", "tighten", "feedback"]
+STAGES = ["ball", "quantizing", "feedback"]
 STAGE_LABELS = {
-    "initial": "Init",
     "ball": "Ball",
-    "boundary": "Bnd",
-    "tighten": "Tight",
+    "quantizing": "Quant",
     "feedback": "Fbk",
 }
 STAGE_INDEX = {s: i + 1 for i, s in enumerate(STAGES)}
@@ -120,24 +118,18 @@ def _synthesize_demo_data() -> pd.DataFrame:
     # stage over stage while keeping distinct absolute magnitudes.
     base_log10_j = {"eli5": 145.0, "mmlu": 132.0, "wildchat": 118.0}
     stage_reduction = {
-        "initial": 0.000,
-        "ball": 0.030,
-        "boundary": 0.055,
-        "tighten": 0.085,
+        "ball": 0.000,
+        "quantizing": 0.020,
         "feedback": 0.110,
     }
     stage_fpr = {
-        "initial": 4.0e-2,
         "ball": 1.2e-2,
-        "boundary": 3.5e-3,
-        "tighten": 6.0e-4,
+        "quantizing": 3.0e-3,
         "feedback": 0.0,
     }
     stage_time = {
-        "initial": 0.8,
-        "ball": 4.5,
-        "boundary": 2.1,
-        "tighten": 6.7,
+        "ball": 5.3,
+        "quantizing": 1.8,
         "feedback": 3.2,
     }
 
@@ -309,16 +301,16 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     rel["rel_mean"] = np.nan
     rel["rel_ci95"] = np.nan
     for dataset in DATASETS:
-        init_mean, _ = _lookup(agg, dataset, "initial")
+        base_mean, _ = _lookup(agg, dataset, "ball")
         mask = rel["dataset"] == dataset
-        rel.loc[mask, "rel_mean"] = rel.loc[mask, "mean"] - init_mean
+        rel.loc[mask, "rel_mean"] = rel.loc[mask, "mean"] - base_mean
         rel.loc[mask, "rel_ci95"] = rel.loc[mask, "ci95"]
 
     _bar_panel(
         rel,
         value_col="rel_mean",
         ci_col="rel_ci95",
-        ylabel=r"$\log_{10} J(\mathcal{C})/J_{\mathrm{init}}$",
+        ylabel=r"$\log_{10} J(\mathcal{C})/J_{\mathrm{ball}}$",
         filename="ablation-geometric-objective.png",
         cfg=cfg,
         zero_line=True,
@@ -337,9 +329,9 @@ def panel_threshold_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     rel["rel_mean"] = np.nan
     rel["rel_ci95"] = np.nan
     for dataset in DATASETS:
-        init_mean, _ = _lookup(agg, dataset, "initial")
+        base_mean, _ = _lookup(agg, dataset, "ball")
         mask = rel["dataset"] == dataset
-        rel.loc[mask, "rel_mean"] = rel.loc[mask, "mean"] - init_mean
+        rel.loc[mask, "rel_mean"] = rel.loc[mask, "mean"] - base_mean
         rel.loc[mask, "rel_ci95"] = rel.loc[mask, "ci95"]
 
     def annotate(ax: plt.Axes) -> None:
@@ -357,7 +349,7 @@ def panel_threshold_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         rel,
         value_col="rel_mean",
         ci_col="rel_ci95",
-        ylabel=r"$\log_{10} J_\tau(\mathcal{C})/J_{\tau,\mathrm{init}}$",
+        ylabel=r"$\log_{10} J_\tau(\mathcal{C})/J_{\tau,\mathrm{ball}}$",
         filename="ablation-threshold-expanded-objective.png",
         cfg=cfg,
         zero_line=True,
@@ -601,7 +593,7 @@ def _save(fig: plt.Figure, filename: str, cfg: Config) -> None:
 
 def print_summary(df: pd.DataFrame, cfg: Config) -> None:
     print("\n--- Ablation summary (k={}, tau={:g}) ---".format(cfg.k, cfg.tau))
-    header = f"{'dataset':<10} {'d(log10 J) total':>18} {'final FPR':>12} {'total time (s)':>16}"
+    header = f"{'dataset':<10} {'d(log10 J) ball->fbk':>18} {'final FPR':>12} {'total time (s)':>16}"
     print(header)
     print("-" * len(header))
 
@@ -610,12 +602,12 @@ def print_summary(df: pd.DataFrame, cfg: Config) -> None:
     time_agg = aggregate(df, "cum_time_s", cfg, use_tau=False)
 
     for dataset in DATASETS:
-        init_j, _ = _lookup(j_agg, dataset, "initial")
+        base_j, _ = _lookup(j_agg, dataset, "ball")
         final_j, _ = _lookup(j_agg, dataset, "feedback")
         final_fpr, _ = _lookup(fpr_agg, dataset, "feedback")
         total_time, _ = _lookup(time_agg, dataset, "feedback")
         print(
-            f"{DATASET_LABELS[dataset]:<10} {final_j - init_j:>18.3f} "
+            f"{DATASET_LABELS[dataset]:<10} {final_j - base_j:>18.3f} "
             f"{final_fpr:>12.2e} {total_time:>16.2f}"
         )
     print()

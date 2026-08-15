@@ -1,6 +1,7 @@
 import time
 from typing import List, Tuple, Optional, Dict, Any
 
+import faiss
 import numpy as np
 from scipy.special import logsumexp
 
@@ -14,8 +15,8 @@ class GonzalezMEBFilter(Filter):
     hyperspheres and answers "is anything indexed within tau of this query?"
     without storing the vectors (tau is supplied at query time, not baked in).
 
-    Construction is a cumulative, ablatable ladder of up to 5 levels
-    (`set_complexity`, default 4), each one refining the cover produced by the
+    Construction is a cumulative, ablatable ladder of up to 2 levels
+    (`set_complexity`, default 2), each one refining the cover produced by the
     previous level while never breaking the covering invariant (every indexed
     vector lies within its ball's radius):
 
@@ -30,22 +31,24 @@ class GonzalezMEBFilter(Filter):
          center, and the process repeats until log J = log sum(r_i^d) stops
          decreasing (or a small iteration cap is hit). Costs a small constant
          multiple of level 1.
-      3. Boundary refinement: points near a cluster boundary (close second-
-         nearest center, or realizing their ball's own radius) are shortlisted
-         each iteration by a cheap distance-only bound, and only that bounded
-         batch pays for real MEB recomputes to test whether migrating the
-         point to its second-nearest ball strictly lowers log J. Coverage is
-         preserved because both affected balls are always exact MEBs of their
-         true (post-move) member sets.
-      4. Radius tightening: one more exact max-distance pass per current
-         assignment, squeezing out any slack left by the approximate MEB
-         steps. Cheap and always safe.
-      5. Feedback-driven refinement: opt-in, driven by externally verified
-         false positives supplied after construction via
-         `set_feedback_policy` + `refine_with_feedback` (there is nothing to
-         do for this level *inside* `construct()` itself, since the feedback
-         set doesn't exist yet -- level 5 only forces construction to retain
-         the vectors/assignment that splitting needs).
+
+    Two further refinements are opt-in and run *after* `construct()` rather
+    than as rungs of the complexity ladder:
+
+      - Feedback-driven refinement: driven by externally verified false
+        positives supplied via `set_feedback_policy` + `refine_with_feedback`.
+        Requires `construct(vectors, retain_assignments=True)` so the
+        original vectors/assignment are available to re-partition from.
+      - Quantization: compresses the stored centroids with a FAISS
+        ScalarQuantizer (`quantize=True` at construction, or a manual
+        `quantize_centers()` call). Every candidate in `_QUANTIZER_CANDIDATES`
+        is tried; each candidate's own per-center reconstruction error is
+        folded into that ball's radius (never subtracted), and whichever
+        candidate yields the smallest resulting total covering volume
+        log10 J(C) = log10 sum_i r_i^d is kept -- so the covering invariant
+        holds regardless of which level wins, and the choice is driven
+        directly by the same geometric objective the construction ladder
+        itself minimizes.
 
     Streaming updates (`add`/`insert`) insert a zero-radius singleton ball and,
     if that exceeds `max_spheres`, merge the pair whose combined footprint
@@ -57,9 +60,10 @@ class GonzalezMEBFilter(Filter):
     Storage: centers/radii/counts live in a single preallocated buffer
     (capacity grows by amortized doubling up to max_spheres), so add()/
     remove() never reallocate or copy the whole structure. `get_bytesize()`
-    covers only that buffer; construction state retained for levels >= 3
-    (the original vectors + assignment, needed by boundary/feedback
-    refinement) is reported separately by `get_construction_bytesize()`.
+    covers only that buffer (using the compressed per-vector size once
+    quantized); construction state retained for `refine_with_feedback` (the
+    original vectors + assignment) is reported separately by
+    `get_construction_bytesize()`.
     """
 
     _BYTES_PER_FLOAT32 = 4
@@ -67,24 +71,26 @@ class GonzalezMEBFilter(Filter):
     _MEB_REFINE_ITERATIONS = 200
     _LLOYD_ITERATIONS = 10
     _BALL_REFINE_ITERATIONS = 10
-    _BOUNDARY_REFINE_ITERATIONS = 5
-    _BOUNDARY_BATCH_SIZE = 256
-    _BOUNDARY_MARGIN = 0.15
     _KMEANS2_ITERATIONS = 10
     _CHUNK_SIZE = 20_000
     _LOG_J_EPS = 1e-9
     _RADIUS_SAFETY_REL = 1e-6
     _RADIUS_SAFETY_ABS = 1e-6
     _DEFAULT_SEED = 42
-    _DEFAULT_COMPLEXITY = 4
+    _DEFAULT_COMPLEXITY = 2
     _FEEDBACK_MAX_CANDIDATE_BALLS = 50
     _FEEDBACK_MAX_MERGE_CANDIDATES = 20
-    _LEVEL_NAMES = {1: "initial_cover", 2: "ball_refine", 3: "boundary_refine", 4: "radius_tighten"}
+    _LEVEL_NAMES = {1: "initial_cover", 2: "ball_refine"}
+    _LN10 = float(np.log(10.0))
+    # Candidate FAISS ScalarQuantizer types tried by quantize_centers(), coarsest
+    # last -- see _apply_quantization for how the winner is picked.
+    _QUANTIZER_CANDIDATES = ("QT_fp16", "QT_8bit", "QT_6bit", "QT_4bit")
     MERGE_CRITERIA = ("log_space", "r_pow_d", "sum_radii", "min_radius_increase")
 
     def __init__(self, dim: int, distance_threshold: float, max_memory: Optional[int] = None,
                  max_spheres: Optional[int] = None, seed: int = _DEFAULT_SEED,
-                 merge_criterion: str = "log_space"):
+                 merge_criterion: str = "log_space", quantize: bool = False,
+                 quantizer_candidates: Optional[Tuple[str, ...]] = None):
         super().__init__(dim, lsh=None, max_memory=max_memory)
         self.distance_threshold = distance_threshold
         self.max_spheres = (max_spheres if max_spheres is not None
@@ -102,16 +108,25 @@ class GonzalezMEBFilter(Filter):
         self._capacity = 0
         self._size = 0
 
-        # construction state (vectors + assignment), retained for level >= 3
+        # construction state (vectors + assignment), retained only when
+        # explicitly requested (needed by refine_with_feedback)
         self._retain_assignments = False
         self._X: Optional[np.ndarray] = None
         self._assignment: Optional[np.ndarray] = None
 
-        # feedback policy (level 5)
+        # feedback policy
         self._feedback_mode = "reserved"
         self._feedback_reserved_fraction = 0.10
         self._feedback_margin = 0.0
         self._feedback_max_iterations = 100
+
+        # quantization policy
+        self._quantize = bool(quantize)
+        self._quantizer_candidates = (tuple(quantizer_candidates) if quantizer_candidates is not None
+                                      else self._QUANTIZER_CANDIDATES)
+        self._quantizer_name: Optional[str] = None
+        self._quantizer_bytes_per_vector: Optional[int] = None
+        self._quantizer_stats: Optional[Dict[str, Any]] = None
 
         # instrumentation
         self._stage_stats: List[Dict[str, Any]] = []
@@ -140,8 +155,8 @@ class GonzalezMEBFilter(Filter):
     # ------------------------------------------------------------------ complexity / feedback policy
 
     def set_complexity(self, level: int) -> None:
-        if level not in (1, 2, 3, 4, 5):
-            raise ValueError(f"complexity level must be in 1..5, got {level}")
+        if level not in (1, 2):
+            raise ValueError(f"complexity level must be in 1..2, got {level}")
         if self._constructed:
             self._constructed = False
         self._complexity_level = level
@@ -589,102 +604,23 @@ class GonzalezMEBFilter(Filter):
 
         return centers, radii, counts, assignment, accepted
 
-    # ------------------------------------------------------------------ level 3: boundary refinement
-
-    def _level3_boundary_refine(self, vectors: np.ndarray, sq_norms: np.ndarray, centers: np.ndarray,
-                                radii: np.ndarray, counts: np.ndarray,
-                                assignment: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
-        centers = centers.copy()
-        radii = radii.copy()
-        counts = counts.copy()
-        assignment = assignment.copy()
-        accepted_total = 0
-
-        for _ in range(self._BOUNDARY_REFINE_ITERATIONS):
-            if len(centers) < 2:
-                break
-            nearest, second, d_nearest, d_second = self._chunked_top2(vectors, sq_norms, centers)
-            r_nearest = radii[nearest].astype(np.float64)
-            r_second = radii[second].astype(np.float64)
-
-            realizes = d_nearest >= r_nearest * (1.0 - self._BOUNDARY_MARGIN)
-            margin_close = d_second <= d_nearest * (1.0 + self._BOUNDARY_MARGIN)
-            eligible = realizes & margin_close & (nearest != second) & np.isfinite(d_second)
-            cand_idx = np.flatnonzero(eligible)
-            if cand_idx.size == 0:
-                break
-
-            shrink_bound = r_nearest[cand_idx]
-            growth_lower_bound = np.maximum(0.0, d_second[cand_idx] - r_second[cand_idx])
-            score = shrink_bound - growth_lower_bound
-            order = np.argsort(-score)
-            batch = cand_idx[order[:self._BOUNDARY_BATCH_SIZE]]
-
-            accepted_this_iter = 0
-            for x in batch:
-                x = int(x)
-                i = int(assignment[x])
-                j = int(second[x])
-                if i == j:
-                    continue
-                members_i = np.flatnonzero(assignment == i)
-                if len(members_i) <= 1:
-                    continue  # never migrate away a ball's last member here
-                members_i_wo_x = members_i[members_i != x]
-                new_c_i, new_r_i = self._minimum_enclosing_ball(vectors[members_i_wo_x], sq_norms[members_i_wo_x])
-                if new_r_i >= radii[i] - self._LOG_J_EPS:
-                    continue  # removing x doesn't actually shrink ball i; skip before the 2nd MEB
-
-                members_j = np.flatnonzero(assignment == j)
-                members_j_with_x = np.concatenate([members_j, [x]])
-                new_c_j, new_r_j = self._minimum_enclosing_ball(vectors[members_j_with_x], sq_norms[members_j_with_x])
-
-                old_log_J = self._log_J(radii)
-                trial_radii = radii.copy()
-                trial_radii[i] = new_r_i
-                trial_radii[j] = new_r_j
-                new_log_J = self._log_J(trial_radii)
-                if new_log_J < old_log_J - self._LOG_J_EPS:
-                    centers[i], radii[i] = new_c_i, new_r_i
-                    centers[j], radii[j] = new_c_j, new_r_j
-                    counts[i] -= 1
-                    counts[j] += 1
-                    assignment[x] = j
-                    accepted_this_iter += 1
-                    accepted_total += 1
-
-            if accepted_this_iter == 0:
-                break
-
-        return centers, radii, counts, assignment, accepted_total
-
-    # ------------------------------------------------------------------ level 4: radius tightening
-
-    def _level4_tighten(self, vectors: np.ndarray, sq_norms: np.ndarray, centers: np.ndarray,
-                        assignment: np.ndarray, num_spheres: int) -> Tuple[np.ndarray, np.ndarray]:
-        radii = np.zeros(num_spheres, dtype=np.float32)
-        counts = np.zeros(num_spheres, dtype=np.int32)
-        groups = self._groups_from_assignment(assignment, num_spheres)
-        for i, idx in enumerate(groups):
-            pts = vectors[idx]
-            c = centers[i].astype(np.float64)
-            d = np.sqrt(np.maximum(np.einsum('ij,ij->i', pts - c, pts - c), 0.0))
-            radii[i] = self._safe_radius(d.max()) if len(d) else 0.0
-            counts[i] = len(idx)
-        return radii, counts
-
     # ------------------------------------------------------------------ instrumentation
 
-    def _record_stage(self, level: int, name: str, t_start: float, radii: np.ndarray, accepted_ops: int) -> None:
-        self._stage_stats.append({
+    def _make_stage_record(self, level: int, name: str, wall_time: float,
+                           radii: np.ndarray, accepted_ops: int) -> Dict[str, Any]:
+        return {
             "level": level,
             "name": name,
-            "wall_time": time.perf_counter() - t_start,
+            "wall_time": wall_time,
             "ball_count": len(radii),
             "log_J": self._log_J(radii),
             "radii_snapshot": np.asarray(radii, dtype=np.float32).copy(),
             "accepted_ops": accepted_ops,
-        })
+        }
+
+    def _record_stage(self, level: int, name: str, t_start: float, radii: np.ndarray, accepted_ops: int) -> None:
+        self._stage_stats.append(
+            self._make_stage_record(level, name, time.perf_counter() - t_start, radii, accepted_ops))
 
     def get_stats(self, taus: Optional[List[float]] = None) -> Dict[str, Any]:
         taus = list(taus) if taus is not None else []
@@ -699,7 +635,7 @@ class GonzalezMEBFilter(Filter):
                 "log_J_tau": {t: self._log_J_tau(stage["radii_snapshot"], t) for t in taus},
                 "accepted_ops": stage["accepted_ops"],
             })
-        return {"levels": levels, "feedback": self._feedback_stats}
+        return {"levels": levels, "feedback": self._feedback_stats, "quantization": self._quantizer_stats}
 
     # ------------------------------------------------------------------ construct
 
@@ -707,8 +643,11 @@ class GonzalezMEBFilter(Filter):
         self._stage_stats = []
         self._feedback_stats = None
         self._merge_cache_valid = False
-        retain = bool(retain_assignments) or self._complexity_level >= 3
-        levels_to_run = min(self._complexity_level, 4)
+        self._quantizer_name = None
+        self._quantizer_bytes_per_vector = None
+        self._quantizer_stats = None
+        retain = bool(retain_assignments)
+        levels_to_run = min(self._complexity_level, 2)
 
         if len(vectors) == 0 or self.max_spheres == 0:
             self._reset_buffers(0)
@@ -723,49 +662,21 @@ class GonzalezMEBFilter(Filter):
             return self._log_volume_bounds()
 
         vectors = np.ascontiguousarray(vectors, dtype=np.float32)
-        n = len(vectors)
         sq_norms = np.einsum('ij,ij->i', vectors, vectors, dtype=np.float64)
 
-        if self.max_spheres >= n:
-            self._reset_buffers(n)
-            self._center_buf[:n] = vectors
-            self._radius_buf[:n] = 0.0
-            self._count_buf[:n] = 1
-            self._size = n
-            assignment = np.arange(n, dtype=np.int32)
-            for lvl in range(1, levels_to_run + 1):
-                t0 = time.perf_counter()
-                self._record_stage(lvl, self._LEVEL_NAMES[lvl], t0, self._radius_buf[:n], 0)
-            self._retain_assignments = retain
-            self._X = vectors if retain else None
-            self._assignment = assignment if retain else None
-            self._constructed = True
-            return self._log_volume_bounds()
-
-        # --- level 1: initial cover ---
-        t0 = time.perf_counter()
-        centers, radii, counts, assignment = self._level1_initial_cover(vectors, sq_norms, self.max_spheres)
-        self._record_stage(1, "initial_cover", t0, radii, 0)
-
-        # --- level 2: ball refinement loop ---
-        if levels_to_run >= 2:
-            t0 = time.perf_counter()
-            centers, radii, counts, assignment, accepted = self._level2_ball_refine(
-                vectors, sq_norms, centers, radii, counts, assignment)
-            self._record_stage(2, "ball_refine", t0, radii, accepted)
-
-        # --- level 3: boundary refinement ---
-        if levels_to_run >= 3:
-            t0 = time.perf_counter()
-            centers, radii, counts, assignment, accepted = self._level3_boundary_refine(
-                vectors, sq_norms, centers, radii, counts, assignment)
-            self._record_stage(3, "boundary_refine", t0, radii, accepted)
-
-        # --- level 4: radius tightening ---
-        if levels_to_run >= 4:
-            t0 = time.perf_counter()
-            radii, counts = self._level4_tighten(vectors, sq_norms, centers, assignment, len(centers))
-            self._record_stage(4, "radius_tighten", t0, radii, 0)
+        if self._quantize:
+            centers, radii, counts, assignment, chosen_k, stage_records, quant = \
+                self._construct_with_quantization(vectors, sq_norms)
+            self.max_spheres = chosen_k
+            self._stage_stats = stage_records
+            if quant is not None:
+                self._quantizer_name = quant["quantizer"]
+                self._quantizer_bytes_per_vector = quant["bytes_per_vector"]
+                self._quantizer_stats = quant
+        else:
+            centers, radii, counts, assignment, stage_records = self._build_cover(
+                vectors, sq_norms, self.max_spheres)
+            self._stage_stats = stage_records
 
         num_spheres = len(centers)
         self._reset_buffers(num_spheres)
@@ -779,6 +690,215 @@ class GonzalezMEBFilter(Filter):
         self._assignment = assignment.astype(np.int32) if retain else None
         self._constructed = True
         return self._log_volume_bounds()
+
+    def _build_cover(self, vectors: np.ndarray, sq_norms: np.ndarray,
+                     k: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Dict[str, Any]]]:
+        """
+        Run the (up to 2-level) construction ladder for an arbitrary ball
+        budget k against already-preprocessed vectors, touching no instance
+        state. Used both for a plain (non-quantized) construct() and, once
+        per quantization candidate, to rebuild at that candidate's own larger
+        effective_k (see _construct_with_quantization). Returns
+        centers/radii/counts/assignment plus this build's own stage records,
+        the same shape _record_stage would append to self._stage_stats for a
+        normal top-level build.
+        """
+        n = len(vectors)
+        levels_to_run = min(self._complexity_level, 2)
+        stage_records: List[Dict[str, Any]] = []
+
+        if k >= n:
+            centers = vectors.copy()
+            radii = np.zeros(n, dtype=np.float32)
+            counts = np.ones(n, dtype=np.int32)
+            assignment = np.arange(n, dtype=np.int32)
+            for lvl in range(1, levels_to_run + 1):
+                stage_records.append(self._make_stage_record(lvl, self._LEVEL_NAMES[lvl], 0.0, radii, 0))
+            return centers, radii, counts, assignment, stage_records
+
+        t0 = time.perf_counter()
+        centers, radii, counts, assignment = self._level1_initial_cover(vectors, sq_norms, k)
+        stage_records.append(self._make_stage_record(1, "initial_cover", time.perf_counter() - t0, radii, 0))
+
+        if levels_to_run >= 2:
+            t0 = time.perf_counter()
+            centers, radii, counts, assignment, accepted = self._level2_ball_refine(
+                vectors, sq_norms, centers, radii, counts, assignment)
+            stage_records.append(
+                self._make_stage_record(2, "ball_refine", time.perf_counter() - t0, radii, accepted))
+
+        return centers, radii, counts, assignment, stage_records
+
+    # ------------------------------------------------------------------ quantization
+
+    def _construct_with_quantization(self, vectors: np.ndarray, sq_norms: np.ndarray):
+        """
+        K (self.max_spheres) is treated as a memory *budget* -- "how many
+        float32-precision spheres this much memory could hold" -- not a
+        literal ball count. A quantizer that halves the per-sphere footprint
+        is only worth using if that freed memory is spent on twice as many,
+        finer spheres, so every candidate here is rebuilt from scratch at its
+        own larger effective_k = budget_k * (float32 bytes/sphere) /
+        (candidate bytes/sphere) -- never just compressed in place at the
+        original k, which could only ever grow J(C).
+
+        The unquantized float32-at-budget_k build is included as its own
+        baseline candidate: more, coarser spheres isn't guaranteed to beat
+        fewer, exact ones, since covering radius shrinks slowly with k until
+        points/ball approaches ~1 (curse of dimensionality), so a modest
+        compression ratio can lose more to quantization noise than it gains
+        from extra spheres. Whichever configuration ends up with the
+        smallest total covering volume log10 J(C) = log10 sum_i r_i^d is
+        kept -- each candidate's own per-center reconstruction error is
+        folded into that ball's radius (never subtracted), so whichever one
+        wins still holds the zero-false-negative covering invariant.
+
+        Returns (centers, radii, counts, assignment, chosen_k, stage_records,
+        quantizer_stats_or_None).
+        """
+        budget_k = self.max_spheres
+        # Per-sphere cost as get_bytesize() actually accounts it: center +
+        # radius (float32) + count (int32) -- omitting the count term here
+        # would let effective_k overshoot the true byte budget once it's
+        # multiplied out over a much larger ball count.
+        bytes_per_sphere_f32 = (self.dim + 2) * self._BYTES_PER_FLOAT32
+
+        centers0, radii0, counts0, assignment0, stages0 = self._build_cover(vectors, sq_norms, budget_k)
+        best = {
+            "log10_J": self._log_J(radii0.astype(np.float64)) / self._LN10,
+            "k": budget_k, "centers": centers0, "radii": radii0, "counts": counts0,
+            "assignment": assignment0, "stages": stages0, "quant": None,
+        }
+
+        for name in self._quantizer_candidates:
+            qtype = getattr(faiss.ScalarQuantizer, name)
+            bytes_per_vector = faiss.ScalarQuantizer(self.dim, qtype).code_size
+            bytes_per_sphere_candidate = bytes_per_vector + 2 * self._BYTES_PER_FLOAT32  # + radius + count
+            effective_k = max(1, budget_k * bytes_per_sphere_f32 // bytes_per_sphere_candidate)
+
+            centers, radii, counts, assignment, stages = self._build_cover(vectors, sq_norms, effective_k)
+            centers32 = np.ascontiguousarray(centers, dtype=np.float32)
+            radii64 = radii.astype(np.float64)
+
+            sq = faiss.ScalarQuantizer(self.dim, qtype)
+            sq.train(centers32)
+            codes = sq.compute_codes(centers32)
+            decoded = sq.decode(codes).astype(np.float64)
+            # Triangle inequality: for any point x, |d(x,center) - d(x,decoded)|
+            # <= ||center - decoded||, so inflating a ball's own radius by its
+            # own reconstruction error keeps every point the true-center ball
+            # covered still covered once the center is replaced by its decoded
+            # (quantized) approximation.
+            error = np.linalg.norm(centers32.astype(np.float64) - decoded, axis=1)
+            quantized_radii = radii64 + error
+            log10_j = self._log_J(quantized_radii) / self._LN10
+
+            if log10_j < best["log10_J"]:
+                best = {
+                    "log10_J": log10_j, "k": effective_k,
+                    "centers": decoded.astype(np.float32),
+                    "radii": quantized_radii.astype(np.float32),
+                    "counts": counts, "assignment": assignment, "stages": stages,
+                    "quant": {
+                        "quantizer": name, "bytes_per_vector": int(codes.shape[1]),
+                        "log10_J": log10_j, "log10_J_unquantized": self._log_J(radii64) / self._LN10,
+                        "mean_center_error": float(error.mean()), "max_center_error": float(error.max()),
+                        "budget_k": budget_k, "effective_k": effective_k,
+                    },
+                }
+
+        return (best["centers"], best["radii"], best["counts"], best["assignment"],
+                best["k"], best["stages"], best["quant"])
+
+    def _apply_quantization_inplace(self) -> Optional[Dict[str, Any]]:
+        """
+        Compress the *currently stored* centers in place, with no k
+        rescaling -- used by quantize_centers() when the original vectors
+        aren't available to rebuild from (construct() wasn't called with
+        retain_assignments=True). Since this can only ever grow radii, it
+        compares every candidate's inflated-radius volume against the
+        unquantized baseline and leaves the cover untouched (returns None)
+        if nothing beats staying float32; see _construct_with_quantization
+        for the k-aware version used when the original vectors are on hand.
+        """
+        if self._size == 0:
+            return None
+        centers = self.all_spheres.astype(np.float32)
+        radii = self.all_radiuses.astype(np.float64)
+        log10_j_plain = self._log_J(radii) / self._LN10
+
+        best = None
+        for name in self._quantizer_candidates:
+            qtype = getattr(faiss.ScalarQuantizer, name)
+            sq = faiss.ScalarQuantizer(self.dim, qtype)
+            sq.train(centers)
+            codes = sq.compute_codes(centers)
+            decoded = sq.decode(codes).astype(np.float64)
+            error = np.linalg.norm(centers.astype(np.float64) - decoded, axis=1)
+            log10_j = self._log_J(radii + error) / self._LN10
+            if best is None or log10_j < best["log10_J"]:
+                best = {
+                    "name": name, "log10_J": log10_j,
+                    "bytes_per_vector": int(codes.shape[1]),
+                    "decoded": decoded.astype(np.float32),
+                    "error": error,
+                }
+
+        if best is None or log10_j_plain <= best["log10_J"]:
+            return None  # unquantized float32 already minimizes volume; leave centers untouched
+
+        self._center_buf[:self._size] = best["decoded"]
+        self._radius_buf[:self._size] = (radii + best["error"]).astype(np.float32)
+        self._merge_cache_valid = False
+        return {
+            "quantizer": best["name"],
+            "bytes_per_vector": best["bytes_per_vector"],
+            "log10_J": best["log10_J"],
+            "log10_J_unquantized": log10_j_plain,
+            "mean_center_error": float(best["error"].mean()),
+            "max_center_error": float(best["error"].max()),
+        }
+
+    def quantize_centers(self) -> Optional[Dict[str, Any]]:
+        """
+        Manually (re-)apply center quantization outside of construct()'s
+        auto-quantize path -- e.g. after refine_with_feedback() has moved or
+        split some balls back to full float32 precision. If construction
+        state was retained (construct(..., retain_assignments=True)), this
+        re-runs the same budget-vs-quantizer search construct() uses when
+        quantize=True, rebuilding each candidate from the original vectors
+        (and may grow self.max_spheres, same as construct()); otherwise it
+        falls back to compressing the currently stored centers in place
+        (_apply_quantization_inplace), which cannot add spheres. Returns the
+        same diagnostic dict as get_stats()["quantization"], or None if
+        nothing was quantized (empty cover, or float32 already minimizes
+        total volume).
+        """
+        if not self._constructed:
+            raise ValueError("GonzalezMEBFilter has not been constructed.")
+        if self._size == 0:
+            return None
+
+        if self._X is not None and len(self._X) > 0:
+            sq_norms = np.einsum('ij,ij->i', self._X, self._X, dtype=np.float64)
+            centers, radii, counts, assignment, chosen_k, stage_records, quant = \
+                self._construct_with_quantization(self._X, sq_norms)
+            self.max_spheres = chosen_k
+            num_spheres = len(centers)
+            self._reset_buffers(num_spheres)
+            self._center_buf[:num_spheres] = centers
+            self._radius_buf[:num_spheres] = radii
+            self._count_buf[:num_spheres] = counts
+            self._size = num_spheres
+            self._assignment = assignment.astype(np.int32)
+            self._stage_stats = stage_records
+        else:
+            quant = self._apply_quantization_inplace()
+
+        self._quantizer_name = quant["quantizer"] if quant else None
+        self._quantizer_bytes_per_vector = quant["bytes_per_vector"] if quant else None
+        self._quantizer_stats = quant
+        return quant
 
     # ------------------------------------------------------------------ query
 
@@ -942,14 +1062,18 @@ class GonzalezMEBFilter(Filter):
     def get_bytesize(self) -> int:
         if not self._constructed:
             return 0
-        return self.all_spheres.nbytes + self.all_radiuses.nbytes + self.sphere_counts.nbytes
+        if self._quantizer_name is not None:
+            center_bytes = self._size * self._quantizer_bytes_per_vector
+        else:
+            center_bytes = self.all_spheres.nbytes
+        return center_bytes + self.all_radiuses.nbytes + self.sphere_counts.nbytes
 
     def get_construction_bytesize(self) -> int:
         if not self._constructed or not self._retain_assignments or self._X is None or self._assignment is None:
             return 0
         return int(self._X.nbytes) + int(self._assignment.nbytes)
 
-    # ------------------------------------------------------------------ level 5: split candidates
+    # ------------------------------------------------------------------ feedback: split candidates
 
     def _two_means_split(self, X: np.ndarray) -> Optional[np.ndarray]:
         n = len(X)
@@ -1050,7 +1174,7 @@ class GonzalezMEBFilter(Filter):
             accept[start:end] = sq_d <= r_total ** 2
         return accept
 
-    # ------------------------------------------------------------------ level 5: merge candidates
+    # ------------------------------------------------------------------ feedback: merge candidates
 
     def _apply_merge_to_cover(self, centers: np.ndarray, radii: np.ndarray, counts: np.ndarray,
                               assignment: np.ndarray, i: int, j: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -1108,7 +1232,7 @@ class GonzalezMEBFilter(Filter):
             centers, radii, counts, assignment = self._apply_merge_to_cover(centers, radii, counts, assignment, i, j)
         return centers, radii, counts, assignment
 
-    # ------------------------------------------------------------------ level 5: reserved mode
+    # ------------------------------------------------------------------ feedback: reserved mode
 
     def _best_split_candidate(self, centers, radii, counts, assignment, X_q, q_sq_norms, thresholds, weights,
                               gamma, loss_and_accept):
@@ -1148,7 +1272,7 @@ class GonzalezMEBFilter(Filter):
             ops += 1
         return centers, radii, counts, assignment, ops
 
-    # ------------------------------------------------------------------ level 5: split_merge mode
+    # ------------------------------------------------------------------ feedback: split_merge mode
 
     def _generate_split_candidates(self, centers, radii, assignment, X_q, q_sq_norms, thresholds, weights, gamma):
         accept = self._per_ball_accept(centers, radii, X_q, q_sq_norms, thresholds, gamma)
@@ -1198,7 +1322,7 @@ class GonzalezMEBFilter(Filter):
             ops += 1
         return centers, radii, counts, assignment, ops
 
-    # ------------------------------------------------------------------ level 5: entry point
+    # ------------------------------------------------------------------ feedback: entry point
 
     def refine_with_feedback(self, queries: np.ndarray, thresholds=None,
                              weights: Optional[np.ndarray] = None) -> Dict[str, Any]:
@@ -1207,8 +1331,7 @@ class GonzalezMEBFilter(Filter):
         if self._X is None or self._assignment is None:
             raise ValueError(
                 "refine_with_feedback requires construction state (original vectors + "
-                "assignment); call construct() with complexity level >= 3, or "
-                "construct(vectors, retain_assignments=True)."
+                "assignment); call construct(vectors, retain_assignments=True)."
             )
 
         t_start = time.perf_counter()

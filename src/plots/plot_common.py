@@ -6,6 +6,7 @@ preset, and small save/aggregate helpers."""
 from __future__ import annotations
 
 import os
+import textwrap
 from typing import List
 
 import numpy as np
@@ -45,7 +46,27 @@ def apply_style(dpi: int = 300) -> None:
         "xtick.minor.size": 0,
         "ytick.minor.size": 0,
         "legend.frameon": False,
+        "legend.fontsize": 7,
+        "legend.title_fontsize": 7,
     })
+
+
+def wrap_label(text: str, width: int = 20) -> str:
+    """Word-wraps an axis label/title to `width` chars per line. The figure
+    size these scripts use (~1.7in wide) is narrower than many verbose
+    labels; bbox_inches="tight" silently clips the trailing text of a long
+    single-line label instead of expanding to fit it, so anything wordy
+    needs to be wrapped onto multiple lines before it's set on an axis.
+
+    Passed through unchanged if it contains a "$": textwrap breaks purely on
+    whitespace, so it can (and will) insert a newline in the middle of a
+    mathtext "$...$" span, leaving each half an unparseable expression that
+    mathtext falls back to rendering as literal text. Callers with a long
+    LaTeX label need to hand-wrap it into separate self-contained "$...$"
+    segments joined by "\\n" instead."""
+    if "$" in text:
+        return text
+    return textwrap.fill(text, width=width)
 
 
 def style_axes(ax: plt.Axes) -> None:

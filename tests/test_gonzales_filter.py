@@ -86,9 +86,9 @@ class TestGonzalezInit(unittest.TestCase):
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=0.5, max_spheres=5)
         self.assertAlmostEqual(f.distance_threshold, 0.5)
 
-    def test_default_complexity_is_4(self):
+    def test_default_complexity_is_2(self):
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
-        self.assertEqual(f._complexity_level, 4)
+        self.assertEqual(f._complexity_level, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +99,7 @@ class TestGonzalezComplexity(unittest.TestCase):
 
     def test_valid_levels_accepted(self):
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
-        for level in (1, 2, 3, 4, 5):
+        for level in (1, 2):
             f.set_complexity(level)
             self.assertEqual(f._complexity_level, level)
 
@@ -108,7 +108,7 @@ class TestGonzalezComplexity(unittest.TestCase):
         with self.assertRaises(ValueError):
             f.set_complexity(0)
         with self.assertRaises(ValueError):
-            f.set_complexity(6)
+            f.set_complexity(3)
 
     def test_changing_complexity_after_construct_requires_rebuild(self):
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
@@ -391,7 +391,7 @@ class TestGonzalezLevels(unittest.TestCase):
 
     def test_no_false_negatives_at_every_level(self):
         vecs = _clustered(5, 30, spread=0.1, sep=12.0, seed=4)
-        for level in (1, 2, 3, 4):
+        for level in (1, 2):
             f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=8, seed=1)
             f.set_complexity(level)
             f.construct(vecs)
@@ -402,17 +402,17 @@ class TestGonzalezLevels(unittest.TestCase):
     def test_log_J_non_increasing_across_levels(self):
         vecs = _rand(150, seed=6)
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=10, seed=1)
-        f.set_complexity(4)
+        f.set_complexity(2)
         f.construct(vecs)
         stats = f.get_stats()
         log_Js = [lvl["log_J"] for lvl in stats["levels"]]
-        self.assertEqual(len(log_Js), 4)
+        self.assertEqual(len(log_Js), 2)
         for a, b in zip(log_Js, log_Js[1:]):
             self.assertLessEqual(b, a + 1e-6, f"log_J increased: {log_Js}")
 
     def test_ball_count_never_exceeds_max_spheres(self):
         vecs = _rand(300, seed=8)
-        for level in (1, 2, 3, 4):
+        for level in (1, 2):
             f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=12, seed=2)
             f.set_complexity(level)
             f.construct(vecs)
@@ -433,7 +433,7 @@ class TestGonzalezLevels(unittest.TestCase):
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=6, seed=1)
         f.construct(vecs)
         stats = f.get_stats(taus=[0.1, 0.5])
-        self.assertEqual([lvl["level"] for lvl in stats["levels"]], [1, 2, 3, 4])
+        self.assertEqual([lvl["level"] for lvl in stats["levels"]], [1, 2])
         for lvl in stats["levels"]:
             self.assertIn(0.1, lvl["log_J_tau"])
             self.assertIn(0.5, lvl["log_J_tau"])
@@ -646,15 +646,13 @@ class TestGonzalezMemory(unittest.TestCase):
 
     def test_construction_bytesize_zero_when_not_retained(self):
         f = GonzalezMEBFilter(dim=self.dim, distance_threshold=R, max_spheres=6)
-        f.set_complexity(2)  # level < 3 -> assignments not retained by default
-        f.construct(_rand(100, self.dim))
+        f.construct(_rand(100, self.dim))  # retain_assignments defaults to False
         self.assertEqual(f.get_construction_bytesize(), 0)
 
     def test_construction_bytesize_nonzero_when_retained(self):
         f = GonzalezMEBFilter(dim=self.dim, distance_threshold=R, max_spheres=6)
-        f.set_complexity(3)  # level >= 3 forces retain_assignments
         vecs = _rand(100, self.dim)
-        f.construct(vecs)
+        f.construct(vecs, retain_assignments=True)
         self.assertGreater(f.get_construction_bytesize(), 0)
         self.assertEqual(f.get_construction_bytesize(), vecs.nbytes + f._assignment.nbytes)
 
@@ -732,8 +730,7 @@ class TestGonzalezFeedback(unittest.TestCase):
 
     def test_refine_without_retained_assignments_raises(self):
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
-        f.set_complexity(2)  # < 3 -> assignments not retained
-        f.construct(_rand(30))
+        f.construct(_rand(30))  # retain_assignments defaults to False
         with self.assertRaises(ValueError):
             f.refine_with_feedback(_rand(5))
 
@@ -741,8 +738,7 @@ class TestGonzalezFeedback(unittest.TestCase):
         dim = 8
         X, rng = _slack_dataset(dim=dim, seed=0)
         f = GonzalezMEBFilter(dim=dim, distance_threshold=0.1, max_spheres=4, seed=3)
-        f.set_complexity(5)
-        f.construct(X)
+        f.construct(X, retain_assignments=True)
 
         big = int(np.argmax(f.all_radiuses))
         mid = f.all_spheres[big].copy()
@@ -760,8 +756,7 @@ class TestGonzalezFeedback(unittest.TestCase):
         dim = 8
         X, rng = _slack_dataset(dim=dim, seed=1)
         f = GonzalezMEBFilter(dim=dim, distance_threshold=0.1, max_spheres=4, seed=3)
-        f.set_complexity(5)
-        f.construct(X)
+        f.construct(X, retain_assignments=True)
         k_before = len(f.all_spheres)
 
         big = int(np.argmax(f.all_radiuses))
@@ -778,8 +773,7 @@ class TestGonzalezFeedback(unittest.TestCase):
         dim = 8
         X, rng = _slack_dataset(dim=dim, seed=2)
         f = GonzalezMEBFilter(dim=dim, distance_threshold=0.1, max_spheres=4, seed=3)
-        f.set_complexity(5)
-        f.construct(X)
+        f.construct(X, retain_assignments=True)
         self.assertIsNone(f.get_stats()["feedback"])
 
         big = int(np.argmax(f.all_radiuses))
@@ -791,6 +785,104 @@ class TestGonzalezFeedback(unittest.TestCase):
         stats = f.get_stats()
         self.assertIsNotNone(stats["feedback"])
         self.assertIn("fraction_eliminated", stats["feedback"])
+
+
+# ---------------------------------------------------------------------------
+# Centroid quantization
+# ---------------------------------------------------------------------------
+
+class TestGonzalezQuantization(unittest.TestCase):
+
+    def test_quantization_disabled_by_default(self):
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=8)
+        f.construct(_rand(100))
+        self.assertIsNone(f.get_stats()["quantization"])
+        self.assertIsNone(f._quantizer_name)
+
+    def test_quantize_respects_the_original_byte_budget_and_uses_more_spheres(self):
+        """K is a memory budget, not a literal ball count: quantize=True must
+        spend the memory a smaller per-sphere footprint frees on *more*
+        spheres, not just compress the same budget_k spheres in place."""
+        f_plain = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=8, seed=1)
+        f_plain.construct(_rand(100))
+
+        f_quant = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=8, seed=1, quantize=True)
+        f_quant.construct(_rand(100))
+
+        stats = f_quant.get_stats()["quantization"]
+        self.assertIsNotNone(stats)
+        self.assertIn(stats["quantizer"], GonzalezMEBFilter._QUANTIZER_CANDIDATES)
+        self.assertLessEqual(f_quant.get_bytesize(), f_plain.get_bytesize())
+        self.assertGreater(len(f_quant.all_spheres), len(f_plain.all_spheres))
+        self.assertEqual(f_quant.max_spheres, stats["effective_k"])
+
+    def test_quantized_total_volume_never_exceeds_unquantized_baseline(self):
+        """The unquantized float32-at-budget_k build is always included as its
+        own candidate, so whichever configuration quantize=True settles on
+        must be at least as good (by total covering volume) as not
+        quantizing at all -- ball count differs, so this compares the
+        aggregate objective, not per-ball radii."""
+        f_plain = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=8, seed=1)
+        f_plain.construct(_rand(100))
+        plain_log10_J = f_plain._log_J(f_plain.all_radiuses.astype(np.float64)) / GonzalezMEBFilter._LN10
+
+        f_quant = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=8, seed=1, quantize=True)
+        f_quant.construct(_rand(100))
+        quant_log10_J = f_quant._log_J(f_quant.all_radiuses.astype(np.float64)) / GonzalezMEBFilter._LN10
+
+        self.assertLessEqual(quant_log10_J, plain_log10_J + 1e-6)
+
+    def test_quantization_preserves_no_false_negatives(self):
+        vecs = _rand(60)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=8, quantize=True)
+        f.construct(vecs)
+        self.assertTrue(all(f.query(vecs)), "quantization introduced a false negative on stored vectors")
+
+        neighbors = _neighbors(vecs, r=R, n=3)
+        self.assertTrue(all(f.query(neighbors)), "quantization introduced a false negative on near neighbors")
+
+    def test_quantize_centers_rebuilds_with_more_spheres_when_vectors_retained(self):
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=8, seed=1)
+        vecs = _rand(200)
+        f.construct(vecs, retain_assignments=True)
+        self.assertIsNone(f.get_stats()["quantization"])
+
+        result = f.quantize_centers()
+        self.assertIsNotNone(result)
+        self.assertEqual(f.get_stats()["quantization"], result)
+        self.assertGreaterEqual(len(f.all_spheres), 8)
+        self.assertTrue(all(f.query(vecs)), "quantize_centers introduced a false negative")
+
+    def test_quantize_centers_without_retained_vectors_cannot_improve_and_returns_none(self):
+        """Without the original vectors there's no way to rebuild at a larger
+        k, and pure in-place precision loss can only grow radii -- so this
+        must leave the cover untouched and report no quantization applied."""
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=8, seed=1)
+        f.construct(_rand(100))  # retain_assignments defaults to False
+        spheres_before = f.all_spheres.copy()
+        radii_before = f.all_radiuses.copy()
+
+        result = f.quantize_centers()
+        self.assertIsNone(result)
+        np.testing.assert_array_equal(f.all_spheres, spheres_before)
+        np.testing.assert_array_equal(f.all_radiuses, radii_before)
+
+    def test_quantize_centers_before_construct_raises(self):
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=8)
+        with self.assertRaises(ValueError):
+            f.quantize_centers()
+
+    def test_quantize_on_empty_filter_is_noop(self):
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5, quantize=True)
+        f.construct(np.empty((0, DIM), dtype=np.float32))
+        self.assertIsNone(f.get_stats()["quantization"])
+        self.assertEqual(f.get_bytesize(), 0)
+
+    def test_quantizer_candidates_can_be_restricted(self):
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=8, seed=1,
+                              quantize=True, quantizer_candidates=("QT_4bit",))
+        f.construct(_rand(100))
+        self.assertEqual(f.get_stats()["quantization"]["quantizer"], "QT_4bit")
 
 
 if __name__ == "__main__":

@@ -533,7 +533,6 @@ def tradeoff_worker(
     return _compute_tradeoff_metrics(predicted, actual_results, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
 
 
-_ABLATION_STAGE_NAMES = ["initial", "ball", "boundary", "tighten", "feedback"]
 _LN10 = float(np.log(10.0))
 
 
@@ -545,6 +544,19 @@ def _log10_J(radii: np.ndarray, dim: int, tau: float = 0.0) -> float:
     with np.errstate(divide='ignore'):
         logr = np.log(r)
     return float(logsumexp(dim * logr)) / _LN10
+
+
+def _J_tau(radii: np.ndarray, dim: int, tau: float = 0.0) -> float:
+    """Linear J_tau(C) = sum_i (r_i + tau)^d. Overflows to +inf for d in the
+    hundreds (float64 maxes out around 1e308, and r**d blows past that for
+    any r > ~1 at d=384) -- _log10_J is the version safe to actually plot;
+    this is kept only for callers that want the raw value when it happens to
+    be representable."""
+    r = np.asarray(radii, dtype=np.float64) + float(tau)
+    if r.size == 0:
+        return 0.0
+    with np.errstate(over='ignore'):
+        return float(np.sum(r ** dim))
 
 
 def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, float]:
@@ -572,13 +584,16 @@ def ablation_worker(
     feedback_fraction: float = 0.1,
 ) -> List[Dict[str, Any]]:
     """
-    Build ONE GonzalezMEBFilter cover per (dataset, k, seed) via the
-    cumulative construction ladder (levels 1-4: initial cover, ball
-    refinement, boundary refinement, radius tightening), then evaluate that
-    same cover at every tau in `tau_values`. Returns one row per
-    (stage, tau) matching the schema plot_ablation.generate_ablation_figures
-    expects: dataset, k, stage, stage_index, tau, log10_J, log10_J_tau, fpr,
-    fnr, stage_time_s, cum_time_s, n_balls, seed.
+    Build ONE GonzalezMEBFilter cover per (dataset, k, seed) via the full
+    (level 1-2) construction ladder, then evaluate that same cover at every
+    tau in `tau_values`. Returns one row per (stage, tau) matching the schema
+    plot_ablation.generate_ablation_figures expects: dataset, k, stage,
+    stage_index, tau, log10_J, log10_J_tau, fpr, fnr, stage_time_s,
+    cum_time_s, n_balls, seed. Reported stages are ["ball", "quantizing",
+    "feedback"] -- the level-1 initial cover (k-means++ seeding, no radius
+    refinement) never gets its own row since it holds no meaningful spheres
+    on its own; its cost is folded into "ball"'s stage_time_s/cum_time_s as
+    a necessary precursor instead.
 
     log10_J is a pure geometric quantity of the cover (sum r_i^d, no tau
     involved) -- panel (a) aggregates it "at the selected k" only, without
@@ -591,17 +606,22 @@ def ablation_worker(
     tau's, which only affect log10_J_tau/fpr/fnr (computed post hoc from the
     same radii) and the feedback branch below.
 
-    Levels 1-4 are each built from scratch via set_complexity(level) so the
-    FPR/FNR of each stage's *actual* cover can be measured directly --
-    GonzalezMEBFilter only retains the final buffer, not per-level snapshots.
-    This mirrors the class's own "cumulative, ablatable ladder" design and
-    costs at most a small constant factor over a single full run (per its
-    docstring), since get_stats() already reports each level's own wall time
-    even in a partial (level < 4) run.
+    "ball" is built via the full ladder (set_complexity defaults to 2) with
+    retain_assignments=True, so the deep copy taken below for the feedback
+    stage -- and quantize_centers()'s own rebuild-from-vectors path -- has
+    the construction state they need.
 
-    Level 5 (feedback) *is* legitimately tau-specific -- which points count
-    as a witnessed false positive depends on tau -- so it branches once per
-    tau off a deep copy of the level-4 cover.
+    "quantizing" applies GonzalezMEBFilter.quantize_centers() to that same
+    cover in place: it rebuilds each FAISS ScalarQuantizer candidate from the
+    retained vectors at its own bytes-rescaled effective_k and keeps
+    whichever configuration (including staying unquantized) minimizes
+    log10 J(C), so n_balls can differ from k here. Its stage_time_s is the
+    wall-clock cost of the quantize_centers() call itself, not the ladder's
+    self-reported per-level times.
+
+    Feedback *is* legitimately tau-specific -- which points count as a
+    witnessed false positive depends on tau -- so it branches once per tau
+    off a deep copy of the post-quantization cover.
     """
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
@@ -622,28 +642,45 @@ def ablation_worker(
     actual_by_tau = {t: np.asarray(a, dtype=bool) for t, a in actual_results_by_tau.items()}
 
     rows: List[Dict[str, Any]] = []
-    filt = None
-    for level in range(1, 5):
-        filt = GonzalezMEBFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed)
-        filt.set_complexity(level)
-        filt.construct(construct_arr)
-        levels = filt.get_stats(taus=tau_values)["levels"]
-        stage = levels[-1]
-        cum_time = sum(s["wall_time"] for s in levels)
-        log10_J = stage["log_J"] / _LN10
 
-        for t in tau_values:
-            predicted = filt.query(eval_q, tau=t)
-            rates = _confusion_rates(predicted, actual_by_tau[t][eval_idx])
-            rows.append({
-                "dataset": dataset, "k": k, "stage": _ABLATION_STAGE_NAMES[level - 1],
-                "stage_index": level, "tau": t,
-                "log10_J": log10_J,
-                "log10_J_tau": stage["log_J_tau"][t] / _LN10,
-                "fpr": rates["fpr"], "fnr": rates["fnr"],
-                "stage_time_s": stage["wall_time"], "cum_time_s": cum_time,
-                "n_balls": stage["ball_count"], "seed": seed,
-            })
+    filt = GonzalezMEBFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed)
+    filt.construct(construct_arr, retain_assignments=True)
+    levels = filt.get_stats(taus=tau_values)["levels"]
+    ball_level = levels[-1]
+    ball_cum_time = sum(s["wall_time"] for s in levels)
+    ball_log10_J = ball_level["log_J"] / _LN10
+
+    for t in tau_values:
+        predicted = filt.query(eval_q, tau=t)
+        rates = _confusion_rates(predicted, actual_by_tau[t][eval_idx])
+        rows.append({
+            "dataset": dataset, "k": k, "stage": "ball", "stage_index": 1, "tau": t,
+            "log10_J": ball_log10_J,
+            "log10_J_tau": ball_level["log_J_tau"][t] / _LN10,
+            "fpr": rates["fpr"], "fnr": rates["fnr"],
+            "stage_time_s": ball_cum_time, "cum_time_s": ball_cum_time,
+            "n_balls": ball_level["ball_count"], "seed": seed,
+        })
+
+    # quantizing: compress the ball-refined cover's centers in place
+    t0 = time.perf_counter()
+    filt.quantize_centers()
+    quant_time = time.perf_counter() - t0
+    quant_cum_time = ball_cum_time + quant_time
+    quant_radii = filt.all_radiuses
+    quant_log10_J = _log10_J(quant_radii, dim)
+
+    for t in tau_values:
+        predicted = filt.query(eval_q, tau=t)
+        rates = _confusion_rates(predicted, actual_by_tau[t][eval_idx])
+        rows.append({
+            "dataset": dataset, "k": k, "stage": "quantizing", "stage_index": 2, "tau": t,
+            "log10_J": quant_log10_J,
+            "log10_J_tau": _log10_J(quant_radii, dim, tau=t),
+            "fpr": rates["fpr"], "fnr": rates["fnr"],
+            "stage_time_s": quant_time, "cum_time_s": quant_cum_time,
+            "n_balls": len(quant_radii), "seed": seed,
+        })
 
     bad = [r for r in rows if r["fnr"] != 0]
     if bad:
@@ -652,8 +689,7 @@ def ablation_worker(
             f"{bad[:3]}"
         )
 
-    # level 5: feedback, branched per tau off a copy of the level-4 cover
-    level4_cum_time = {r["tau"]: r["cum_time_s"] for r in rows if r["stage"] == "tighten"}
+    # feedback: branched per tau off a copy of the post-quantization cover
     for t in tau_values:
         filt_t = copy.deepcopy(filt)
         witness_actual_t = actual_by_tau[t][witness_idx]
@@ -671,19 +707,114 @@ def ablation_worker(
         rates = _confusion_rates(predicted, eval_actual_t)
         if rates["fnr"] != 0:
             raise ValueError(
-                f"Zero-false-negative invariant violated at level 5/feedback "
+                f"Zero-false-negative invariant violated at the feedback stage "
                 f"(dataset={dataset}, k={k}, tau={t}, seed={seed}): fnr={rates['fnr']}"
             )
 
         radii = filt_t.all_radiuses
-        base_cum_time = level4_cum_time[t]
         rows.append({
-            "dataset": dataset, "k": k, "stage": "feedback", "stage_index": 5, "tau": t,
+            "dataset": dataset, "k": k, "stage": "feedback", "stage_index": 3, "tau": t,
             "log10_J": _log10_J(radii, dim),
             "log10_J_tau": _log10_J(radii, dim, tau=t),
             "fpr": rates["fpr"], "fnr": rates["fnr"],
-            "stage_time_s": feedback_time, "cum_time_s": base_cum_time + feedback_time,
+            "stage_time_s": feedback_time, "cum_time_s": quant_cum_time + feedback_time,
             "n_balls": len(radii), "seed": seed,
+        })
+    return rows
+
+
+def system_tau_worker(
+    dim: int,
+    dataset: str,
+    k: int,
+    tau_values: List[float],
+    seed: int,
+    construct_tau: float,
+    vectors_construct: VectorInput,
+    vectors_query: VectorInput,
+    actual_results_by_tau: Dict[float, List[bool]],
+) -> List[Dict[str, Any]]:
+    """
+    Build ONE GonzalezMEBFilter cover (fixed ball budget k) per (dataset,
+    seed) against a flat L2 index storing the same construct set, then sweep
+    the query-time similarity threshold tau over that single construction --
+    mirrors ablation_worker's "build once, evaluate at every tau" shape, but
+    measures system_worker's two-pass filtered-access throughput/index-access
+    metrics at each tau instead of a memory-budget sweep at one fixed tau.
+
+    tau is purely a query-time knob here (GonzalezMEBFilter.query(tau=...)),
+    so it never touches the cover itself; `construct_tau` is a single,
+    sweep-independent construction-tightness knob, same role it plays in
+    ablation_worker. The query stream (vectors_query) is fixed-length and
+    reused unchanged across the whole sweep -- only tau (and therefore how
+    much of it counts as a ground-truth duplicate) changes.
+
+    Returns one row per tau with:
+      - redundancy_rate: the *measured* fraction of the fixed query stream
+        that's an actual duplicate at that tau (mean of actual_results_by_tau[tau]),
+        which is what the figure's shared x-axis plots against -- not the
+        nominal percentage used upstream to pick tau, since
+        calculate_nn_distance_threshold's sampled percentile and this
+        exact nearest-construct-neighbour rate aren't identical.
+      - throughput_improvement_pct: % throughput gain of the filtered
+        pipeline (trust filter negatives, only hit the index on positives)
+        over the unfiltered flat-index baseline, both timed on the same
+        query stream.
+      - mean_index_accesses: count of queries that reached the flat index
+        (filter positives) -- "mean" once aggregated over the seed sweep at
+        plot time via plot_common.mean_ci95.
+      - fpr/fnr: empirical confusion rates against actual_results_by_tau[tau].
+      - j_tau/log10_j_tau: the threshold-expanded geometric objective
+        J_tau(C) = sum_i (r_i + tau)^d, linear (may be +inf at this
+        dimensionality) and log10 (always finite) -- see _J_tau/_log10_J.
+    """
+    construct_arr = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
+    query_arr = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
+    n_q = len(query_arr)
+    for t, actual in actual_results_by_tau.items():
+        if len(actual) != n_q:
+            raise ValueError(
+                f"vectors_query ({n_q}) and actual_results_by_tau[{t}] ({len(actual)}) length mismatch"
+            )
+
+    index = faiss.IndexFlatL2(dim)
+    index.add(construct_arr)
+
+    filt = GonzalezMEBFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed)
+    filt.construct(construct_arr)
+    radii = filt.all_radiuses
+
+    rows: List[Dict[str, Any]] = []
+    for t in tau_values:
+        actual = np.asarray(actual_results_by_tau[t], dtype=bool)
+        redundancy_rate = float(np.mean(actual)) if len(actual) > 0 else 0.0
+
+        # PASS 1 (baseline): every query goes to the flat index
+        start = time.perf_counter()
+        index.search(query_arr, 1)
+        time_without = time.perf_counter() - start
+
+        # PASS 2 (filtered): trust filter negatives, search the index only for positives
+        start = time.perf_counter()
+        predicted = np.asarray(filt.query(query_arr, tau=t), dtype=bool)
+        n_index_accesses = int(predicted.sum())
+        if n_index_accesses > 0:
+            index.search(query_arr[predicted], 1)
+        time_with = time.perf_counter() - start
+
+        rates = _confusion_rates(predicted.tolist(), actual)
+        throughput_without = n_q / max(time_without, 1e-9)
+        throughput_with = n_q / max(time_with, 1e-9)
+
+        rows.append({
+            "dataset": dataset, "k": k, "tau": t, "seed": seed,
+            "redundancy_rate": redundancy_rate,
+            "throughput_improvement_pct": (throughput_with - throughput_without) / throughput_without * 100.0,
+            "mean_index_accesses": n_index_accesses,
+            "fpr": rates["fpr"], "fnr": rates["fnr"],
+            "j_tau": _J_tau(radii, dim, tau=t),
+            "log10_j_tau": _log10_J(radii, dim, tau=t),
+            "n_balls": len(radii),
         })
     return rows
 
@@ -969,6 +1100,7 @@ _WORKER_FNS: Dict[str, Any] = {
     'dynamic': dynamic_worker,
     'tradeoff': tradeoff_worker,
     'system':  system_worker,
+    'system_tau': system_tau_worker,
     'ablation': ablation_worker,
     'query_performance': query_performance_worker,
     'equal_memory': equal_memory_worker,

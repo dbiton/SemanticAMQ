@@ -1,16 +1,34 @@
+import math
 import os
-import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import Tuple, Dict, List
+
+from plots.plot_common import apply_style, style_axes, save_figure, wrap_label
+
+DPI = 300
+GRID_FIGSIZE = (3.4, 3.0)  # 2x2 grids: two paper-style panels per side
+LINEWIDTH = 0.8
+MARKERSIZE = 2.5
+LEGEND_LINEWIDTH = 1.0
+LEGEND_MARKERSIZE = 3
+
+
+def _legend_figsize(n_items: int, ncol: int) -> Tuple[float, float]:
+    """Fixed-width legend strip whose height grows with the number of rows
+    needed to fit n_items at ncol columns, keeping single-row legends the
+    same size across every plot script."""
+    rows = max(1, math.ceil(n_items / max(1, ncol)))
+    return (4.5, 0.28 * rows + 0.05)
 
 
 def plot_results(results_list: list, folder: str) -> None:
     df = pd.DataFrame(results_list)
     df[['Filter', 'LSH']] = df['Config'].str.split(' + ', regex=False, expand=True)
 
-    sns.set_theme(style="whitegrid")
+    apply_style(DPI)
+    outdir = f"plots/{folder}"
 
     unique_filters = df['Filter'].unique()
     color_map = dict(zip(unique_filters, sns.color_palette("husl", len(unique_filters))))
@@ -30,49 +48,44 @@ def plot_results(results_list: list, folder: str) -> None:
     ylabels = {'Memory Usage': 'Memory Usage (bytes)', 'FPR': 'False Positive Rate (FPR)', 'FNR': 'False Negative Rate (FNR)'}
     bounded_metrics = ('F1-Score', 'Precision', 'Recall', 'FPR', 'FNR')
     for metric in bounded_metrics + ('Memory Usage',):
-        fig, ax = plt.subplots(figsize=(8, 6))
+        fig, ax = plt.subplots()
+        style_axes(ax)
         if len(memory_budgets) > 1:
-            # One curve per duplicate percentage, coloured dark-to-light from
-            # smallest to largest; line style still distinguishes filters.
             sns.lineplot(
                 data=df, x='Memory Budget (MB)', y=metric,
                 hue='Percentage', style='Filter',
-                markers=True, dashes=False,
+                markers=True, dashes=False, linewidth=LINEWIDTH, markersize=MARKERSIZE,
                 palette=pct_palette, ax=ax,
             )
-            ax.legend(fontsize=8, ncol=2)
-            ax.set_xlabel('Memory Budget (MB)', fontsize=12)
+            ax.legend(ncol=2)
+            ax.set_xlabel(wrap_label('Memory Budget (MB)'))
         else:
             sns.lineplot(
                 data=df, x='Percentage', y=metric,
                 hue='Filter', style='LSH',
-                markers=marker_map, dashes=False,
+                markers=marker_map, dashes=False, linewidth=LINEWIDTH, markersize=MARKERSIZE,
                 palette=color_map, ax=ax, legend=False,
             )
-            ax.set_xlabel('Percentage of Duplicates (%)', fontsize=12)
-        ax.set_ylabel(ylabels.get(metric, metric), fontsize=12)
+            ax.set_xlabel(wrap_label('Percentage of Duplicates (%)'))
+        ax.set_ylabel(wrap_label(ylabels.get(metric, metric)))
         if metric in bounded_metrics:
             ax.set_ylim(-0.05, 1.05)
         filename = f'{metric.lower().replace("-", "_").replace(" ", "_")}_plot.png'
-        plt.savefig(f"plots/{folder}/{filename}", bbox_inches='tight', dpi=300)
-        plt.close()
-        print(f"Saved plots/{folder}/{filename}")
+        save_figure(fig, filename, outdir, DPI)
 
-    fig_leg, ax_leg = plt.subplots(figsize=(10, 2))
+    fig_leg, ax_leg = plt.subplots(figsize=_legend_figsize(len(configs), min(3, len(configs))))
     ax_leg.axis('off')
     handles = [
-        plt.Line2D([0], [0], color=color_map[filter_name], lw=2, marker=marker_map[lsh_name])
+        plt.Line2D([0], [0], color=color_map[filter_name], lw=LEGEND_LINEWIDTH, marker=marker_map[lsh_name],
+                  markersize=LEGEND_MARKERSIZE)
         for filter_name, lsh_name in (c.split(' + ') for c in configs)
     ]
     ax_leg.legend(
         handles, configs,
         loc='center', ncol=min(3, len(configs)),
-        title="Configuration (Color = Filter, Marker = LSH)",
-        title_fontsize=12, fontsize=10, frameon=True,
+        title=wrap_label("Configuration (Color = Filter, Marker = LSH)"),
     )
-    plt.savefig(f"plots/{folder}/legend_only.png", bbox_inches='tight', dpi=300)
-    plt.close()
-    print(f"Saved plots/{folder}/legend_only.png")
+    save_figure(fig_leg, 'legend_only.png', outdir, DPI)
 
     _plot_radius_stats(df, len(memory_budgets) > 1, folder)
 
@@ -102,7 +115,8 @@ def _plot_radius_error_bars(
     palette = (dict(zip(groups, sns.color_palette("husl", len(groups))))
                if group_col else {None: '#2a78d6'})
 
-    fig, ax = plt.subplots(figsize=(9 if group_col else 8, 6))
+    fig, ax = plt.subplots()
+    style_axes(ax)
     for group in groups:
         sub = plot_df if group is None else plot_df[plot_df[group_col] == group]
         agg = sub.groupby(x_col)[_RADIUS_COLUMNS].mean().sort_index()
@@ -112,17 +126,18 @@ def _plot_radius_error_bars(
         prefix = f"{group} - " if group is not None else ""
         ax.errorbar(
             agg.index, agg['Radius Mean'], yerr=agg['Radius Std'],
-            fmt='-o', color=color, capsize=4, linewidth=2, label=f"{prefix}Mean ± Std",
+            fmt='-o', color=color, capsize=1.5, linewidth=LINEWIDTH, markersize=MARKERSIZE,
+            label=f"{prefix}Mean ± Std",
         )
-        ax.plot(agg.index, agg['Radius Max'], color=color, alpha=0.6, marker='^', linestyle='--', label=f"{prefix}Max")
-        ax.plot(agg.index, agg['Radius Min'], color=color, alpha=0.6, marker='v', linestyle='--', label=f"{prefix}Min")
+        ax.plot(agg.index, agg['Radius Max'], color=color, alpha=0.6, marker='^', linestyle='--',
+                linewidth=LINEWIDTH, markersize=MARKERSIZE, label=f"{prefix}Max")
+        ax.plot(agg.index, agg['Radius Min'], color=color, alpha=0.6, marker='v', linestyle='--',
+                linewidth=LINEWIDTH, markersize=MARKERSIZE, label=f"{prefix}Min")
 
-    ax.set_xlabel(xlabel, fontsize=12)
-    ax.set_ylabel('Sphere Radius', fontsize=12)
-    ax.legend(fontsize=9, loc='best')
-    plt.savefig(f"{out_folder}/{filename}", bbox_inches='tight', dpi=300)
-    plt.close()
-    print(f"Saved {out_folder}/{filename}")
+    ax.set_xlabel(wrap_label(xlabel))
+    ax.set_ylabel('Sphere Radius')
+    ax.legend(loc='best')
+    save_figure(fig, filename, out_folder, DPI)
 
 
 def _plot_radius_stats(df: pd.DataFrame, vs_memory: bool, folder: str) -> None:
@@ -135,7 +150,8 @@ def plot_throughput_results(results_list: list, folder: str, ylabel: str, title_
     df = pd.DataFrame(results_list)
     df[['Filter', 'LSH']] = df['Config'].str.split(' + ', regex=False, expand=True)
 
-    sns.set_theme(style="whitegrid")
+    apply_style(DPI)
+    outdir = f"plots/{folder}"
 
     unique_filters = df['Filter'].unique()
     color_map = dict(zip(unique_filters, sns.color_palette("husl", len(unique_filters))))
@@ -146,36 +162,33 @@ def plot_throughput_results(results_list: list, folder: str, ylabel: str, title_
 
     configs = df['Config'].unique()
 
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots()
+    style_axes(ax)
     sns.lineplot(
         data=df, x='FilterSize', y='Throughput',
         hue='Filter', style='LSH',
-        markers=marker_map, dashes=False,
+        markers=marker_map, dashes=False, linewidth=LINEWIDTH, markersize=MARKERSIZE,
         palette=color_map, ax=ax, legend=False,
     )
-    ax.set_xlabel('Number of Elements in Filter', fontsize=12)
-    ax.set_ylabel(ylabel, fontsize=12)
-    ax.set_title(f'Throughput vs Filter Size ({title_suffix})', fontsize=13)
+    ax.set_xlabel(wrap_label('Number of Elements in Filter'))
+    ax.set_ylabel(wrap_label(ylabel))
+    ax.set_title(wrap_label(f'Throughput vs Filter Size ({title_suffix})'))
     filename = f'throughput_{title_suffix.lower().replace(" ", "_")}_plot.png'
-    plt.savefig(f"plots/{folder}/{filename}", bbox_inches='tight', dpi=300)
-    plt.close()
-    print(f"Saved plots/{folder}/{filename}")
+    save_figure(fig, filename, outdir, DPI)
 
-    fig_leg, ax_leg = plt.subplots(figsize=(10, 2))
+    fig_leg, ax_leg = plt.subplots(figsize=_legend_figsize(len(configs), min(3, len(configs))))
     ax_leg.axis('off')
     handles = [
-        plt.Line2D([0], [0], color=color_map[filter_name], lw=2, marker=marker_map[lsh_name])
+        plt.Line2D([0], [0], color=color_map[filter_name], lw=LEGEND_LINEWIDTH, marker=marker_map[lsh_name],
+                  markersize=LEGEND_MARKERSIZE)
         for filter_name, lsh_name in (c.split(' + ') for c in configs)
     ]
     ax_leg.legend(
         handles, configs,
         loc='center', ncol=min(3, len(configs)),
-        title="Configuration (Color = Filter, Marker = LSH)",
-        title_fontsize=12, fontsize=10, frameon=True,
+        title=wrap_label("Configuration (Color = Filter, Marker = LSH)"),
     )
-    plt.savefig(f"plots/{folder}/throughput_legend_only.png", bbox_inches='tight', dpi=300)
-    plt.close()
-    print(f"Saved plots/{folder}/throughput_legend_only.png")
+    save_figure(fig_leg, 'throughput_legend_only.png', outdir, DPI)
 
 
 def get_plot_mappings(all_filters: List[str]) -> Tuple[Dict, Dict, Dict]:
@@ -193,11 +206,11 @@ def get_plot_mappings(all_filters: List[str]) -> Tuple[Dict, Dict, Dict]:
     base_color_map = dict(zip(unique_bases, base_palette))
 
     color_map = {config: base_color_map[config.split(' + ')[0]] for config in all_filters}
-    
+
     # markers and dashes cycle for uniqueness
     marker_map = {config: available_marks[i % len(available_marks)] for i, config in enumerate(all_filters)}
     dash_map = {config: available_dashes[i % len(available_dashes)] for i, config in enumerate(all_filters)}
-    
+
     return color_map, marker_map, dash_map
 
 
@@ -211,10 +224,8 @@ def plot_system_results(results_list: list, folder: str = "plots/system") -> Non
     latency, and throughput (with filter) as a function of memory budget,
     one line per dataset.
     """
-    os.makedirs(folder, exist_ok=True)
+    apply_style(DPI)
     df = pd.DataFrame(results_list)
-
-    sns.set_theme(style="whitegrid")
 
     baseline = 'No Filter'
     configs  = list(dict.fromkeys(df['Config']))
@@ -240,23 +251,22 @@ def plot_system_results(results_list: list, folder: str = "plots/system") -> Non
         with_df = df[['Dataset', 'Config', with_col]].rename(columns={with_col: ylabel, 'Config': 'Pipeline'})
         long_df = pd.concat([base_df, with_df], ignore_index=True)
 
-        fig, ax = plt.subplots(figsize=(max(8, 1.6 * len(datasets)), 6))
+        fig, ax = plt.subplots()
+        style_axes(ax)
         sns.barplot(
             data=long_df, x='Dataset', y=ylabel, hue='Pipeline',
             order=datasets, hue_order=pipelines, palette=palette,
-            errorbar='sd', capsize=0.15, err_kws={'linewidth': 1.2}, ax=ax,
+            errorbar='sd', capsize=0.15, err_kws={'linewidth': LINEWIDTH}, ax=ax,
         )
-        ax.set_xlabel('Dataset', fontsize=12)
-        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_xlabel('Dataset')
+        ax.set_ylabel(wrap_label(ylabel))
         # above the axes so it can never sit on top of a bar
         ax.legend(
-            title=None, fontsize=9, loc='lower center',
-            bbox_to_anchor=(0.5, 1.02), ncol=min(3, len(pipelines)), frameon=False,
+            title=None, loc='lower center',
+            bbox_to_anchor=(0.5, 1.02), ncol=min(3, len(pipelines)),
         )
         filename = f'system_{name}_plot.png'
-        plt.savefig(f"{folder}/{filename}", bbox_inches='tight', dpi=300)
-        plt.close()
-        print(f"Saved {folder}/{filename}")
+        save_figure(fig, filename, folder, DPI)
 
     vs_memory_metrics = [
         ('Index Accesses', 'Index Accesses', 'index_accesses'),
@@ -298,20 +308,19 @@ def _plot_metric_vs_memory(
     configs = list(dict.fromkeys(plot_df['Config']))
     palette = dict(zip(datasets, sns.color_palette("husl", len(datasets))))
 
-    fig, ax = plt.subplots(figsize=(9, 6))
+    fig, ax = plt.subplots()
+    style_axes(ax)
     sns.lineplot(
         data=plot_df, x='Memory Budget (MB)', y=col,
         hue='Dataset', style='Config' if len(configs) > 1 else None,
         hue_order=datasets, palette=palette,
-        markers=True, dashes=False, ax=ax,
+        markers=True, dashes=False, linewidth=LINEWIDTH, markersize=MARKERSIZE, ax=ax,
     )
-    ax.set_xlabel('Memory Budget (MB)', fontsize=12)
-    ax.set_ylabel(ylabel, fontsize=12)
-    ax.legend(fontsize=9, loc='best')
+    ax.set_xlabel(wrap_label('Memory Budget (MB)'))
+    ax.set_ylabel(wrap_label(ylabel))
+    ax.legend(loc='best')
     filename = f'system_{name}_vs_memory_plot.png'
-    plt.savefig(f"{folder}/{filename}", bbox_inches='tight', dpi=300)
-    plt.close()
-    print(f"Saved {folder}/{filename}")
+    save_figure(fig, filename, folder, DPI)
 
 
 def _plot_fpvr_vs_memory(df: pd.DataFrame, datasets: List[str], folder: str) -> None:
@@ -338,7 +347,8 @@ def _plot_fpvr_vs_memory(df: pd.DataFrame, datasets: List[str], folder: str) -> 
     configs = list(dict.fromkeys(plot_df['Config']))
     palette = dict(zip(datasets, sns.color_palette("husl", len(datasets))))
 
-    fig, ax = plt.subplots(figsize=(9, 6))
+    fig, ax = plt.subplots()
+    style_axes(ax)
     for dataset in datasets:
         color = palette[dataset]
         for config in configs:
@@ -348,33 +358,30 @@ def _plot_fpvr_vs_memory(df: pd.DataFrame, datasets: List[str], folder: str) -> 
                 continue
             label = dataset if len(configs) <= 1 else f"{dataset} ({config})"
             mid = (sub['FPVR Lower'] + sub['FPVR Upper']) / 2
-            ax.plot(sub['Memory Budget (MB)'], mid, color=color, marker='o', label=label)
+            ax.plot(sub['Memory Budget (MB)'], mid, color=color, marker='o', linewidth=LINEWIDTH,
+                    markersize=MARKERSIZE, label=label)
             ax.fill_between(sub['Memory Budget (MB)'], sub['FPVR Lower'], sub['FPVR Upper'],
                              color=color, alpha=0.2, linewidth=0)
 
-    ax.set_xlabel('Memory Budget (MB)', fontsize=12)
-    ax.set_ylabel('False Positive Volume Ratio (log[V_filter / V_original])', fontsize=12)
-    ax.legend(fontsize=9, loc='best')
+    ax.set_xlabel(wrap_label('Memory Budget (MB)'))
+    ax.set_ylabel(wrap_label('False Positive Volume Ratio (log[V_filter / V_original])'))
+    ax.legend(loc='best')
     filename = 'system_fpvr_vs_memory_plot.png'
-    plt.savefig(f"{folder}/{filename}", bbox_inches='tight', dpi=300)
-    plt.close()
-    print(f"Saved {folder}/{filename}")
+    save_figure(fig, filename, folder, DPI)
 
 
 def plot_equal_memory_results(results_list: list, folder: str = "plots/equal_memory") -> None:
     """
     Plots the equal-memory comparison: every filter is evaluated at the same
-    fixed set of memory budgets (see main.py::equal_memory_evaluation), each
+    fixed set of memory budgets (see main.py::generate_equal_memory), each
     having independently picked its best available configuration on a
     calibration workload. One line plot per metric (FPR, FNR, latency,
     throughput), x-axis = memory budget (log scale), one line per filter
     config; the legend is a separate, shared image rather than embedded in
     each panel.
     """
-    os.makedirs(folder, exist_ok=True)
+    apply_style(DPI)
     df = pd.DataFrame(results_list)
-
-    sns.set_theme(style="whitegrid")
 
     df['Memory Budget (MB)'] = (df['Memory Budget'] / (1024 * 1024)).round(4)
     configs = list(dict.fromkeys(df['Config']))
@@ -387,41 +394,38 @@ def plot_equal_memory_results(results_list: list, folder: str = "plots/equal_mem
         ('Throughput (qps)', 'Query Throughput (queries/s)', 'throughput'),
     ]
     for col, ylabel, name in metrics:
-        fig, ax = plt.subplots(figsize=(8, 6))
+        fig, ax = plt.subplots()
+        style_axes(ax)
         sns.lineplot(
             data=df, x='Memory Budget (MB)', y=col, hue='Config', style='Config',
             markers=marker_map, dashes=dash_map, palette=color_map,
-            linewidth=2, markersize=8, ax=ax, legend=False,
+            linewidth=LINEWIDTH, markersize=MARKERSIZE, ax=ax, legend=False,
         )
         ax.set_xscale('log', base=2)
-        ax.set_xlabel('Memory Budget (MB)', fontsize=12)
-        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_xlabel(wrap_label('Memory Budget (MB)'))
+        ax.set_ylabel(wrap_label(ylabel))
         if col in ('FPR', 'FNR'):
             ax.set_ylim(-0.05, 1.05)
         else:
             ax.set_yscale('log')
         filename = f'equal_memory_{name}_plot.png'
-        plt.savefig(f"{folder}/{filename}", bbox_inches='tight', dpi=300)
-        plt.close()
-        print(f"Saved {folder}/{filename}")
+        save_figure(fig, filename, folder, DPI)
 
-    fig_leg, ax_leg = plt.subplots(figsize=(10, 2))
+    fig_leg, ax_leg = plt.subplots(figsize=_legend_figsize(len(configs), min(3, len(configs))))
     ax_leg.axis('off')
     handles = [
         plt.Line2D(
             [0], [0], color=color_map[config], marker=marker_map[config],
-            dashes=dash_map[config], lw=2, markersize=8,
+            dashes=dash_map[config], lw=LEGEND_LINEWIDTH, markersize=LEGEND_MARKERSIZE,
         )
         for config in configs
     ]
     ax_leg.legend(
         handles, configs,
         loc='center', ncol=min(3, len(configs)),
-        title="Configuration", title_fontsize=12, fontsize=10, frameon=True,
+        title="Configuration",
     )
-    plt.savefig(f"{folder}/legend_only.png", bbox_inches='tight', dpi=300)
-    plt.close()
-    print(f"Saved {folder}/legend_only.png")
+    save_figure(fig_leg, 'legend_only.png', folder, DPI)
 
     csv_path = f"{folder}/equal_memory_evaluations.csv"
     df.to_csv(csv_path, index=False)
@@ -430,15 +434,15 @@ def plot_equal_memory_results(results_list: list, folder: str = "plots/equal_mem
 
 def plot_tradeoff_results(sphere_results: list, memory_results: list, folder: str = "plots/tradeoff") -> None:
     """
-    Plots tradeoff evaluation results, comparing FPR, FNR, Precision, F1-Score, QPS, 
+    Plots tradeoff evaluation results, comparing FPR, FNR, Precision, F1-Score, QPS,
     and ConstructTime across both geometric (spheres) and hardware (memory) sweeps.
     """
-    os.makedirs(folder, exist_ok=True)
-    
+    apply_style(DPI)
+
     # Initialize DataFrames and inject Mode labels
     df_spheres = pd.DataFrame(sphere_results) if sphere_results else pd.DataFrame()
     df_memory = pd.DataFrame(memory_results) if memory_results else pd.DataFrame()
-    
+
     if not df_spheres.empty and 'Mode' not in df_spheres.columns:
         df_spheres.insert(0, 'Mode', 'sphere_test')
     if not df_memory.empty and 'Mode' not in df_memory.columns:
@@ -447,8 +451,6 @@ def plot_tradeoff_results(sphere_results: list, memory_results: list, folder: st
     # Convert Bytes to MB for the memory plots
     if not df_memory.empty:
         df_memory['MemoryBudget_MB'] = df_memory['MemoryBudget'] / (1024 * 1024)
-
-    sns.set_theme(style="whitegrid")
 
     # Generate unified maps for colors, markers, and dash patterns
     all_filters = list(dict.fromkeys(list(df_spheres['Config'].unique()) + list(df_memory['Config'].unique())))
@@ -460,9 +462,9 @@ def plot_tradeoff_results(sphere_results: list, memory_results: list, folder: st
         if ax_obj.get_legend() is not None:
             ax_obj.get_legend().remove()
         ax_obj.legend(
-            handles, labels, 
-            loc='upper center', bbox_to_anchor=(0.5, -0.18), 
-            ncol=min(3, len(labels)), fontsize=11, frameon=True
+            handles, labels,
+            loc='upper center', bbox_to_anchor=(0.5, -0.22),
+            ncol=min(3, len(labels)),
         )
 
     # Dictionary of standard plot styling args to keep calls clean
@@ -470,156 +472,151 @@ def plot_tradeoff_results(sphere_results: list, memory_results: list, folder: st
         'palette': color_map,
         'markers': marker_map,
         'dashes': dash_map,
-        'linewidth': 2.5,
-        'markersize': 10,
-        'markeredgewidth': 1.5,
+        'linewidth': LINEWIDTH,
+        'markersize': MARKERSIZE,
+        'markeredgewidth': 0.4,
         'alpha': 0.75
     }
 
     # CHART 1: Evaluate how increasing sphere count impacts overall filtering accuracy
     if not df_spheres.empty:
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig, axes = plt.subplots(2, 2, figsize=GRID_FIGSIZE)
         (ax1, ax2), (ax3, ax4) = axes
-        
+
         metrics = [
-            ('FPR', 'False Positive Rate (FPR)', ax1, 'FPR across Sphere Count'),
-            ('FNR', 'False Negative Rate (FNR)', ax2, 'FNR across Sphere Count'),
-            ('Precision', 'Precision', ax3, 'Precision across Sphere Count'),
-            ('F1-Score', 'F1-Score', ax4, 'F1-Score across Sphere Count')
+            ('FPR', 'False Positive Rate (FPR)', ax1, 'FPR'),
+            ('FNR', 'False Negative Rate (FNR)', ax2, 'FNR'),
+            ('Precision', 'Precision', ax3, 'Precision'),
+            ('F1-Score', 'F1-Score', ax4, 'F1-Score')
         ]
-        
+
         for col, ylabel, ax, title in metrics:
+            style_axes(ax)
             sns.lineplot(
                 data=df_spheres, x='NumSpheres', y=col, hue='Config', style='Config',
                 ax=ax, **plot_kwargs
             )
-            ax.set_xlabel('Number of Spheres', fontsize=12, fontweight='bold')
-            ax.set_ylabel(ylabel, fontsize=12, fontweight='bold')
+            ax.set_xlabel('Number of Spheres')
+            ax.set_ylabel(wrap_label(ylabel))
             ax.set_ylim(-0.05, 1.05)
-            ax.set_title(title, fontsize=13)
+            ax.set_title(wrap_label(title))
             if ax.get_legend() is not None:
                 ax.get_legend().remove()
-        
+
         handles, labels = ax1.get_legend_handles_labels()
-        fig.legend(handles, labels, loc='lower center', bbox_to_anchor=(0.5, 0.02), ncol=min(3, len(labels)), fontsize=12, frameon=True)
-        
-        plt.suptitle('Filter Accuracy Metrics across Sphere Allocations', fontsize=16, y=0.96)
-        fig.subplots_adjust(bottom=0.12, top=0.92, hspace=0.3)
-        
+        fig.legend(handles, labels, loc='lower center', bbox_to_anchor=(0.5, 0.0), ncol=min(3, len(labels)))
+
+        fig.suptitle(wrap_label('Filter Accuracy Metrics across Sphere Allocations', width=40), fontsize=8, y=0.99)
+        fig.subplots_adjust(bottom=0.22, top=0.80, hspace=1.05, wspace=0.45)
+
         filename1 = "accuracy_vs_spheres_plot.png"
-        plt.savefig(f"{folder}/{filename1}", bbox_inches='tight', dpi=300)
-        plt.close()
-        print(f"Saved {folder}/{filename1}")
+        save_figure(fig, filename1, folder, DPI)
 
     # CHART 2: Analyze the trade-off between memory allocation and filtering accuracy
     if not df_memory.empty:
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig, axes = plt.subplots(2, 2, figsize=GRID_FIGSIZE)
         (ax1, ax2), (ax3, ax4) = axes
-        
+
         metrics = [
-            ('FPR', 'False Positive Rate (FPR)', ax1, 'FPR across Memory Size'),
-            ('FNR', 'False Negative Rate (FNR)', ax2, 'FNR across Memory Size'),
-            ('Precision', 'Precision', ax3, 'Precision across Memory Size'),
-            ('F1-Score', 'F1-Score', ax4, 'F1-Score across Memory Size')
+            ('FPR', 'False Positive Rate (FPR)', ax1, 'FPR'),
+            ('FNR', 'False Negative Rate (FNR)', ax2, 'FNR'),
+            ('Precision', 'Precision', ax3, 'Precision'),
+            ('F1-Score', 'F1-Score', ax4, 'F1-Score')
         ]
-        
+
         for col, ylabel, ax, title in metrics:
+            style_axes(ax)
             sns.lineplot(
                 data=df_memory, x='MemoryBudget_MB', y=col, hue='Config', style='Config',
                 ax=ax, **plot_kwargs
             )
-            ax.set_xlabel('Memory Allocation (MB)', fontsize=12, fontweight='bold')
-            ax.set_ylabel(ylabel, fontsize=12, fontweight='bold')
+            ax.set_xlabel('Memory Allocation (MB)')
+            ax.set_ylabel(wrap_label(ylabel))
             ax.set_ylim(-0.05, 1.05)
-            ax.set_title(title, fontsize=13)
+            ax.set_title(wrap_label(title))
             if ax.get_legend() is not None:
                 ax.get_legend().remove()
-        
+
         handles, labels = ax1.get_legend_handles_labels()
-        fig.legend(handles, labels, loc='lower center', bbox_to_anchor=(0.5, 0.02), ncol=min(3, len(labels)), fontsize=12, frameon=True)
-        
-        plt.suptitle('Filter Accuracy Metrics across Memory Budgets', fontsize=16, y=0.96)
-        fig.subplots_adjust(bottom=0.12, top=0.92, hspace=0.3)
-        
+        fig.legend(handles, labels, loc='lower center', bbox_to_anchor=(0.5, 0.0), ncol=min(3, len(labels)))
+
+        fig.suptitle(wrap_label('Filter Accuracy Metrics across Memory Budgets', width=40), fontsize=8, y=0.99)
+        fig.subplots_adjust(bottom=0.22, top=0.80, hspace=1.05, wspace=0.45)
+
         filename2 = "accuracy_vs_memory_plot.png"
-        plt.savefig(f"{folder}/{filename2}", bbox_inches='tight', dpi=300)
-        plt.close()
-        print(f"Saved {folder}/{filename2}")
+        save_figure(fig, filename2, folder, DPI)
 
     # CHART 3: Compare query performance scaling across different sphere densities
     if not df_spheres.empty and 'QPS' in df_spheres.columns:
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots()
+        style_axes(ax)
         sns.lineplot(
             data=df_spheres, x='NumSpheres', y='QPS', hue='Config', style='Config',
             ax=ax, **plot_kwargs
         )
-        ax.set_xlabel('Number of Spheres', fontsize=12, fontweight='bold')
-        ax.set_ylabel('Queries per Second (QPS)', fontsize=12, fontweight='bold')
-        ax.set_title('Query Throughput across Sphere Count', fontsize=13)
+        ax.set_xlabel('Number of Spheres')
+        ax.set_ylabel(wrap_label('Queries per Second (QPS)'))
+        ax.set_title(wrap_label('Query Throughput across Sphere Count'))
         _add_bottom_legend(ax)
-        
+
         filename3 = "qps_vs_spheres_plot.png"
-        plt.savefig(f"{folder}/{filename3}", bbox_inches='tight', dpi=300)
-        plt.close()
-        print(f"Saved {folder}/{filename3}")
+        save_figure(fig, filename3, folder, DPI)
 
     # CHART 4: Assess how memory budget constraints affect query throughput (QPS)
     if not df_memory.empty and 'QPS' in df_memory.columns:
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots()
+        style_axes(ax)
         sns.lineplot(
             data=df_memory, x='MemoryBudget_MB', y='QPS', hue='Config', style='Config',
             ax=ax, **plot_kwargs
         )
-        ax.set_xlabel('Memory Allocation (MB)', fontsize=12, fontweight='bold')
-        ax.set_ylabel('Queries per Second (QPS)', fontsize=12, fontweight='bold')
-        ax.set_title('Query Throughput across Memory Size', fontsize=13)
+        ax.set_xlabel('Memory Allocation (MB)')
+        ax.set_ylabel(wrap_label('Queries per Second (QPS)'))
+        ax.set_title(wrap_label('Query Throughput across Memory Size'))
         _add_bottom_legend(ax)
-        
+
         filename4 = "qps_vs_memory_plot.png"
-        plt.savefig(f"{folder}/{filename4}", bbox_inches='tight', dpi=300)
-        plt.close()
-        print(f"Saved {folder}/{filename4}")
-        
+        save_figure(fig, filename4, folder, DPI)
+
     # CHART 5: Benchmark filter construction time relative to sphere complexity
     if not df_spheres.empty and 'ConstructTime' in df_spheres.columns:
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots()
+        style_axes(ax)
         sns.lineplot(
             data=df_spheres, x='NumSpheres', y='ConstructTime', hue='Config', style='Config',
             ax=ax, **plot_kwargs
         )
-        ax.set_xlabel('Number of Spheres', fontsize=12, fontweight='bold')
-        ax.set_ylabel('Construct Time (Seconds)', fontsize=12, fontweight='bold')
-        ax.set_title('Filter Build Time across Sphere Count', fontsize=13)
+        ax.set_xlabel('Number of Spheres')
+        ax.set_ylabel(wrap_label('Construct Time (Seconds)'))
+        ax.set_title(wrap_label('Filter Build Time across Sphere Count'))
         _add_bottom_legend(ax)
-        
+
         filename5 = "construct_time_vs_spheres_plot.png"
-        plt.savefig(f"{folder}/{filename5}", bbox_inches='tight', dpi=300)
-        plt.close()
-        print(f"Saved {folder}/{filename5}")
+        save_figure(fig, filename5, folder, DPI)
 
     # CHART 6: Measure the impact of memory capacity on filter initialization speed
     if not df_memory.empty and 'ConstructTime' in df_memory.columns:
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots()
+        style_axes(ax)
         sns.lineplot(
             data=df_memory, x='MemoryBudget_MB', y='ConstructTime', hue='Config', style='Config',
             ax=ax, **plot_kwargs
         )
-        ax.set_xlabel('Memory Allocation (MB)', fontsize=12, fontweight='bold')
-        ax.set_ylabel('Construct Time (Seconds)', fontsize=12, fontweight='bold')
-        ax.set_title('Filter Build Time across Memory Size', fontsize=13)
+        ax.set_xlabel('Memory Allocation (MB)')
+        ax.set_ylabel(wrap_label('Construct Time (Seconds)'))
+        ax.set_title(wrap_label('Filter Build Time across Memory Size'))
         _add_bottom_legend(ax)
-        
+
         filename6 = "construct_time_vs_memory_plot.png"
-        plt.savefig(f"{folder}/{filename6}", bbox_inches='tight', dpi=300)
-        plt.close()
-        print(f"Saved {folder}/{filename6}")
+        save_figure(fig, filename6, folder, DPI)
 
     # Final Result: Combine and save all experimental metrics for documentation
     if not df_spheres.empty and not df_memory.empty:
         final_df = pd.concat([df_spheres, df_memory], ignore_index=True)
-        
+
         # Save to current folder
         filename7 = "tradeoff_evaluations.csv"
+        os.makedirs(folder, exist_ok=True)
         final_df.to_csv(f"{folder}/{filename7}", index=False)
         print(f"Saved {folder}/{filename7}")
 
