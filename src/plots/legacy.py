@@ -98,7 +98,7 @@ def _plot_radius_error_bars(
 ) -> None:
     """
     Single combined plot of sphere-radius statistics reported by geometric
-    filters like GonzalezMEBFilter: Mean is drawn as a line with error bars
+    filters like BallCoverFilter: Mean is drawn as a line with error bars
     of +/- one Std, Max/Min as dashed bounding lines around it. Values at a
     given x are averaged first (over whatever else was swept, e.g. duplicate
     percentage) since error bars need one point per x, not seaborn's implicit

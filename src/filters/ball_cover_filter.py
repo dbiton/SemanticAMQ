@@ -10,7 +10,7 @@ from filters import ball_geometry
 from hyperspheres_volume import estimate_hypersphere_volume
 
 
-class GonzalezMEBFilter(Filter):
+class BallCoverFilter(Filter):
     """
     Duplicate filter that covers the input vectors with a bounded number of
     hyperspheres and answers "is anything indexed within tau of this query?"
@@ -835,7 +835,7 @@ class GonzalezMEBFilter(Filter):
         total volume).
         """
         if not self._constructed:
-            raise ValueError("GonzalezMEBFilter has not been constructed.")
+            raise ValueError("BallCoverFilter has not been constructed.")
         if self._size == 0:
             return None
 
@@ -864,7 +864,7 @@ class GonzalezMEBFilter(Filter):
 
     def query(self, vectors: np.ndarray, tau: Optional[float] = None) -> List[bool]:
         if not self._constructed:
-            raise ValueError("GonzalezMEBFilter has not been constructed.")
+            raise ValueError("BallCoverFilter has not been constructed.")
         if tau is None:
             tau = self.distance_threshold
 
@@ -1287,7 +1287,7 @@ class GonzalezMEBFilter(Filter):
     def refine_with_feedback(self, queries: np.ndarray, thresholds=None,
                              weights: Optional[np.ndarray] = None) -> Dict[str, Any]:
         if not self._constructed:
-            raise ValueError("GonzalezMEBFilter has not been constructed.")
+            raise ValueError("BallCoverFilter has not been constructed.")
         if self._X is None or self._assignment is None:
             raise ValueError(
                 "refine_with_feedback requires construction state (original vectors + "

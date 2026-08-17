@@ -23,7 +23,7 @@ from plots.plot_system_tau import generate_system_tau_figures
 from plots.plot_common import DATASETS, DATASET_LABELS
 from typing import Tuple, List
 from filters.first_n_filter import FirstNFilter
-from filters.gonzales_filter import GonzalezMEBFilter
+from src.filters.ball_cover_filter import BallCoverFilter
 from filters.dsbf_filter import DSBFFilter
 from filters.covering_lsh_fallback_filter import CoveringLSHFallbackFilter
 from filters.lsbf_filter import LSBFFilter
@@ -40,7 +40,7 @@ DATASET = 'ELI5'
 # plot_common so the dataset trio has one source of truth.
 DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
 
-dynamic_filters = [GonzalezMEBFilter, DSBFFilter, CoveringLSHFallbackFilter, LSBFFilter, DSHFilter]
+dynamic_filters = [BallCoverFilter, DSBFFilter, CoveringLSHFallbackFilter, LSBFFilter, DSHFilter]
 static_filters  = []
 
 def calculate_max_memory_budget_bytes(num_vectors: int, dimension: int, bytes_per_element: float) -> int:
@@ -240,7 +240,7 @@ def plot_static(results: list) -> None:
 
 def generate_equal_memory() -> list:
     """
-    Equal-memory comparison: every registered filter (GonzalezMEBFilter --
+    Equal-memory comparison: every registered filter (BallCoverFilter --
     the paper's own method -- plus the four LSH/Bloom baselines) is given the
     exact same memory budget from EQUAL_MEMORY_BUDGETS_BYTES (clipped to a
     dataset-scaled maximum via calculate_max_memory_budget_bytes, so a small
@@ -294,7 +294,7 @@ def generate_equal_memory() -> list:
     # smaller num_vectors and produces a ceiling of a couple MB here -- far
     # below the budget at which a covering-ball method can give every
     # construct point its own sphere (num_construct * bytes_per_sphere,
-    # mirroring GonzalezMEBFilter._calculate_max_spheres's own formula), which
+    # mirroring BallCoverFilter._calculate_max_spheres's own formula), which
     # is the point past which more memory stops buying additional accuracy for
     # any covering-based method. Below that point every filter is forced into
     # heavy compression and FPR stays pinned regardless of budget; sweeping up
@@ -340,7 +340,7 @@ def generate_system() -> Tuple[pd.DataFrame, int]:
     that explicitly stores all construct vectors, as a function of the
     threshold-driven redundancy rate of the query stream, at a fixed ball
     budget k -- not the memory-budget sweep this used to run. One
-    GonzalezMEBFilter cover is built per (dataset, seed) at that fixed k,
+    BallCoverFilter cover is built per (dataset, seed) at that fixed k,
     then queried at every tau in a sweep (see system_tau_worker); tau is a
     pure query-time knob controlling how much of the fixed-length query
     stream counts as a ground-truth duplicate, which is the "redundancy
@@ -456,7 +456,7 @@ def plot_system(df: pd.DataFrame, k: int) -> None:
 def generate_system_tau() -> Tuple[pd.DataFrame, int]:
     """
     Same measurement as generate_system() -- fixed ball budget k, one
-    GonzalezMEBFilter cover built per (dataset, seed), then queried at every
+    BallCoverFilter cover built per (dataset, seed), then queried at every
     tau in a sweep (system_tau_worker) -- but tau itself is the swept
     independent variable here, instead of being reverse-engineered per
     dataset from percentiles of that dataset's own nearest-construct-
@@ -546,7 +546,7 @@ def plot_system_tau(df: pd.DataFrame, k: int) -> None:
 
 def generate_ablation() -> Tuple[pd.DataFrame, int]:
     """
-    Generate the per-stage construction-ladder data for GonzalezMEBFilter
+    Generate the per-stage construction-ladder data for BallCoverFilter
     (ball refine -> quantizing -> feedback) across the 3 datasets the
     ablation figure needs, and write it to results/ablation.csv. Returns the
     long-format df plus the largest k used.
@@ -557,7 +557,7 @@ def generate_ablation() -> Tuple[pd.DataFrame, int]:
       - k_values = k_fractions * the smallest construct set (same pattern as
         generate_system's k_fraction), guaranteed < that set's size since
         every fraction is < 1 -- k >= a construct set's size makes
-        GonzalezMEBFilter fall back to one zero-radius ball per point
+        BallCoverFilter fall back to one zero-radius ball per point
         (log10_J = -inf, unplottable).
       - tau_values = duplicate_percentages-th percentile of each dataset's
         own nearest-neighbour distance (calculate_nn_distance_threshold),
@@ -662,7 +662,7 @@ def plot_ablation(df: pd.DataFrame, k: int) -> None:
 def generate_query_performance() -> pd.DataFrame:
     """
     Measure single-query vs. batched-query latency/throughput of a
-    GonzalezMEBFilter cover as a function of filter size k, across the same
+    BallCoverFilter cover as a function of filter size k, across the same
     3 datasets used by generate_ablation(). Mirrors generate_ablation()'s
     structure: one job per (dataset, k, seed), flattened into a long-format
     DataFrame, written to results/query_performance.csv. Render with
@@ -687,7 +687,7 @@ def generate_query_performance() -> pd.DataFrame:
             f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
         )
 
-    # k >= a dataset's construct-set size makes GonzalezMEBFilter fall back to
+    # k >= a dataset's construct-set size makes BallCoverFilter fall back to
     # one zero-radius ball per point, so clamp the sweep the same way
     # generate_ablation() does (kept defensive even though the 100K-row
     # datasets comfortably support k=1024 at 20% construct).

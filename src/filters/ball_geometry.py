@@ -1,4 +1,4 @@
-"""Ball-cover geometry shared by GonzalezMEBFilter and the streaming insertion
+"""Ball-cover geometry shared by BallCoverFilter and the streaming insertion
 methods in streaming_insertion.py (Section 2.3's merge rule + the log-space
 covering objective). Extracted as free functions parameterized by `dim`
 directly (no instance state) so both call sites can share one implementation
@@ -19,7 +19,7 @@ _RADIUS_SAFETY_ABS = 1e-6
 
 def safe_radius(r: float) -> float:
     """Inflate a freshly computed radius by a tiny margin -- same rationale
-    and constants as GonzalezMEBFilter._safe_radius: a radius from a direct
+    and constants as BallCoverFilter._safe_radius: a radius from a direct
     sqrt(sum((x-c)^2)) can come out a few ULPs smaller than what the
     "expand" distance formula (query-time, BLAS-batched) later measures for
     that exact same point, silently breaking FNR=0 at tau=0. Many orders of
@@ -32,7 +32,7 @@ def safe_radius(r: float) -> float:
 def merged_ball(ci: np.ndarray, ri: float, cj: np.ndarray, rj: float) -> Tuple[np.ndarray, float]:
     """Merge two balls B_i=(ci,ri), B_j=(cj,rj): if one contains the other,
     the merge is that ball unchanged; otherwise the externally-tangent ball
-    covering both. Verbatim geometry from GonzalezMEBFilter._merged_ball."""
+    covering both. Verbatim geometry from BallCoverFilter._merged_ball."""
     ci64 = np.asarray(ci, dtype=np.float64)
     cj64 = np.asarray(cj, dtype=np.float64)
     ri = float(ri)
@@ -116,7 +116,7 @@ def pairwise_merge_geometry(ci: np.ndarray, ri: np.ndarray, cj: np.ndarray, rj: 
 def argmin_bucket_key(bucket: np.ndarray, key: np.ndarray) -> int:
     """Flat index of the preferred (bucket, key) pair: bucket 0 (beneficial)
     before bucket 1 (neutral/harmful), ascending key within a bucket -- same
-    tie-break convention as GonzalezMEBFilter._merge_cache_best_pair."""
+    tie-break convention as BallCoverFilter._merge_cache_best_pair."""
     bucket = np.asarray(bucket).ravel()
     key = np.asarray(key).ravel()
     mask0 = bucket == 0
@@ -169,7 +169,7 @@ def sq_dists_to_centers(vectors: np.ndarray, sq_norms: np.ndarray, centers: np.n
 def ball_cover_query(centers: np.ndarray, radii: np.ndarray, q: np.ndarray, tau: float,
                      chunk_size: int = _CHUNK_SIZE) -> np.ndarray:
     """Batched containment test at eff_r = radius + tau, chunked over q the
-    same way GonzalezMEBFilter.query is."""
+    same way BallCoverFilter.query is."""
     n = len(q)
     if len(centers) == 0 or n == 0:
         return np.zeros(n, dtype=bool)

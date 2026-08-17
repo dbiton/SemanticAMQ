@@ -13,7 +13,7 @@ import time
 from scipy.special import logsumexp
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 
-from filters.gonzales_filter import GonzalezMEBFilter
+from src.filters.ball_cover_filter import BallCoverFilter
 from filters import streaming_insertion
 from hyperspheres_volume import estimate_hypersphere_volume
 from vector_source import VectorSource
@@ -95,7 +95,7 @@ def _radius_stats(filter_instance: Any) -> Dict[str, float]:
 
 
 _DIRECT_TAU_FILTERS = {
-    "FirstNFilter", "GonzalezMEBFilter",
+    "FirstNFilter", "BallCoverFilter",
     "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", "DSHFilter",
 }
 
@@ -486,7 +486,7 @@ def ablation_worker(
     actual_results_by_tau: Dict[float, List[bool]],
     feedback_fraction: float = 0.1,
 ) -> List[Dict[str, Any]]:
-    """Builds one GonzalezMEBFilter cover per (dataset, k, seed) via the full
+    """Builds one BallCoverFilter cover per (dataset, k, seed) via the full
     construction ladder, then evaluates it at every tau. Returns one row per
     (stage, tau) for stages ["ball", "quantizing", "feedback"]; construct_tau
     is a sweep-independent construction knob, kept separate from the
@@ -511,7 +511,7 @@ def ablation_worker(
 
     rows: List[Dict[str, Any]] = []
 
-    filt = GonzalezMEBFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed)
+    filt = BallCoverFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed)
     filt.construct(construct_arr, retain_assignments=True)
     levels = filt.get_stats(taus=tau_values)["levels"]
     ball_level = levels[-1]
@@ -600,7 +600,7 @@ def system_tau_worker(
     vectors_query: VectorInput,
     actual_results_by_tau: Dict[float, List[bool]],
 ) -> List[Dict[str, Any]]:
-    """Builds one GonzalezMEBFilter cover (fixed k) per (dataset, seed) plus a
+    """Builds one BallCoverFilter cover (fixed k) per (dataset, seed) plus a
     flat L2 index over the same construct set, then sweeps the query-time
     threshold tau over that single construction, measuring filtered vs.
     unfiltered throughput/index-access/FPR/FNR at each tau. redundancy_rate
@@ -617,7 +617,7 @@ def system_tau_worker(
     index = faiss.IndexFlatL2(dim)
     index.add(construct_arr)
 
-    filt = GonzalezMEBFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed)
+    filt = BallCoverFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed)
     filt.construct(construct_arr)
     radii = filt.all_radiuses
 
@@ -670,7 +670,7 @@ def query_performance_worker(
     query), batched mode is left uncapped. Returns one row per mode."""
     construct_arr = _to_construct_array(vectors_construct)
 
-    filt = GonzalezMEBFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed)
+    filt = BallCoverFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed)
     filt.construct(construct_arr)
 
     rows: List[Dict[str, Any]] = []
@@ -717,14 +717,14 @@ def scaling_worker(
     actual_results: List[bool],
     single_query_limit: int = 2000,
 ) -> Dict[str, Any]:
-    """Builds one GonzalezMEBFilter at fixed k over n=len(vectors_construct)
+    """Builds one BallCoverFilter at fixed k over n=len(vectors_construct)
     vectors; reports construction time, single-query latency, memory, FPR."""
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
     n = len(construct_arr)
 
     construct_start = time.perf_counter()
-    filt = GonzalezMEBFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed)
+    filt = BallCoverFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed)
     filt.construct(construct_arr)
     construct_time_s = time.perf_counter() - construct_start
 
@@ -834,7 +834,7 @@ def stream_m4_exactness_worker(
     n = len(stream_arr)
 
     m4 = streaming_insertion.make_method("M4", dim=dim, k=k, seed=seed)
-    ref = GonzalezMEBFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
+    ref = BallCoverFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
                             merge_criterion="log_space")
     ref.construct(np.empty((0, dim), dtype=np.float32))
 
@@ -903,7 +903,7 @@ def stream_delta_distribution_worker(
     stream_arr = _to_construct_array(vectors_stream_pool)[:stream_len]
 
     if method == "ref_exhaustive":
-        filt = GonzalezMEBFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
+        filt = BallCoverFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
                                  merge_criterion="log_space")
         filt.construct(np.empty((0, dim), dtype=np.float32))
         deltas: List[float] = []
@@ -958,7 +958,7 @@ def stream_rebuild_worker(
 ) -> List[Dict[str, Any]]:
     """Simulates one rebuild policy over vectors_stream, reporting FPR and
     amortized cost per checkpoint.
-      "streaming": GonzalezMEBFilter.add() per arrival, never rebuilt.
+      "streaming": BallCoverFilter.add() per arrival, never rebuilt.
       "periodic": like "streaming", rebuilt from scratch every T arrivals.
       "oracle": rebuilt from scratch at every checkpoint.
     sweep/fold_offset are pass-through tag columns only."""
@@ -971,13 +971,13 @@ def stream_rebuild_worker(
     rows: List[Dict[str, Any]] = []
     cumulative_time_s = 0.0
 
-    def _fpr(filt: GonzalezMEBFilter) -> float:
+    def _fpr(filt: BallCoverFilter) -> float:
         predicted = filt.query(negative_arr, tau=tau_mid)
         return float(np.mean(predicted)) if len(predicted) else 0.0
 
     if policy == "oracle":
         for c in checkpoint_set:
-            filt = GonzalezMEBFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
+            filt = BallCoverFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
                                      merge_criterion=merge_criterion)
             t0 = time.perf_counter()
             filt.construct(stream_arr[:c])
@@ -998,7 +998,7 @@ def stream_rebuild_worker(
         raise ValueError(f"Unknown policy {policy!r}; expected 'streaming', 'periodic', or 'oracle'")
 
     rebuild_every = T if (policy == "periodic" and T is not None) else None
-    filt = GonzalezMEBFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
+    filt = BallCoverFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
                              merge_criterion=merge_criterion)
     t0 = time.perf_counter()
     filt.construct(np.empty((0, dim), dtype=np.float32))

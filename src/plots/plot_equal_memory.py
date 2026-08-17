@@ -39,23 +39,23 @@ DEMO = False
 # Fixed filter styling -- must match every other figure in the paper.
 # --------------------------------------------------------------------------- #
 
-CONFIGS = ["GonzalezMEBFilter", "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", "DSHFilter"]
+CONFIGS = ["BallCoverFilter", "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", "DSHFilter"]
 CONFIG_LABELS = {
-    "GonzalezMEBFilter": "Ours",
+    "BallCoverFilter": "Ours",
     "DSBFFilter": "DSBF",
     "CoveringLSHFallbackFilter": "CoveringLSH-Fallback",
     "LSBFFilter": "LSBF",
     "DSHFilter": "DSH",
 }
 CONFIG_COLORS = {
-    "GonzalezMEBFilter": "#0072B2",
+    "BallCoverFilter": "#0072B2",
     "DSBFFilter": "#E69F00",
     "CoveringLSHFallbackFilter": "#009E73",
     "LSBFFilter": "#CC79A7",
     "DSHFilter": "#D55E00",
 }
 CONFIG_MARKERS = {
-    "GonzalezMEBFilter": "o",
+    "BallCoverFilter": "o",
     "DSBFFilter": "s",
     "CoveringLSHFallbackFilter": "^",
     "LSBFFilter": "D",
@@ -82,11 +82,11 @@ def _synthesize_demo_data() -> pd.DataFrame:
     budgets_bytes = [64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024]
 
     base_fpr = {
-        "GonzalezMEBFilter": 0.35, "DSBFFilter": 0.9, "CoveringLSHFallbackFilter": 0.85,
+        "BallCoverFilter": 0.35, "DSBFFilter": 0.9, "CoveringLSHFallbackFilter": 0.85,
         "LSBFFilter": 0.9, "DSHFilter": 0.9,
     }
     base_latency_ms = {
-        "GonzalezMEBFilter": 0.006, "DSBFFilter": 0.015, "CoveringLSHFallbackFilter": 0.004,
+        "BallCoverFilter": 0.006, "DSBFFilter": 0.015, "CoveringLSHFallbackFilter": 0.004,
         "LSBFFilter": 0.012, "DSHFilter": 0.004,
     }
 

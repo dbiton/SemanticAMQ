@@ -12,7 +12,7 @@ genuine comparison of decision rules, not of bootstrap artifacts.
 
 The two references described in the streaming spec (exhaustive O(k^2 d)
 Algorithm 2, and from-scratch static rebuild) are NOT implemented here --
-they're just GonzalezMEBFilter used directly (see exhaustive_algo2_step
+they're just BallCoverFilter used directly (see exhaustive_algo2_step
 below, and runner.stream_rebuild_worker's policy="oracle").
 """
 
@@ -26,12 +26,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from filters import ball_geometry
-from filters.gonzales_filter import GonzalezMEBFilter
+from src.filters.ball_cover_filter import BallCoverFilter
 
 
 class BallCover:
     """Fixed-capacity (centers, radii) array pair with in-place mutation.
-    Unlike GonzalezMEBFilter's own buffers, capacity here is always known up
+    Unlike BallCoverFilter's own buffers, capacity here is always known up
     front (k, or k+1 where a method transiently needs a singleton slot) --
     nothing to grow into, so no amortized-doubling machinery."""
 
@@ -356,9 +356,9 @@ class _GrowingBuffer:
 
 class PeriodicBatchRebuild(StreamingInsertionMethod):
     """M5: buffer arrivals; every b insertions, discard the cover and rerun
-    GonzalezMEBFilter.construct() (Gonzalez seeding -> Lloyd -> MEB
+    BallCoverFilter.construct() (Gonzalez seeding -> Lloyd -> MEB
     refinement -> reassignment) on every point seen so far. Between rebuilds,
-    absorb arrivals using the M2 rule directly (not GonzalezMEBFilter.add(),
+    absorb arrivals using the M2 rule directly (not BallCoverFilter.add(),
     which would silently substitute Algorithm 2's rule instead)."""
 
     name = "M5"
@@ -366,7 +366,7 @@ class PeriodicBatchRebuild(StreamingInsertionMethod):
     def __init__(self, dim: int, k: int, seed: int = 0, b: int = 1000, construct_tau: float = 0.0):
         super().__init__(dim, k, seed)
         self.b = b
-        self._filt = GonzalezMEBFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed)
+        self._filt = BallCoverFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed)
         self._filt.construct(np.empty((0, dim), dtype=np.float32))
         self._buffer = _GrowingBuffer(dim)
         self.rebuild_time_s = 0.0
@@ -396,14 +396,14 @@ class PeriodicBatchRebuild(StreamingInsertionMethod):
         self.cover = new_cover
 
 
-def exhaustive_algo2_step(filt: GonzalezMEBFilter, x: np.ndarray) -> Optional[float]:
-    """Drive one arrival through a GonzalezMEBFilter exactly as add() does
+def exhaustive_algo2_step(filt: BallCoverFilter, x: np.ndarray) -> Optional[float]:
+    """Drive one arrival through a BallCoverFilter exactly as add() does
     (unrestricted exhaustive argmin over the cached k x k cost matrix), but
     also return the realized merge Delta -- None if this arrival didn't
     trigger a merge (e.g. during bootstrap). Used by the M4-exactness and
     Delta-distribution diagnostics, which need to observe what the exhaustive
     reference chose without re-deriving its selection logic. Mirrors
-    GonzalezMEBFilter.add()'s body; not a public method on that class because
+    BallCoverFilter.add()'s body; not a public method on that class because
     only these diagnostics need the realized Delta back."""
     x = np.ascontiguousarray(x, dtype=np.float32)[np.newaxis, :]
     if not filt._constructed:

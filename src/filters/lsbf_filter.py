@@ -55,7 +55,7 @@ class LSBFFilter(Filter):
     secondary uniform hash.
 
     tau is baked in at construction via `distance_threshold` (mirrors
-    GonzalezMEBFilter/FirstNFilter/DSBFFilter); `query(..., tau=t)` only
+    BallCoverFilter/FirstNFilter/DSBFFilter); `query(..., tau=t)` only
     accepts t == distance_threshold or t=None.
     """
 
