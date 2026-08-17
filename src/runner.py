@@ -96,7 +96,7 @@ def _radius_stats(filter_instance: Any) -> Dict[str, float]:
 
 _DIRECT_TAU_FILTERS = {
     "FirstNFilter", "BallCoverFilter",
-    "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", "DSHFilter",
+    "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", "DSHFilter", "HNSWFilter",
 }
 
 
