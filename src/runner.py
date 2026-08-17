@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
@@ -484,15 +483,12 @@ def ablation_worker(
     vectors_construct: VectorInput,
     vectors_query: VectorInput,
     actual_results_by_tau: Dict[float, List[bool]],
-    feedback_fraction: float = 0.1,
 ) -> List[Dict[str, Any]]:
     """Builds one BallCoverFilter cover per (dataset, k, seed) via the full
     construction ladder, then evaluates it at every tau. Returns one row per
-    (stage, tau) for stages ["ball", "quantizing", "feedback"]; construct_tau
-    is a sweep-independent construction knob, kept separate from the
-    evaluated tau's so log10_J stays tau-independent for a given cover.
-    Feedback is tau-specific (false positives depend on tau), so it branches
-    per tau off a deep copy of the post-quantization cover."""
+    (stage, tau) for stages ["ball", "quantizing"]; construct_tau is a
+    sweep-independent construction knob, kept separate from the evaluated
+    tau's so log10_J stays tau-independent for a given cover."""
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
     n_q = len(query_arr)
@@ -502,11 +498,6 @@ def ablation_worker(
                 f"vectors_query ({n_q}) and actual_results_by_tau[{t}] ({len(actual)}) length mismatch"
             )
 
-    n_witness = max(1, int(round(n_q * feedback_fraction))) if n_q > 0 else 0
-    rng = np.random.default_rng(seed)
-    perm = rng.permutation(n_q)
-    witness_idx, eval_idx = perm[:n_witness], perm[n_witness:]
-    witness_q, eval_q = query_arr[witness_idx], query_arr[eval_idx]
     actual_by_tau = {t: np.asarray(a, dtype=bool) for t, a in actual_results_by_tau.items()}
 
     rows: List[Dict[str, Any]] = []
@@ -519,8 +510,8 @@ def ablation_worker(
     ball_log10_J = ball_level["log_J"] / _LN10
 
     for t in tau_values:
-        predicted = filt.query(eval_q, tau=t)
-        rates = _confusion_rates(predicted, actual_by_tau[t][eval_idx])
+        predicted = filt.query(query_arr, tau=t)
+        rates = _confusion_rates(predicted, actual_by_tau[t])
         rows.append({
             "dataset": dataset, "k": k, "stage": "ball", "stage_index": 1, "tau": t,
             "log10_J": ball_log10_J,
@@ -538,8 +529,8 @@ def ablation_worker(
     quant_log10_J = _log10_J(quant_radii, dim)
 
     for t in tau_values:
-        predicted = filt.query(eval_q, tau=t)
-        rates = _confusion_rates(predicted, actual_by_tau[t][eval_idx])
+        predicted = filt.query(query_arr, tau=t)
+        rates = _confusion_rates(predicted, actual_by_tau[t])
         rows.append({
             "dataset": dataset, "k": k, "stage": "quantizing", "stage_index": 2, "tau": t,
             "log10_J": quant_log10_J,
@@ -556,36 +547,6 @@ def ablation_worker(
             f"{bad[:3]}"
         )
 
-    for t in tau_values:
-        filt_t = copy.deepcopy(filt)
-        witness_actual_t = actual_by_tau[t][witness_idx]
-        eval_actual_t = actual_by_tau[t][eval_idx]
-
-        feedback_time = 0.0
-        if n_witness > 0:
-            witness_pred = np.asarray(filt_t.query(witness_q, tau=t), dtype=bool)
-            fp_witnesses = witness_q[witness_pred & ~witness_actual_t]
-            if len(fp_witnesses) > 0:
-                feedback = filt_t.refine_with_feedback(fp_witnesses, thresholds=t)
-                feedback_time = feedback["elapsed_seconds"]
-
-        predicted = filt_t.query(eval_q, tau=t)
-        rates = _confusion_rates(predicted, eval_actual_t)
-        if rates["fnr"] != 0:
-            raise ValueError(
-                f"Zero-false-negative invariant violated at the feedback stage "
-                f"(dataset={dataset}, k={k}, tau={t}, seed={seed}): fnr={rates['fnr']}"
-            )
-
-        radii = filt_t.all_radiuses
-        rows.append({
-            "dataset": dataset, "k": k, "stage": "feedback", "stage_index": 3, "tau": t,
-            "log10_J": _log10_J(radii, dim),
-            "log10_J_tau": _log10_J(radii, dim, tau=t),
-            "fpr": rates["fpr"], "fnr": rates["fnr"],
-            "stage_time_s": feedback_time, "cum_time_s": quant_cum_time + feedback_time,
-            "n_balls": len(radii), "seed": seed,
-        })
     return rows
 
 

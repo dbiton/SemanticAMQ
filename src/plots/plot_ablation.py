@@ -35,11 +35,10 @@ DPI = 400
 EMIT_PDF = False
 DEMO = False
 
-STAGES = ["ball", "quantizing", "feedback"]
+STAGES = ["ball", "quantizing"]
 STAGE_LABELS = {
     "ball": "Ball",
     "quantizing": "Quant",
-    "feedback": "Fbk",
 }
 STAGE_INDEX = {s: i + 1 for i, s in enumerate(STAGES)}
 
@@ -120,17 +119,14 @@ def _synthesize_demo_data() -> pd.DataFrame:
     stage_reduction = {
         "ball": 0.000,
         "quantizing": 0.020,
-        "feedback": 0.110,
     }
     stage_fpr = {
         "ball": 1.2e-2,
         "quantizing": 3.0e-3,
-        "feedback": 0.0,
     }
     stage_time = {
         "ball": 5.3,
         "quantizing": 1.8,
-        "feedback": 3.2,
     }
 
     rows = []
@@ -593,7 +589,7 @@ def _save(fig: plt.Figure, filename: str, cfg: Config) -> None:
 
 def print_summary(df: pd.DataFrame, cfg: Config) -> None:
     print("\n--- Ablation summary (k={}, tau={:g}) ---".format(cfg.k, cfg.tau))
-    header = f"{'dataset':<10} {'d(log10 J) ball->fbk':>18} {'final FPR':>12} {'total time (s)':>16}"
+    header = f"{'dataset':<10} {'d(log10 J) ball->quant':>18} {'final FPR':>12} {'total time (s)':>16}"
     print(header)
     print("-" * len(header))
 
@@ -603,9 +599,9 @@ def print_summary(df: pd.DataFrame, cfg: Config) -> None:
 
     for dataset in DATASETS:
         base_j, _ = _lookup(j_agg, dataset, "ball")
-        final_j, _ = _lookup(j_agg, dataset, "feedback")
-        final_fpr, _ = _lookup(fpr_agg, dataset, "feedback")
-        total_time, _ = _lookup(time_agg, dataset, "feedback")
+        final_j, _ = _lookup(j_agg, dataset, "quantizing")
+        final_fpr, _ = _lookup(fpr_agg, dataset, "quantizing")
+        total_time, _ = _lookup(time_agg, dataset, "quantizing")
         print(
             f"{DATASET_LABELS[dataset]:<10} {final_j - base_j:>18.3f} "
             f"{final_fpr:>12.2e} {total_time:>16.2f}"

@@ -548,9 +548,9 @@ def plot_system_tau(df: pd.DataFrame, k: int) -> None:
 def generate_ablation() -> Tuple[pd.DataFrame, int]:
     """
     Generate the per-stage construction-ladder data for BallCoverFilter
-    (ball refine -> quantizing -> feedback) across the 3 datasets the
-    ablation figure needs, and write it to results/ablation.csv. Returns the
-    long-format df plus the largest k used.
+    (ball refine -> quantizing) across the 3 datasets the ablation figure
+    needs, and write it to results/ablation.csv. Returns the long-format df
+    plus the largest k used.
 
     k and tau are both derived from num_vectors/percentage_construct rather
     than hardcoded absolute values, so editing those two knobs rescales
@@ -576,7 +576,6 @@ def generate_ablation() -> Tuple[pd.DataFrame, int]:
     k_fractions            = [0.03, 0.06, 0.125, 0.25]
     duplicate_percentages  = [5, 10, 20]
     seeds                  = [0, 1, 2]
-    feedback_fraction      = 0.10
     output_csv             = "results/ablation.csv"
 
     datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
@@ -641,7 +640,7 @@ def generate_ablation() -> Tuple[pd.DataFrame, int]:
                     dim=dim, dataset=DATASET_KEYS[dataset],
                     k=k, tau_values=tau_values, seed=seed, construct_tau=construct_tau,
                     vectors_construct=construct_source, vectors_query=query_source,
-                    actual_results_by_tau=actual_results_by_tau, feedback_fraction=feedback_fraction,
+                    actual_results_by_tau=actual_results_by_tau,
                 )
 
     job_results = runner.run()

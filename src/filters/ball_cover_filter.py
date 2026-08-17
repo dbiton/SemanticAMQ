@@ -33,13 +33,9 @@ class BallCoverFilter(Filter):
          decreasing (or a small iteration cap is hit). Costs a small constant
          multiple of level 1.
 
-    Two further refinements are opt-in and run *after* `construct()` rather
-    than as rungs of the complexity ladder:
+    A further refinement is opt-in and runs *after* `construct()` rather
+    than as a rung of the complexity ladder:
 
-      - Feedback-driven refinement: driven by externally verified false
-        positives supplied via `set_feedback_policy` + `refine_with_feedback`.
-        Requires `construct(vectors, retain_assignments=True)` so the
-        original vectors/assignment are available to re-partition from.
       - Quantization: compresses the stored centroids with a FAISS
         ScalarQuantizer (`quantize=True` at construction, or a manual
         `quantize_centers()` call). Every candidate in `_QUANTIZER_CANDIDATES`
@@ -62,9 +58,9 @@ class BallCoverFilter(Filter):
     (capacity grows by amortized doubling up to max_spheres), so add()/
     remove() never reallocate or copy the whole structure. `get_bytesize()`
     covers only that buffer (using the compressed per-vector size once
-    quantized); construction state retained for `refine_with_feedback` (the
-    original vectors + assignment) is reported separately by
-    `get_construction_bytesize()`.
+    quantized); construction state retained for quantize_centers()'s
+    rebuild-from-vectors path (the original vectors + assignment) is
+    reported separately by `get_construction_bytesize()`.
     """
 
     _BYTES_PER_FLOAT32 = 4
@@ -79,8 +75,6 @@ class BallCoverFilter(Filter):
     _RADIUS_SAFETY_ABS = 1e-6
     _DEFAULT_SEED = 42
     _DEFAULT_COMPLEXITY = 2
-    _FEEDBACK_MAX_CANDIDATE_BALLS = 50
-    _FEEDBACK_MAX_MERGE_CANDIDATES = 20
     _LEVEL_NAMES = {1: "initial_cover", 2: "ball_refine"}
     _LN10 = float(np.log(10.0))
     # Candidate FAISS ScalarQuantizer types tried by quantize_centers(), coarsest
@@ -110,16 +104,10 @@ class BallCoverFilter(Filter):
         self._size = 0
 
         # construction state (vectors + assignment), retained only when
-        # explicitly requested (needed by refine_with_feedback)
+        # explicitly requested (needed by quantize_centers()'s rebuild path)
         self._retain_assignments = False
         self._X: Optional[np.ndarray] = None
         self._assignment: Optional[np.ndarray] = None
-
-        # feedback policy
-        self._feedback_mode = "reserved"
-        self._feedback_reserved_fraction = 0.10
-        self._feedback_margin = 0.0
-        self._feedback_max_iterations = 100
 
         # quantization policy
         self._quantize = bool(quantize)
@@ -131,7 +119,6 @@ class BallCoverFilter(Filter):
 
         # instrumentation
         self._stage_stats: List[Dict[str, Any]] = []
-        self._feedback_stats: Optional[Dict[str, Any]] = None
 
         # incremental merge-cost cache for streaming add()
         self._merge_bucket: Optional[np.ndarray] = None
@@ -153,7 +140,7 @@ class BallCoverFilter(Filter):
     def sphere_counts(self) -> np.ndarray:
         return self._count_buf[:self._size]
 
-    # ------------------------------------------------------------------ complexity / feedback policy
+    # ------------------------------------------------------------------ complexity policy
 
     def set_complexity(self, level: int) -> None:
         if level not in (1, 2):
@@ -161,15 +148,6 @@ class BallCoverFilter(Filter):
         if self._constructed:
             self._constructed = False
         self._complexity_level = level
-
-    def set_feedback_policy(self, mode: str = "reserved", reserved_fraction: float = 0.10,
-                            margin: float = 0.0, max_iterations: int = 100) -> None:
-        if mode not in ("reserved", "split_merge"):
-            raise ValueError(f"Unknown feedback mode {mode!r}; expected 'reserved' or 'split_merge'")
-        self._feedback_mode = mode
-        self._feedback_reserved_fraction = reserved_fraction
-        self._feedback_margin = margin
-        self._feedback_max_iterations = max_iterations
 
     # ------------------------------------------------------------------ sizing / buffers
 
@@ -595,13 +573,12 @@ class BallCoverFilter(Filter):
                 "log_J_tau": {t: self._log_J_tau(stage["radii_snapshot"], t) for t in taus},
                 "accepted_ops": stage["accepted_ops"],
             })
-        return {"levels": levels, "feedback": self._feedback_stats, "quantization": self._quantizer_stats}
+        return {"levels": levels, "quantization": self._quantizer_stats}
 
     # ------------------------------------------------------------------ construct
 
     def construct(self, vectors: np.ndarray, retain_assignments: bool = False) -> Tuple[float, float]:
         self._stage_stats = []
-        self._feedback_stats = None
         self._merge_cache_valid = False
         self._quantizer_name = None
         self._quantizer_bytes_per_vector = None
@@ -822,9 +799,9 @@ class BallCoverFilter(Filter):
     def quantize_centers(self) -> Optional[Dict[str, Any]]:
         """
         Manually (re-)apply center quantization outside of construct()'s
-        auto-quantize path -- e.g. after refine_with_feedback() has moved or
-        split some balls back to full float32 precision. If construction
-        state was retained (construct(..., retain_assignments=True)), this
+        auto-quantize path -- e.g. after streaming add()/remove() calls have
+        left centers at full float32 precision. If construction state was
+        retained (construct(..., retain_assignments=True)), this
         re-runs the same budget-vs-quantizer search construct() uses when
         quantize=True, rebuilding each candidate from the original vectors
         (and may grow self.max_spheres, same as construct()); otherwise it
@@ -1032,331 +1009,3 @@ class BallCoverFilter(Filter):
         if not self._constructed or not self._retain_assignments or self._X is None or self._assignment is None:
             return 0
         return int(self._X.nbytes) + int(self._assignment.nbytes)
-
-    # ------------------------------------------------------------------ feedback: split candidates
-
-    def _two_means_split(self, X: np.ndarray) -> Optional[np.ndarray]:
-        n = len(X)
-        if n < 2:
-            return None
-        sqn = np.einsum('ij,ij->i', X, X, dtype=np.float64)
-        i1 = int(np.argmax(sqn - 2.0 * (X @ X[0]) + sqn[0]))
-        d1 = sqn - 2.0 * (X @ X[i1]) + sqn[i1]
-        i2 = int(np.argmax(d1))
-        centers = np.stack([X[i1], X[i2]]).astype(np.float64)
-        membership = None
-        for _ in range(self._KMEANS2_ITERATIONS):
-            sq_d = sqn[:, None] - 2.0 * (X @ centers.T) + np.einsum('ij,ij->i', centers, centers)[None, :]
-            membership = np.argmin(sq_d, axis=1)
-            if len(np.unique(membership)) < 2:
-                return None
-            for c in range(2):
-                centers[c] = X[membership == c].mean(axis=0)
-        return membership.astype(np.int32)
-
-    def _pca_split(self, X: np.ndarray) -> Optional[np.ndarray]:
-        if len(X) < 2:
-            return None
-        mean = X.mean(axis=0)
-        Xc = (X - mean).astype(np.float64)
-        cov = Xc.T @ Xc
-        _, vecs = np.linalg.eigh(cov)
-        top = vecs[:, -1]
-        proj = Xc @ top
-        median = np.median(proj)
-        membership = (proj > median).astype(np.int32)
-        if len(np.unique(membership)) < 2:
-            return None
-        return membership
-
-    def _witness_split(self, X: np.ndarray, witness: np.ndarray) -> Optional[np.ndarray]:
-        d = np.linalg.norm(X.astype(np.float64) - witness.astype(np.float64), axis=1)
-        median = np.median(d)
-        membership = (d > median).astype(np.int32)
-        if len(np.unique(membership)) < 2:
-            return None
-        return membership
-
-    def _split_candidates_for_ball(self, ball_idx: int, assignment: np.ndarray, accept_col: np.ndarray,
-                                   weights: np.ndarray, X_q: np.ndarray) -> List[Dict[str, Any]]:
-        members_global_idx = np.flatnonzero(assignment == ball_idx)
-        if len(members_global_idx) < 2:
-            return []
-        Xi = self._X[members_global_idx]
-        memberships = []
-        m2 = self._two_means_split(Xi)
-        if m2 is not None:
-            memberships.append(m2)
-        mp = self._pca_split(Xi)
-        if mp is not None:
-            memberships.append(mp)
-        witness_idx = np.flatnonzero(accept_col)
-        if witness_idx.size > 0:
-            top_witness = X_q[witness_idx[np.argmax(weights[witness_idx])]]
-            mw = self._witness_split(Xi, top_witness)
-            if mw is not None:
-                memberships.append(mw)
-        return [{"ball_idx": ball_idx, "members": members_global_idx, "membership": m} for m in memberships]
-
-    def _apply_split_to_cover(self, centers: np.ndarray, radii: np.ndarray, counts: np.ndarray,
-                              assignment: np.ndarray, ball_idx: int, members_global_idx: np.ndarray,
-                              membership: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        idx0 = members_global_idx[membership == 0]
-        idx1 = members_global_idx[membership == 1]
-        sqn0 = np.einsum('ij,ij->i', self._X[idx0], self._X[idx0], dtype=np.float64)
-        sqn1 = np.einsum('ij,ij->i', self._X[idx1], self._X[idx1], dtype=np.float64)
-        c0, r0 = self._minimum_enclosing_ball(self._X[idx0], sqn0)
-        c1, r1 = self._minimum_enclosing_ball(self._X[idx1], sqn1)
-
-        new_centers = np.vstack([centers, c1[None, :]])
-        new_radii = np.append(radii, np.float32(r1))
-        new_counts = np.append(counts, np.int32(len(idx1)))
-        new_centers[ball_idx] = c0
-        new_radii[ball_idx] = r0
-        new_counts[ball_idx] = len(idx0)
-
-        new_assignment = assignment.copy()
-        new_assignment[idx1] = len(centers)  # new slot appended at the old length
-        return new_centers, new_radii, new_counts, new_assignment
-
-    def _per_ball_accept(self, centers: np.ndarray, radii: np.ndarray, X_q: np.ndarray, q_sq_norms: np.ndarray,
-                         thresholds: np.ndarray, gamma: float) -> np.ndarray:
-        m = len(X_q)
-        k = len(centers)
-        accept = np.zeros((m, k), dtype=bool)
-        if m == 0 or k == 0:
-            return accept
-        eff_r = radii[None, :].astype(np.float64) + gamma
-        for start in range(0, m, self._CHUNK_SIZE):
-            end = min(start + self._CHUNK_SIZE, m)
-            sq_d = self._sq_dists_to_centers(X_q[start:end], q_sq_norms[start:end], centers)
-            r_total = eff_r + thresholds[start:end, None]
-            accept[start:end] = sq_d <= r_total ** 2
-        return accept
-
-    # ------------------------------------------------------------------ feedback: merge candidates
-
-    def _apply_merge_to_cover(self, centers: np.ndarray, radii: np.ndarray, counts: np.ndarray,
-                              assignment: np.ndarray, i: int, j: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        if i > j:
-            i, j = j, i
-        c_new, r_new = self._merged_ball(centers[i], radii[i], centers[j], radii[j])
-
-        new_centers = centers.copy()
-        new_radii = radii.copy()
-        new_counts = counts.copy()
-        new_centers[i] = c_new.astype(np.float32)
-        new_radii[i] = r_new
-        new_counts[i] = int(counts[i]) + int(counts[j])
-
-        last = len(new_centers) - 1
-        new_assignment = assignment.copy()
-        new_assignment[assignment == j] = i
-        if j != last:
-            new_centers[j] = new_centers[last]
-            new_radii[j] = new_radii[last]
-            new_counts[j] = new_counts[last]
-            new_assignment[assignment == last] = j
-        new_centers = np.delete(new_centers, last, axis=0)
-        new_radii = np.delete(new_radii, last)
-        new_counts = np.delete(new_counts, last)
-        return new_centers, new_radii, new_counts, new_assignment
-
-    def _top_merge_candidates(self, centers: np.ndarray, radii: np.ndarray, top_n: int) -> List[Tuple[int, int]]:
-        n = len(centers)
-        if n < 2:
-            return []
-        bucket, key = self._all_pairs_merge_keys(centers, radii)
-        mask0 = bucket == 0
-        key_eff = np.where(mask0, key, np.inf) if mask0.any() else np.where(bucket == 1, key, np.inf)
-
-        iu = np.triu_indices(n, k=1)
-        pair_keys = np.minimum(key_eff[iu], key_eff[(iu[1], iu[0])])
-        order = np.argsort(pair_keys)
-        take = min(top_n, len(order))
-        result = []
-        for t in range(take):
-            oi = order[t]
-            if not np.isfinite(pair_keys[oi]):
-                break
-            result.append((int(iu[0][oi]), int(iu[1][oi])))
-        return result
-
-    def _merge_down(self, centers: np.ndarray, radii: np.ndarray, counts: np.ndarray,
-                    assignment: np.ndarray, target_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        while len(centers) > target_size:
-            pairs = self._top_merge_candidates(centers, radii, top_n=1)
-            if not pairs:
-                break
-            i, j = pairs[0]
-            centers, radii, counts, assignment = self._apply_merge_to_cover(centers, radii, counts, assignment, i, j)
-        return centers, radii, counts, assignment
-
-    # ------------------------------------------------------------------ feedback: reserved mode
-
-    def _best_split_candidate(self, centers, radii, counts, assignment, X_q, q_sq_norms, thresholds, weights,
-                              gamma, loss_and_accept):
-        accept = self._per_ball_accept(centers, radii, X_q, q_sq_norms, thresholds, gamma)
-        ball_has_witness = np.flatnonzero(accept.any(axis=0))
-        if ball_has_witness.size > self._FEEDBACK_MAX_CANDIDATE_BALLS:
-            witness_weight = np.array([weights[accept[:, b]].sum() for b in ball_has_witness])
-            keep = np.argsort(-witness_weight)[:self._FEEDBACK_MAX_CANDIDATE_BALLS]
-            ball_has_witness = ball_has_witness[keep]
-
-        base_loss, _ = loss_and_accept(centers, radii)
-        best = None
-        for b in ball_has_witness:
-            b = int(b)
-            for cand in self._split_candidates_for_ball(b, assignment, accept[:, b], weights, X_q):
-                new_centers, new_radii, new_counts, new_assignment = self._apply_split_to_cover(
-                    centers, radii, counts, assignment, cand["ball_idx"], cand["members"], cand["membership"])
-                new_loss, _ = loss_and_accept(new_centers, new_radii)
-                gain = base_loss - new_loss
-                if best is None or gain > best[0]:
-                    best = (gain, new_centers, new_radii, new_counts, new_assignment)
-        return best
-
-    def _feedback_reserved(self, centers, radii, counts, assignment, X_q, q_sq_norms, thresholds, weights,
-                           gamma, loss_and_accept):
-        k = len(centers)
-        s = min(int(np.ceil(self._feedback_reserved_fraction * k)), max(k - 1, 0))
-        centers, radii, counts, assignment = self._merge_down(centers, radii, counts, assignment, k - s)
-
-        ops = 0
-        for _ in range(s):
-            best = self._best_split_candidate(centers, radii, counts, assignment, X_q, q_sq_norms, thresholds,
-                                              weights, gamma, loss_and_accept)
-            if best is None or best[0] <= 0:
-                break
-            _, centers, radii, counts, assignment = best
-            ops += 1
-        return centers, radii, counts, assignment, ops
-
-    # ------------------------------------------------------------------ feedback: split_merge mode
-
-    def _generate_split_candidates(self, centers, radii, assignment, X_q, q_sq_norms, thresholds, weights, gamma):
-        accept = self._per_ball_accept(centers, radii, X_q, q_sq_norms, thresholds, gamma)
-        ball_has_witness = np.flatnonzero(accept.any(axis=0))
-        if ball_has_witness.size > self._FEEDBACK_MAX_CANDIDATE_BALLS:
-            witness_weight = np.array([weights[accept[:, b]].sum() for b in ball_has_witness])
-            keep = np.argsort(-witness_weight)[:self._FEEDBACK_MAX_CANDIDATE_BALLS]
-            ball_has_witness = ball_has_witness[keep]
-        candidates = []
-        for b in ball_has_witness:
-            b = int(b)
-            candidates.extend(self._split_candidates_for_ball(b, assignment, accept[:, b], weights, X_q))
-        return candidates
-
-    def _feedback_split_merge(self, centers, radii, counts, assignment, X_q, q_sq_norms, thresholds, weights,
-                              gamma, loss_and_accept):
-        ops = 0
-        for _ in range(self._feedback_max_iterations):
-            loss_current, _ = loss_and_accept(centers, radii)
-            if loss_current <= 0:
-                break
-            split_candidates = self._generate_split_candidates(
-                centers, radii, assignment, X_q, q_sq_norms, thresholds, weights, gamma)
-            if not split_candidates:
-                break
-            merge_candidates = self._top_merge_candidates(centers, radii, top_n=self._FEEDBACK_MAX_MERGE_CANDIDATES)
-            if not merge_candidates:
-                break
-
-            best = None
-            for sc in split_candidates:
-                centers_s, radii_s, counts_s, assignment_s = self._apply_split_to_cover(
-                    centers, radii, counts, assignment, sc["ball_idx"], sc["members"], sc["membership"])
-                for (mi, mj) in merge_candidates:
-                    if mi == sc["ball_idx"] or mj == sc["ball_idx"]:
-                        continue
-                    centers_sm, radii_sm, counts_sm, assignment_sm = self._apply_merge_to_cover(
-                        centers_s, radii_s, counts_s, assignment_s, mi, mj)
-                    loss_sm, _ = loss_and_accept(centers_sm, radii_sm)
-                    gain = loss_current - loss_sm
-                    if best is None or gain > best[0]:
-                        best = (gain, centers_sm, radii_sm, counts_sm, assignment_sm)
-
-            if best is None or best[0] <= 0:
-                break
-            _, centers, radii, counts, assignment = best
-            ops += 1
-        return centers, radii, counts, assignment, ops
-
-    # ------------------------------------------------------------------ feedback: entry point
-
-    def refine_with_feedback(self, queries: np.ndarray, thresholds=None,
-                             weights: Optional[np.ndarray] = None) -> Dict[str, Any]:
-        if not self._constructed:
-            raise ValueError("BallCoverFilter has not been constructed.")
-        if self._X is None or self._assignment is None:
-            raise ValueError(
-                "refine_with_feedback requires construction state (original vectors + "
-                "assignment); call construct(vectors, retain_assignments=True)."
-            )
-
-        t_start = time.perf_counter()
-        X_q = np.ascontiguousarray(queries, dtype=np.float32)
-        m = len(X_q)
-
-        if thresholds is None:
-            thr = np.full(m, self.distance_threshold, dtype=np.float64)
-        elif np.isscalar(thresholds):
-            thr = np.full(m, float(thresholds), dtype=np.float64)
-        else:
-            thr = np.asarray(thresholds, dtype=np.float64)
-        w = np.ones(m, dtype=np.float64) if weights is None else np.asarray(weights, dtype=np.float64)
-        gamma = self._feedback_margin
-        q_sq_norms = np.einsum('ij,ij->i', X_q, X_q, dtype=np.float64) if m else np.empty(0)
-
-        def loss_and_accept(centers, radii):
-            if len(centers) == 0 or m == 0:
-                return 0.0, np.zeros(m, dtype=bool)
-            accepted = np.zeros(m, dtype=bool)
-            radii64 = radii.astype(np.float64)
-            for start in range(0, m, self._CHUNK_SIZE):
-                end = min(start + self._CHUNK_SIZE, m)
-                sq_d = self._sq_dists_to_centers(X_q[start:end], q_sq_norms[start:end], centers)
-                eff_r = radii64[None, :] + thr[start:end, None] + gamma
-                accepted[start:end] = np.any(sq_d <= eff_r ** 2, axis=1)
-            return float(w[accepted].sum()), accepted
-
-        centers = self.all_spheres.copy()
-        radii = self.all_radiuses.copy()
-        counts = self.sphere_counts.copy()
-        assignment = self._assignment.copy()
-
-        log_J_before = self._log_J(radii)
-        loss_before, _ = loss_and_accept(centers, radii)
-
-        accepted_ops = 0
-        if loss_before > 0.0:
-            if self._feedback_mode == "reserved":
-                centers, radii, counts, assignment, accepted_ops = self._feedback_reserved(
-                    centers, radii, counts, assignment, X_q, q_sq_norms, thr, w, gamma, loss_and_accept)
-            elif self._feedback_mode == "split_merge":
-                centers, radii, counts, assignment, accepted_ops = self._feedback_split_merge(
-                    centers, radii, counts, assignment, X_q, q_sq_norms, thr, w, gamma, loss_and_accept)
-            else:
-                raise ValueError(f"Unknown feedback mode {self._feedback_mode!r}")
-
-        loss_after, _ = loss_and_accept(centers, radii)
-        log_J_after = self._log_J(radii)
-
-        num_spheres = len(centers)
-        self._reset_buffers(num_spheres)
-        self._center_buf[:num_spheres] = centers
-        self._radius_buf[:num_spheres] = radii
-        self._count_buf[:num_spheres] = counts
-        self._size = num_spheres
-        self._assignment = assignment.astype(np.int32)
-
-        fraction_eliminated = (1.0 - loss_after / loss_before) if loss_before > 0.0 else 0.0
-        result = {
-            "accepted_operations": accepted_ops,
-            "fraction_eliminated": fraction_eliminated,
-            "log_J_before": log_J_before,
-            "log_J_after": log_J_after,
-            "elapsed_seconds": time.perf_counter() - t_start,
-        }
-        self._feedback_stats = result
-        return result
