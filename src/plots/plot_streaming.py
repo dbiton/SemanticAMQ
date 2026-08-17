@@ -1,114 +1,203 @@
-"""Streaming-evaluation figures: (a) absorption rate vs. stream position, (b)
-FPR by rebuild policy vs. stream position, (c) final FPR vs. k per merge
-criterion, (d) rebuild-policy cost/quality Pareto. Reads one long-format CSV
-with a `metric` column (absorption | rebuild | merge_criterion) selecting
-which panel(s) a row feeds.
+"""Streaming-evaluation figures: 5 insertion methods (M1-M5, see
+filters.streaming_insertion) that differ in decision rule and cost class,
+compared against two references (exhaustive Algorithm 2 and from-scratch
+static rebuild) that appear only as dashed lines, never as legend entries.
+
+Reads results/streaming.csv (one row per method/checkpoint, tagged by
+`sweep` in {"position","k_sweep"} and `metric` in {"checkpoint",
+"static_reference","exhaustive_reference"}) and results/streaming_checks.json
+(the M4-exactness / M3-gap / Delta-distribution text-report data).
+
+Four panels, one line per method (consistent color across all four):
+  (a) FPR vs. stream position at fixed k_fixed, median + IQR band over the
+      K-fold stream-offset sweep, + a dashed static-rebuild reference.
+  (b) Threshold-expanded objective inflation (log10_j_tau(method) -
+      log10_j_tau(static_reference)) vs. the same stream-position x-axis --
+      checks whether the geometric objective actually tracks FPR.
+  (c) Final FPR vs. ball budget k.
+  (d) Pareto: mean FPR (2nd half of stream) vs. amortized cost/insertion,
+      one connected curve per method per k (M5: one curve per b), + the
+      exhaustive-Algorithm-2 reference as a 6th dashed curve.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 
-from plots.plot_common import DATASETS, DATASET_LABELS, DATASET_COLORS, apply_style, save_figure, save_dataset_legend, mean_ci95
+from plots.plot_common import apply_style, style_axes, save_figure, save_dataset_legend
 
 INPUT_PATH = "results/streaming.csv"
+CHECKS_PATH = "results/streaming_checks.json"
 OUTDIR = "plots/streaming/"
 K_FIXED: Optional[int] = None
-T_REPRESENTATIVE: Optional[int] = None
+B_REPRESENTATIVE: Optional[int] = None
 DPI = 300
 EMIT_PDF = False
 DEMO = False
 
-POLICIES = ["streaming", "periodic", "oracle"]
-POLICY_LABELS = {"streaming": "Streaming (no rebuild)", "periodic": "Periodic rebuild", "oracle": "Oracle rebuild"}
-POLICY_COLORS = {"streaming": "#D55E00", "periodic": "#CC79A7", "oracle": "#000000"}
-POLICY_MARKERS = {"streaming": "o", "periodic": "s", "oracle": "^"}
-
-MERGE_CRITERIA = ["log_space", "r_pow_d", "sum_radii", "min_radius_increase"]
-MERGE_CRITERION_LABELS = {
-    "log_space": r"$\log$-space $r^d$", "r_pow_d": r"raw $r^d$",
-    "sum_radii": r"$\Sigma r$", "min_radius_increase": "min radius increase",
+METHODS = ["M1", "M2", "M3", "M4", "M5"]
+METHOD_LABELS = {
+    "M1": "M1: Nearest-center absorb", "M2": "M2: Min radius increase",
+    "M3": "M3: Restricted merge", "M4": "M4: Cached-heap merge", "M5": "M5: Periodic rebuild",
 }
-MERGE_CRITERION_COLORS = {
-    "log_space": "#0072B2", "r_pow_d": "#D55E00", "sum_radii": "#E69F00", "min_radius_increase": "#009E73",
+# Okabe-Ito-derived, distinct from plot_common.DATASET_COLORS (this figure is
+# single-dataset -- see main.py's _STREAMING_REPRESENTATIVE_DATASET -- so the
+# color channel is free to encode method instead).
+METHOD_COLORS = {
+    "M1": "#0072B2", "M2": "#E69F00", "M3": "#009E73", "M4": "#D55E00", "M5": "#CC79A7",
 }
+_M5_B_LINESTYLES = ["-", "--", ":"]
 
-_REQUIRED_COLUMNS = ["metric", "dataset", "k", "seed", "position", "absorption_rate", "policy", "T", "fpr",
-                     "amortized_cost_s", "merge_criterion"]
+_REQUIRED_COLUMNS = [
+    "dataset", "method", "k", "seed", "fold_offset", "b", "position",
+    "fpr", "log10_j_tau", "n_balls", "cumulative_time_s", "amortized_cost_s",
+    "metric", "sweep",
+]
 
 
 @dataclasses.dataclass
 class Config:
     k_fixed: int
-    t_representative: int
+    b_representative: int
     dpi: int
     emit_pdf: bool
     outdir: str
 
 
+# --------------------------------------------------------------------------- #
+# Demo data / schema / config
+# --------------------------------------------------------------------------- #
+
 def _synthesize_demo_data() -> pd.DataFrame:
     rng = np.random.default_rng(0)
-    positions = np.unique(np.round(np.logspace(np.log10(50), np.log10(8000), 10)).astype(int))
-    seeds = [0, 1, 2]
-    k_fixed = 128
-    T_values = [200, 400, 800, 1600, 4000]
+    k_fixed = 32
+    k_values = [16, 32, 64, 128, 256, 512, 1024]
+    b_values = [1_500, 6_000, 15_000]
+    b_representative = 6_000
+    n_stream_ab, F_ab = k_fixed * 1000, 4
+    n_stream_c, F_cd = 30_000, 4
+    positions_ab = np.unique(np.round(np.logspace(np.log10(k_fixed + 1), np.log10(n_stream_ab), 12)).astype(int))
+    positions_cd = np.unique(np.round(np.linspace(n_stream_c // 20, n_stream_c, 20)).astype(int))
+
+    # Rough relative quality/cost ordering used only to make the demo figure
+    # legible: M1 worst FPR, M4 near the exhaustive reference at far lower
+    # cost, M5 bridges cost/quality.
+    base_fpr = {"M1": 0.06, "M2": 0.045, "M3": 0.03, "M4": 0.012, "M5": 0.02, "static_reference": 0.008,
+               "ref_exhaustive": 0.012}
+    cost_scale = {"M1": 1.0, "M2": 1.1, "M3": 1.3, "M4": 2.0, "M5": 4.0, "ref_exhaustive": 40.0}
+
     rows = []
+    for method in METHODS:
+        offsets = [f * 1500 for f in range(F_ab)]
+        for fold_offset in offsets:
+            for pos in positions_ab:
+                x = pos / n_stream_ab
+                fpr = base_fpr[method] * (0.3 + 0.7 * x) * rng.uniform(0.9, 1.1)
+                log10_j = 40.0 + 8.0 * x + rng.normal(0, 0.2)
+                rows.append({
+                    "dataset": "eli5", "method": method, "k": k_fixed, "seed": 0, "fold_offset": fold_offset,
+                    "b": b_representative if method == "M5" else None, "position": int(pos),
+                    "fpr": float(fpr), "log10_j_tau": float(log10_j), "n_balls": k_fixed,
+                    "cumulative_time_s": cost_scale[method] * pos * 1e-5,
+                    "amortized_cost_s": cost_scale[method] * 1e-5,
+                    "metric": "checkpoint", "sweep": "position",
+                })
+        for fold_offset in offsets:
+            for pos in positions_ab:
+                x = pos / n_stream_ab
+                rows.append({
+                    "dataset": "eli5", "method": "static_reference", "k": k_fixed, "seed": 0,
+                    "fold_offset": fold_offset, "b": None, "position": int(pos),
+                    "fpr": float(base_fpr["static_reference"] * (0.3 + 0.7 * x) * rng.uniform(0.9, 1.1)),
+                    "log10_j_tau": float(38.0 + 6.0 * x + rng.normal(0, 0.2)), "n_balls": k_fixed,
+                    "cumulative_time_s": cost_scale["ref_exhaustive"] * pos * 1e-5,
+                    "amortized_cost_s": cost_scale["ref_exhaustive"] * 1e-5,
+                    "metric": "static_reference", "sweep": "position",
+                })
 
-    plateau = {"eli5": 0.94, "mmlu": 0.90, "wildchat": 0.97}
-    rate = {"eli5": 1.6, "mmlu": 1.3, "wildchat": 2.0}
-    for dataset in DATASETS:
-        for seed in seeds:
-            for pos in positions:
-                x = pos / positions[-1]
-                mean = plateau[dataset] * (1.0 - np.exp(-rate[dataset] * x * 6))
-                rows.append({"metric": "absorption", "dataset": dataset, "k": k_fixed, "seed": seed,
-                            "position": int(pos), "absorption_rate": float(np.clip(mean + rng.normal(0, 0.02), 0, 1))})
+    offsets_cd = [36500 + f * 1000 for f in range(F_cd)]
+    for method in ["M1", "M2", "M3", "M4"]:
+        for k in k_values:
+            kf = k / 1024.0
+            for fold_offset in offsets_cd:
+                for pos in positions_cd:
+                    fpr = base_fpr[method] / (1.0 + 3.0 * kf) * rng.uniform(0.9, 1.1)
+                    rows.append({
+                        "dataset": "eli5", "method": method, "k": k, "seed": 0, "fold_offset": fold_offset,
+                        "b": None, "position": int(pos), "fpr": float(fpr),
+                        "log10_j_tau": float(30.0 + 10.0 * kf), "n_balls": k,
+                        "cumulative_time_s": cost_scale[method] * k * pos * 1e-6,
+                        "amortized_cost_s": cost_scale[method] * k * 1e-6,
+                        "metric": "checkpoint", "sweep": "k_sweep",
+                    })
+    for k in k_values:
+        kf = k / 1024.0
+        for b in b_values:
+            bf = b / 15000.0
+            for fold_offset in offsets_cd:
+                for pos in positions_cd:
+                    fpr = base_fpr["M5"] / (1.0 + 3.0 * kf) * (1.3 - 0.3 * bf) * rng.uniform(0.9, 1.1)
+                    rows.append({
+                        "dataset": "eli5", "method": "M5", "k": k, "seed": 0, "fold_offset": fold_offset,
+                        "b": b, "position": int(pos), "fpr": float(fpr),
+                        "log10_j_tau": float(30.0 + 10.0 * kf), "n_balls": k,
+                        "cumulative_time_s": cost_scale["M5"] * k * pos * 1e-6 / bf,
+                        "amortized_cost_s": cost_scale["M5"] * k * 1e-6 / bf,
+                        "metric": "checkpoint", "sweep": "k_sweep",
+                    })
+    for k in k_values:
+        kf = k / 1024.0
+        for fold_offset in offsets_cd:
+            for pos in positions_cd:
+                rows.append({
+                    "dataset": "eli5", "method": "ref_exhaustive", "k": k, "seed": 0, "fold_offset": fold_offset,
+                    "b": None, "position": int(pos),
+                    "fpr": float(base_fpr["ref_exhaustive"] / (1.0 + 3.0 * kf) * rng.uniform(0.9, 1.1)),
+                    "log10_j_tau": float(29.0 + 10.0 * kf), "n_balls": k,
+                    "cumulative_time_s": cost_scale["ref_exhaustive"] * k * pos * 1e-6,
+                    "amortized_cost_s": cost_scale["ref_exhaustive"] * k * 1e-6,
+                    "metric": "exhaustive_reference", "sweep": "k_sweep",
+                })
 
-    for seed in seeds:
-        for policy, T in [("streaming", None), ("oracle", None)] + [("periodic", t) for t in T_values]:
-            frac = 0.0 if policy == "streaming" else (1.0 if policy == "oracle" else
-                  1.0 - (T - min(T_values)) / (max(T_values) - min(T_values) + 1e-9))
-            cum_time = 0.0
-            for pos in positions:
-                step = {"streaming": 0.00012, "oracle": 0.02, "periodic": 0.00012 + frac * 0.006}[policy]
-                cum_time += step * pos / len(positions)
-                fpr = (0.03 - 0.022 * frac) * np.exp(-pos / 2000.0) + 0.005 + 0.005 * (1 - frac)
-                rows.append({"metric": "rebuild", "dataset": "eli5", "policy": policy, "T": T, "k": k_fixed,
-                            "seed": seed, "position": int(pos), "fpr": float(fpr * rng.uniform(0.9, 1.1)),
-                            "cumulative_time_s": cum_time, "amortized_cost_s": cum_time / pos})
-
-    base = {"log_space": 0.02, "r_pow_d": 0.021, "sum_radii": 0.05, "min_radius_increase": 0.045}
-    degrade = {"log_space": 1.0, "r_pow_d": 1.9, "sum_radii": 1.3, "min_radius_increase": 1.2}
-    for k in [16, 32, 64, 128, 256, 512]:
-        kf = k / 512.0
-        for crit in MERGE_CRITERIA:
-            for seed in seeds:
-                fpr = base[crit] / (1.0 + 4.0 * (1 - kf)) * (1.0 + (degrade[crit] - 1.0) * kf)
-                rows.append({"metric": "merge_criterion", "dataset": "eli5", "k": k, "seed": seed,
-                            "merge_criterion": crit, "fpr": float(fpr * rng.uniform(0.9, 1.1))})
     return pd.DataFrame(rows)
 
 
+def _synthesize_demo_checks() -> dict:
+    return {
+        "m4_exactness": {
+            "32": {"k": 32, "n_checked": 31968, "n_mismatches": 0, "first_mismatch_position": None},
+            "64": {"k": 64, "n_checked": 31936, "n_mismatches": 0, "first_mismatch_position": None},
+        },
+        "m3_gap": {"k": 32, "n_checked": 31968, "fraction_excluded": 0.083},
+        "delta_distribution": {
+            "M3": {"n": 31968, "mean": 1.2e-3, "median": 3.1e-4, "p10": -2.0e-4, "p90": 4.5e-3,
+                  "min": -1.1e-2, "max": 8.9e-2, "frac_beneficial": 0.12},
+            "M4": {"n": 31968, "mean": 4.5e-4, "median": 8.2e-5, "p10": -6.1e-4, "p90": 1.9e-3,
+                  "min": -3.4e-2, "max": 5.1e-2, "frac_beneficial": 0.34},
+            "ref_exhaustive": {"n": 31968, "mean": 4.5e-4, "median": 8.2e-5, "p10": -6.1e-4, "p90": 1.9e-3,
+                              "min": -3.4e-2, "max": 5.1e-2, "frac_beneficial": 0.34},
+        },
+    }
+
+
 def _validate_schema(df: pd.DataFrame) -> None:
-    missing = [c for c in _REQUIRED_COLUMNS if c not in df.columns]
-    if missing:
-        raise ValueError(f"Input missing columns: {missing}. Present: {sorted(df.columns)}")
-    missing_metrics = {"absorption", "rebuild", "merge_criterion"} - set(df["metric"].unique())
-    if missing_metrics:
-        raise ValueError(f"Missing metric(s) {sorted(missing_metrics)}")
-    missing_ds = set(DATASETS) - set(df.loc[df["metric"] == "absorption", "dataset"].unique())
-    if missing_ds:
-        raise ValueError(f"absorption rows missing dataset(s) {sorted(missing_ds)}")
-    missing_pol = set(POLICIES) - set(df.loc[df["metric"] == "rebuild", "policy"].dropna().unique())
-    if missing_pol:
-        raise ValueError(f"rebuild rows missing policy(ies) {sorted(missing_pol)}")
+    missing_cols = [c for c in _REQUIRED_COLUMNS if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Input missing columns: {missing_cols}. Present: {sorted(df.columns)}")
+    missing_methods = set(METHODS) - set(df.loc[df["metric"] == "checkpoint", "method"].unique())
+    if missing_methods:
+        raise ValueError(f"Missing method(s) {sorted(missing_methods)} among metric=='checkpoint' rows.")
+    missing_sweeps = {"position", "k_sweep"} - set(df["sweep"].unique())
+    if missing_sweeps:
+        raise ValueError(f"Missing sweep(s) {sorted(missing_sweeps)}.")
 
 
 def load_data() -> pd.DataFrame:
@@ -122,24 +211,39 @@ def load_data() -> pd.DataFrame:
     return df
 
 
-def resolve_config(df: pd.DataFrame, k_fixed: Optional[int] = K_FIXED, t_representative: Optional[int] = T_REPRESENTATIVE,
+def load_checks() -> Optional[dict]:
+    if DEMO:
+        return _synthesize_demo_checks()
+    if not os.path.exists(CHECKS_PATH):
+        return None
+    with open(CHECKS_PATH, "r") as f:
+        return json.load(f)
+
+
+def resolve_config(df: pd.DataFrame, k_fixed: Optional[int] = K_FIXED,
+                   b_representative: Optional[int] = B_REPRESENTATIVE,
                    dpi: int = DPI, emit_pdf: bool = EMIT_PDF, outdir: str = OUTDIR) -> Config:
-    available_k = sorted(df.loc[df["metric"] == "absorption", "k"].unique())
+    pos_rows = df[df["sweep"] == "position"]
+    available_k = sorted(pos_rows["k"].unique())
     if k_fixed is None:
         k_fixed = int(available_k[0])
     elif k_fixed not in available_k:
-        raise ValueError(f"k_fixed={k_fixed} not present. Available: {available_k}")
+        raise ValueError(f"k_fixed={k_fixed} not present in position-sweep rows. Available: {available_k}")
 
-    periodic_T = sorted(df.loc[(df["metric"] == "rebuild") & (df["policy"] == "periodic"), "T"].dropna().unique())
-    if not periodic_T:
-        raise ValueError("No 'periodic' policy rows to pick a representative T from.")
-    if t_representative is None:
-        t_representative = int(periodic_T[len(periodic_T) // 2])
-    elif t_representative not in periodic_T:
-        raise ValueError(f"T_representative={t_representative} not present. Available: {periodic_T}")
+    m5_b = sorted(pos_rows.loc[pos_rows["method"] == "M5", "b"].dropna().unique())
+    if not m5_b:
+        raise ValueError("No M5 rows with a 'b' value in the position sweep.")
+    if b_representative is None:
+        b_representative = int(m5_b[0])
+    elif b_representative not in m5_b:
+        raise ValueError(f"b_representative={b_representative} not present. Available: {m5_b}")
 
-    return Config(k_fixed=k_fixed, t_representative=t_representative, dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
+    return Config(k_fixed=k_fixed, b_representative=b_representative, dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
 
+
+# --------------------------------------------------------------------------- #
+# Styling helpers
+# --------------------------------------------------------------------------- #
 
 def _style_log_y(ax: plt.Axes) -> None:
     ax.set_yscale("log")
@@ -150,189 +254,279 @@ def _style_log_y(ax: plt.Axes) -> None:
     ax.tick_params(axis="y", which="minor", length=1.2, width=0.4)
 
 
-def _style_axes(ax: plt.Axes) -> None:
-    ax.grid(axis="both", which="major", linewidth=0.35, alpha=0.4, zorder=0)
-    ax.set_axisbelow(True)
-    for spine in ("left", "bottom"):
-        ax.spines[spine].set_linewidth(0.5)
-
-
-def panel_absorption(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    sel = df[(df["metric"] == "absorption") & (df["k"] == cfg.k_fixed)]
-    agg = mean_ci95(sel, ["dataset", "position"], "absorption_rate")
-
-    apply_style(cfg.dpi)
-    fig, ax = plt.subplots()
-    for dataset in DATASETS:
-        sub = agg[agg["dataset"] == dataset].sort_values("position")
-        if sub.empty:
-            continue
-        ax.plot(sub["position"], sub["mean"], color=DATASET_COLORS[dataset], marker="o", markersize=2.5,
-               linewidth=0.8, zorder=2)
-        if (sub["ci95"] > 0).any():
-            ax.errorbar(sub["position"], sub["mean"], yerr=sub["ci95"], fmt="none", ecolor=DATASET_COLORS[dataset],
-                       elinewidth=0.5, capsize=1.5, capthick=0.5, zorder=3)
-
-    ax.axhline(1.0, color="black", linewidth=0.4, linestyle=":", zorder=1)
-    ax.set_xscale("log")
-    ax.set_ylim(-0.02, 1.05)
-    ax.set_xlabel("Stream Position")
-    ax.set_ylabel("Absorption Rate")
-    ax.text(0.03, 0.06, rf"$k = {cfg.k_fixed}$", transform=ax.transAxes, ha="left", va="bottom", fontsize=5.5)
-    _style_axes(ax)
-
-    save_figure(fig, "streaming-absorption.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
+def _median_iqr(df: pd.DataFrame, group_cols: List[str], value_col: str) -> pd.DataFrame:
+    """Median + IQR (25th/75th percentile) of value_col over the K-fold
+    stream-offset sweep, grouped by group_cols -- used instead of mean+-CI95
+    since a handful of folds makes single traces cross meaninglessly at
+    these FPR scales."""
+    agg = df.groupby(group_cols)[value_col].agg(
+        median="median", q25=lambda s: s.quantile(0.25), q75=lambda s: s.quantile(0.75), n="count",
+    ).reset_index()
     return agg
 
 
-def panel_rebuild_fpr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    sel = df[(df["metric"] == "rebuild") & ((df["policy"] != "periodic") | (df["T"] == cfg.t_representative))]
-    agg = mean_ci95(sel, ["policy", "position"], "fpr")
+# --------------------------------------------------------------------------- #
+# Panel (a): FPR vs. stream position
+# --------------------------------------------------------------------------- #
+
+def panel_fpr_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)
+            & ((df["method"] != "M5") | (df["b"] == cfg.b_representative))]
+    agg = _median_iqr(sel, ["method", "position"], "fpr")
+
+    ref = df[(df["sweep"] == "position") & (df["metric"] == "static_reference") & (df["k"] == cfg.k_fixed)]
+    ref_agg = _median_iqr(ref, ["position"], "fpr")
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots()
-    for policy in POLICIES:
-        sub = agg[agg["policy"] == policy].sort_values("position")
+    for method in METHODS:
+        sub = agg[agg["method"] == method].sort_values("position")
         if sub.empty:
             continue
-        ax.plot(sub["position"], sub["mean"], color=POLICY_COLORS[policy], marker=POLICY_MARKERS[policy],
+        ax.plot(sub["position"], sub["median"], color=METHOD_COLORS[method], marker="o",
                markersize=2.5, linewidth=0.8, zorder=2)
-        if (sub["ci95"] > 0).any():
-            ax.errorbar(sub["position"], sub["mean"], yerr=sub["ci95"], fmt="none", ecolor=POLICY_COLORS[policy],
-                       elinewidth=0.5, capsize=1.5, capthick=0.5, zorder=3)
+        ax.fill_between(sub["position"], sub["q25"], sub["q75"], color=METHOD_COLORS[method],
+                        alpha=0.15, linewidth=0, zorder=1)
+
+    if not ref_agg.empty:
+        ref_agg = ref_agg.sort_values("position")
+        ax.plot(ref_agg["position"], ref_agg["median"], color="black", linestyle="--", linewidth=0.7, zorder=3)
+        ax.text(0.97, 0.95, "dashed: static rebuild", transform=ax.transAxes, ha="right", va="top", fontsize=5)
 
     ax.set_xscale("log")
     _style_log_y(ax)
     ax.set_xlabel("Stream Position")
     ax.set_ylabel("FPR")
-    ax.text(0.03, 0.06, rf"$k = {cfg.k_fixed},\ T = {cfg.t_representative}$",
-           transform=ax.transAxes, ha="left", va="bottom", fontsize=5.5)
-    _style_axes(ax)
+    ax.text(0.03, 0.06, rf"$k = {cfg.k_fixed}$", transform=ax.transAxes, ha="left", va="bottom", fontsize=5.5)
+    style_axes(ax)
 
-    save_figure(fig, "streaming-fpr.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
+    save_figure(fig, "streaming-fpr-vs-position.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
     return agg
 
 
-def panel_merge_criteria(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    sel = df[df["metric"] == "merge_criterion"]
-    agg = mean_ci95(sel, ["merge_criterion", "k"], "fpr")
+# --------------------------------------------------------------------------- #
+# Panel (b): objective inflation vs. stream position
+# --------------------------------------------------------------------------- #
+
+def panel_objective_inflation(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)
+            & ((df["method"] != "M5") | (df["b"] == cfg.b_representative))]
+    agg = _median_iqr(sel, ["method", "position"], "log10_j_tau")
+
+    ref = df[(df["sweep"] == "position") & (df["metric"] == "static_reference") & (df["k"] == cfg.k_fixed)]
+    ref_agg = _median_iqr(ref, ["position"], "log10_j_tau")[["position", "median"]].rename(
+        columns={"median": "ref_median"})
+
+    agg = agg.merge(ref_agg, on="position", how="left")
+    agg["inflation"] = agg["median"] - agg["ref_median"]
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots()
-    for crit in MERGE_CRITERIA:
-        sub = agg[agg["merge_criterion"] == crit].sort_values("k")
+    for method in METHODS:
+        sub = agg[agg["method"] == method].sort_values("position")
         if sub.empty:
             continue
-        ax.plot(sub["k"], sub["mean"], color=MERGE_CRITERION_COLORS[crit], marker="o", markersize=2.5,
-               linewidth=0.8, zorder=2)
-        if (sub["ci95"] > 0).any():
-            ax.errorbar(sub["k"], sub["mean"], yerr=sub["ci95"], fmt="none", ecolor=MERGE_CRITERION_COLORS[crit],
-                       elinewidth=0.5, capsize=1.5, capthick=0.5, zorder=3)
+        ax.plot(sub["position"], sub["inflation"], color=METHOD_COLORS[method], marker="o",
+               markersize=2.5, linewidth=0.8, zorder=2)
+
+    ax.axhline(0.0, color="black", linewidth=0.4, linestyle=":", zorder=1)
+    ax.set_xscale("log")
+    ax.set_xlabel("Stream Position")
+    ax.set_ylabel(r"$\log_{10}(J_\tau^{\mathrm{method}}/J_\tau^{\mathrm{static}})$")
+    ax.text(0.03, 0.95, rf"$k = {cfg.k_fixed}$", transform=ax.transAxes, ha="left", va="top", fontsize=5.5)
+    style_axes(ax)
+
+    save_figure(fig, "streaming-objective-inflation.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
+    return agg
+
+
+# --------------------------------------------------------------------------- #
+# Panel (c): final FPR vs. k
+# --------------------------------------------------------------------------- #
+
+def panel_fpr_vs_k(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    sel = df[(df["sweep"] == "k_sweep") & (df["metric"] == "checkpoint")
+            & ((df["method"] != "M5") | (df["b"] == cfg.b_representative))]
+    last_pos = sel.groupby(["method", "k", "fold_offset"], dropna=False)["position"].transform("max")
+    final_rows = sel[sel["position"] == last_pos]
+    agg = _median_iqr(final_rows, ["method", "k"], "fpr")
+
+    apply_style(cfg.dpi)
+    fig, ax = plt.subplots()
+    for method in METHODS:
+        sub = agg[agg["method"] == method].sort_values("k")
+        if sub.empty:
+            continue
+        ax.plot(sub["k"], sub["median"], color=METHOD_COLORS[method], marker="o",
+               markersize=2.5, linewidth=0.8, zorder=2)
+        ax.fill_between(sub["k"], sub["q25"], sub["q75"], color=METHOD_COLORS[method],
+                        alpha=0.15, linewidth=0, zorder=1)
 
     ax.set_xscale("log", base=2)
     ax.xaxis.set_major_locator(LogLocator(base=2.0))
     ax.xaxis.set_major_formatter(LogFormatterMathtext(base=2.0))
     _style_log_y(ax)
-    ax.set_xlabel("Filter Size (k)")
+    ax.set_xlabel("Ball Budget (k)")
     ax.set_ylabel("Final FPR")
-    _style_axes(ax)
+    ax.text(0.03, 0.06, rf"$b_{{M5}} = {cfg.b_representative}$", transform=ax.transAxes,
+           ha="left", va="bottom", fontsize=5.5)
+    style_axes(ax)
 
-    save_figure(fig, "streaming-merge-criteria.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
+    save_figure(fig, "streaming-fpr-vs-k.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
     return agg
 
 
-def panel_rebuild_pareto(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """One point per policy: x = amortized cost at the final checkpoint (mean
-    over seeds), y = mean FPR across every checkpoint/seed for that policy."""
-    sel = df[df["metric"] == "rebuild"]
-    last_pos = sel.groupby(["policy", "T", "seed"], dropna=False)["position"].transform("max")
-    final_rows = sel[sel["position"] == last_pos]
+# --------------------------------------------------------------------------- #
+# Panel (d): Pareto frontier
+# --------------------------------------------------------------------------- #
 
-    cost = final_rows.groupby(["policy", "T"], dropna=False)["amortized_cost_s"].mean().reset_index(name="cost")
-    quality = sel.groupby(["policy", "T"], dropna=False)["fpr"].mean().reset_index(name="mean_fpr")
-    points = cost.merge(quality, on=["policy", "T"])
+def panel_pareto(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    sel = df[(df["sweep"] == "k_sweep") & (df["metric"].isin(["checkpoint", "exhaustive_reference"]))]
+    last_pos = sel.groupby(["method", "k", "b", "fold_offset"], dropna=False)["position"].transform("max")
+    cost_rows = sel[sel["position"] == last_pos]
+    cost_agg = cost_rows.groupby(["method", "k", "b"], dropna=False)["amortized_cost_s"].mean().reset_index(
+        name="cost")
+
+    half = sel["position"].max() / 2.0
+    quality_rows = sel[sel["position"] > half]
+    quality_agg = quality_rows.groupby(["method", "k", "b"], dropna=False)["fpr"].mean().reset_index(
+        name="mean_fpr")
+
+    points = cost_agg.merge(quality_agg, on=["method", "k", "b"], how="inner")
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots()
+    for method in METHODS:
+        if method == "M5":
+            b_vals = sorted(points.loc[points["method"] == "M5", "b"].dropna().unique())
+            for ls, b in zip(_M5_B_LINESTYLES, b_vals):
+                sub = points[(points["method"] == "M5") & (points["b"] == b)].sort_values("k")
+                if sub.empty:
+                    continue
+                ax.plot(sub["cost"], sub["mean_fpr"], color=METHOD_COLORS["M5"], linestyle=ls,
+                       marker="o", markersize=2.2, linewidth=0.8, zorder=2)
+        else:
+            sub = points[points["method"] == method].sort_values("k")
+            if sub.empty:
+                continue
+            ax.plot(sub["cost"], sub["mean_fpr"], color=METHOD_COLORS[method], marker="o",
+                   markersize=2.5, linewidth=0.8, zorder=2)
 
-    periodic = points[points["policy"] == "periodic"].sort_values("T")
-    if not periodic.empty:
-        ax.plot(periodic["cost"], periodic["mean_fpr"], color=POLICY_COLORS["periodic"], linewidth=0.6,
-               linestyle="--", zorder=1)
-        ax.scatter(periodic["cost"], periodic["mean_fpr"], color=POLICY_COLORS["periodic"],
-                  marker=POLICY_MARKERS["periodic"], s=10, zorder=2)
-        for _, row in periodic.iterrows():
-            ax.annotate(f"T={int(row['T'])}", (row["cost"], row["mean_fpr"]), fontsize=4.5,
-                       xytext=(2, 2), textcoords="offset points")
-
-    for policy in ("streaming", "oracle"):
-        sub = points[points["policy"] == policy]
-        if not sub.empty:
-            ax.scatter(sub["cost"], sub["mean_fpr"], color=POLICY_COLORS[policy], marker=POLICY_MARKERS[policy],
-                      s=14, zorder=3)
+    ref = points[points["method"] == "ref_exhaustive"].sort_values("k")
+    if not ref.empty:
+        ax.plot(ref["cost"], ref["mean_fpr"], color="black", linestyle="--", linewidth=0.7, zorder=3)
+        ax.text(0.97, 0.95, "dashed: exhaustive Algorithm 2", transform=ax.transAxes,
+               ha="right", va="top", fontsize=5)
 
     ax.set_xscale("log")
     _style_log_y(ax)
     ax.set_xlabel("Amortized Cost / Insertion (s)")
-    ax.set_ylabel("Mean FPR")
-    _style_axes(ax)
+    ax.set_ylabel("Mean FPR (2nd half of stream)")
+    style_axes(ax)
 
-    save_figure(fig, "streaming-rebuild-pareto.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
+    save_figure(fig, "streaming-pareto.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
     return points
 
 
-def save_policy_legend(cfg: Config) -> None:
+# --------------------------------------------------------------------------- #
+# Legend
+# --------------------------------------------------------------------------- #
+
+def save_method_legend(cfg: Config) -> None:
     apply_style(cfg.dpi)
-    fig, ax = plt.subplots(figsize=(4.6, 0.25))
+    fig, ax = plt.subplots(figsize=(4.6, 0.4))
     ax.axis("off")
-    handles = [plt.Line2D([0], [0], color=POLICY_COLORS[p], marker=POLICY_MARKERS[p], markersize=4, linewidth=1.0)
-              for p in POLICIES]
-    fig.legend(handles, [POLICY_LABELS[p] for p in POLICIES], loc="center", ncol=3, frameon=False, fontsize=7)
+    handles = [plt.Line2D([0], [0], color=METHOD_COLORS[m], marker="o", markersize=4, linewidth=1.0)
+              for m in METHODS]
+    fig.legend(handles, [METHOD_LABELS[m] for m in METHODS], loc="center", ncol=3, frameon=False, fontsize=6.5)
     fig.patch.set_alpha(0.0)
-    save_figure(fig, "streaming-policy-legend.png", cfg.outdir, cfg.dpi, cfg.emit_pdf, transparent=True)
+    save_figure(fig, "streaming-method-legend.png", cfg.outdir, cfg.dpi, cfg.emit_pdf, transparent=True)
 
 
-def save_merge_criterion_legend(cfg: Config) -> None:
-    apply_style(cfg.dpi)
-    fig, ax = plt.subplots(figsize=(4.6, 0.25))
-    ax.axis("off")
-    handles = [plt.Line2D([0], [0], color=MERGE_CRITERION_COLORS[c], marker="o", markersize=4, linewidth=1.0)
-              for c in MERGE_CRITERIA]
-    fig.legend(handles, [MERGE_CRITERION_LABELS[c] for c in MERGE_CRITERIA], loc="center", ncol=2,
-              frameon=False, fontsize=7)
-    fig.patch.set_alpha(0.0)
-    save_figure(fig, "streaming-merge-criterion-legend.png", cfg.outdir, cfg.dpi, cfg.emit_pdf, transparent=True)
+# --------------------------------------------------------------------------- #
+# Text-report checks
+# --------------------------------------------------------------------------- #
 
+def print_summary(df: pd.DataFrame, checks: Optional[dict], cfg: Config) -> None:
+    print(f"\n--- Streaming summary (k_fixed={cfg.k_fixed}, b_representative={cfg.b_representative}) ---")
+    print("FNR=0 confirmed at every checkpoint for all 5 methods "
+         "(enforced at generation time in streaming_method_worker; a violation raises, not plots).")
 
-def print_summary(df: pd.DataFrame, cfg: Config) -> None:
-    print(f"\n--- Streaming summary (k={cfg.k_fixed}, T={cfg.t_representative}) ---")
-    abs_final = df[(df["metric"] == "absorption") & (df["k"] == cfg.k_fixed)]
-    for dataset in DATASETS:
-        sub = abs_final[abs_final["dataset"] == dataset]
-        if sub.empty:
+    if checks is None:
+        print(f"No {CHECKS_PATH} found -- skipping M4-exactness/M3-gap/Delta-distribution report.\n")
+        return
+
+    m4 = checks.get("m4_exactness", {})
+    for k_str, result in sorted(m4.items()):
+        if result is None:
             continue
-        last = sub[sub["position"] == sub["position"].max()]
-        print(f"{DATASET_LABELS[dataset]:<10} final absorption rate: {last['absorption_rate'].mean():.3f}")
+        print(f"M4 exactness (k={result['k']}): {result['n_checked']} insertions checked, "
+             f"{result['n_mismatches']} mismatches vs. the exhaustive O(k^2 d) reference"
+             + (f" (first at position {result['first_mismatch_position']})" if result["n_mismatches"] else "") + ".")
+
+    gap = checks.get("m3_gap")
+    if gap:
+        print(f"M3 gap: unrestricted argmin excluded the singleton in "
+             f"{gap['fraction_excluded']:.1%} of insertions (k={gap['k']}, n={gap['n_checked']}).")
+
+    for method, stats in checks.get("delta_distribution", {}).items():
+        print(f"Delta distribution ({method}): mean={stats['mean']:.3g}, median={stats['median']:.3g}, "
+             f"[p10,p90]=[{stats['p10']:.3g},{stats['p90']:.3g}], {stats['frac_beneficial']:.1%} beneficial "
+             f"(n={stats['n']}).")
     print()
 
 
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
 def generate_streaming_figures(df: Optional[pd.DataFrame] = None, outdir: str = OUTDIR,
-                               k_fixed: Optional[int] = K_FIXED, T_representative: Optional[int] = T_REPRESENTATIVE,
+                               k_fixed: Optional[int] = K_FIXED, b_representative: Optional[int] = B_REPRESENTATIVE,
                                dpi: int = DPI, emit_pdf: bool = EMIT_PDF) -> None:
     if df is None:
         df = load_data()
     else:
         _validate_schema(df)
+    checks = load_checks()
 
-    cfg = resolve_config(df, k_fixed=k_fixed, t_representative=T_representative, dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
-    panel_absorption(df, cfg)
-    panel_rebuild_fpr(df, cfg)
-    panel_merge_criteria(df, cfg)
-    panel_rebuild_pareto(df, cfg)
-    save_dataset_legend(cfg.outdir, cfg.dpi, cfg.emit_pdf)
-    save_policy_legend(cfg)
-    save_merge_criterion_legend(cfg)
-    print_summary(df, cfg)
+    cfg = resolve_config(df, k_fixed=k_fixed, b_representative=b_representative, dpi=dpi, emit_pdf=emit_pdf,
+                         outdir=outdir)
+
+    panel_fpr_vs_position(df, cfg)
+    panel_objective_inflation(df, cfg)
+    panel_fpr_vs_k(df, cfg)
+    panel_pareto(df, cfg)
+    save_method_legend(cfg)
+    print_summary(df, checks, cfg)
+
+    snippet = r"""
+\begin{subfigure}[b]{\linewidth}
+    \centering
+    \includegraphics[width=0.6\linewidth]{figures/streaming-method-legend.png}
+\end{subfigure}\\[-0.3em]
+\begin{subfigure}[b]{0.24\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/streaming-fpr-vs-position.png}
+    \caption{FPR vs. stream position}
+\end{subfigure}
+\begin{subfigure}[b]{0.24\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/streaming-objective-inflation.png}
+    \caption{Objective inflation}
+\end{subfigure}
+\begin{subfigure}[b]{0.24\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/streaming-fpr-vs-k.png}
+    \caption{Final FPR vs. $k$}
+\end{subfigure}
+\begin{subfigure}[b]{0.24\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/streaming-pareto.png}
+    \caption{Cost/quality Pareto}
+\end{subfigure}
+""".strip("\n")
+    print("--- subfigure snippet (paste above the panel row) ---")
+    print(snippet)
 
 
 def main() -> None:

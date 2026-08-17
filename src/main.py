@@ -1,3 +1,4 @@
+import json
 import os
 
 import faiss
@@ -854,33 +855,67 @@ def _build_streaming_negative_set(
 
 def generate_streaming() -> Tuple[pd.DataFrame, int, int]:
     """
-    Fix filter size k and stream vectors in one at a time, producing the
-    long-format data behind the streaming figure's four panels:
-      (a) absorption rate vs. stream position, 3 datasets;
-      (b) FPR vs. stream position, one line per rebuild policy;
-      (c) final FPR vs. k, one line per merge criterion;
-      (d) rebuild-policy cost/quality Pareto.
-    Panels (b)-(d) use one representative dataset and a fixed negative set
-    (see _build_streaming_negative_set) so the sweeps stay tractable. Returns
-    the df plus k_fixed/T_representative, which plot_streaming() needs and
-    can't derive from the df alone.
+    Compare 5 streaming insertion methods (M1-M5, see
+    filters.streaming_insertion) that differ in decision rule and cost
+    class, not in a tuning knob -- the O(k^2 d) -> O(kd) merge-search
+    optimization (M4) is the centerpiece result. Produces the long-format
+    data behind the streaming figure's four panels:
+      (a) FPR vs. stream position (fixed k_fixed), + a dashed static-rebuild
+          reference (stream_rebuild_worker policy="oracle");
+      (b) threshold-expanded objective inflation vs. stream position (same
+          x-axis/checkpoints as (a));
+      (c) final FPR vs. ball budget k, one line per method;
+      (d) Pareto: mean FPR (2nd half of stream) vs. amortized cost/insertion,
+          one connected curve per method per k (M5: per (k, b)), plus the
+          exhaustive Algorithm 2 reference (stream_rebuild_worker
+          policy="streaming", merge_criterion="log_space" -- no new code
+          needed, add() already *is* that reference) as a 6th dashed curve,
+          since "M4 matches Algorithm 2's quality at a fraction of the cost"
+          is the paper's stated centerpiece claim and (d) is where it's made.
+
+    Every dataset on disk caps out around ~100k vectors, so the spec's
+    "stream position from k to >= 10^3 * k" is only reachable at a small
+    k_fixed -- see k_fixed's comment below. Panel (c)'s k-sweep goes up to
+    k=1024 but shares one fixed-length stream (n_stream_c) across every k,
+    not a literal 10^3*k-scaled length -- documented here rather than
+    silently truncated; most consequential at k=1024 (~29*k, not 1000*k).
+
+    "Multiple starting offsets" (the paper's K-fold variance protocol) is
+    operationalized as overlapping offset windows into one shared
+    representative-dataset pool (true disjoint folds don't scale to a
+    useful count at this vector budget) -- a sliding-window robustness
+    check, not strict cross-validation.
+
+    FNR=0 is asserted per checkpoint inside streaming_method_worker (raises,
+    not recorded) for every method -- the covering invariant is a
+    correctness requirement, not a plotted quantity.
+
+    Writes results/streaming.csv (panels a-d) and results/streaming_checks.json
+    (the M4-exactness / M3-gap / Delta-distribution text-report checks).
+    Returns the long-format df plus k_fixed/b_representative, which
+    plot_streaming() needs and can't derive from the df alone.
     """
-    dim              = 384
-    n_stream         = 100
-    n_negative       = 100
-    # Derived from n_stream/n_negative so a smaller test stream can't starve
-    # the candidate pool the way an independent constant did.
-    num_vectors_pool = n_stream + 20 * n_negative
-    k_fixed          = 128
-    k_values         = [16, 32, 64, 128, 256, 512]
+    dim = 384
+    # 10^3 * k_fixed = 32,000 fits the ~100k-vector budget alongside a held-out
+    # negative pool and K-fold offset margin (see the pool arithmetic below);
+    # k_fixed also sits inside the panel-(c) k-sweep, so (a)/(b) is
+    # cross-checkable against (c) at k=32.
+    k_fixed = 32
+    k_values = [16, 32, 64, 128, 256, 512, 1024]
+    methods = ["M1", "M2", "M3", "M4"]  # M5 handled separately below (its own b dimension)
+    # The paper's illustrative b in {1e3,1e4,1e5} doesn't fit a ~30k-vector
+    # stream (1e5 would mean "rebuild once, at the very end" -- a materially
+    # different, less interesting policy); replaced with values that stay
+    # meaningful at this budget while spanning a similar order of magnitude.
+    b_values_sweep = [1_500, 6_000, 15_000]
+    b_representative = 6_000  # panels a/b's single M5 curve
+    n_stream_ab, F_ab, stride_ab = k_fixed * 1000, 4, 1_500
+    n_stream_c, F_cd, stride_cd = 30_000, 4, 1_000
+    n_negative, negative_candidate_multiplier = 500, 10
     duplicate_percentage = 2.0  # calibrates tau_mid; see calculate_nn_distance_threshold
-    seeds            = [0, 1, 2]
-    merge_criteria   = GonzalezMEBFilter.MERGE_CRITERIA
-    T_values = sorted(set(max(1, n_stream // d) for d in (40, 20, 10, 5, 2)))
-    T_representative = T_values[len(T_values) // 2]
-    checkpoints = sorted(set(
-        int(round(x)) for x in np.logspace(np.log10(50), np.log10(n_stream), num=10)
-    ))
+    seed = 0  # fixed; fold_offset supplies the stream-order variance instead
+    output_csv = "results/streaming.csv"
+    checks_output = "results/streaming_checks.json"
 
     datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
     missing = [d for d in DATASET_KEYS if d not in datasets]
@@ -899,86 +934,169 @@ def generate_streaming() -> Tuple[pd.DataFrame, int, int]:
 
     rep_dataset = _STREAMING_REPRESENTATIVE_DATASET
     rep_key = DATASET_KEYS[rep_dataset]
-    rep_vectors = load_embeds(rep_dataset, num_vectors_pool)[0]
-    n_stream_eff = min(n_stream, len(rep_vectors))
-    stream_vectors = rep_vectors[:n_stream_eff]
-    stream_source = VectorSource(rep_dataset, 0, n_stream_eff)
 
-    print(f"{rep_dataset}: calibrating tau_mid against the stream...")
-    tau_mid = calculate_nn_distance_threshold(stream_vectors, duplicate_percentage)
+    pool_ab_len = n_stream_ab + (F_ab - 1) * stride_ab
+    pool_cd_len = n_stream_c + (F_cd - 1) * stride_cd
+    negative_candidates_len = n_negative * negative_candidate_multiplier
+    cd_start = pool_ab_len
+    neg_start = pool_ab_len + pool_cd_len
+    total_needed = neg_start + negative_candidates_len
+
+    rep_n_available = len(load_embeds(rep_dataset, total_needed)[0])
+    if rep_n_available < total_needed:
+        raise RuntimeError(
+            f"{rep_dataset}: only {rep_n_available} vectors on disk, need {total_needed} "
+            f"(pool_ab={pool_ab_len} + pool_cd={pool_cd_len} + negative_candidates="
+            f"{negative_candidates_len}). Lower F_ab/F_cd/n_stream_*/n_negative."
+        )
+
+    offsets_ab = [f * stride_ab for f in range(F_ab)]
+    offsets_cd = [cd_start + f * stride_cd for f in range(F_cd)]
+
+    print(f"{rep_dataset}: calibrating tau_mid against the a/b stream...")
+    calib_vectors = load_embeds(rep_dataset, n_stream_ab)[0][:n_stream_ab]
+    tau_mid = calculate_nn_distance_threshold(calib_vectors, duplicate_percentage)
     print(f"tau_mid={tau_mid:.4f}")
 
-    runner_a = Runner(num_workers=MAX_WORKERS)
-    for dataset in datasets:
-        if dataset == rep_dataset:
-            ds_stream_source = stream_source
-        else:
-            ds_vectors = load_embeds(dataset, num_vectors_pool)[0]
-            ds_stream_source = VectorSource(dataset, 0, min(n_stream, len(ds_vectors)))
-        for seed in seeds:
-            runner_a.submit(
-                'stream_absorption',
-                dim=dim, dataset=DATASET_KEYS[dataset], k=k_fixed, seed=seed, tau_mid=tau_mid,
-                vectors_stream=ds_stream_source, checkpoints=checkpoints,
-            )
-    absorption_rows = runner_a.run()
-    print("Streaming absorption evaluation completed.")
-    df_absorption = pd.DataFrame([row for job_rows in absorption_rows for row in job_rows])
-    df_absorption["metric"] = "absorption"
-
-    n_candidates_available = len(rep_vectors) - n_stream_eff
-    if n_candidates_available < n_negative:
-        raise RuntimeError(
-            f"{rep_dataset}: only {n_candidates_available} vectors left after the "
-            f"{n_stream_eff}-vector stream (need at least {n_negative} to build the negative "
-            f"set); raise num_vectors_pool or lower n_stream/n_negative."
-        )
-    candidate_pool = rep_vectors[n_stream_eff:n_stream_eff + min(20 * n_negative, n_candidates_available)]
     print(f"{rep_dataset}: building fixed streaming negative set...")
-    negative_vectors = _build_streaming_negative_set(rep_dataset, stream_vectors, candidate_pool, tau_mid, n_negative)
+    stream_union = load_embeds(rep_dataset, neg_start)[0]
+    candidate_pool = load_embeds(rep_dataset, neg_start + negative_candidates_len)[0][neg_start:]
+    negative_vectors = _build_streaming_negative_set(rep_dataset, stream_union, candidate_pool, tau_mid, n_negative)
 
-    runner_b = Runner(num_workers=MAX_WORKERS)
-    for seed in seeds:
-        for policy, T in [("streaming", None), ("oracle", None)] + [("periodic", t) for t in T_values]:
+    checkpoints_ab = sorted(set(
+        int(round(x)) for x in np.logspace(np.log10(k_fixed + 1), np.log10(n_stream_ab), num=12)
+    ))
+    checkpoints_cd = sorted(set(
+        int(round(x)) for x in np.linspace(n_stream_c // 20, n_stream_c, num=20)
+    ))
+
+    # Every row each worker returns is now self-describing (method/sweep/
+    # metric/fold_offset all included directly -- see streaming_method_worker
+    # and stream_rebuild_worker's docstrings), so results don't need
+    # positional reconstruction here -- which matters because Runner's
+    # parallel mode returns results in *completion* order, not submission
+    # order. output_csv makes each Runner write every job's rows to disk as
+    # soon as that job finishes, so a mid-sweep crash still leaves whatever
+    # completed so far on disk instead of losing the whole run.
+
+    # --- Runner A: panels (a)/(b), position sweep at fixed k_fixed ---
+    runner_a = Runner(num_workers=MAX_WORKERS, output_csv=output_csv, truncate=True)
+    for method in methods + ["M5"]:
+        method_kwargs = {"b": b_representative, "construct_tau": tau_mid} if method == "M5" else {}
+        for fold_offset in offsets_ab:
+            src = VectorSource(rep_dataset, fold_offset, fold_offset + n_stream_ab)
+            runner_a.submit(
+                'streaming_method',
+                dim=dim, dataset=rep_key, k=k_fixed, seed=seed, fold_offset=fold_offset, tau_mid=tau_mid,
+                method=method, method_kwargs=method_kwargs,
+                vectors_stream_pool=src, stream_len=n_stream_ab,
+                vectors_negative=negative_vectors, checkpoints=checkpoints_ab, sweep="position",
+            )
+    for fold_offset in offsets_ab:
+        src = VectorSource(rep_dataset, fold_offset, fold_offset + n_stream_ab)
+        runner_a.submit(
+            'stream_rebuild',
+            dim=dim, dataset=rep_key, k=k_fixed, seed=seed, tau_mid=tau_mid, policy="oracle", T=None,
+            vectors_stream=src, vectors_negative=negative_vectors, checkpoints=checkpoints_ab,
+            sweep="position", fold_offset=fold_offset,
+        )
+    rows_ab = runner_a.run()
+    print("Streaming position-sweep (a/b) evaluation completed.")
+    df_ab = pd.DataFrame([row for job_rows in rows_ab for row in job_rows])
+
+    # --- Runner B: panels (c)/(d), k sweep over a shared stream length ---
+    runner_b = Runner(num_workers=MAX_WORKERS, output_csv=output_csv, truncate=False)
+    for method in methods:
+        for k in k_values:
+            for fold_offset in offsets_cd:
+                src = VectorSource(rep_dataset, fold_offset, fold_offset + n_stream_c)
+                runner_b.submit(
+                    'streaming_method',
+                    dim=dim, dataset=rep_key, k=k, seed=seed, fold_offset=fold_offset, tau_mid=tau_mid,
+                    method=method, method_kwargs={},
+                    vectors_stream_pool=src, stream_len=n_stream_c,
+                    vectors_negative=negative_vectors, checkpoints=checkpoints_cd, sweep="k_sweep",
+                )
+    for k in k_values:
+        for b in b_values_sweep:
+            for fold_offset in offsets_cd:
+                src = VectorSource(rep_dataset, fold_offset, fold_offset + n_stream_c)
+                runner_b.submit(
+                    'streaming_method',
+                    dim=dim, dataset=rep_key, k=k, seed=seed, fold_offset=fold_offset, tau_mid=tau_mid,
+                    method="M5", method_kwargs={"b": b, "construct_tau": tau_mid},
+                    vectors_stream_pool=src, stream_len=n_stream_c,
+                    vectors_negative=negative_vectors, checkpoints=checkpoints_cd, sweep="k_sweep",
+                )
+    for k in k_values:
+        for fold_offset in offsets_cd:
+            src = VectorSource(rep_dataset, fold_offset, fold_offset + n_stream_c)
             runner_b.submit(
                 'stream_rebuild',
-                dim=dim, dataset=rep_key, k=k_fixed, seed=seed, tau_mid=tau_mid, policy=policy, T=T,
-                vectors_stream=stream_source, vectors_negative=negative_vectors, checkpoints=checkpoints,
+                dim=dim, dataset=rep_key, k=k, seed=seed, tau_mid=tau_mid, policy="streaming", T=None,
+                vectors_stream=src, vectors_negative=negative_vectors, checkpoints=checkpoints_cd,
+                sweep="k_sweep", fold_offset=fold_offset,
             )
-    rebuild_rows = runner_b.run()
-    print("Streaming rebuild-policy evaluation completed.")
-    df_rebuild = pd.DataFrame([row for job_rows in rebuild_rows for row in job_rows])
-    df_rebuild["metric"] = "rebuild"
+    rows_cd = runner_b.run()
+    print("Streaming k-sweep (c/d) evaluation completed.")
+    df_cd = pd.DataFrame([row for job_rows in rows_cd for row in job_rows])
 
-    runner_c = Runner(num_workers=MAX_WORKERS)
-    for k in k_values:
-        for merge_criterion in merge_criteria:
-            for seed in seeds:
-                runner_c.submit(
-                    'stream_merge_criterion',
-                    dim=dim, dataset=rep_key, k=k, seed=seed, tau_mid=tau_mid, merge_criterion=merge_criterion,
-                    vectors_stream=stream_source, vectors_negative=negative_vectors,
-                )
-    merge_criterion_rows = runner_c.run()
-    print("Streaming merge-criterion evaluation completed.")
-    df_merge_criteria = pd.DataFrame(merge_criterion_rows)
-    df_merge_criteria["metric"] = "merge_criterion"
-
-    output_csv = "results/streaming.csv"
-    df = pd.concat([df_absorption, df_rebuild, df_merge_criteria], ignore_index=True)
+    df = pd.concat([df_ab, df_cd], ignore_index=True)
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
     df.to_csv(output_csv, index=False)
-    print(f"Wrote {output_csv}")
+    print(f"Wrote {output_csv} (already written incrementally during the run; this is the final canonical pass)")
 
-    return df, k_fixed, T_representative
+    # --- Runner C: the three text-report checks (M4 exactness, M3 gap, Delta distribution) ---
+    runner_c = Runner(num_workers=MAX_WORKERS)
+    check_src = VectorSource(rep_dataset, 0, n_stream_ab)
+    for k in (32, 64):
+        runner_c.submit(
+            'stream_m4_exactness',
+            dim=dim, dataset=rep_key, k=k, seed=seed, tau_mid=tau_mid,
+            vectors_stream_pool=VectorSource(rep_dataset, 0, k * 1000), stream_len=k * 1000,
+        )
+    runner_c.submit(
+        'stream_m3_gap',
+        dim=dim, dataset=rep_key, k=k_fixed, seed=seed, tau_mid=tau_mid,
+        vectors_stream_pool=check_src, stream_len=n_stream_ab,
+    )
+    for method in ("M3", "M4", "ref_exhaustive"):
+        runner_c.submit(
+            'stream_delta_distribution',
+            dim=dim, dataset=rep_key, k=k_fixed, seed=seed, tau_mid=tau_mid, method=method,
+            vectors_stream_pool=check_src, stream_len=n_stream_ab,
+        )
+    check_results = runner_c.run()
+    print("Streaming correctness/diagnostic checks completed.")
+
+    # Routed by each result's own distinguishing field, not by submission
+    # position -- Runner's parallel mode returns results in completion
+    # order, which needn't match submission order.
+    checks = {"m4_exactness": {}, "m3_gap": None, "delta_distribution": {}}
+    for result in check_results:
+        if "n_mismatches" in result:
+            checks["m4_exactness"][result["k"]] = result
+        elif "fraction_excluded" in result:
+            checks["m3_gap"] = result
+        elif "frac_beneficial" in result:
+            checks["delta_distribution"][result["method"]] = result
+        else:
+            raise ValueError(f"Unrecognized streaming check result shape: {sorted(result.keys())}")
+
+    os.makedirs(os.path.dirname(checks_output), exist_ok=True)
+    with open(checks_output, "w") as f:
+        json.dump(checks, f, indent=2)
+    print(f"Wrote {checks_output}")
+
+    return df, k_fixed, b_representative
 
 
-def plot_streaming(df: pd.DataFrame, k_fixed: int, T_representative: int) -> None:
-    generate_streaming_figures(df, k_fixed=k_fixed, T_representative=T_representative)
+def plot_streaming(df: pd.DataFrame, k_fixed: int, b_representative: int) -> None:
+    generate_streaming_figures(df, k_fixed=k_fixed, b_representative=b_representative)
 
 
 def generate_dynamic() -> list:
-    num_vectors              = 100_000
+    num_vectors              = 1_000
     dim                      = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
@@ -1146,11 +1264,12 @@ def generate_and_plot_all() -> None:
     below). The early return currently isolates system for standalone
     testing; remove it to also run the other 5.
     """
+    plot_streaming(*generate_streaming())
     #plot_static(generate_static())
     #plot_dynamic(generate_dynamic())
     #plot_equal_memory(generate_equal_memory()) // failed on 100K
     #plot_system(*generate_system())
-    plot_system_tau(*generate_system_tau())
+    #plot_system_tau(*generate_system_tau())
     return
     try:
         pass
@@ -1228,10 +1347,9 @@ def plot_all() -> None:
 
     try:
         df = pd.read_csv("results/streaming.csv")
-        k_fixed = int(df.loc[df["metric"].isin(["absorption", "rebuild"]), "k"].iloc[0])
-        periodic_T = sorted(df.loc[df["policy"] == "periodic", "T"].dropna().unique())
-        T_representative = int(periodic_T[len(periodic_T) // 2])
-        plot_streaming(df, k_fixed=k_fixed, T_representative=T_representative)
+        k_fixed = int(df.loc[df["sweep"] == "position", "k"].iloc[0])
+        b_representative = int(df.loc[(df["sweep"] == "position") & (df["method"] == "M5"), "b"].dropna().iloc[0])
+        plot_streaming(df, k_fixed=k_fixed, b_representative=b_representative)
     except Exception as e:
         print(f"An error occurred: {e}")
 

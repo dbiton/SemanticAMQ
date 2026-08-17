@@ -6,6 +6,7 @@ import numpy as np
 from scipy.special import logsumexp
 
 from filters.filter import Filter
+from filters import ball_geometry
 from hyperspheres_volume import estimate_hypersphere_volume
 
 
@@ -255,20 +256,10 @@ class GonzalezMEBFilter(Filter):
 
     def _log_J(self, radii: np.ndarray) -> float:
         """log sum_i r_i^d, safe for d ~ hundreds where r^d over/underflows float64."""
-        r = np.asarray(radii, dtype=np.float64)
-        if r.size == 0:
-            return -np.inf
-        with np.errstate(divide='ignore'):
-            logr = np.log(r)
-        return float(logsumexp(self.dim * logr))
+        return ball_geometry.log_J(radii, self.dim)
 
     def _log_J_tau(self, radii: np.ndarray, tau: float) -> float:
-        r = np.asarray(radii, dtype=np.float64) + float(tau)
-        if r.size == 0:
-            return -np.inf
-        with np.errstate(divide='ignore'):
-            logr = np.log(r)
-        return float(logsumexp(self.dim * logr))
+        return ball_geometry.log_J_tau(radii, self.dim, tau)
 
     def _pairwise_merge_keys(self, ci: np.ndarray, ri: np.ndarray,
                              cj: np.ndarray, rj: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -304,27 +295,7 @@ class GonzalezMEBFilter(Filter):
                               r_merged: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Delta = M^d * (a_ij - a_i - a_j) with M = max(r_i, r_j, r_ij) and
         a_x = exp(d * log(r_x / M)) (safe underflow to 0); never materializes r^d."""
-        M = np.maximum(np.maximum(ri, rj), r_merged)
-
-        def a_of(r):
-            # r<=0 (zero-radius ball) substitutes M for r, not 1.0: numpy still
-            # eagerly evaluates the discarded branch, and 1.0 >> M would overflow
-            # exp(); M makes it exp(0) = 1 instead, always safe.
-            with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
-                safe_M = np.where(M > 0, M, 1.0)
-                safe_r = np.where(r > 0, r, safe_M)
-                ratio = np.where((r > 0) & (M > 0), np.exp(self.dim * (np.log(safe_r) - np.log(safe_M))), 0.0)
-            return ratio
-
-        a_i, a_j, a_ij = a_of(ri), a_of(rj), a_of(r_merged)
-        diff_a = a_ij - a_i - a_j
-        sign = np.sign(diff_a)
-        with np.errstate(divide='ignore'):
-            log_abs = self.dim * np.log(np.where(M > 0, M, 1.0)) + np.log(np.where(diff_a != 0, np.abs(diff_a), 1.0))
-        log_abs = np.where(diff_a != 0, log_abs, -np.inf)
-        bucket = np.where(sign < 0, 0, 1).astype(np.int8)
-        key = np.where(sign < 0, -log_abs, log_abs)
-        return bucket, key
+        return ball_geometry.merge_cost_log_space(ri, rj, r_merged, self.dim)
 
     def _merge_cost_r_pow_d(self, ri: np.ndarray, rj: np.ndarray,
                             r_merged: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -370,18 +341,7 @@ class GonzalezMEBFilter(Filter):
 
     @staticmethod
     def _merged_ball(ci: np.ndarray, ri: float, cj: np.ndarray, rj: float) -> Tuple[np.ndarray, float]:
-        ci64 = np.asarray(ci, dtype=np.float64)
-        cj64 = np.asarray(cj, dtype=np.float64)
-        ri = float(ri)
-        rj = float(rj)
-        delta = float(np.sqrt(np.maximum(np.sum((ci64 - cj64) ** 2), 0.0)))
-        if delta + ri <= rj:
-            return cj64, rj
-        if delta + rj <= ri:
-            return ci64, ri
-        r_new = (delta + ri + rj) / 2.0
-        c_new = ci64 + ((r_new - ri) / delta) * (cj64 - ci64)
-        return c_new, r_new
+        return ball_geometry.merged_ball(ci, ri, cj, rj)
 
     # ------------------------------------------------------------------ chunked distances
 
