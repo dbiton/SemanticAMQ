@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from filters import ball_geometry
-from src.filters.ball_cover_filter import BallCoverFilter
+from filters.ball_cover_filter import BallCoverFilter
 
 
 class BallCover:

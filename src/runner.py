@@ -12,7 +12,7 @@ import time
 from scipy.special import logsumexp
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 
-from src.filters.ball_cover_filter import BallCoverFilter
+from filters.ball_cover_filter import BallCoverFilter
 from filters import streaming_insertion
 from hyperspheres_volume import estimate_hypersphere_volume
 from vector_source import VectorSource

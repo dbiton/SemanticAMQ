@@ -6,10 +6,6 @@ import time
 import numpy as np
 import pandas as pd
 
-from filters.cuckoo_filter import CuckooFilter
-from filters.gcs_filter import GCSFilter
-from filters.pyfusefilter_filters import Fuse8Filter, Xor8Filter
-from filters.quotient_filter import QuotientFilterWrapper
 from lsh import FaissSimHashLSH, LSH, DummyLSH
 from runner import Runner
 from plots.legacy import plot_results, plot_throughput_results, plot_tradeoff_results, plot_equal_memory_results
@@ -22,8 +18,7 @@ from plots.plot_system import generate_system_figures
 from plots.plot_system_tau import generate_system_tau_figures
 from plots.plot_common import DATASETS, DATASET_LABELS
 from typing import Tuple, List
-from filters.first_n_filter import FirstNFilter
-from src.filters.ball_cover_filter import BallCoverFilter
+from filters.ball_cover_filter import BallCoverFilter
 from filters.dsbf_filter import DSBFFilter
 from filters.covering_lsh_fallback_filter import CoveringLSHFallbackFilter
 from filters.lsbf_filter import LSBFFilter
@@ -575,7 +570,7 @@ def generate_ablation() -> Tuple[pd.DataFrame, int]:
     percentage_construct   = 20
     k_fractions            = [0.03, 0.06, 0.125, 0.25]
     duplicate_percentages  = [5, 10, 20]
-    seeds                  = [0, 1, 2]
+    seeds                  = [0]
     output_csv             = "results/ablation.csv"
 
     datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
@@ -1264,7 +1259,8 @@ def generate_and_plot_all() -> None:
     below). The early return currently isolates system for standalone
     testing; remove it to also run the other 5.
     """
-    plot_streaming(*generate_streaming())
+    plot_ablation(*generate_ablation())
+    #plot_streaming(*generate_streaming())
     #plot_static(generate_static())
     #plot_dynamic(generate_dynamic())
     #plot_equal_memory(generate_equal_memory()) // failed on 100K
