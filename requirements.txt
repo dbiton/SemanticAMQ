@@ -6,6 +6,7 @@ pandas
 numpy
 matplotlib
 scipy
+scikit-learn
 lightgbm
 heapdict
 wordfreq

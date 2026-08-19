@@ -159,6 +159,8 @@ def estimate_hypersphere_volume(centroids: np.ndarray,
     """
     centroids = np.asarray(centroids, dtype=np.float64)
     radii = np.asarray(radii, dtype=np.float64).ravel()
+    centroids = centroids[radii > 0]
+    radii = radii[radii > 0]
     n, dim = centroids.shape
     if n == 0:
         return (-np.inf, -np.inf) if return_log else (0.0, 0.0)

@@ -4,7 +4,6 @@ sys.path.append(os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file
 import h5py
 import numpy as np
 from typing import Tuple, List
-from util.dataset_paths import dataset_filenames
 
 
 def generate_synthetic_dataset(
@@ -96,11 +95,11 @@ def generate_synthetic_dataset(
 
 
 def save_synthetic_dataset(
-    filename: str, 
-    dataset: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    filename: str = "synthetic_d16", 
+    dataset: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] = None
 ) -> None:
     """Saves generated synthetic dataset to an HDF5 file."""
-    filepath = dataset_filenames[filename]
+    filepath = f"./datasets/{filename}.h5"
     construct_vectors, query_vectors, boxes_d, boxes_a = dataset
 
     directory = os.path.dirname(filepath)
@@ -116,10 +115,10 @@ def save_synthetic_dataset(
 
 
 def load_synthetic_dataset(
-    filename: str
+    filename: str = "synthetic_d16"
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Tuple[np.ndarray, np.ndarray]]]:
     """Loads a synthetic dataset from an HDF5 file."""
-    filepath = dataset_filenames[filename]
+    filepath = f"./datasets/{filename}.h5"
     print(f"Loading synthetic dataset from {filepath}...")
     
     with h5py.File(filepath, 'r') as f:

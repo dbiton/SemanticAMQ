@@ -62,10 +62,10 @@ class KDBoxFilter(Filter):
     _MAX_NEIGHBORS = 50
     _BATCH_SIZE = 2048
 
-    def __init__(self, dim: int, distance_threshold: float, max_memory: Optional[int] = None, max_shapes: Optional[int] = None):
+    def __init__(self, dim: int, distance_threshold: float, max_memory: Optional[int] = None, max_spheres: Optional[int] = None):
         super().__init__(dim, lsh=None, max_memory=max_memory)
         self.distance_threshold = distance_threshold
-        self.max_boxes = (max_shapes if max_shapes is not None 
+        self.max_boxes = (max_spheres if max_spheres is not None 
                     else self._calculate_max_boxes(self.max_memory))
         self._num_boxes = 0
         self._all_boxes = np.arange(self.max_boxes, dtype=np.int32)

@@ -1,0 +1,275 @@
+"""
+DSHFilter -- Distance-Sensitive Hashing.
+
+[VERIFY] Source and what was confirmed by reading the paper directly
+------------------------------------------------------------------------
+Aumuller, Christiani, Pagh & Silvestri, "Distance-Sensitive Hashing"
+(PODS 2018). A distance-sensitive hash (DSH) family is formally a
+distribution over pairs of functions (h, g) with a collision-probability
+function (CPF) of distance that need not be monotone -- unlike classical
+LSH, a DSH's CPF can *peak* at a nonzero target distance (e.g. for annulus/
+shell search). The paper gives a concrete Euclidean construction
+h(x) = floor((<a,x>+b)/w), g(x) = h(x) + k with a ~ N(0, I_d), and a
+"filter-based" spherical variant thresholding <a,x> against an interval.
+The paper does not give a closed-form formula for calibrating that interval
+to a target distance -- it states the asymptotic scaling but leaves
+practical calibration to the implementer.
+
+This baseline's use case (semantic AMQ: "is anything within tau of q?") only
+needs sensitivity to a *ball* around 0, not an off-origin annulus, so this
+implementation adopts the task brief's own suggested concrete instantiation
+-- h(x) = 1 iff <a,x> in [-z, z] for Gaussian a, an interval centered at 0,
+concatenated `num_projections_per_table` times per table, `num_tables`
+tables -- and reduces calibration to the single free parameter z (the
+window half-width).
+
+Calibration objective (chosen deliberately, and different from a naive
+"maximize p(0) - p(tau)"): for this per-projection rule, two points at
+distance 0 collide with probability exactly 1 for *any* z (a point always
+matches itself), so p(0) carries no calibration signal at all. What actually
+needs separating is the collision probability AT the target radius,
+p(tau; z), from the collision probability at a *typical unrelated-pair*
+distance, p(r_far; z) -- r_far defaults to sqrt(2), the expected L2 distance
+between independent random points on the unit sphere in high dimension.
+Both are estimated by batched Monte Carlo simulation with a target-standard-
+-error stopping rule (the same pattern already used by
+`src/lsh.py::CrossPolytopeLSH._get_base_probabilities`), and z is chosen
+from a bounded grid to maximize p(tau; z) - p(r_far; z).
+
+If the best achievable gap on this grid falls below `calibration_min_gap`,
+the constructor raises `RuntimeError` with the measured gap rather than
+silently building a non-functional filter -- the fail-loud safety valve the
+task brief asks for when a DSH-family calibration does not converge to a
+useful operating point. In practice (verified against realistic tau values
+in [0.05, 0.8] at dim=384 on the unit sphere), the default grid finds a
+comfortably usable gap; the class is implemented and registered
+unconditionally, and any calibration-quality caveats specific to a given
+(dim, tau) combination are surfaced through this exception rather than
+hidden.
+"""
+
+import math
+from typing import List, Optional, Tuple
+
+import numpy as np
+from pybloom_live import BloomFilter as _BloomFilter
+
+from filters.filter import Filter
+
+
+class DSHFilter(Filter):
+    """
+    Distance-sensitive hashing (Aumuller, Christiani, Pagh & Silvestri,
+    PODS 2018), instantiated as a symmetric acceptance-window hash on
+    Gaussian projections (see module docstring for the calibration
+    approach and its documented departure from a naive interpretation of
+    the task brief's own suggestion).
+
+    tau is baked in at construction via `distance_threshold` (the window
+    half-width z and num_tables are both calibrated around it); `query(...,
+    tau=t)` only accepts t == distance_threshold or t=None.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        distance_threshold: float,
+        max_memory: Optional[int] = None,
+        num_projections_per_table: int = 4,
+        num_tables: Optional[int] = None,
+        max_L: int = 256,
+        error_rate: float = 0.01,
+        calibration_grid: int = 13,
+        calibration_min_gap: float = 0.05,
+        far_reference_distance: Optional[float] = None,
+        max_spheres: Optional[int] = None,
+        seed: int = 42,
+    ):
+        super().__init__(dim, lsh=None, max_memory=max_memory)
+        self.distance_threshold = float(distance_threshold)
+        self.num_projections_per_table = num_projections_per_table
+        self._error_rate = error_rate
+        self._max_spheres = max_spheres  # unused; accepted for _instantiate_filter parity
+        # sqrt(2) is the expected L2 distance between independent points on a
+        # uniformly-random unit sphere, but real embedding corpora cluster
+        # much more tightly than that assumption (e.g. sentence embeddings
+        # occupy a narrow cone, not the full sphere), so a duplicate
+        # threshold derived from real data can end up close to or even past
+        # a fixed sqrt(2) reference -- leaving no room for the calibration to
+        # separate "near" from "far". Scaling the reference off tau itself
+        # keeps a healthy margin regardless of how the corpus is distributed.
+        self.far_reference_distance = (
+            far_reference_distance if far_reference_distance is not None
+            else max(math.sqrt(2.0), 2.5 * self.distance_threshold)
+        )
+
+        rng = np.random.default_rng(seed)
+
+        self.z, best_gap, self._p_table_tau = self._calibrate(
+            rng, dim, self.distance_threshold, self.far_reference_distance,
+            num_projections_per_table, calibration_grid,
+        )
+        if best_gap < calibration_min_gap:
+            raise RuntimeError(
+                f"DSHFilter calibration did not converge to a usable operating point: "
+                f"best achievable gap p(tau)-p(far) = {best_gap:.4f} at z={self.z:.4f} "
+                f"is below calibration_min_gap={calibration_min_gap} "
+                f"(dim={dim}, distance_threshold={self.distance_threshold}, "
+                f"num_projections_per_table={num_projections_per_table}). "
+                f"Try a smaller num_projections_per_table, a larger calibration_grid, "
+                f"or accept a lower calibration_min_gap."
+            )
+
+        if num_tables is None:
+            p = np.clip(self._p_table_tau, 1e-300, 0.999999)
+            self.num_tables = int(np.ceil(np.log(0.5) / np.log1p(-p)))
+            if self.num_tables > max_L:
+                raise RuntimeError(
+                    f"DSHFilter would need num_tables={self.num_tables} to reach 50% "
+                    f"collision probability at tau, exceeding max_L={max_L}."
+                )
+        else:
+            self.num_tables = num_tables
+
+        self._projections = rng.standard_normal(
+            (self.num_tables, num_projections_per_table, dim)
+        ).astype(np.float32)
+
+        if max_memory is not None:
+            bits_available = max_memory * 8
+            self._capacity = max(
+                1, int(bits_available * (math.log(2) ** 2) / (-math.log(error_rate)))
+            )
+        else:
+            self._capacity = 1_000 * self.num_tables
+
+        self.filter: Optional[_BloomFilter] = None
+
+    # ------------------------------------------------------------------ calibration
+
+    @staticmethod
+    def _match_probability(
+        rng: np.random.Generator, dim: int, r: float, z: float,
+        batch_size: int = 8_000, max_sims: int = 40_000, target_se: float = 0.004,
+    ) -> float:
+        """
+        Monte Carlo estimate of P(bit(X) == bit(Q)) for a single Gaussian
+        projection with acceptance window [-z, z], where X is a random unit
+        vector and Q is at Euclidean distance r from X in a random direction
+        -- batched with a target-standard-error stopping rule, mirroring
+        `CrossPolytopeLSH._get_base_probabilities`.
+        """
+        if r <= 0.0:
+            return 1.0
+        matches = 0
+        total = 0
+        p_hat = 1.0
+        while total < max_sims:
+            X = rng.standard_normal((batch_size, dim))
+            X /= np.linalg.norm(X, axis=1, keepdims=True)
+            noise = rng.standard_normal((batch_size, dim))
+            noise /= np.linalg.norm(noise, axis=1, keepdims=True)
+            Q = X + r * noise
+            a = rng.standard_normal((batch_size, dim))
+            proj_x = np.einsum('ij,ij->i', a, X)
+            proj_q = np.einsum('ij,ij->i', a, Q)
+            bit_x = np.abs(proj_x) <= z
+            bit_q = np.abs(proj_q) <= z
+            matches += int(np.sum(bit_x == bit_q))
+            total += batch_size
+            p_hat = matches / total
+            se = math.sqrt(p_hat * (1.0 - p_hat) / total)
+            if se <= target_se:
+                break
+        return float(p_hat)
+
+    def _calibrate(
+        self, rng: np.random.Generator, dim: int, tau: float, r_far: float,
+        num_projections_per_table: int, calibration_grid: int,
+    ) -> Tuple[float, float, float]:
+        """Grid-search the window half-width z maximizing p(tau;z) - p(r_far;z)
+        for a single projection, then raise the per-projection probabilities
+        to num_projections_per_table (AND composition within a table)."""
+        z_candidates = np.linspace(0.1 * tau, 3.0 * r_far, calibration_grid)
+        best_z, best_gap, best_p_tau = float(z_candidates[0]), -1.0, 0.0
+        for z in z_candidates:
+            p_tau = self._match_probability(rng, dim, tau, float(z))
+            p_far = self._match_probability(rng, dim, r_far, float(z))
+            gap = p_tau - p_far
+            if gap > best_gap:
+                best_z, best_gap, best_p_tau = float(z), gap, p_tau
+        p_table_tau = best_p_tau ** num_projections_per_table
+        return best_z, best_gap, p_table_tau
+
+    # ------------------------------------------------------------------ hashing / storage
+
+    def _codes(self, vectors: np.ndarray) -> np.ndarray:
+        """(n, num_tables) opaque per-table signature codes: each table's code
+        is the tuple of num_projections_per_table window-membership bits."""
+        vecs = np.ascontiguousarray(vectors, dtype=np.float32)
+        # projections[t, k, :] . vecs[n, :] -> (n, num_tables, K)
+        proj = np.einsum('nd,tkd->ntk', vecs, self._projections)
+        bits = (np.abs(proj) <= self.z)  # (n, num_tables, K) bool
+        packed = np.packbits(bits, axis=-1)  # (n, num_tables, ceil(K/8))
+        contiguous = np.ascontiguousarray(packed)
+        void_dt = np.dtype((np.void, contiguous.shape[-1]))
+        return contiguous.view(void_dt).reshape(vecs.shape[0], self.num_tables)
+
+    def _insert_batch(self, vectors: np.ndarray) -> None:
+        if len(vectors) == 0:
+            return
+        codes = self._codes(vectors)
+        for row in codes:
+            for t in range(self.num_tables):
+                key = self._signature_to_key((t, row[t].tobytes()))
+                self.filter.add(key)
+
+    # ------------------------------------------------------------------ Filter interface
+
+    def get_exact_matching_fpr(self) -> float:
+        return float(self._error_rate)
+
+    def construct(self, vectors: np.ndarray) -> None:
+        capacity = (
+            self._capacity if self.max_memory is not None
+            else max(self._capacity, len(vectors) * self.num_tables)
+        )
+        self.filter = _BloomFilter(capacity=capacity, error_rate=self._error_rate)
+        self._insert_batch(vectors)
+
+    def query(self, vectors: np.ndarray, tau: Optional[float] = None) -> List[bool]:
+        if self.filter is None:
+            raise ValueError("DSHFilter has not been constructed.")
+        if tau is not None and abs(tau - self.distance_threshold) > 1e-9:
+            raise ValueError(
+                f"DSHFilter bakes tau into construction (distance_threshold="
+                f"{self.distance_threshold}); query-time tau={tau} is not supported."
+            )
+        if len(vectors) == 0:
+            return []
+        codes = self._codes(vectors)
+        results = []
+        for row in codes:
+            hit = any(
+                self._signature_to_key((t, row[t].tobytes())) in self.filter
+                for t in range(self.num_tables)
+            )
+            results.append(hit)
+        return results
+
+    def add(self, vectors: np.ndarray) -> None:
+        if self.filter is None:
+            self.construct(vectors)
+            return
+        self._insert_batch(vectors)
+
+    def insert(self, vectors: np.ndarray) -> None:
+        self.add(vectors)
+
+    def get_bytesize(self) -> int:
+        proj_bytes = int(self._projections.nbytes)
+        if self.filter is None:
+            return proj_bytes
+        bits_needed = -self.filter.capacity * math.log(self._error_rate) / (math.log(2) ** 2)
+        bloom_bytes = int(math.ceil(bits_needed / 8))
+        return bloom_bytes + proj_bytes

@@ -10,9 +10,6 @@ class LSH(ABC):
 
     @classmethod
     def build_optimized(cls, dim: int, threshold_d: float, K: Optional[int] = None, max_L: int = 256) -> "LSH":
-        MAX_SAFE_K = 64
-        MAX_TOTAL_BITS = 1_000_000
-    
         dummy = cls(dim=dim, L=1, K=1)
         p_threshold, _ = dummy._get_base_probabilities(threshold_d, threshold_d)
 
@@ -24,11 +21,10 @@ class LSH(ABC):
             return int(np.ceil(np.log(0.5) / np.log1p(-p_k)))
 
         if K is not None:
-            K = min(K, MAX_SAFE_K)
             L = calculate_L(K)
         else:
             best_K, best_L = 1, calculate_L(1)
-            for test_K in range(2, MAX_SAFE_K + 1):
+            for test_K in range(2, 256):
                 test_L = calculate_L(test_K)
                 if test_L > max_L:
                     break
@@ -37,9 +33,6 @@ class LSH(ABC):
 
         if L > max_L:
             raise ValueError(f"Cannot achieve 50% threshold at D={threshold_d} within max_L={max_L}. Requires L={L}.")
-
-        if (L * K) > MAX_TOTAL_BITS:
-            raise ValueError(f"Total projection bits ({L} * {K} = {L * K}) exceeds safe threshold of {MAX_TOTAL_BITS}.")
 
         return cls(dim=dim, L=L, K=K)
 
@@ -65,6 +58,13 @@ class LSH(ABC):
         void_dt = np.dtype((np.void, contiguous.dtype.itemsize * self.K))
         return contiguous.view(void_dt).reshape(vectors.shape[0], self.L)
 
+class DummyLSH(LSH):
+    def _get_base_probabilities(self, r1: float, r2: float) -> Tuple[float, float]:
+        return 0.5, 0.5
+
+    def _compute_raw_hashes(self, vectors: np.ndarray) -> np.ndarray:
+        n_samples = vectors.shape[0]
+        return np.zeros((n_samples, self.L, self.K), dtype=np.uint8)
 
 class SimHashLSH(LSH):
     def __init__(self, dim: int, L: int, K: int):

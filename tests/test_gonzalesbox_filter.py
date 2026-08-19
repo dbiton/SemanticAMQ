@@ -34,7 +34,7 @@ def _neighbors_in_box(v: np.ndarray, r: float, n: int = 5, seed: int = 1) -> np.
 
 class TestGonzalezBoxInit(unittest.TestCase):
     def test_max_boxes_stored(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=10)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=10)
         self.assertEqual(f.max_boxes, 10)
 
     def test_max_memory_derives_box_count(self):
@@ -44,17 +44,17 @@ class TestGonzalezBoxInit(unittest.TestCase):
         self.assertEqual(f.max_boxes, 40)
 
     def test_distance_threshold_stored(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=0.5, max_shapes=5)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=0.5, max_spheres=5)
         self.assertAlmostEqual(f.distance_threshold, 0.5)
 
     def test_initial_state_not_constructed(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=5)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         self.assertFalse(f._constructed)
 
 
 class TestGonzalezClusteringLogic(unittest.TestCase):
     def test_gonzalez_clustering_assignments(self):
-        f = GonzalezBoxFilter(dim=2, distance_threshold=0.01, max_shapes=3)
+        f = GonzalezBoxFilter(dim=2, distance_threshold=0.01, max_spheres=3)
         vecs = np.array([
             [0.0, 0.0], [0.1, 0.1],  
             [10.0, 10.0], [10.1, 10.1], 
@@ -66,14 +66,14 @@ class TestGonzalezClusteringLogic(unittest.TestCase):
         self.assertEqual(len(unique_clusters), 3)
 
     def test_gonzalez_stops_early_if_threshold_met(self):
-        f = GonzalezBoxFilter(dim=2, distance_threshold=100.0, max_shapes=5)
+        f = GonzalezBoxFilter(dim=2, distance_threshold=100.0, max_spheres=5)
         vecs = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]], dtype=np.float32)
         sq_norms = np.sum(vecs * vecs, axis=1)
         assignments = f._gonzalez_clustering(vecs, sq_norms, k=5)
         self.assertEqual(len(np.unique(assignments)), 1)
 
     def test_gonzalez_clustering_identical_vectors(self):
-        f = GonzalezBoxFilter(dim=2, distance_threshold=R, max_shapes=3)
+        f = GonzalezBoxFilter(dim=2, distance_threshold=R, max_spheres=3)
         vecs = np.array([[5.0, 5.0]] * 10, dtype=np.float32)
         sq_norms = np.sum(vecs * vecs, axis=1)
         assignments = f._gonzalez_clustering(vecs, sq_norms, k=3)
@@ -86,14 +86,14 @@ class TestGonzalezClusteringLogic(unittest.TestCase):
 
 class TestGonzalezBoxConstruct(unittest.TestCase):
     def test_produces_correct_number_of_boxes(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=8)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=8)
         f.construct(_rand(100))
         self.assertTrue(f._constructed)
         self.assertEqual(len(f.all_boxes), 8)
 
     def test_trivial_case_fewer_vectors_than_boxes(self):
         vecs = _rand(3)
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=20)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=20)
         f.construct(vecs)
         self.assertTrue(f._constructed)
         self.assertEqual(len(f.all_boxes), 3)
@@ -101,7 +101,7 @@ class TestGonzalezBoxConstruct(unittest.TestCase):
     def test_all_vectors_within_bounds_of_some_box_in_nontrivial_case(self):
         """Every original vector must fall within the bounds of at least one stored box."""
         vecs = _rand(100, seed=23)
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=10)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=10)
         f.construct(vecs)
         self.assertLess(len(f.all_boxes), len(vecs))
 
@@ -115,7 +115,7 @@ class TestGonzalezBoxConstruct(unittest.TestCase):
         self.assertEqual(len(uncovered), 0, f"{len(uncovered)} vectors not within bounds of any box.")
 
     def test_boxes_incorporate_distance_threshold(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=10)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=10)
         vecs = _rand(200)
         f.construct(vecs)
         sides = f.all_boxes_max - f.all_boxes_min
@@ -124,20 +124,20 @@ class TestGonzalezBoxConstruct(unittest.TestCase):
     def test_separated_clusters_get_one_box_each(self):
         """Well-separated tight clusters should each collapse to an isolated box."""
         vecs = _clustered(4, 25, spread=0.02, sep=20.0)
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=4)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=4)
         f.construct(vecs)
         self.assertEqual(len(f.all_boxes), 4)
         sides = f.all_boxes_max - f.all_boxes_min
         self.assertTrue(np.all(sides < 2 * R + 0.5))
 
     def test_construct_with_zero_vectors_sets_constructed_flag(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=5)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f.construct(np.empty((0, DIM), dtype=np.float32))
         self.assertTrue(f._constructed)
         self.assertEqual(len(f.all_boxes), 0)
 
     def test_construct_with_zero_max_boxes(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=0)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=0)
         f.construct(_rand(10))
         self.assertTrue(f._constructed)
         self.assertEqual(len(f.all_boxes), 0)
@@ -145,18 +145,18 @@ class TestGonzalezBoxConstruct(unittest.TestCase):
 
     def test_exact_max_boxes_match_vectors_count(self):
         vecs = _rand(5)
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=5)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f.construct(vecs)
         self.assertEqual(len(f.all_boxes), 5)
         
     def test_reconstruct_replaces_previous_state(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=10)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=10)
         first = _rand(10, seed=0)
         second = _rand(10, seed=7) + 50.0
         f.construct(first)
         
         # Reset and construct again
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=10)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=10)
         f.construct(second)
         self.assertTrue(all(f.query(second)))
         self.assertFalse(any(f.query(first)))
@@ -169,14 +169,14 @@ class TestGonzalezBoxConstruct(unittest.TestCase):
 class TestGonzalezBoxQuery(unittest.TestCase):
     def test_stored_vectors_always_recalled(self):
         vecs = _rand(60)
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=8)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=8)
         f.construct(vecs)
         results = f.query(vecs)
         self.assertNotIn(False, results)
 
     def test_neighbors_within_threshold_recalled(self):
         vecs = _rand(20)
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=5)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f.construct(vecs)
         neighbors = _neighbors_in_box(vecs, r=R, n=3)
         results = f.query(neighbors)
@@ -185,7 +185,7 @@ class TestGonzalezBoxQuery(unittest.TestCase):
     def test_uniform_points_around_stored_vectors_recalled(self):
         """Points sampled uniformly from within the L-infinity bounds around each stored vector must be recalled."""
         vecs = _rand(15, seed=11)
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=5)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f.construct(vecs)
 
         samples = _neighbors_in_box(vecs, r=R, n=30)
@@ -196,7 +196,7 @@ class TestGonzalezBoxQuery(unittest.TestCase):
     def test_single_point_just_outside_threshold_rejected(self):
         """A filter built from a single point should reject a query that exceeds distance_threshold on one axis."""
         vec = _rand(1, seed=42)
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=1)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=1)
         f.construct(vec)
         self.assertTrue(f.query(vec)[0])
 
@@ -208,10 +208,10 @@ class TestGonzalezBoxQuery(unittest.TestCase):
         stored = _rand(10, seed=0)
         queries = _neighbors_in_box(stored, r=0.6 * 0.95, n=2)
 
-        f_small = GonzalezBoxFilter(dim=DIM, distance_threshold=0.1, max_shapes=10)
+        f_small = GonzalezBoxFilter(dim=DIM, distance_threshold=0.1, max_spheres=10)
         f_small.construct(stored)
 
-        f_large = GonzalezBoxFilter(dim=DIM, distance_threshold=0.7, max_shapes=10)
+        f_large = GonzalezBoxFilter(dim=DIM, distance_threshold=0.7, max_spheres=10)
         f_large.construct(stored)
 
         recall_small = sum(f_small.query(queries))
@@ -220,23 +220,23 @@ class TestGonzalezBoxQuery(unittest.TestCase):
 
     def test_distant_vectors_rejected(self):
         vecs = _rand(30)
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=5)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f.construct(vecs)
         self.assertFalse(any(f.query(vecs + 1000.0)))
 
     def test_query_before_construct_raises(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=5)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         with self.assertRaises(ValueError):
             f.query(np.zeros((1, DIM), dtype=np.float32))
             
     def test_query_on_empty_filter_returns_all_false(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=5)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f.construct(np.empty((0, DIM), dtype=np.float32))
         self.assertFalse(any(f.query(_rand(10))))
 
     def test_query_returns_list_of_bools(self):
         vecs = _rand(20)
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=4)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=4)
         f.construct(vecs)
         results = f.query(vecs)
         self.assertIsInstance(results, list)
@@ -245,12 +245,12 @@ class TestGonzalezBoxQuery(unittest.TestCase):
     def test_batch_equals_individual(self):
         vecs = _rand(50)
         queries = _rand(15, seed=99)
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=6)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=6)
         f.construct(vecs)
         self.assertEqual(f.query(queries), [f.query(q[None, :])[0] for q in queries])
 
     def test_query_with_empty_vectors_returns_empty_list(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=5)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f.construct(_rand(10))
         self.assertEqual(f.query(np.empty((0, DIM), dtype=np.float32)), [])
 
@@ -261,34 +261,34 @@ class TestGonzalezBoxQuery(unittest.TestCase):
 
 class TestGonzalezBoxDynamicUpdates(unittest.TestCase):
     def test_add_new_vectors_updates_boxes(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=5)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f.construct(_rand(10))
         f.add(_rand(20, seed=42) + 100.0)
         self.assertTrue(len(f.all_boxes) <= 5)
 
     def test_add_before_construct_calls_construct(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=5)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         vecs = _rand(10)
         f.add(vecs)
         self.assertTrue(f._constructed)
         self.assertNotIn(False, f.query(vecs))
 
     def test_add_empty_vectors_safe(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=5)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f.construct(_rand(10))
         f.add(np.empty((0, DIM), dtype=np.float32))
         self.assertTrue(f._constructed)
 
     def test_insert_is_alias_to_add(self):
-        f1 = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=5)
-        f2 = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=5)
+        f1 = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        f2 = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         vecs = _rand(20)
         f1.add(vecs)
         f2.insert(vecs)
         self.assertTrue(np.array_equal(f1.all_boxes_min, f2.all_boxes_min))
 
     def test_add_covered_vector_does_not_increase_box_count(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=5)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f.construct(_rand(10, seed=42))
         box_count = len(f.all_boxes)
 
@@ -299,14 +299,14 @@ class TestGonzalezBoxDynamicUpdates(unittest.TestCase):
 
     def test_add_duplicate_does_not_create_new_box(self):
         vecs = _rand(5)
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=30)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=30)
         f.construct(vecs)
         before = len(f.all_boxes)
         f.add(vecs[:1])
         self.assertEqual(len(f.all_boxes), before)
 
     def test_add_growth_and_merge_at_max_boxes(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=3)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=3)
         f.construct(np.array([[0.0] * DIM], dtype=np.float32))
         self.assertEqual(len(f.all_boxes), 1)
 
@@ -320,14 +320,14 @@ class TestGonzalezBoxDynamicUpdates(unittest.TestCase):
         self.assertLessEqual(len(f.all_boxes), 3)
 
     def test_add_in_batches(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=10)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=10)
         f.construct(_rand(5))
         vecs = _rand(4000)
         f.add(vecs)
         self.assertLessEqual(len(f.all_boxes), 10)
 
     def test_add_preserves_no_false_negatives_over_many_batches(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=8)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=8)
         all_vecs = []
         f.construct(_rand(20, seed=0))
         all_vecs.append(_rand(20, seed=0))
@@ -345,12 +345,12 @@ class TestGonzalezBoxDynamicUpdates(unittest.TestCase):
 
 class TestGonzalezBoxMemoryAndState(unittest.TestCase):
     def test_bytesize_before_construct_is_zero(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=10)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=10)
         self.assertEqual(f.get_bytesize(), 0)
 
     def test_bytesize_after_construct(self):
         k = 6
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=k)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=k)
         f.construct(_rand(100))
         active_boxes = f._all_boxes.nbytes
         min_bytes = f._all_boxes_min.nbytes
@@ -360,14 +360,14 @@ class TestGonzalezBoxMemoryAndState(unittest.TestCase):
         self.assertEqual(f.get_bytesize(), active_boxes + min_bytes + max_bytes + idx_bytes + heap_bytes)
 
     def test_get_new_index_expands_capacity(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=2)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=2)
         f._num_boxes = len(f._all_boxes_min) 
         old_cap = len(f._all_boxes_min)
         idx = f._get_new_index()
         self.assertEqual(len(f._all_boxes_min), old_cap * 2)
 
     def test_all_boxes_properties_slice_correctly(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=10)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=10)
         f.construct(_rand(5))
         self.assertEqual(f.all_boxes.shape, (5,))
         self.assertEqual(f.all_boxes_min.shape, (5, DIM))
@@ -376,23 +376,23 @@ class TestGonzalezBoxMemoryAndState(unittest.TestCase):
 
 class TestGonzalezBoxEdgeCasesAndInterface(unittest.TestCase):
     def test_remove_raises_not_implemented(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=5)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         with self.assertRaises(NotImplementedError):
             f.remove(_rand(5))
 
     def test_exact_matching_fpr_is_zero(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=5)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         self.assertEqual(f.get_exact_matching_fpr(), 0.0)
 
     def test_extreme_coordinates_handling(self):
-        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_shapes=5)
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         extreme_vecs = np.array([[1e10, -1e10] * (DIM // 2)], dtype=np.float32)
         f.construct(extreme_vecs)
         self.assertTrue(f.query(extreme_vecs)[0])
 
     def test_high_dimension(self):
         high_dim = 512
-        f = GonzalezBoxFilter(dim=high_dim, distance_threshold=R, max_shapes=5)
+        f = GonzalezBoxFilter(dim=high_dim, distance_threshold=R, max_spheres=5)
         vecs = _rand(20, dim=high_dim)
         f.construct(vecs)
         self.assertNotIn(False, f.query(vecs))
