@@ -6,9 +6,9 @@ import time
 import numpy as np
 import pandas as pd
 
-from lsh import FaissSimHashLSH, LSH, DummyLSH
+from lsh import LSH, DummyLSH
 from runner import Runner
-from plots.legacy import plot_results, plot_throughput_results, plot_tradeoff_results, plot_equal_memory_results
+from plots.legacy import plot_results, plot_throughput_results, plot_equal_memory_results
 from plots.plot_ablation import generate_ablation_figures
 from plots.plot_query_performance import generate_query_performance_figures
 from plots.plot_equal_memory import generate_equal_memory_figures
@@ -17,7 +17,7 @@ from plots.plot_streaming import generate_streaming_figures
 from plots.plot_system import generate_system_figures
 from plots.plot_system_tau import generate_system_tau_figures
 from plots.plot_common import DATASETS, DATASET_LABELS
-from typing import Tuple, List
+from typing import Tuple
 from filters.ball_cover_filter import BallCoverFilter
 from filters.dsbf_filter import DSBFFilter
 from filters.covering_lsh_fallback_filter import CoveringLSHFallbackFilter
@@ -26,7 +26,7 @@ from filters.dsh_filter import DSHFilter
 from filters.hnsw_filter import HNSWFilter
 from util.dataset_paths import dataset_filenames
 from util.fetch_datasets import load_embeds
-from vector_source import VectorSource, ArrayVectorSource
+from vector_source import VectorSource
 
 MAX_WORKERS = 6
 DATASET = 'ELI5'
@@ -236,11 +236,17 @@ def plot_static(results: list) -> None:
 
 def generate_equal_memory() -> list:
     """
-    Equal-memory comparison: every registered filter (BallCoverFilter --
-    the paper's own method -- plus the four LSH/Bloom baselines) is given the
-    exact same memory budget from EQUAL_MEMORY_BUDGETS_BYTES (clipped to a
-    dataset-scaled maximum via calculate_max_memory_budget_bytes, so a small
-    dataset never gets a budget wildly larger than its own raw vector size).
+    Equal-memory comparison: every registered filter (BallCoverFilter -- the
+    paper's own method -- plus the five baselines in dynamic_filters:
+    DSBFFilter, CoveringLSHFallbackFilter, LSBFFilter, DSHFilter, HNSWFilter)
+    is given the exact same memory budget. count_memory_steps evenly spaced
+    budgets are swept from max_memory_budget/count_memory_steps up to
+    max_memory_budget, where max_memory_budget is scaled off the construct
+    set itself (num_construct * bytes for one float32 sphere per point) --
+    not calculate_max_memory_budget_bytes, which is tuned for
+    generate_static()/generate_dynamic()'s much smaller num_vectors and
+    would cap out at a couple MB here, far below the point past which more
+    memory stops buying additional accuracy for a covering-based method.
 
     For each budget, every filter's best available "valid configuration" is
     chosen on a calibration workload disjoint from both the construct set and
@@ -542,10 +548,12 @@ def plot_system_tau(df: pd.DataFrame, k: int) -> None:
 
 def generate_ablation() -> Tuple[pd.DataFrame, int]:
     """
-    Generate the per-stage construction-ladder data for BallCoverFilter
-    (ball refine -> quantizing) across the 3 datasets the ablation figure
-    needs, and write it to results/ablation.csv. Returns the long-format df
-    plus the largest k used.
+    Generate the per-(level, stage) construction data for BallCoverFilter
+    (each of the 3 init levels, ball cover -> quantizing) across the 3
+    datasets the ablation figure needs, and write it to results/ablation.csv.
+    Quantizing is run per level (each level's own cover is quantized
+    independently), not once on a single shared cover. Returns the
+    long-format df plus the largest k used.
 
     k and tau are both derived from num_vectors/percentage_construct rather
     than hardcoded absolute values, so editing those two knobs rescales
@@ -565,7 +573,7 @@ def generate_ablation() -> Tuple[pd.DataFrame, int]:
         that dataset's own distribution) is what actually stays meaningful
         as num_vectors/percentage_construct change -- not the raw float.
     """
-    num_vectors            = 1_000
+    num_vectors            = 10_000
     dim                    = 384
     percentage_construct   = 20
     k_fractions            = [0.03, 0.06, 0.125, 0.25]
@@ -630,13 +638,14 @@ def generate_ablation() -> Tuple[pd.DataFrame, int]:
         }
         for k in k_values:
             for seed in seeds:
-                runner.submit(
-                    'ablation',
-                    dim=dim, dataset=DATASET_KEYS[dataset],
-                    k=k, tau_values=tau_values, seed=seed, construct_tau=construct_tau,
-                    vectors_construct=construct_source, vectors_query=query_source,
-                    actual_results_by_tau=actual_results_by_tau,
-                )
+                for level in BallCoverFilter.LEVELS:
+                    runner.submit(
+                        'ablation',
+                        dim=dim, dataset=DATASET_KEYS[dataset],
+                        k=k, level=level, tau_values=tau_values, seed=seed, construct_tau=construct_tau,
+                        vectors_construct=construct_source, vectors_query=query_source,
+                        actual_results_by_tau=actual_results_by_tau,
+                    )
 
     job_results = runner.run()
     print("Ablation evaluation completed.")
@@ -1134,122 +1143,6 @@ def plot_dynamic(results: list) -> None:
     plot_results(results, "dynamic")
 
 
-def generate_tradeoff() -> Tuple[List, List]:
-    num_vectors = 100_000
-    dim = 384
-    max_L = 256
-    percentage_construct = 10
-    target_percentile = 0.2
-    dataset = DATASET
-    random_test = False
-
-    # load dataset arrays for ground-truth processing
-    vectors = load_embeds(dataset, num_vectors)[0]
-    num_construct = num_vectors * percentage_construct // 100
-    vectors_construct = vectors[:num_construct]
-    vectors_query = vectors[num_construct:]
-
-    # create construct and query vector objects for workers
-    construct_source = VectorSource(dataset, 0, num_construct)
-    query_source = VectorSource(dataset, num_construct, num_vectors)
-
-    # calculate constant reference distance threshold
-    print(f"Pre-calculating evaluation distance baselines at {target_percentile}%...")
-    distance_threshold = calculate_distance_threshold(vectors, target_percentile)
-
-    # means we run test with randomly generated queires for testing generalization
-    if random_test:
-        print("\nPreparing Generalization Test (Random Vectors)...")
-        # generate random samples from a uniform distribution and normalize them for dataset consistency
-        random_queries = np.random.uniform(low=np.min(vectors), high=np.max(vectors), size=(len(vectors_query), dim)).astype(np.float32)
-        random_queries_norms = np.linalg.norm(random_queries, axis=1, keepdims=True)
-        random_queries = random_queries / np.where(random_queries_norms == 0, 1e-10, random_queries_norms)
-
-        print("Calculating actual results for random queries...")
-        actual_results = compute_static_actual_results(vectors_construct, random_queries, distance_threshold)
-        query_source = ArrayVectorSource("random_queries", array=random_queries)
-
-    # else we run the original dataset queries provided
-    else:
-        # compute static filter resuls
-        print("Calculating actual results for test queries...")
-        actual_results = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
-
-    runner = Runner(num_workers=MAX_WORKERS)
-
-    # EXPERIMENT 1: Evaluate Geometric Filter Performance
-    # Tests how the number of spheres (spatial partitioning) impacts 
-    # search accuracy and speed for ball-based filters.
-    sphere_sizes = [5, 10, 20, 40, 80, 160, 320, 640, 1280, 2560, 5120, 10240]
-    sphere_sizes = [s for s in sphere_sizes if s < len(vectors_construct)] + [len(vectors_construct)]
-    sphere_filters = [KDBallFilter, KMEBFilter]
-
-    for size in sphere_sizes:
-        for filter_cls in sphere_filters:
-            runner.submit(
-                'tradeoff',
-                filter_cls=filter_cls,
-                lsh_cls=FaissSimHashLSH,
-                dim=dim,
-                distance_threshold=distance_threshold,
-                max_L=max_L,
-                vectors_construct=construct_source,
-                vectors_query=query_source,
-                actual_results=actual_results,
-                max_spheres=size,
-                memory_budget=None
-            )
-
-    print("\nExecuting sphere evaluation...")
-    raw_sphere_results = runner.run()
-    sphere_results = [r for r in raw_sphere_results if r is not None]
-    runner.clear() # clear runner jobs
-    print("Sphere evaluation completed.")
-
-    # EXPERIMENT 2: Benchmark Resource Efficiency
-    # Compares all available filter strategies under strict memory limits 
-    # to identify which methods perform best when storage is constrained.
-    memory_budgets = [500*1024, 1*1024*1024, 2*1024*1024, 4*1024*1024, 8*1024*1024, 16*1024*1024, 32*1024*1024, 64*1024*1024]
-
-    for budget in memory_budgets:
-        for filter_cls in static_filters + dynamic_filters:
-            runner.submit(
-                'tradeoff',
-                filter_cls=filter_cls,
-                lsh_cls=FaissSimHashLSH,
-                dim=dim,
-                distance_threshold=distance_threshold,
-                max_L=max_L,
-                vectors_construct=construct_source,
-                vectors_query=query_source,
-                actual_results=actual_results,
-                max_spheres=None,
-                memory_budget=budget
-            )
-
-    print("\nExecuting memory evaluation...")
-    raw_memory_results = runner.run()
-    memory_results = [r for r in raw_memory_results if r is not None]
-    print("Memory evaluation completed.")
-
-    return sphere_results, memory_results
-
-
-def plot_tradeoff(sphere_results: List, memory_results: List) -> None:
-    plot_tradeoff_results(sphere_results, memory_results)
-
-
-def _load_tradeoff() -> Tuple[List, List]:
-    """Reconstructs sphere_results/memory_results from tradeoff_evaluations.csv
-    (written as a side effect of plot_tradeoff -- see legacy.plot_tradeoff_results),
-    splitting back on the 'Mode' column plot_tradeoff_results itself stamps onto
-    each half before concatenating them for that CSV."""
-    df = pd.read_csv("plots/tradeoff/tradeoff_evaluations.csv")
-    sphere_results = df[df["Mode"] == "sphere_test"].to_dict("records")
-    memory_results = df[df["Mode"] == "memory_test"].to_dict("records")
-    return sphere_results, memory_results
-
-
 def generate_and_plot_all() -> None:
     """
     Run every active evaluation end-to-end (generate, then plot), the same
@@ -1267,12 +1160,6 @@ def generate_and_plot_all() -> None:
     #plot_system(*generate_system())
     #plot_system_tau(*generate_system_tau())
     return
-    try:
-        pass
-        #plot_tradeoff(*generate_tradeoff())
-    except Exception as e:
-        print(f"An error occurred: {e}")
-
     try:
         plot_ablation(*generate_ablation())
     except Exception as e:
@@ -1299,18 +1186,13 @@ def plot_all() -> None:
     Re-render every figure from data a prior generate_and_plot_all() run
     already persisted to disk, without repeating the (expensive) evaluation
     sweeps -- handy for iterating on plot styling alone. Reads back
-    results/{ablation,query_performance,scaling,streaming,system}.csv and
-    plots/tradeoff/tradeoff_evaluations.csv, re-deriving whatever generate-time
-    metadata (k, k_fixed, T_representative) each plot_ needs directly from the
-    loaded data instead of threading it through from the generate_ call.
-    Requires at least one prior generate_and_plot_all() (or equivalent
-    generate_X + plot_X) run to have produced those files.
+    results/{ablation,query_performance,scaling,streaming,system}.csv,
+    re-deriving whatever generate-time metadata (k, k_fixed,
+    T_representative) each plot_ needs directly from the loaded data instead
+    of threading it through from the generate_ call. Requires at least one
+    prior generate_and_plot_all() (or equivalent generate_X + plot_X) run to
+    have produced those files.
     """
-    try:
-        plot_tradeoff(*_load_tradeoff())
-    except Exception as e:
-        print(f"An error occurred: {e}")
-
     try:
         df = pd.read_csv("results/system.csv")
         plot_system(df, k=int(df["k"].iloc[0]))
@@ -1351,5 +1233,5 @@ def plot_all() -> None:
 
 
 if __name__ == "__main__":
-    generate_and_plot_all()
-    # plot_all()
+    # generate_and_plot_all()
+    plot_all()

@@ -86,38 +86,27 @@ class TestGonzalezInit(unittest.TestCase):
         f = BallCoverFilter(dim=DIM, distance_threshold=0.5, max_spheres=5)
         self.assertAlmostEqual(f.distance_threshold, 0.5)
 
-    def test_default_complexity_is_2(self):
+    def test_default_level_is_3(self):
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5)
-        self.assertEqual(f._complexity_level, 2)
+        self.assertEqual(f.level, 3)
 
 
 # ---------------------------------------------------------------------------
-# set_complexity
+# level (init strategy, set at construction time)
 # ---------------------------------------------------------------------------
 
-class TestGonzalezComplexity(unittest.TestCase):
+class TestBallCoverLevel(unittest.TestCase):
 
     def test_valid_levels_accepted(self):
-        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5)
-        for level in (1, 2):
-            f.set_complexity(level)
-            self.assertEqual(f._complexity_level, level)
+        for level in (1, 2, 3):
+            f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5, level=level)
+            self.assertEqual(f.level, level)
 
     def test_invalid_level_raises(self):
-        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         with self.assertRaises(ValueError):
-            f.set_complexity(0)
+            BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5, level=0)
         with self.assertRaises(ValueError):
-            f.set_complexity(3)
-
-    def test_changing_complexity_after_construct_requires_rebuild(self):
-        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5)
-        f.construct(_rand(20))
-        self.assertTrue(f._constructed)
-        f.set_complexity(2)
-        self.assertFalse(f._constructed)
-        with self.assertRaises(ValueError):
-            f.query(_rand(1))
+            BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5, level=4)
 
 
 # ---------------------------------------------------------------------------
@@ -196,13 +185,17 @@ class TestGonzalezConstruct(unittest.TestCase):
                         f"Expected small intra-cluster radii, got {f.all_radiuses}")
         np.testing.assert_array_equal(np.sort(f.sphere_counts), 25)
 
-    def test_clustering_stops_early_when_threshold_covered(self):
-        """If every point is within distance_threshold of a center, k-means++
-        seeding stops adding centers even when max_spheres allows more."""
+    def test_budget_saturates_even_when_tightly_clustered(self):
+        """Budget saturation (invariant #2): all three init levels return
+        exactly max_spheres balls whenever max_spheres < n, even when the
+        data is one tight, well-under-threshold cluster -- unlike the
+        retired k-means++ path, none of them early-stop under
+        distance_threshold."""
         vecs = _clustered(3, 30, spread=0.01, sep=20.0)
-        f = BallCoverFilter(dim=DIM, distance_threshold=1.0, max_spheres=50)
-        f.construct(vecs)
-        self.assertLess(len(f.all_spheres), 50)
+        for level in (1, 2, 3):
+            f = BallCoverFilter(dim=DIM, distance_threshold=1.0, max_spheres=50, level=level, seed=1)
+            f.construct(vecs)
+            self.assertEqual(len(f.all_spheres), 50, f"level {level} did not saturate to max_spheres")
 
     def test_construct_returns_log_volume_bounds(self):
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=8)
@@ -347,6 +340,37 @@ class TestGonzalezQuery(unittest.TestCase):
         self.assertAlmostEqual(float(f.all_radiuses[0]), 0.0, places=5)
         self.assertTrue(f.query(vec, tau=0.0)[0])
 
+    def test_query_multi_tau_matches_per_tau_query(self):
+        vecs = _rand(60, seed=12)
+        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=8)
+        f.construct(vecs)
+        probes = _neighbors(vecs, r=R, n=3)
+        taus = [0.0, 0.1, R, 0.5, 1.0]
+
+        result = f.query_multi_tau(probes, taus)
+        self.assertEqual(sorted(result.keys()), sorted(taus))
+        for t in taus:
+            self.assertEqual(result[t], f.query(probes, tau=t), f"mismatch at tau={t}")
+
+    def test_query_multi_tau_before_construct_raises(self):
+        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        with self.assertRaises(ValueError):
+            f.query_multi_tau(_rand(3), [0.0, 0.5])
+
+    def test_query_multi_tau_on_empty_filter_returns_all_false(self):
+        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        f.construct(np.empty((0, DIM), dtype=np.float32))
+        result = f.query_multi_tau(_rand(4), [0.0, 1.0])
+        self.assertEqual(result[0.0], [False] * 4)
+        self.assertEqual(result[1.0], [False] * 4)
+
+    def test_query_multi_tau_empty_batch_returns_empty_lists(self):
+        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        f.construct(_rand(20))
+        result = f.query_multi_tau(np.empty((0, DIM), dtype=np.float32), [0.0, 0.5])
+        self.assertEqual(result[0.0], [])
+        self.assertEqual(result[0.5], [])
+
 
 # ---------------------------------------------------------------------------
 # Threshold independence
@@ -391,42 +415,50 @@ class TestGonzalezLevels(unittest.TestCase):
 
     def test_no_false_negatives_at_every_level(self):
         vecs = _clustered(5, 30, spread=0.1, sep=12.0, seed=4)
-        for level in (1, 2):
-            f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=8, seed=1)
-            f.set_complexity(level)
+        for level in (1, 2, 3):
+            f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=8, seed=1, level=level)
             f.construct(vecs)
             for tau in (0.0, R, 1.0):
                 self.assertTrue(all(f.query(vecs, tau=tau)),
                                 f"false negative at level {level}, tau={tau}")
 
-    def test_log_J_non_increasing_across_levels(self):
+    def test_log_J_non_increasing_across_stages(self):
         vecs = _rand(150, seed=6)
-        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=10, seed=1)
-        f.set_complexity(2)
-        f.construct(vecs)
-        stats = f.get_stats()
-        log_Js = [lvl["log_J"] for lvl in stats["levels"]]
-        self.assertEqual(len(log_Js), 2)
-        for a, b in zip(log_Js, log_Js[1:]):
-            self.assertLessEqual(b, a + 1e-6, f"log_J increased: {log_Js}")
+        for level in (1, 2, 3):
+            f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=10, seed=1, level=level)
+            f.construct(vecs)
+            stats = f.get_stats()
+            log_Js = [lvl["log_J"] for lvl in stats["levels"]]
+            self.assertEqual(len(log_Js), 2)
+            for a, b in zip(log_Js, log_Js[1:]):
+                self.assertLessEqual(b, a + 1e-6, f"level {level}: log_J increased: {log_Js}")
 
     def test_ball_count_never_exceeds_max_spheres(self):
         vecs = _rand(300, seed=8)
-        for level in (1, 2):
-            f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=12, seed=2)
-            f.set_complexity(level)
+        for level in (1, 2, 3):
+            f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=12, seed=2, level=level)
             f.construct(vecs)
             self.assertLessEqual(len(f.all_spheres), 12)
 
+    def test_exactly_k_balls_when_n_greater_than_k(self):
+        """Budget saturation invariant #2: exactly k balls, not merely <= k,
+        whenever n > k."""
+        vecs = _rand(300, seed=8)
+        for level in (1, 2, 3):
+            f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=12, seed=2, level=level)
+            f.construct(vecs)
+            self.assertEqual(len(f.all_spheres), 12, f"level {level} did not saturate to k")
+
     def test_determinism_same_seed_same_result(self):
         vecs = _rand(120, seed=9)
-        f1 = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=10, seed=7)
-        f2 = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=10, seed=7)
-        f1.construct(vecs)
-        f2.construct(vecs)
-        np.testing.assert_array_equal(f1.all_spheres, f2.all_spheres)
-        np.testing.assert_array_equal(f1.all_radiuses, f2.all_radiuses)
-        np.testing.assert_array_equal(f1.sphere_counts, f2.sphere_counts)
+        for level in (1, 2, 3):
+            f1 = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=10, seed=7, level=level)
+            f2 = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=10, seed=7, level=level)
+            f1.construct(vecs)
+            f2.construct(vecs)
+            np.testing.assert_array_equal(f1.all_spheres, f2.all_spheres)
+            np.testing.assert_array_equal(f1.all_radiuses, f2.all_radiuses)
+            np.testing.assert_array_equal(f1.sphere_counts, f2.sphere_counts)
 
     def test_get_stats_reports_per_level_entries(self):
         vecs = _rand(80, seed=10)
@@ -438,7 +470,60 @@ class TestGonzalezLevels(unittest.TestCase):
             self.assertIn(0.1, lvl["log_J_tau"])
             self.assertIn(0.5, lvl["log_J_tau"])
             self.assertGreaterEqual(lvl["wall_time"], 0.0)
-        self.assertIsNone(stats["feedback"])
+
+    def test_n_less_than_k_gives_n_singletons_at_every_level(self):
+        vecs = _rand(4, seed=50)
+        for level in (1, 2, 3):
+            f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=100, level=level)
+            f.construct(vecs)
+            self.assertEqual(len(f.all_spheres), 4, f"level {level}")
+            np.testing.assert_allclose(f.all_radiuses, 0.0, atol=1e-6)
+
+    def test_coverage_invariant_at_every_level(self):
+        vecs = _rand(150, seed=17)
+        for level in (1, 2, 3):
+            f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=10, seed=1, level=level)
+            f.construct(vecs)
+            self.assertTrue(_covering_ok(vecs, f, tau=0.0), f"level {level} covering invariant violated")
+
+    def test_log_J_finite_and_negative_at_high_dim(self):
+        """log J must stay finite (never overflow via a raw r**d) at d ~ 384,
+        where r**d itself would over/underflow float64."""
+        dim = 384
+        rng = np.random.default_rng(3)
+        vecs = rng.standard_normal((100, dim)).astype(np.float32) * 0.01
+        for level in (1, 2, 3):
+            f = BallCoverFilter(dim=dim, distance_threshold=0.05, max_spheres=8, seed=1, level=level)
+            f.construct(vecs)
+            log_J = f.get_stats()["levels"][-1]["log_J"]
+            self.assertTrue(np.isfinite(log_J), f"level {level}: log_J={log_J}")
+            self.assertLess(log_J, 0.0, f"level {level}: expected negative-large log_J, got {log_J}")
+
+    def test_gonzalez_lower_bound_only_set_for_level_3(self):
+        vecs = _rand(150, seed=6)
+        for level in (1, 2):
+            f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=10, seed=1, level=level)
+            f.construct(vecs)
+            self.assertIsNone(f.lower_bound, f"level {level} should not report a certificate")
+
+        f3 = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=10, seed=1, level=3)
+        f3.construct(vecs)
+        self.assertIsNotNone(f3.lower_bound)
+        self.assertTrue(np.isfinite(f3.lower_bound))
+        log_J = f3.get_stats()["levels"][-1]["log_J"]
+        self.assertGreaterEqual(log_J - f3.lower_bound, -1e-6,
+                                "log_J fell below its own certified lower bound")
+
+    def test_streaming_shuffle_and_n_candidates_preserve_coverage(self):
+        vecs = _rand(200, seed=21)
+        for shuffle in (False, True):
+            for n_candidates in (0, 3):
+                f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=10, seed=1, level=1,
+                                     streaming_shuffle=shuffle, streaming_n_candidates=n_candidates)
+                f.construct(vecs)
+                self.assertEqual(len(f.all_spheres), 10)
+                self.assertTrue(_covering_ok(vecs, f, tau=0.0),
+                                f"shuffle={shuffle}, n_candidates={n_candidates}")
 
 
 # ---------------------------------------------------------------------------
@@ -699,92 +784,6 @@ class TestGonzalezEdgeCases(unittest.TestCase):
         f.construct(vecs)
         self.assertEqual(len(f.all_spheres), 4)
         np.testing.assert_allclose(f.all_radiuses, 0.0, atol=1e-6)
-
-
-# ---------------------------------------------------------------------------
-# Level 5: feedback-driven refinement
-# ---------------------------------------------------------------------------
-
-def _slack_dataset(dim=8, seed=0):
-    """Five tight, well-separated clusters with only 4 spheres allowed, so
-    clustering is forced to merge two of them into one large-radius ball --
-    exactly the kind of slack feedback refinement should be able to exploit."""
-    rng = np.random.default_rng(seed)
-    vals = [-60.0, -40.0, -20.0, 20.0, 40.0]
-    centers = [np.full(dim, v, dtype=np.float32) for v in vals]
-    clusters = [c + rng.standard_normal((25, dim)).astype(np.float32) * 0.2 for c in centers]
-    return np.vstack(clusters), rng
-
-
-class TestGonzalezFeedback(unittest.TestCase):
-
-    def test_set_feedback_policy_rejects_unknown_mode(self):
-        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5)
-        with self.assertRaises(ValueError):
-            f.set_feedback_policy(mode="bogus")
-
-    def test_refine_without_construct_raises(self):
-        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5)
-        with self.assertRaises(ValueError):
-            f.refine_with_feedback(_rand(5))
-
-    def test_refine_without_retained_assignments_raises(self):
-        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5)
-        f.construct(_rand(30))  # retain_assignments defaults to False
-        with self.assertRaises(ValueError):
-            f.refine_with_feedback(_rand(5))
-
-    def test_reserved_mode_eliminates_false_positives_without_false_negatives(self):
-        dim = 8
-        X, rng = _slack_dataset(dim=dim, seed=0)
-        f = BallCoverFilter(dim=dim, distance_threshold=0.1, max_spheres=4, seed=3)
-        f.construct(X, retain_assignments=True)
-
-        big = int(np.argmax(f.all_radiuses))
-        mid = f.all_spheres[big].copy()
-        fp_queries = mid + rng.standard_normal((30, dim)).astype(np.float32) * 0.3
-        self.assertEqual(sum(f.query(fp_queries)), 30)  # verified false positives
-
-        f.set_feedback_policy(mode="reserved", reserved_fraction=0.25)
-        result = f.refine_with_feedback(fp_queries)
-
-        self.assertGreater(result["fraction_eliminated"], 0.0)
-        self.assertLessEqual(len(f.all_spheres), f.max_spheres)
-        self.assertTrue(all(f.query(X)), "feedback refinement introduced a false negative")
-
-    def test_split_merge_mode_preserves_ball_count(self):
-        dim = 8
-        X, rng = _slack_dataset(dim=dim, seed=1)
-        f = BallCoverFilter(dim=dim, distance_threshold=0.1, max_spheres=4, seed=3)
-        f.construct(X, retain_assignments=True)
-        k_before = len(f.all_spheres)
-
-        big = int(np.argmax(f.all_radiuses))
-        mid = f.all_spheres[big].copy()
-        fp_queries = mid + rng.standard_normal((30, dim)).astype(np.float32) * 0.3
-
-        f.set_feedback_policy(mode="split_merge")
-        f.refine_with_feedback(fp_queries)
-
-        self.assertEqual(len(f.all_spheres), k_before)
-        self.assertTrue(all(f.query(X)), "feedback refinement introduced a false negative")
-
-    def test_get_stats_feedback_populated_after_refine(self):
-        dim = 8
-        X, rng = _slack_dataset(dim=dim, seed=2)
-        f = BallCoverFilter(dim=dim, distance_threshold=0.1, max_spheres=4, seed=3)
-        f.construct(X, retain_assignments=True)
-        self.assertIsNone(f.get_stats()["feedback"])
-
-        big = int(np.argmax(f.all_radiuses))
-        mid = f.all_spheres[big].copy()
-        fp_queries = mid + rng.standard_normal((30, dim)).astype(np.float32) * 0.3
-        f.set_feedback_policy(mode="reserved", reserved_fraction=0.25)
-        f.refine_with_feedback(fp_queries)
-
-        stats = f.get_stats()
-        self.assertIsNotNone(stats["feedback"])
-        self.assertIn("fraction_eliminated", stats["feedback"])
 
 
 # ---------------------------------------------------------------------------

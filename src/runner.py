@@ -99,14 +99,17 @@ _DIRECT_TAU_FILTERS = {
 }
 
 
-def _instantiate_filter(filter_cls: Any, dim: int, lsh: Any, memory_budget: int, distance_threshold: float = None, max_spheres: int = None) -> Any:
+def _instantiate_filter(filter_cls: Any, dim: int, lsh: Any, memory_budget: int, distance_threshold: float = None,
+                        max_spheres: int = None, extra_kwargs: Optional[Dict[str, Any]] = None) -> Any:
+    extra_kwargs = extra_kwargs or {}
     if filter_cls.__name__ not in _DIRECT_TAU_FILTERS:
         try:
-            return filter_cls(dim=dim, lsh=lsh, max_memory=memory_budget)
+            return filter_cls(dim=dim, lsh=lsh, max_memory=memory_budget, **extra_kwargs)
         except TypeError:
-            return filter_cls(dim=dim, lsh=lsh)
+            return filter_cls(dim=dim, lsh=lsh, **extra_kwargs)
     else:
-        return filter_cls(dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold, max_spheres=max_spheres)
+        return filter_cls(dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold,
+                          max_spheres=max_spheres, **extra_kwargs)
 
 
 def static_worker(
@@ -196,8 +199,13 @@ def _build_calibrated_filter(
     if name in _CONSTRUCTION_TIME_CONFIG_DIALS:
         best_f1, best_instance = -1.0, None
         for kwargs in _CONSTRUCTION_TIME_CONFIG_DIALS[name]:
-            candidate = filter_cls(
-                dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold, **kwargs
+            # Routed through _instantiate_filter's own dispatch (not a
+            # hardcoded direct-tau constructor call) so a filter added to
+            # this dial registry that isn't in _DIRECT_TAU_FILTERS (i.e.
+            # takes lsh= instead of distance_threshold=/max_spheres=) still
+            # gets built correctly.
+            candidate = _instantiate_filter(
+                filter_cls, dim, lsh, memory_budget, distance_threshold, extra_kwargs=kwargs
             )
             candidate.construct(construct_arr)
             f1 = (
@@ -378,71 +386,6 @@ def system_worker(
     }
 
 
-def _compute_tradeoff_metrics(
-    predicted: List[bool],
-    actual: List[bool],
-    config: str,
-    max_spheres: int,
-    memory_budget: int,
-    memory_usage: int,
-    construct_time: float,
-    qps: float
-) -> Dict[str, Any]:
-    tp, fp, fn, tn = _binary_confusion(predicted, actual)
-    precision, recall, f1 = _precision_recall_f1(predicted, actual)
-    return {
-        "Config": config,
-        "NumSpheres": max_spheres if max_spheres is not None else 0,
-        "MemoryBudget": memory_budget,
-        "MemoryUsage": memory_usage,
-        "FPR": fp / (fp + tn) if (fp + tn) > 0 else 0.0,
-        "FNR": fn / (fn + tp) if (fn + tp) > 0 else 0.0,
-        "Precision": precision,
-        "Recall": recall,
-        "F1-Score": f1,
-        "ConstructTime": construct_time,
-        "QPS": qps
-    }
-
-
-def tradeoff_worker(
-    filter_cls: Any,
-    lsh_cls: Any,
-    dim: int,
-    distance_threshold: float,
-    max_L: int,
-    vectors_construct: np.ndarray,
-    vectors_query: np.ndarray,
-    actual_results: List[bool],
-    max_spheres: int = None,
-    memory_budget: int = None
-) -> Dict[str, Any]:
-    try:
-        config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
-        lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
-        vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
-
-        construct_start = time.perf_counter()
-        filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold, max_spheres)
-        filter_instance.construct(vectors_construct)
-        construct_latency = time.perf_counter() - construct_start
-
-        query_start = time.perf_counter()
-        predicted: List[bool] = []
-        for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
-            predicted.extend(filter_instance.query(block))
-        query_latency = time.perf_counter() - query_start
-
-        qps = len(vectors_query) / max(query_latency, 1e-9)
-        memory_usage = filter_instance.get_bytesize()
-
-    except Exception as e:
-        print(f"  [Skipped] {config} failed: {e}")
-        return None
-
-    return _compute_tradeoff_metrics(predicted, actual_results, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
-
-
 _LN10 = float(np.log(10.0))
 
 
@@ -465,6 +408,19 @@ def _J_tau(radii: np.ndarray, dim: int, tau: float = 0.0) -> float:
         return float(np.sum(r ** dim))
 
 
+def _gonzalez_bound_log10_J_tau(lower_bound_nats: float, dim: int, tau: float) -> float:
+    """Extend BallCoverFilter's level-3 certificate (lower_bound = d*log(D/2),
+    natural log, tau=0) to tau > 0 in log10 space. The pigeonhole argument
+    guarantees some ball has raw radius >= D/2 regardless of tau, and
+    log_J_tau is a logsumexp (>= any single term) over (r_i + tau)^d, so
+    d*log(D/2 + tau) lower-bounds log_J_tau too -- D/2 is recovered from the
+    stored bound via D/2 = exp(lower_bound/d) rather than re-deriving D."""
+    if not np.isfinite(lower_bound_nats):
+        return float('-inf')
+    half_d = float(np.exp(lower_bound_nats / dim))
+    return float(dim * np.log(half_d + float(tau))) / _LN10
+
+
 def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, float]:
     tp, fp, fn, tn = _binary_confusion(predicted, actual)
     return {
@@ -477,6 +433,7 @@ def ablation_worker(
     dim: int,
     dataset: str,
     k: int,
+    level: int,
     tau_values: List[float],
     seed: int,
     construct_tau: float,
@@ -484,11 +441,24 @@ def ablation_worker(
     vectors_query: VectorInput,
     actual_results_by_tau: Dict[float, List[bool]],
 ) -> List[Dict[str, Any]]:
-    """Builds one BallCoverFilter cover per (dataset, k, seed) via the full
-    construction ladder, then evaluates it at every tau. Returns one row per
-    (stage, tau) for stages ["ball", "quantizing"]; construct_tau is a
-    sweep-independent construction knob, kept separate from the evaluated
-    tau's so log10_J stays tau-independent for a given cover."""
+    """Builds one BallCoverFilter cover per (dataset, k, seed, level) using
+    the given init strategy `level` (1-3, see BallCoverFilter), then
+    quantizes THAT level's own cover and evaluates both the unquantized and
+    quantized cover at every tau. Returns one row per (stage, tau) for
+    stages ["ball", "quantizing"], each row tagged with `level` so a caller
+    sweeping level=1,2,3 gets quantizing-per-level rather than one shared
+    quantizing pass; construct_tau is a sweep-independent construction knob,
+    kept separate from the evaluated tau's so log10_J stays tau-independent
+    for a given cover.
+
+    When level == 3, ALSO emits a "Bound Ball" / "Bound Quant" pair (tagged
+    level=0, a reserved sentinel -- not a real construction level) using the
+    Gonzalez certificate (filt.lower_bound) captured right after construct(),
+    before quantize_centers() can overwrite it while searching quantizer
+    candidates at other k's. The same certified floor is used for both
+    stages: quantization can only inflate radii at a fixed k, so it can't
+    certifiably beat the unquantized bound, and this is the only level that
+    can produce a bound at all (see BallCoverFilter's class docstring)."""
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
     n_q = len(query_arr)
@@ -502,18 +472,19 @@ def ablation_worker(
 
     rows: List[Dict[str, Any]] = []
 
-    filt = BallCoverFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed)
+    filt = BallCoverFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed, level=level)
     filt.construct(construct_arr, retain_assignments=True)
+    lower_bound = filt.lower_bound  # capture before quantize_centers() can overwrite it
     levels = filt.get_stats(taus=tau_values)["levels"]
     ball_level = levels[-1]
     ball_cum_time = sum(s["wall_time"] for s in levels)
     ball_log10_J = ball_level["log_J"] / _LN10
 
+    ball_predicted_by_tau = filt.query_multi_tau(query_arr, tau_values)
     for t in tau_values:
-        predicted = filt.query(query_arr, tau=t)
-        rates = _confusion_rates(predicted, actual_by_tau[t])
+        rates = _confusion_rates(ball_predicted_by_tau[t], actual_by_tau[t])
         rows.append({
-            "dataset": dataset, "k": k, "stage": "ball", "stage_index": 1, "tau": t,
+            "dataset": dataset, "k": k, "level": level, "stage": "ball", "stage_index": 1, "tau": t,
             "log10_J": ball_log10_J,
             "log10_J_tau": ball_level["log_J_tau"][t] / _LN10,
             "fpr": rates["fpr"], "fnr": rates["fnr"],
@@ -528,11 +499,11 @@ def ablation_worker(
     quant_radii = filt.all_radiuses
     quant_log10_J = _log10_J(quant_radii, dim)
 
+    quant_predicted_by_tau = filt.query_multi_tau(query_arr, tau_values)
     for t in tau_values:
-        predicted = filt.query(query_arr, tau=t)
-        rates = _confusion_rates(predicted, actual_by_tau[t])
+        rates = _confusion_rates(quant_predicted_by_tau[t], actual_by_tau[t])
         rows.append({
-            "dataset": dataset, "k": k, "stage": "quantizing", "stage_index": 2, "tau": t,
+            "dataset": dataset, "k": k, "level": level, "stage": "quantizing", "stage_index": 2, "tau": t,
             "log10_J": quant_log10_J,
             "log10_J_tau": _log10_J(quant_radii, dim, tau=t),
             "fpr": rates["fpr"], "fnr": rates["fnr"],
@@ -540,10 +511,23 @@ def ablation_worker(
             "n_balls": len(quant_radii), "seed": seed,
         })
 
+    if level == 3 and lower_bound is not None and np.isfinite(lower_bound):
+        bound_log10_J = lower_bound / _LN10
+        for bound_stage in ("ball", "quantizing"):
+            for t in tau_values:
+                rows.append({
+                    "dataset": dataset, "k": k, "level": 0, "stage": bound_stage, "stage_index": 0, "tau": t,
+                    "log10_J": bound_log10_J,
+                    "log10_J_tau": _gonzalez_bound_log10_J_tau(lower_bound, dim, t),
+                    "fpr": 0.0, "fnr": 0.0,
+                    "stage_time_s": 0.0, "cum_time_s": 0.0,
+                    "n_balls": k, "seed": seed,
+                })
+
     bad = [r for r in rows if r["fnr"] != 0]
     if bad:
         raise ValueError(
-            f"Zero-false-negative invariant violated (dataset={dataset}, k={k}, seed={seed}): "
+            f"Zero-false-negative invariant violated (dataset={dataset}, k={k}, level={level}, seed={seed}): "
             f"{bad[:3]}"
         )
 
@@ -994,7 +978,6 @@ def stream_rebuild_worker(
 _WORKER_FNS: Dict[str, Any] = {
     'static':  static_worker,
     'dynamic': dynamic_worker,
-    'tradeoff': tradeoff_worker,
     'system':  system_worker,
     'system_tau': system_tau_worker,
     'ablation': ablation_worker,
