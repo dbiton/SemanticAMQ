@@ -3,12 +3,13 @@ import os
 
 import faiss
 import time
+import inspect
 import numpy as np
 import pandas as pd
 
 from lsh import FaissSimHashLSH, LSH, DummyLSH
 from runner import Runner
-from plots.legacy import plot_results, plot_throughput_results, plot_tradeoff_results, plot_equal_memory_results
+from plots.legacy import plot_results, plot_throughput_results, load_tradeoff_results, plot_tradeoff_results, plot_equal_memory_results
 from plots.plot_ablation import generate_ablation_figures
 from plots.plot_query_performance import generate_query_performance_figures
 from plots.plot_equal_memory import generate_equal_memory_figures
@@ -135,22 +136,31 @@ def calculate_nn_distance_threshold(
     return float(np.percentile(nn_dist, percentage))
 
 
-def compute_actual_results(vectors: np.ndarray, distance_threshold: float) -> list[bool]:
+def compute_dynamic_actual_results(vectors: np.ndarray, distance_threshold: float) -> list[bool]:
     """
     Online ground-truth: the first vector is unique; each subsequent vector is a
     duplicate if it falls within `distance_threshold` of any previously accepted
     unique vector, otherwise it joins the reference set.
     """
-    actual   = [False]
-    ref_set  = [vectors[0]]
+    vectors = np.ascontiguousarray(vectors, dtype=np.float32)
 
-    for v in vectors[1:]:
-        ref_array = np.array(ref_set)
-        distances = np.sqrt(np.sum((ref_array - v) ** 2, axis=1))
-        is_dup    = bool(np.any(distances <= distance_threshold))
+    actual = [False]
+    thresh_sq = distance_threshold ** 2
+
+    index = faiss.IndexFlatL2(vectors.shape[1])
+    index.add(vectors[0:1])
+
+    for i in range(1, len(vectors)):
+        v = vectors[i:i+1]
+
+        # find the single nearest accepted vector
+        nn_sq_dist, _ = index.search(v, 1)
+
+        # check if the closest vector is within the threshold
+        is_dup = bool(nn_sq_dist[0, 0] <= thresh_sq)
         actual.append(is_dup)
         if not is_dup:
-            ref_set.append(v)
+            index.add(v)
 
     return actual
 
@@ -1113,7 +1123,7 @@ def generate_dynamic() -> list:
 
     for percentage in np.linspace(min_percentage_duplicates, max_percentage_duplicates, count_steps):
         distance_threshold = calculate_distance_threshold(vectors, percentage)
-        actual_results = compute_actual_results(vectors, distance_threshold)[num_construct:]
+        actual_results = compute_dynamic_actual_results(vectors, distance_threshold)[num_construct:]
         for memory_budget in memory_budgets:
             for filter_cls in dynamic_filters:
                 runner.submit(
@@ -1134,120 +1144,209 @@ def plot_dynamic(results: list) -> None:
     plot_results(results, "dynamic")
 
 
-def generate_tradeoff() -> Tuple[List, List]:
+def generate_tradeoff_static() -> Tuple[List, List]:
+    """
+    A function that orchestrates the tradeoff benchmarking pipeline by generating static ground truth 
+    and evaluating filter performance across varying memory and sphere constraints. It supports 
+    routing between real-world embeddings and synthetic datasets, and optionally stress-tests 
+    generalization robustness using synthetically generated random queries.
+    """
     num_vectors = 100_000
     dim = 384
     max_L = 256
     percentage_construct = 10
-    target_percentile = 0.2
+    distance_threshold = 0.2
     dataset = DATASET
     random_test = False
+    synthetic_test = False
 
-    # load dataset arrays for ground-truth processing
-    vectors = load_embeds(dataset, num_vectors)[0]
+    # calculate number of vectors for construct and query based on given percentage
     num_construct = num_vectors * percentage_construct // 100
-    vectors_construct = vectors[:num_construct]
-    vectors_query = vectors[num_construct:]
+    num_query = num_vectors - num_construct
 
-    # create construct and query vector objects for workers
-    construct_source = VectorSource(dataset, 0, num_construct)
-    query_source = VectorSource(dataset, num_construct, num_vectors)
-
-    # calculate constant reference distance threshold
-    print(f"Pre-calculating evaluation distance baselines at {target_percentile}%...")
-    distance_threshold = calculate_distance_threshold(vectors, target_percentile)
-
-    # means we run test with randomly generated queires for testing generalization
-    if random_test:
-        print("\nPreparing Generalization Test (Random Vectors)...")
-        # generate random samples from a uniform distribution and normalize them for dataset consistency
-        random_queries = np.random.uniform(low=np.min(vectors), high=np.max(vectors), size=(len(vectors_query), dim)).astype(np.float32)
-        random_queries_norms = np.linalg.norm(random_queries, axis=1, keepdims=True)
-        random_queries = random_queries / np.where(random_queries_norms == 0, 1e-10, random_queries_norms)
-
-        print("Calculating actual results for random queries...")
-        actual_results = compute_static_actual_results(vectors_construct, random_queries, distance_threshold)
-        query_source = ArrayVectorSource("random_queries", array=random_queries)
-
-    # else we run the original dataset queries provided
+    # if we are using synthetic dataset, load it using our saved dataset keys
+    if synthetic_test:
+        print(f"Loading synthetic dataset from '{dataset}' using targeted keys...")
+        # create construct and query vector objects for workers
+        construct_vectors = VectorSource(dataset, 0, num_construct, dataset_key="construct_vectors")
+        query_vectors = VectorSource(dataset, 0, num_query, dataset_key="query_vectors")
+    
+    # else we load regular real dataset, use regular api
     else:
-        # compute static filter resuls
-        print("Calculating actual results for test queries...")
-        actual_results = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
+        print(f"Loading real-world embeddings from dataset: '{dataset}'...")
+        # create construct and query vector objects for workers
+        construct_vectors = VectorSource(dataset, 0, num_construct)
+        query_vectors = VectorSource(dataset, num_construct, num_vectors)
+
+        # means we run test with randomly generated queires for testing generalization
+        if random_test:
+            print("\nPreparing Generalization Test (Random Vectors)...")
+            # generate random samples from a uniform distribution and normalize them for dataset consistency
+            all_vectors = np.vstack((construct_vectors.to_array(), query_vectors.to_array()))
+            random_queries = np.random.uniform(low=np.min(all_vectors), high=np.max(all_vectors), size=(num_query, dim)).astype(np.float32)
+            random_queries_norms = np.linalg.norm(random_queries, axis=1, keepdims=True)
+            random_queries = random_queries / np.where(random_queries_norms == 0, 1e-10, random_queries_norms)
+            query_vectors = ArrayVectorSource("random_queries", array=random_queries)
+
+    # compute actual labels for query vectors for workers
+    print("Calculating actual results for test queries...")
+    actual_results = compute_static_actual_results(construct_vectors.to_array(), query_vectors.to_array(), distance_threshold)
 
     runner = Runner(num_workers=MAX_WORKERS)
 
     # EXPERIMENT 1: Evaluate Geometric Filter Performance
     # Tests how the number of spheres (spatial partitioning) impacts 
     # search accuracy and speed for ball-based filters.
-    sphere_sizes = [5, 10, 20, 40, 80, 160, 320, 640, 1280, 2560, 5120, 10240]
-    sphere_sizes = [s for s in sphere_sizes if s < len(vectors_construct)] + [len(vectors_construct)]
-    sphere_filters = [KDBallFilter, KMEBFilter]
+    num_spheres = [5, 10, 20, 40, 80, 160, 320, 640, 1000, 1500, 2000, 2300, 2600, 2900, 3200, 3600,
+                    4000, 4400, 4800, 5300, 5800, 6000, 6300, 6800, 7400, 8000, 8700, 9000, 9700, 10000]
+    num_spheres = [s for s in num_spheres if s < num_construct] + [num_construct]
+    geometric_filters = [f for f in dynamic_filters + static_filters if 'max_spheres' in inspect.signature(f.__init__).parameters]
 
-    for size in sphere_sizes:
-        for filter_cls in sphere_filters:
+    for size in num_spheres:
+        for filter_cls in geometric_filters:
             runner.submit(
-                'tradeoff',
-                filter_cls=filter_cls,
-                lsh_cls=FaissSimHashLSH,
-                dim=dim,
-                distance_threshold=distance_threshold,
-                max_L=max_L,
-                vectors_construct=construct_source,
-                vectors_query=query_source,
-                actual_results=actual_results,
-                max_spheres=size,
-                memory_budget=None
+                'tradeoff_static', filter_cls=filter_cls, lsh_cls=DummyLSH,
+                dim=dim, distance_threshold=distance_threshold, max_L=max_L,
+                vectors_construct=construct_vectors, vectors_query=query_vectors,
+                actual_results=actual_results, max_spheres=size, memory_budget=None
             )
 
-    print("\nExecuting sphere evaluation...")
+    print("\nExecuting sphere size evaluation...")
     raw_sphere_results = runner.run()
     sphere_results = [r for r in raw_sphere_results if r is not None]
     runner.clear() # clear runner jobs
-    print("Sphere evaluation completed.")
+    print("Sphere size evaluation completed.")
 
     # EXPERIMENT 2: Benchmark Resource Efficiency
     # Compares all available filter strategies under strict memory limits 
     # to identify which methods perform best when storage is constrained.
-    memory_budgets = [500*1024, 1*1024*1024, 2*1024*1024, 4*1024*1024, 8*1024*1024, 16*1024*1024, 32*1024*1024, 64*1024*1024]
+    MB = 1024 * 1024
+    memory_budgets = [int(0.5 * MB), int(0.75 * MB), int(1 * MB), int(1.5 * MB), int(2 * MB), int(3 * MB), int(4.5 * MB), 
+                      int(6.5 * MB), int(9 * MB), int(13 * MB), int(18 * MB), int(26 * MB), int(38 * MB), int(54 * MB), int(64 * MB)]
 
     for budget in memory_budgets:
         for filter_cls in static_filters + dynamic_filters:
             runner.submit(
-                'tradeoff',
-                filter_cls=filter_cls,
-                lsh_cls=FaissSimHashLSH,
-                dim=dim,
-                distance_threshold=distance_threshold,
-                max_L=max_L,
-                vectors_construct=construct_source,
-                vectors_query=query_source,
-                actual_results=actual_results,
-                max_spheres=None,
-                memory_budget=budget
+                'tradeoff_static', filter_cls=filter_cls, lsh_cls=DummyLSH,
+                dim=dim, distance_threshold=distance_threshold, max_L=max_L,
+                vectors_construct=construct_vectors, vectors_query=query_vectors,
+                actual_results=actual_results, max_spheres=None, memory_budget=budget
             )
 
     print("\nExecuting memory evaluation...")
     raw_memory_results = runner.run()
     memory_results = [r for r in raw_memory_results if r is not None]
     print("Memory evaluation completed.")
-
-    return sphere_results, memory_results
-
-
-def plot_tradeoff(sphere_results: List, memory_results: List) -> None:
     plot_tradeoff_results(sphere_results, memory_results)
 
-
-def _load_tradeoff() -> Tuple[List, List]:
-    """Reconstructs sphere_results/memory_results from tradeoff_evaluations.csv
-    (written as a side effect of plot_tradeoff -- see legacy.plot_tradeoff_results),
-    splitting back on the 'Mode' column plot_tradeoff_results itself stamps onto
-    each half before concatenating them for that CSV."""
-    df = pd.read_csv("plots/tradeoff/tradeoff_evaluations.csv")
-    sphere_results = df[df["Mode"] == "sphere_test"].to_dict("records")
-    memory_results = df[df["Mode"] == "memory_test"].to_dict("records")
     return sphere_results, memory_results
+
+
+def plot_tradeoff_static(sphere_results: List, memory_results: List) -> None:
+    plot_tradeoff_results(sphere_results, memory_results, folder="plots/tradeoff_static")
+
+
+def generate_tradeoff_dynamic() -> Tuple[List, List]:
+    """
+    A function that orchestrates the tradeoff benchmarking pipeline by generating dynamic ground truth 
+    and evaluating filter performance across varying memory and sphere constraints. It supports 
+    routing between real-world embeddings and synthetic datasets, and optionally stress-tests 
+    generalization robustness using synthetically generated random queries.
+    """
+    num_vectors = 100_000
+    dim = 384
+    max_L = 256
+    percentage_construct = 10
+    distance_threshold = 0.2
+    dataset = DATASET
+    random_test = False
+    synthetic_test = False
+
+    # calculate number of vectors for construct and query based on given percentage
+    num_construct = num_vectors * percentage_construct // 100
+    num_query = num_vectors - num_construct
+
+    # if we are using synthetic dataset, load it using our saved dataset keys
+    if synthetic_test:
+        print(f"Loading synthetic dataset from '{dataset}' using targeted keys...")
+        # create construct and query vector objects for workers
+        construct_vectors = VectorSource(dataset, 0, num_construct, dataset_key="construct_vectors")
+        query_vectors = VectorSource(dataset, 0, num_query, dataset_key="query_vectors")
+    
+    # else we load regular real dataset, use regular api
+    else:
+        print(f"Loading real-world embeddings from dataset: '{dataset}'...")
+        # create construct and query vector objects for workers
+        construct_vectors = VectorSource(dataset, 0, num_construct)
+        query_vectors = VectorSource(dataset, num_construct, num_vectors)
+
+        # means we run test with randomly generated queires for testing generalization
+        if random_test:
+            print("\nPreparing Generalization Test (Random Vectors)...")
+            # generate random samples from a uniform distribution and normalize them for dataset consistency
+            all_vectors = np.vstack((construct_vectors.to_array(), query_vectors.to_array()))
+            random_queries = np.random.uniform(low=np.min(all_vectors), high=np.max(all_vectors), size=(num_query, dim)).astype(np.float32)
+            random_queries_norms = np.linalg.norm(random_queries, axis=1, keepdims=True)
+            random_queries = random_queries / np.where(random_queries_norms == 0, 1e-10, random_queries_norms)
+            query_vectors = ArrayVectorSource("random_queries", array=random_queries)
+
+    # compute actual labels for query vectors for workers
+    print("Calculating actual results for test queries...")
+    all_vectors = np.vstack((construct_vectors.to_array(), query_vectors.to_array()))
+    actual_results = compute_dynamic_actual_results(all_vectors, distance_threshold)[num_construct:]
+
+    runner = Runner(num_workers=MAX_WORKERS)
+
+    # EXPERIMENT 1: Evaluate Geometric Filter Performance
+    # Tests how the number of spheres (spatial partitioning) impacts 
+    # search accuracy and speed for ball-based filters.
+    num_spheres = [5, 10, 20, 40, 80, 160, 320, 640, 1000, 1500, 2000, 2300, 2600, 2900, 3200, 3600,
+                    4000, 4400, 4800, 5300, 5800, 6000, 6300, 6800, 7400, 8000, 8700, 9000, 9700, 10000]
+    num_spheres = [s for s in num_spheres if s < num_construct] + [num_construct]
+    geometric_filters = [f for f in dynamic_filters + static_filters if 'max_spheres' in inspect.signature(f.__init__).parameters]
+
+    for size in num_spheres:
+        for filter_cls in geometric_filters:
+            runner.submit(
+                'tradeoff_dynamic', filter_cls=filter_cls, lsh_cls=DummyLSH,
+                dim=dim, distance_threshold=distance_threshold, max_L=max_L,
+                vectors_construct=construct_vectors, vectors_query=query_vectors,
+                actual_results=actual_results, max_spheres=size, memory_budget=None
+            )
+
+    print("\nExecuting sphere size evaluation...")
+    raw_sphere_results = runner.run()
+    sphere_results = [r for r in raw_sphere_results if r is not None]
+    runner.clear() # clear runner jobs
+    print("Spheres size evaluation completed.")
+
+    # EXPERIMENT 2: Benchmark Resource Efficiency
+    # Compares all available filter strategies under strict memory limits 
+    # to identify which methods perform best when storage is constrained.
+    MB = 1024 * 1024
+    memory_budgets = [int(0.5 * MB), int(0.75 * MB), int(1 * MB), int(1.5 * MB), int(2 * MB), int(3 * MB), int(4.5 * MB), 
+                      int(6.5 * MB), int(9 * MB), int(13 * MB), int(18 * MB), int(26 * MB), int(38 * MB), int(54 * MB), int(64 * MB)]
+
+    for budget in memory_budgets:
+        for filter_cls in dynamic_filters:
+            runner.submit(
+                'tradeoff_dynamic', filter_cls=filter_cls, lsh_cls=DummyLSH,
+                dim=dim, distance_threshold=distance_threshold, max_L=max_L,
+                vectors_construct=construct_vectors, vectors_query=query_vectors,
+                actual_results=actual_results, max_spheres=None, memory_budget=budget
+            )
+
+    print("\nExecuting memory evaluation...")
+    raw_memory_results = runner.run()
+    memory_results = [r for r in raw_memory_results if r is not None]
+    print("Memory evaluation completed.")
+    plot_tradeoff_results(sphere_results, memory_results, folder="plots/tradeoff_dynamic")
+
+    return sphere_results, memory_results
+
+
+def plot_tradeoff_dynamic(sphere_results: List, memory_results: List) -> None:
+    plot_tradeoff_results(sphere_results, memory_results, folder="plots/tradeoff_dynamic")
 
 
 def generate_and_plot_all() -> None:
@@ -1269,7 +1368,7 @@ def generate_and_plot_all() -> None:
     return
     try:
         pass
-        #plot_tradeoff(*generate_tradeoff())
+        #plot_tradeoff_static(*generate_tradeoff_static())
     except Exception as e:
         print(f"An error occurred: {e}")
 
@@ -1307,7 +1406,8 @@ def plot_all() -> None:
     generate_X + plot_X) run to have produced those files.
     """
     try:
-        plot_tradeoff(*_load_tradeoff())
+        sphere, memory = load_tradeoff_results(folder="plots/tradeoff_static")
+        plot_tradeoff_static(sphere, memory)
     except Exception as e:
         print(f"An error occurred: {e}")
 
@@ -1346,6 +1446,12 @@ def plot_all() -> None:
         k_fixed = int(df.loc[df["sweep"] == "position", "k"].iloc[0])
         b_representative = int(df.loc[(df["sweep"] == "position") & (df["method"] == "M5"), "b"].dropna().iloc[0])
         plot_streaming(df, k_fixed=k_fixed, b_representative=b_representative)
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+    try:
+        sphere, memory = load_tradeoff_results(folder="plots/tradeoff_dynamic")
+        plot_tradeoff_dynamic(sphere, memory)
     except Exception as e:
         print(f"An error occurred: {e}")
 

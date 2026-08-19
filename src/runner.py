@@ -8,6 +8,7 @@ import faiss
 import numpy as np
 import pandas as pd
 import time
+import inspect
 
 from scipy.special import logsumexp
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
@@ -93,20 +94,14 @@ def _radius_stats(filter_instance: Any) -> Dict[str, float]:
     }
 
 
-_DIRECT_TAU_FILTERS = {
-    "FirstNFilter", "BallCoverFilter",
-    "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", "DSHFilter", "HNSWFilter",
-}
-
-
 def _instantiate_filter(filter_cls: Any, dim: int, lsh: Any, memory_budget: int, distance_threshold: float = None, max_spheres: int = None) -> Any:
-    if filter_cls.__name__ not in _DIRECT_TAU_FILTERS:
+    if 'max_spheres' in inspect.signature(filter_cls.__init__).parameters:
+        return filter_cls(dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold, max_spheres=max_spheres)
+    else:
         try:
             return filter_cls(dim=dim, lsh=lsh, max_memory=memory_budget)
         except TypeError:
             return filter_cls(dim=dim, lsh=lsh)
-    else:
-        return filter_cls(dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold, max_spheres=max_spheres)
 
 
 def static_worker(
@@ -388,8 +383,18 @@ def _compute_tradeoff_metrics(
     construct_time: float,
     qps: float
 ) -> Dict[str, Any]:
-    tp, fp, fn, tn = _binary_confusion(predicted, actual)
-    precision, recall, f1 = _precision_recall_f1(predicted, actual)
+    """
+    function for computing memory and sphere tradeoff metrics
+    """
+    tp = sum(1 for p, a in zip(predicted, actual) if p and a)
+    fp = sum(1 for p, a in zip(predicted, actual) if p and not a)
+    fn = sum(1 for p, a in zip(predicted, actual) if not p and a)
+    tn = sum(1 for p, a in zip(predicted, actual) if not p and not a)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
     return {
         "Config": config,
         "NumSpheres": max_spheres if max_spheres is not None else 0,
@@ -405,7 +410,7 @@ def _compute_tradeoff_metrics(
     }
 
 
-def tradeoff_worker(
+def tradeoff_static_worker(
     filter_cls: Any,
     lsh_cls: Any,
     dim: int,
@@ -417,21 +422,75 @@ def tradeoff_worker(
     max_spheres: int = None,
     memory_budget: int = None
 ) -> Dict[str, Any]:
+    """
+    Function for executing a single benchmarking trial of a static filter,
+    constructing the filter once from the full dataset and measuring
+    construction time, memory usage, query throughput, and accuracy metrics.
+    """
     try:
         config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
         lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
         vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
 
-        construct_start = time.perf_counter()
+        construct_start = time.perf_counter() # start construct timer
         filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold, max_spheres)
         filter_instance.construct(vectors_construct)
-        construct_latency = time.perf_counter() - construct_start
+        construct_latency = time.perf_counter() - construct_start # final construct time
 
-        query_start = time.perf_counter()
+        query_start = time.perf_counter() # start qps timer
+        # stream the query set in bounded blocks for efficiency
         predicted: List[bool] = []
         for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
             predicted.extend(filter_instance.query(block))
-        query_latency = time.perf_counter() - query_start
+        query_latency = time.perf_counter() - query_start # final qps timer
+
+        qps = len(vectors_query) / max(query_latency, 1e-9)
+        memory_usage = filter_instance.get_bytesize()
+
+    except Exception as e:
+        print(f"  [Skipped] {config} failed: {e}")
+        return None
+
+    return _compute_tradeoff_metrics(predicted, actual_results, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
+
+
+def tradeoff_dynamic_worker(
+    filter_cls: Any,
+    lsh_cls: Any,
+    dim: int,
+    distance_threshold: float,
+    max_L: int,
+    vectors_construct: np.ndarray,
+    vectors_query: np.ndarray,
+    actual_results: List[bool],
+    max_spheres: int = None,
+    memory_budget: int = None
+) -> Dict[str, Any]:
+    """
+    Function for executing a single benchmarking trial of a dynamic filter,
+    where vectors are inserted incrementally while measuring insertion time,
+    memory usage, query throughput, and accuracy metrics.
+    """
+    try:
+        config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
+        lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
+        vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
+
+        construct_start = time.perf_counter() # start construct timer
+        filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold, max_spheres)
+        filter_instance.construct(vectors_construct)
+        construct_latency = time.perf_counter() - construct_start # final construct time
+
+        query_start = time.perf_counter() # start throughput timer
+        predicted: List[bool] = []
+        for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
+            block_preds = filter_instance.query(block)
+            predicted.extend(block_preds)
+
+            misses = [block[i] for i, is_dup in enumerate(block_preds) if not is_dup]
+            if misses:
+                filter_instance.insert(np.array(misses, dtype=np.float32))
+        query_latency = time.perf_counter() - query_start # final throughput timer
 
         qps = len(vectors_query) / max(query_latency, 1e-9)
         memory_usage = filter_instance.get_bytesize()
@@ -994,7 +1053,8 @@ def stream_rebuild_worker(
 _WORKER_FNS: Dict[str, Any] = {
     'static':  static_worker,
     'dynamic': dynamic_worker,
-    'tradeoff': tradeoff_worker,
+    'tradeoff_static': tradeoff_static_worker,
+    'tradeoff_dynamic': tradeoff_dynamic_worker,
     'system':  system_worker,
     'system_tau': system_tau_worker,
     'ablation': ablation_worker,
