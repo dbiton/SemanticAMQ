@@ -1,10 +1,7 @@
-import time
-from typing import List, Tuple, Optional, Dict, Any
-
-import faiss
+import sys, heapq, time
 import numpy as np
-from scipy.special import logsumexp
-
+import faiss
+from typing import List, Tuple, Optional, Dict, Any
 from filters.filter import Filter
 from filters import ball_geometry
 from hyperspheres_volume import estimate_hypersphere_volume
@@ -47,14 +44,15 @@ class BallCoverFilter(Filter):
         directly by the same geometric objective the construction ladder
         itself minimizes.
 
-    Streaming updates (`add`/`insert`) insert a zero-radius singleton ball and,
-    if that exceeds `max_spheres`, merge the pair whose combined footprint
-    grows least (in log-space, since r^d overflows/underflows float64 well
-    inside float32's dynamic range at d ~ 384). An incremental sign/log-
-    magnitude cost cache means only the merged ball's row/column needs
-    recomputing per insertion, not the full k^2 pair matrix.
+    Streaming updates (`add`/`insert`) evaluate incoming vectors and create new
+    spheres with radius `distance_threshold` for uncovered points. If the sphere
+    count exceeds `max_spheres`, the filter iteratively merges candidate pairs from
+    a minimal-pair min-heap. Volume growth is evaluated in log-space to prevent
+    float64 overflow/underflow at high dimensions. To avoid full neighbor search, 
+    candidate merges are restricted to nearest neighbors (`_MAX_NEIGHBORS`), and obsolete 
+    heap entries are lazily invalidated via a per-sphere version array (`_sphere_versions`).
 
-    Storage: centers/radii/counts live in a single preallocated buffer
+    Storage: centers/radii live in a single preallocated buffer
     (capacity grows by amortized doubling up to max_spheres), so add()/
     remove() never reallocate or copy the whole structure. `get_bytesize()`
     covers only that buffer (using the compressed per-vector size once
@@ -64,6 +62,9 @@ class BallCoverFilter(Filter):
     """
 
     _BYTES_PER_FLOAT32 = 4
+    _BYTES_PER_FLOAT64 = 8
+    _MAX_NEIGHBORS = 50
+    _BATCH_SIZE = 2048
     _MEB_CORESET_ITERATIONS = 30
     _MEB_REFINE_ITERATIONS = 200
     _LLOYD_ITERATIONS = 10
@@ -71,40 +72,34 @@ class BallCoverFilter(Filter):
     _KMEANS2_ITERATIONS = 10
     _CHUNK_SIZE = 20_000
     _LOG_J_EPS = 1e-9
-    _RADIUS_SAFETY_REL = 1e-6
-    _RADIUS_SAFETY_ABS = 1e-6
     _DEFAULT_SEED = 42
     _DEFAULT_COMPLEXITY = 2
     _LEVEL_NAMES = {1: "initial_cover", 2: "ball_refine"}
     _LN10 = float(np.log(10.0))
-    # Candidate FAISS ScalarQuantizer types tried by quantize_centers(), coarsest
-    # last -- see _apply_quantization for how the winner is picked.
     _QUANTIZER_CANDIDATES = ("QT_fp16", "QT_8bit", "QT_6bit", "QT_4bit")
-    MERGE_CRITERIA = ("log_space", "r_pow_d", "sum_radii", "min_radius_increase")
 
     def __init__(self, dim: int, distance_threshold: float, max_memory: Optional[int] = None,
                  max_spheres: Optional[int] = None, seed: int = _DEFAULT_SEED,
-                 merge_criterion: str = "log_space", quantize: bool = False,
-                 quantizer_candidates: Optional[Tuple[str, ...]] = None):
+                 quantize: bool = False, quantizer_candidates: Optional[Tuple[str, ...]] = None):
         super().__init__(dim, lsh=None, max_memory=max_memory)
         self.distance_threshold = distance_threshold
         self.max_spheres = (max_spheres if max_spheres is not None
                             else self._calculate_max_spheres(self.max_memory))
         self._seed = seed
-        if merge_criterion not in self.MERGE_CRITERIA:
-            raise ValueError(f"Unknown merge_criterion {merge_criterion!r}; expected one of {self.MERGE_CRITERIA}")
-        self.merge_criterion = merge_criterion
         self._constructed = False
         self._complexity_level = self._DEFAULT_COMPLEXITY
 
-        self._center_buf = np.empty((0, dim), dtype=np.float32)
-        self._radius_buf = np.empty((0,), dtype=np.float32)
-        self._count_buf = np.empty((0,), dtype=np.int32)
-        self._capacity = 0
-        self._size = 0
+        # main filter sphere buffers
+        self._num_spheres = 0
+        self._all_spheres = np.arange(self.max_spheres, dtype=np.int32)
+        self._all_centers = np.empty((self.max_spheres, dim), dtype=np.float32)
+        self._all_radiuses = np.empty((self.max_spheres,), dtype=np.float32)
 
-        # construction state (vectors + assignment), retained only when
-        # explicitly requested (needed by quantize_centers()'s rebuild path)
+        # streaming merge data structures, minimal pair heap and sphere version array
+        self._sphere_versions = np.zeros((self.max_spheres,), dtype=np.int32)
+        self._minimal_pairs: List[Tuple[float, int, int, int, int]] = []
+
+        # construction state
         self._retain_assignments = False
         self._X: Optional[np.ndarray] = None
         self._assignment: Optional[np.ndarray] = None
@@ -116,29 +111,21 @@ class BallCoverFilter(Filter):
         self._quantizer_name: Optional[str] = None
         self._quantizer_bytes_per_vector: Optional[int] = None
         self._quantizer_stats: Optional[Dict[str, Any]] = None
-
-        # instrumentation
         self._stage_stats: List[Dict[str, Any]] = []
-
-        # incremental merge-cost cache for streaming add()
-        self._merge_bucket: Optional[np.ndarray] = None
-        self._merge_key: Optional[np.ndarray] = None
-        self._merge_cache_valid = False
-        self._merge_cache_size = 0
 
     # ------------------------------------------------------------------ properties
 
     @property
     def all_spheres(self) -> np.ndarray:
-        return self._center_buf[:self._size]
+        return self._all_spheres[:self._num_spheres]
+
+    @property
+    def all_centers(self) -> np.ndarray:
+        return self._all_centers[self.all_spheres]
 
     @property
     def all_radiuses(self) -> np.ndarray:
-        return self._radius_buf[:self._size]
-
-    @property
-    def sphere_counts(self) -> np.ndarray:
-        return self._count_buf[:self._size]
+        return self._all_radiuses[self.all_spheres]
 
     # ------------------------------------------------------------------ complexity policy
 
@@ -152,174 +139,53 @@ class BallCoverFilter(Filter):
     # ------------------------------------------------------------------ sizing / buffers
 
     def _calculate_max_spheres(self, max_memory: int, gamma: float = 4.0) -> int:
-        bytes_per_sphere = (self.dim + 1) * self._BYTES_PER_FLOAT32
+        bytes_per_sphere = (self.dim + 2) * self._BYTES_PER_FLOAT32
         return max(1, int(max_memory // (bytes_per_sphere * gamma)))
 
-    def _reset_buffers(self, capacity: int) -> None:
-        self._center_buf = np.empty((capacity, self.dim), dtype=np.float32)
-        self._radius_buf = np.empty(capacity, dtype=np.float32)
-        self._count_buf = np.empty(capacity, dtype=np.int32)
-        self._capacity = capacity
-        self._size = 0
-        self._merge_bucket = None
-        self._merge_key = None
-        self._merge_cache_valid = False
-        self._merge_cache_size = 0
-
-    def _grow_capacity(self) -> None:
-        # Allowed to grow one past max_spheres: add() always inserts a singleton
-        # first and only then merges the cheapest pair back down to max_spheres,
-        # so a transient k+1 must fit.
-        hard_cap = self.max_spheres + 1
-        new_capacity = min(hard_cap, max(self._capacity * 2, self._capacity + 1))
-        if new_capacity <= self._capacity:
+    def _ensure_capacity(self, required_cap: int) -> None:
+        current_cap = len(self._all_centers)
+        if required_cap <= current_cap:
             return
-        center_buf = np.empty((new_capacity, self.dim), dtype=np.float32)
-        radius_buf = np.empty(new_capacity, dtype=np.float32)
-        count_buf = np.empty(new_capacity, dtype=np.int32)
-        center_buf[:self._size] = self._center_buf[:self._size]
-        radius_buf[:self._size] = self._radius_buf[:self._size]
-        count_buf[:self._size] = self._count_buf[:self._size]
-        self._center_buf, self._radius_buf, self._count_buf = center_buf, radius_buf, count_buf
-        if self._merge_bucket is not None:
-            merge_bucket = np.full((new_capacity, new_capacity), 2, dtype=np.int8)
-            merge_key = np.full((new_capacity, new_capacity), np.inf, dtype=np.float64)
-            merge_bucket[:self._capacity, :self._capacity] = self._merge_bucket
-            merge_key[:self._capacity, :self._capacity] = self._merge_key
-            self._merge_bucket, self._merge_key = merge_bucket, merge_key
-        self._capacity = new_capacity
 
-    def _append_sphere(self, center: np.ndarray, radius: float, count: int) -> None:
-        if self._size == self._capacity:
-            self._grow_capacity()
-            if self._size == self._capacity:
-                return  # at hard capacity already, nothing to grow into
-        self._center_buf[self._size] = center
-        self._radius_buf[self._size] = radius
-        self._count_buf[self._size] = count
-        self._size += 1
+        new_cap = max(current_cap * 2, required_cap)
+        new_spheres = np.empty((new_cap,), dtype=np.int32)
+        new_spheres[:current_cap] = self._all_spheres
+        new_spheres[current_cap:] = np.arange(current_cap, new_cap, dtype=np.int32)
+        self._all_spheres = new_spheres
 
-    def _compact(self) -> None:
-        """Swap out zero-count spheres against the tail, in place."""
-        i = 0
-        n = self._size
-        while i < n:
-            if self._count_buf[i] == 0:
-                n -= 1
-                if i != n:
-                    self._center_buf[i] = self._center_buf[n]
-                    self._radius_buf[i] = self._radius_buf[n]
-                    self._count_buf[i] = self._count_buf[n]
-            else:
-                i += 1
-        self._size = n
-        self._merge_cache_valid = False
+        new_centers = np.empty((new_cap, self.dim), dtype=np.float32)
+        new_centers[:current_cap] = self._all_centers
+        self._all_centers = new_centers
+
+        new_radiuses = np.empty((new_cap,), dtype=np.float32)
+        new_radiuses[:current_cap] = self._all_radiuses
+        self._all_radiuses = new_radiuses
+
+        new_versions = np.zeros(new_cap, dtype=np.int32)
+        new_versions[:current_cap] = self._sphere_versions
+        self._sphere_versions = new_versions
+
+    def _get_new_index(self) -> int:
+        if self._num_spheres == len(self._all_centers):
+            self._ensure_capacity(len(self._all_centers) * 2)
+        return self._all_spheres[self._num_spheres]
+
+    def _reset_buffers(self, capacity: int) -> None:
+        self._ensure_capacity(capacity)
+        self._num_spheres = 0
+        self._minimal_pairs = []
+        self._sphere_versions.fill(0)
 
     # ------------------------------------------------------------------ numerics (log-space)
 
     def _safe_radius(self, r: float) -> float:
-        """
-        Inflate a freshly computed radius by a tiny margin before it is cast to
-        float32 for storage. Query-time containment is tested with the "expand"
-        distance formula (||x||^2 - 2 x.c + ||c||^2, needed for BLAS-batched n x k
-        matmuls), which suffers catastrophic cancellation for points close to
-        their center -- so a radius computed via a direct sqrt(sum((x-c)^2)) can
-        come out a few ULPs *larger* than what the expand formula later measures
-        for that exact same point, silently breaking the zero-false-negative
-        invariant at tau=0. This margin is many orders of magnitude below any
-        realistic distance_threshold, so it never affects observable recall.
-        """
-        r = float(r)
-        return r * (1.0 + self._RADIUS_SAFETY_REL) + self._RADIUS_SAFETY_ABS
+        return ball_geometry.safe_radius(r)
 
     def _log_J(self, radii: np.ndarray) -> float:
-        """log sum_i r_i^d, safe for d ~ hundreds where r^d over/underflows float64."""
         return ball_geometry.log_J(radii, self.dim)
 
     def _log_J_tau(self, radii: np.ndarray, tau: float) -> float:
         return ball_geometry.log_J_tau(radii, self.dim, tau)
-
-    def _pairwise_merge_keys(self, ci: np.ndarray, ri: np.ndarray,
-                             cj: np.ndarray, rj: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Vectorized (bucket, key, merged_radius) for merging ball(s) (ci, ri) with
-        ball(s) (cj, rj). bucket 0 = beneficial merge (cost < 0), key ascending
-        = most beneficial first; bucket 1 = neutral/harmful, key ascending =
-        least harmful first. Cost function is pluggable via self.merge_criterion
-        (see MERGE_CRITERIA and the _merge_cost_* helpers below); geometry
-        (r_merged) is identical across criteria.
-        """
-        diff = ci - cj
-        delta = np.sqrt(np.maximum(np.sum(diff * diff, axis=-1), 0.0))
-        contain_j_in_i = delta + rj <= ri
-        contain_i_in_j = delta + ri <= rj
-        r_general = (delta + ri + rj) / 2.0
-        r_merged = np.where(contain_i_in_j, rj, np.where(contain_j_in_i, ri, r_general))
-
-        if self.merge_criterion == "log_space":
-            bucket, key = self._merge_cost_log_space(ri, rj, r_merged)
-        elif self.merge_criterion == "r_pow_d":
-            bucket, key = self._merge_cost_r_pow_d(ri, rj, r_merged)
-        elif self.merge_criterion == "sum_radii":
-            bucket, key = self._merge_cost_sum_radii(ri, rj, r_merged)
-        elif self.merge_criterion == "min_radius_increase":
-            bucket, key = self._merge_cost_min_radius_increase(ri, rj, r_merged)
-        else:
-            raise ValueError(f"Unknown merge_criterion {self.merge_criterion!r}")
-
-        return bucket, key, r_merged
-
-    def _merge_cost_log_space(self, ri: np.ndarray, rj: np.ndarray,
-                              r_merged: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Delta = M^d * (a_ij - a_i - a_j) with M = max(r_i, r_j, r_ij) and
-        a_x = exp(d * log(r_x / M)) (safe underflow to 0); never materializes r^d."""
-        return ball_geometry.merge_cost_log_space(ri, rj, r_merged, self.dim)
-
-    def _merge_cost_r_pow_d(self, ri: np.ndarray, rj: np.ndarray,
-                            r_merged: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Delta = r_merged^d - r_i^d - r_j^d, computed directly (no log-domain
-        protection) -- overflows to +-inf well within realistic radii at d ~ 384,
-        intentionally, as a naive baseline."""
-        with np.errstate(over='ignore', invalid='ignore'):
-            delta = r_merged ** self.dim - ri ** self.dim - rj ** self.dim
-        delta = np.where(np.isnan(delta), np.inf, delta)
-        sign = np.sign(delta)
-        bucket = np.where(sign < 0, 0, 1).astype(np.int8)
-        key = np.where(sign < 0, -delta, delta)
-        return bucket, key
-
-    def _merge_cost_sum_radii(self, ri: np.ndarray, rj: np.ndarray,
-                              r_merged: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Delta = r_merged - r_i - r_j under the linear objective J = sum r_i."""
-        delta = r_merged - ri - rj
-        sign = np.sign(delta)
-        bucket = np.where(sign < 0, 0, 1).astype(np.int8)
-        key = np.where(sign < 0, -delta, delta)
-        return bucket, key
-
-    def _merge_cost_min_radius_increase(self, ri: np.ndarray, rj: np.ndarray,
-                                        r_merged: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Cost = growth of the merged radius past the larger constituent ball;
-        always >= 0 by construction of r_merged, so bucket is always 1 (never
-        "strictly beneficial") -- smallest growth first."""
-        delta = r_merged - np.maximum(ri, rj)
-        bucket = np.ones_like(delta, dtype=np.int8)
-        key = delta
-        return bucket, key
-
-    def _all_pairs_merge_keys(self, centers: np.ndarray, radii: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        c64 = centers.astype(np.float64)
-        r64 = radii.astype(np.float64)
-        bucket, key, _ = self._pairwise_merge_keys(c64[:, None, :], r64[:, None], c64[None, :, :], r64[None, :])
-        n = len(centers)
-        idx = np.arange(n)
-        bucket[idx, idx] = 2
-        key[idx, idx] = np.inf
-        return bucket, key
-
-    @staticmethod
-    def _merged_ball(ci: np.ndarray, ri: float, cj: np.ndarray, rj: float) -> Tuple[np.ndarray, float]:
-        return ball_geometry.merged_ball(ci, ri, cj, rj)
 
     # ------------------------------------------------------------------ chunked distances
 
@@ -474,14 +340,14 @@ class BallCoverFilter(Filter):
         return center32, self._safe_radius(d.max())
 
     def _log_volume_bounds(self) -> Tuple[float, float]:
-        if self._size == 0:
+        if len(self.all_centers) == 0:
             return -np.inf, -np.inf
-        return estimate_hypersphere_volume(self.all_spheres, self.all_radiuses, return_log=True)
+        return estimate_hypersphere_volume(self.all_centers, self.all_radiuses, return_log=True)
 
     # ------------------------------------------------------------------ level 1: initial cover
 
     def _level1_initial_cover(self, vectors: np.ndarray, sq_norms: np.ndarray,
-                              k: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                              k: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         stop_sq = float(self.distance_threshold) ** 2
         rng = np.random.default_rng(self._seed)
 
@@ -497,7 +363,6 @@ class BallCoverFilter(Filter):
 
         centers_out = np.empty((num_spheres, self.dim), dtype=np.float32)
         radii_out = np.empty(num_spheres, dtype=np.float32)
-        counts_out = np.empty(num_spheres, dtype=np.int32)
         for i, idx in enumerate(groups):
             pts = vectors[idx]
             c32 = pts.mean(axis=0, dtype=np.float64).astype(np.float32)
@@ -505,15 +370,13 @@ class BallCoverFilter(Filter):
             d = np.sqrt(np.maximum(np.einsum('ij,ij->i', pts.astype(np.float64) - c, pts.astype(np.float64) - c), 0.0))
             centers_out[i] = c32
             radii_out[i] = self._safe_radius(d.max())
-            counts_out[i] = len(idx)
 
-        return centers_out, radii_out, counts_out, assignment.astype(np.int32)
+        return centers_out, radii_out, assignment.astype(np.int32)
 
     # ------------------------------------------------------------------ level 2: ball refinement
 
     def _level2_ball_refine(self, vectors: np.ndarray, sq_norms: np.ndarray, centers: np.ndarray,
-                            radii: np.ndarray, counts: np.ndarray,
-                            assignment: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+                            radii: np.ndarray, assignment: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
         prev_log_J = self._log_J(radii)
         accepted = 0
 
@@ -525,22 +388,20 @@ class BallCoverFilter(Filter):
 
             new_centers = np.empty((num_spheres, self.dim), dtype=np.float32)
             new_radii = np.empty(num_spheres, dtype=np.float32)
-            new_counts = np.empty(num_spheres, dtype=np.int32)
             for i, idx in enumerate(groups):
                 c, r = self._minimum_enclosing_ball(vectors[idx], sq_norms[idx])
                 new_centers[i] = c
                 new_radii[i] = r
-                new_counts[i] = len(idx)
 
             new_log_J = self._log_J(new_radii)
             if new_log_J < prev_log_J - self._LOG_J_EPS:
-                centers, radii, counts, assignment = new_centers, new_radii, new_counts, new_assignment.astype(np.int32)
+                centers, radii, assignment = new_centers, new_radii, new_assignment.astype(np.int32)
                 prev_log_J = new_log_J
                 accepted += 1
             else:
                 break
 
-        return centers, radii, counts, assignment, accepted
+        return centers, radii, assignment, accepted
 
     # ------------------------------------------------------------------ instrumentation
 
@@ -579,7 +440,6 @@ class BallCoverFilter(Filter):
 
     def construct(self, vectors: np.ndarray, retain_assignments: bool = False) -> Tuple[float, float]:
         self._stage_stats = []
-        self._merge_cache_valid = False
         self._quantizer_name = None
         self._quantizer_bytes_per_vector = None
         self._quantizer_stats = None
@@ -602,7 +462,7 @@ class BallCoverFilter(Filter):
         sq_norms = np.einsum('ij,ij->i', vectors, vectors, dtype=np.float64)
 
         if self._quantize:
-            centers, radii, counts, assignment, chosen_k, stage_records, quant = \
+            centers, radii, assignment, chosen_k, stage_records, quant = \
                 self._construct_with_quantization(vectors, sq_norms)
             self.max_spheres = chosen_k
             self._stage_stats = stage_records
@@ -611,16 +471,14 @@ class BallCoverFilter(Filter):
                 self._quantizer_bytes_per_vector = quant["bytes_per_vector"]
                 self._quantizer_stats = quant
         else:
-            centers, radii, counts, assignment, stage_records = self._build_cover(
+            centers, radii, assignment, stage_records = self._build_cover(
                 vectors, sq_norms, self.max_spheres)
             self._stage_stats = stage_records
 
         num_spheres = len(centers)
         self._reset_buffers(num_spheres)
-        self._center_buf[:num_spheres] = centers
-        self._radius_buf[:num_spheres] = radii
-        self._count_buf[:num_spheres] = counts
-        self._size = num_spheres
+        for center, radius in zip(centers, radii):
+            self._add_sphere(center, radius)
 
         self._retain_assignments = retain
         self._X = vectors if retain else None
@@ -629,7 +487,7 @@ class BallCoverFilter(Filter):
         return self._log_volume_bounds()
 
     def _build_cover(self, vectors: np.ndarray, sq_norms: np.ndarray,
-                     k: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Dict[str, Any]]]:
+                     k: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Dict[str, Any]]]:
         """
         Run the (up to 2-level) construction ladder for an arbitrary ball
         budget k against already-preprocessed vectors, touching no instance
@@ -647,24 +505,23 @@ class BallCoverFilter(Filter):
         if k >= n:
             centers = vectors.copy()
             radii = np.zeros(n, dtype=np.float32)
-            counts = np.ones(n, dtype=np.int32)
             assignment = np.arange(n, dtype=np.int32)
             for lvl in range(1, levels_to_run + 1):
                 stage_records.append(self._make_stage_record(lvl, self._LEVEL_NAMES[lvl], 0.0, radii, 0))
-            return centers, radii, counts, assignment, stage_records
+            return centers, radii, assignment, stage_records
 
         t0 = time.perf_counter()
-        centers, radii, counts, assignment = self._level1_initial_cover(vectors, sq_norms, k)
+        centers, radii, assignment = self._level1_initial_cover(vectors, sq_norms, k)
         stage_records.append(self._make_stage_record(1, "initial_cover", time.perf_counter() - t0, radii, 0))
 
         if levels_to_run >= 2:
             t0 = time.perf_counter()
-            centers, radii, counts, assignment, accepted = self._level2_ball_refine(
-                vectors, sq_norms, centers, radii, counts, assignment)
+            centers, radii, assignment, accepted = self._level2_ball_refine(
+                vectors, sq_norms, centers, radii, assignment)
             stage_records.append(
                 self._make_stage_record(2, "ball_refine", time.perf_counter() - t0, radii, accepted))
 
-        return centers, radii, counts, assignment, stage_records
+        return centers, radii, assignment, stage_records
 
     # ------------------------------------------------------------------ quantization
 
@@ -700,20 +557,20 @@ class BallCoverFilter(Filter):
         # multiplied out over a much larger ball count.
         bytes_per_sphere_f32 = (self.dim + 2) * self._BYTES_PER_FLOAT32
 
-        centers0, radii0, counts0, assignment0, stages0 = self._build_cover(vectors, sq_norms, budget_k)
+        centers0, radii0, assignment0, stages0 = self._build_cover(vectors, sq_norms, budget_k)
         best = {
             "log10_J": self._log_J(radii0.astype(np.float64)) / self._LN10,
-            "k": budget_k, "centers": centers0, "radii": radii0, "counts": counts0,
+            "k": budget_k, "centers": centers0, "radii": radii0,
             "assignment": assignment0, "stages": stages0, "quant": None,
         }
 
         for name in self._quantizer_candidates:
             qtype = getattr(faiss.ScalarQuantizer, name)
             bytes_per_vector = faiss.ScalarQuantizer(self.dim, qtype).code_size
-            bytes_per_sphere_candidate = bytes_per_vector + 2 * self._BYTES_PER_FLOAT32  # + radius + count
+            bytes_per_sphere_candidate = bytes_per_vector + 2 * self._BYTES_PER_FLOAT32  
             effective_k = max(1, budget_k * bytes_per_sphere_f32 // bytes_per_sphere_candidate)
 
-            centers, radii, counts, assignment, stages = self._build_cover(vectors, sq_norms, effective_k)
+            centers, radii, assignment, stages = self._build_cover(vectors, sq_norms, effective_k)
             centers32 = np.ascontiguousarray(centers, dtype=np.float32)
             radii64 = radii.astype(np.float64)
 
@@ -735,7 +592,7 @@ class BallCoverFilter(Filter):
                     "log10_J": log10_j, "k": effective_k,
                     "centers": decoded.astype(np.float32),
                     "radii": quantized_radii.astype(np.float32),
-                    "counts": counts, "assignment": assignment, "stages": stages,
+                    "assignment": assignment, "stages": stages,
                     "quant": {
                         "quantizer": name, "bytes_per_vector": int(codes.shape[1]),
                         "log10_J": log10_j, "log10_J_unquantized": self._log_J(radii64) / self._LN10,
@@ -744,8 +601,7 @@ class BallCoverFilter(Filter):
                     },
                 }
 
-        return (best["centers"], best["radii"], best["counts"], best["assignment"],
-                best["k"], best["stages"], best["quant"])
+        return (best["centers"], best["radii"], best["assignment"], best["k"], best["stages"], best["quant"])
 
     def _apply_quantization_inplace(self) -> Optional[Dict[str, Any]]:
         """
@@ -758,9 +614,10 @@ class BallCoverFilter(Filter):
         if nothing beats staying float32; see _construct_with_quantization
         for the k-aware version used when the original vectors are on hand.
         """
-        if self._size == 0:
+        if self._num_spheres == 0:
             return None
-        centers = self.all_spheres.astype(np.float32)
+
+        centers = self.all_centers.astype(np.float32)
         radii = self.all_radiuses.astype(np.float64)
         log10_j_plain = self._log_J(radii) / self._LN10
 
@@ -772,6 +629,7 @@ class BallCoverFilter(Filter):
             codes = sq.compute_codes(centers)
             decoded = sq.decode(codes).astype(np.float64)
             error = np.linalg.norm(centers.astype(np.float64) - decoded, axis=1)
+
             log10_j = self._log_J(radii + error) / self._LN10
             if best is None or log10_j < best["log10_J"]:
                 best = {
@@ -784,9 +642,10 @@ class BallCoverFilter(Filter):
         if best is None or log10_j_plain <= best["log10_J"]:
             return None  # unquantized float32 already minimizes volume; leave centers untouched
 
-        self._center_buf[:self._size] = best["decoded"]
-        self._radius_buf[:self._size] = (radii + best["error"]).astype(np.float32)
-        self._merge_cache_valid = False
+        current_spheres = self.all_spheres
+        self._all_centers[current_spheres] = best["decoded"]
+        self._all_radiuses[current_spheres] = (radii + best["error"]).astype(np.float32)
+
         return {
             "quantizer": best["name"],
             "bytes_per_vector": best["bytes_per_vector"],
@@ -813,20 +672,20 @@ class BallCoverFilter(Filter):
         """
         if not self._constructed:
             raise ValueError("BallCoverFilter has not been constructed.")
-        if self._size == 0:
+        if self._num_spheres == 0:
             return None
 
         if self._X is not None and len(self._X) > 0:
             sq_norms = np.einsum('ij,ij->i', self._X, self._X, dtype=np.float64)
-            centers, radii, counts, assignment, chosen_k, stage_records, quant = \
+            centers, radii, assignment, chosen_k, stage_records, quant = \
                 self._construct_with_quantization(self._X, sq_norms)
             self.max_spheres = chosen_k
             num_spheres = len(centers)
             self._reset_buffers(num_spheres)
-            self._center_buf[:num_spheres] = centers
-            self._radius_buf[:num_spheres] = radii
-            self._count_buf[:num_spheres] = counts
-            self._size = num_spheres
+            self._all_centers[:num_spheres] = centers
+            self._all_radiuses[:num_spheres] = radii
+            self._all_spheres[:num_spheres] = np.arange(num_spheres, dtype=np.int32)
+            self._num_spheres = num_spheres
             self._assignment = assignment.astype(np.int32)
             self._stage_stats = stage_records
         else:
@@ -845,12 +704,12 @@ class BallCoverFilter(Filter):
         if tau is None:
             tau = self.distance_threshold
 
-        if self._size == 0 or len(vectors) == 0:
+        if len(self.all_centers) == 0 or len(vectors) == 0:
             return [False] * len(vectors)
 
         q = np.ascontiguousarray(vectors, dtype=np.float32)
         n = len(q)
-        centers = self.all_spheres
+        centers = self.all_centers
         eff_r = self.all_radiuses.astype(np.float64) + float(tau)
         q_sq_norms = np.einsum('ij,ij->i', q, q, dtype=np.float64)
 
@@ -861,132 +720,117 @@ class BallCoverFilter(Filter):
             result[start:end] = np.any(sq_d <= (eff_r[None, :]) ** 2, axis=1)
         return result.tolist()
 
-    # ------------------------------------------------------------------ streaming add/remove
+    # ------------------------------------------------------------------ streaming / dynamic merge
 
-    def _ensure_merge_cache(self) -> None:
-        if self._merge_cache_valid and self._merge_cache_size == self._size:
-            return
-        if self._merge_bucket is None or self._merge_bucket.shape[0] < self._capacity:
-            cap = max(self._capacity, 1)
-            self._merge_bucket = np.full((cap, cap), 2, dtype=np.int8)
-            self._merge_key = np.full((cap, cap), np.inf, dtype=np.float64)
-        n = self._size
-        if n > 0:
-            bucket, key = self._all_pairs_merge_keys(self.all_spheres, self.all_radiuses)
-            self._merge_bucket[:n, :n] = bucket
-            self._merge_key[:n, :n] = key
-        self._merge_cache_valid = True
-        self._merge_cache_size = n
+    def _add_sphere(self, center: np.ndarray, radius: float) -> None:
+        current_spheres = self.all_spheres
 
-    def _merge_cache_recompute_slot(self, idx: int) -> None:
-        """Recompute the row/column of the merge-cost cache for slot `idx` only
-        (O(k*d)), instead of rebuilding the whole k x k matrix."""
-        n = self._size
-        centers = self.all_spheres[:n].astype(np.float64)
-        radii = self.all_radiuses[:n].astype(np.float64)
-        ci = centers[idx]
-        ri = radii[idx]
-        bucket, key, _ = self._pairwise_merge_keys(ci[None, :], ri, centers, radii)
-        bucket[idx] = 2
-        key[idx] = np.inf
-        self._merge_bucket[idx, :n] = bucket
-        self._merge_key[idx, :n] = key
-        self._merge_bucket[:n, idx] = bucket
-        self._merge_key[:n, idx] = key
-        self._merge_bucket[idx, idx] = 2
-        self._merge_key[idx, idx] = np.inf
+        if self._num_spheres > 0:
+            current_centers = self._all_centers[current_spheres]
+            current_radiuses = self._all_radiuses[current_spheres]
+            center_sq = np.einsum('ij,ij->i', center[None, :], center[None, :], dtype=np.float64)
 
-    def _merge_cache_best_pair(self) -> Tuple[int, int]:
-        n = self._size
-        bucket = self._merge_bucket[:n, :n]
-        key = self._merge_key[:n, :n]
-        mask0 = bucket == 0
-        if mask0.any():
-            key_eff = np.where(mask0, key, np.inf)
-        else:
-            key_eff = np.where(bucket == 1, key, np.inf)
-        flat_idx = int(np.argmin(key_eff))
-        i, j = divmod(flat_idx, n)
-        return i, j
+            sq_center_distances = self._sq_dists_to_centers(
+                center[None, :], center_sq, current_centers)[0]
+            center_distances = np.sqrt(np.maximum(sq_center_distances, 0.0))
 
-    def _apply_merge_in_place(self, i: int, j: int) -> None:
-        if i > j:
-            i, j = j, i
-        c_new, r_new = self._merged_ball(self._center_buf[i], float(self._radius_buf[i]),
-                                         self._center_buf[j], float(self._radius_buf[j]))
-        count_new = int(self._count_buf[i]) + int(self._count_buf[j])
-        self._center_buf[i] = c_new.astype(np.float32)
-        self._radius_buf[i] = r_new
-        self._count_buf[i] = count_new
+            if np.any(center_distances + radius <= current_radiuses):
+                return
 
-        last = self._size - 1
-        if j != last:
-            self._center_buf[j] = self._center_buf[last]
-            self._radius_buf[j] = self._radius_buf[last]
-            self._count_buf[j] = self._count_buf[last]
-            if self._merge_cache_valid:
-                self._merge_bucket[j, :self._size] = self._merge_bucket[last, :self._size]
-                self._merge_key[j, :self._size] = self._merge_key[last, :self._size]
-                self._merge_bucket[:self._size, j] = self._merge_bucket[:self._size, last]
-                self._merge_key[:self._size, j] = self._merge_key[:self._size, last]
+            contained_indices = (center_distances + current_radiuses) <= radius
+            if np.any(contained_indices):
+                contained_spheres = current_spheres[contained_indices]
+                current_spheres = current_spheres[~contained_indices]
+                self._all_spheres[:self._num_spheres] = np.concatenate([current_spheres, contained_spheres])
+                self._num_spheres -= len(contained_spheres)
+                self._sphere_versions[contained_spheres] += 1
+                current_radiuses = current_radiuses[~contained_indices]
+                center_distances = center_distances[~contained_indices]
 
-        self._size -= 1
-        if self._merge_cache_valid:
-            self._merge_cache_size = self._size
-            self._merge_cache_recompute_slot(i)
-            if j != last:
-                self._merge_cache_recompute_slot(j)
+        sphere_idx = self._get_new_index()
+        sphere_version = self._sphere_versions[sphere_idx]
+        self._all_centers[sphere_idx] = center
+        self._all_radiuses[sphere_idx] = radius
+        self._num_spheres += 1
+
+        if len(current_spheres) > 0:
+            max_neighbors = min(self._MAX_NEIGHBORS, len(current_spheres))
+            if max_neighbors == len(current_spheres):
+                neighbors_indices = np.arange(len(current_spheres))
+            else:
+                neighbors_indices = np.argpartition(center_distances, max_neighbors - 1)[:max_neighbors]
+
+            closest_neighbors = current_spheres[neighbors_indices]
+            neighbors_center_dists = center_distances[neighbors_indices]
+            neighbors_radiuses = current_radiuses[neighbors_indices]
+            merged_radius = np.maximum((neighbors_radiuses + neighbors_center_dists + radius) / 2.0, 1e-6)
+
+            # log(R_merged^D - (R_1^D + R_2^D)) = D*log(R_merged) + log(1 - ((R_1/R_merged)^D + (R_2/R_merged)^D))
+            merged_volumes = self.dim * np.log(merged_radius) + np.log(np.maximum(1.0 - ((radius / merged_radius) ** self.dim + (neighbors_radiuses / merged_radius) ** self.dim), 1e-6))
+
+            for volume, neighbor_idx in zip(merged_volumes, closest_neighbors):
+                neighbor_version = self._sphere_versions[neighbor_idx]
+                heapq.heappush(self._minimal_pairs, (volume, sphere_idx, sphere_version, neighbor_idx, neighbor_version))
+
+    def _merge_spheres(self) -> None:
+        while self._num_spheres > self.max_spheres and self._minimal_pairs:
+            vol, i, i_version, j, j_version = heapq.heappop(self._minimal_pairs)
+
+            if self._sphere_versions[i] != i_version or self._sphere_versions[j] != j_version:
+                continue
+
+            center_i, radius_i = self._all_centers[i], self._all_radiuses[i]
+            center_j, radius_j = self._all_centers[j], self._all_radiuses[j]
+
+            centers_diff = center_i - center_j
+            distance_ij = float(np.sqrt(np.dot(centers_diff, centers_diff)))
+            new_radius = (distance_ij + radius_i + radius_j) / 2.0
+
+            if distance_ij > 0.0:
+                weight_j = ((radius_j - radius_i) / (2.0 * distance_ij)) + 0.5
+                weight_i = ((radius_i - radius_j) / (2.0 * distance_ij)) + 0.5
+                new_center = weight_j * center_j + weight_i * center_i
+            else:
+                new_center = center_i
+
+            current_spheres = self.all_spheres[(self.all_spheres != i) & (self.all_spheres != j)]
+            self._all_spheres[:self._num_spheres] = np.concatenate([current_spheres, [i, j]])
+            self._sphere_versions[[i, j]] += 1
+            self._num_spheres -= 2
+
+            self._add_sphere(new_center.astype(np.float32), new_radius)
 
     def add(self, vectors: np.ndarray) -> None:
         if not self._constructed:
             self.construct(vectors)
             return
-        if len(vectors) == 0:
-            return
-        if self.max_spheres == 0:
+
+        if len(vectors) == 0 or self.max_spheres == 0:
             return
 
-        new_vectors = np.ascontiguousarray(vectors, dtype=np.float32)
-        for q in new_vectors:
-            self._append_sphere(q, 0.0, 1)
-            if self._size <= self.max_spheres:
-                # cheap incremental update: new ball's row/col only, if cache is live
-                if self._merge_cache_valid and self._merge_bucket is not None and self._merge_bucket.shape[0] >= self._size:
-                    self._merge_cache_size = self._size
-                    self._merge_cache_recompute_slot(self._size - 1)
-                continue
+        for i in range(0, len(vectors), self._BATCH_SIZE):
+            vector_batch = vectors[i:i + self._BATCH_SIZE]
+            vector_batch = np.ascontiguousarray(vector_batch, dtype=np.float32)
+            sq_vector_batch = np.einsum('ij,ij->i', vector_batch, vector_batch, dtype=np.float64)
 
-            # over budget: merge the globally cheapest pair back down to max_spheres
-            self._ensure_merge_cache()
-            if not self._merge_cache_valid:
-                # size didn't actually grow (hard capacity reached without room);
-                # nothing meaningful to merge
-                continue
-            i, j = self._merge_cache_best_pair()
-            self._apply_merge_in_place(i, j)
+            if self._num_spheres > 0:
+                sq_batch_distances = self._sq_dists_to_centers(
+                    vector_batch, sq_vector_batch, self.all_centers)
+                batch_distances = np.sqrt(np.maximum(sq_batch_distances, 0.0))
+
+                is_already_covered = np.any(batch_distances <= (self.all_radiuses[None, :] - self.distance_threshold), axis=1)
+                vector_batch = vector_batch[~is_already_covered]
+
+            for vec in vector_batch:
+                self._add_sphere(vec, self.distance_threshold)
+
+            self._merge_spheres()
 
     def insert(self, vectors: np.ndarray) -> None:
         self.add(vectors)
 
-    def remove(self, vectors: np.ndarray, tau: Optional[float] = None) -> List[bool]:
-        if tau is None:
-            tau = self.distance_threshold
-        if self._size == 0 or len(vectors) == 0:
-            return [False] * len(vectors)
-
-        q = np.ascontiguousarray(vectors, dtype=np.float32)
-        centers = self.all_spheres
-        sq_d = self._sq_dists_to_centers(q, np.einsum('ij,ij->i', q, q, dtype=np.float64), centers)
-        nearest = np.argmin(sq_d, axis=1)
-        nearest_d = np.sqrt(np.maximum(sq_d[np.arange(len(q)), nearest], 0.0))
-        in_sphere = nearest_d <= self._radius_buf[nearest].astype(np.float64) + float(tau)
-
-        if np.any(in_sphere):
-            decrements = np.bincount(nearest[in_sphere], minlength=self._size)
-            self._count_buf[:self._size] -= decrements.astype(self._count_buf.dtype)
-            self._compact()
-
-        return in_sphere.tolist()
+    def remove(self, vectors: np.ndarray) -> List[bool]:
+        raise NotImplementedError("BallCoverFilter does not support remove operation.")
 
     # ------------------------------------------------------------------ memory / misc
 
@@ -1000,10 +844,10 @@ class BallCoverFilter(Filter):
         if not self._constructed:
             return 0
         if self._quantizer_name is not None:
-            center_bytes = self._size * self._quantizer_bytes_per_vector
+            center_bytes = self._num_spheres * self._quantizer_bytes_per_vector
         else:
-            center_bytes = self.all_spheres.nbytes
-        return center_bytes + self.all_radiuses.nbytes + self.sphere_counts.nbytes
+            center_bytes = self.all_centers.nbytes
+        return center_bytes + self.all_radiuses.nbytes + self._all_spheres.nbytes + sys.getsizeof(self._minimal_pairs)
 
     def get_construction_bytesize(self) -> int:
         if not self._constructed or not self._retain_assignments or self._X is None or self._assignment is None:
