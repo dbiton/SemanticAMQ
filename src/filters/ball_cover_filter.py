@@ -1,4 +1,8 @@
-import sys, heapq, time
+import heapq
+import time
+from typing import List, Tuple, Optional, Dict, Any
+
+import faiss
 import numpy as np
 import faiss
 from typing import List, Tuple, Optional, Dict, Any
@@ -13,25 +17,19 @@ class BallCoverFilter(Filter):
     hyperspheres and answers "is anything indexed within tau of this query?"
     without storing the vectors (tau is supplied at query time, not baked in).
 
-    Construction is a cumulative, ablatable ladder of up to 2 levels
-    (`set_complexity`, default 2), each one refining the cover produced by the
-    previous level while never breaking the covering invariant (every indexed
-    vector lies within its ball's radius):
-
-      1. Initial cover: k-means++ seeding (probability proportional to squared
-         distance from the nearest existing center -- far less sensitive to
-         outliers than farthest-point/Gonzalez seeding) + a few Lloyd
-         iterations, then each center is recomputed as the exact centroid of
-         its final assignment and the radius is the exact max distance to any
-         member. Cheapest level; O(n*k*d) for the Lloyd/assignment passes.
-      2. Ball refinement: each cluster's ball is replaced by its Badoiu-
-         Clarkson coreset MEB, vectors are reassigned to the nearest refined
-         center, and the process repeats until log J = log sum(r_i^d) stops
-         decreasing (or a small iteration cap is hit). Costs a small constant
-         multiple of level 1.
+    Construction is a fixed two-stage pipeline. Stage I builds an initial
+    cover using one of three selectable strategies (`level`, set at
+    construction time, default 3 -- see _init_streaming_merge/
+    _init_hierarchical_split/_init_gonzalez); Stage II then always refines
+    that cover: each cluster's ball is replaced by its Badoiu-Clarkson
+    coreset MEB, vectors are reassigned to the nearest refined center, and
+    the process repeats until log J = log sum(r_i^d) stops decreasing (or a
+    small iteration cap is hit). Stage II is level-agnostic -- it consumes
+    the same (centers, radii, counts, assignment) shape regardless of which
+    level produced it.
 
     A further refinement is opt-in and runs *after* `construct()` rather
-    than as a rung of the complexity ladder:
+    than as a pipeline stage:
 
       - Quantization: compresses the stored centroids with a FAISS
         ScalarQuantizer (`quantize=True` at construction, or a manual
@@ -40,9 +38,9 @@ class BallCoverFilter(Filter):
         folded into that ball's radius (never subtracted), and whichever
         candidate yields the smallest resulting total covering volume
         log10 J(C) = log10 sum_i r_i^d is kept -- so the covering invariant
-        holds regardless of which level wins, and the choice is driven
-        directly by the same geometric objective the construction ladder
-        itself minimizes.
+        holds regardless of which candidate wins, and the choice is driven
+        directly by the same geometric objective construction itself
+        minimizes.
 
     Streaming updates (`add`/`insert`) evaluate incoming vectors and create new
     spheres with radius `distance_threshold` for uncovered points. If the sphere
@@ -67,27 +65,39 @@ class BallCoverFilter(Filter):
     _BATCH_SIZE = 2048
     _MEB_CORESET_ITERATIONS = 30
     _MEB_REFINE_ITERATIONS = 200
-    _LLOYD_ITERATIONS = 10
     _BALL_REFINE_ITERATIONS = 10
-    _KMEANS2_ITERATIONS = 10
     _CHUNK_SIZE = 20_000
     _LOG_J_EPS = 1e-9
     _DEFAULT_SEED = 42
-    _DEFAULT_COMPLEXITY = 2
-    _LEVEL_NAMES = {1: "initial_cover", 2: "ball_refine"}
+    LEVELS = (1, 2, 3)
+    _DEFAULT_LEVEL = 3
+    _STAGE2_NAME = "ball_refine"
+    _STAGE1_NAMES = {1: "streaming_merge_init", 2: "hierarchical_split_init", 3: "gonzalez_init"}
     _LN10 = float(np.log(10.0))
     _QUANTIZER_CANDIDATES = ("QT_fp16", "QT_8bit", "QT_6bit", "QT_4bit")
 
     def __init__(self, dim: int, distance_threshold: float, max_memory: Optional[int] = None,
                  max_spheres: Optional[int] = None, seed: int = _DEFAULT_SEED,
-                 quantize: bool = False, quantizer_candidates: Optional[Tuple[str, ...]] = None):
+                 merge_criterion: str = "log_space", quantize: bool = False,
+                 quantizer_candidates: Optional[Tuple[str, ...]] = None,
+                 level: int = _DEFAULT_LEVEL, streaming_shuffle: bool = False,
+                 streaming_n_candidates: int = 0):
         super().__init__(dim, lsh=None, max_memory=max_memory)
         self.distance_threshold = distance_threshold
         self.max_spheres = (max_spheres if max_spheres is not None
                             else self._calculate_max_spheres(self.max_memory))
         self._seed = seed
+        if merge_criterion not in self.MERGE_CRITERIA:
+            raise ValueError(f"Unknown merge_criterion {merge_criterion!r}; expected one of {self.MERGE_CRITERIA}")
+        self.merge_criterion = merge_criterion
+        if level not in self.LEVELS:
+            raise ValueError(f"level must be in {self.LEVELS}, got {level}")
+        self.level = level
+        self.streaming_shuffle = bool(streaming_shuffle)
+        self.streaming_n_candidates = int(streaming_n_candidates)
+        # certificate: only level 3 (Gonzalez) populates this, see _init_gonzalez
+        self.lower_bound: Optional[float] = None
         self._constructed = False
-        self._complexity_level = self._DEFAULT_COMPLEXITY
 
         # main filter sphere buffers
         self._num_spheres = 0
@@ -126,15 +136,6 @@ class BallCoverFilter(Filter):
     @property
     def all_radiuses(self) -> np.ndarray:
         return self._all_radiuses[self.all_spheres]
-
-    # ------------------------------------------------------------------ complexity policy
-
-    def set_complexity(self, level: int) -> None:
-        if level not in (1, 2):
-            raise ValueError(f"complexity level must be in 1..2, got {level}")
-        if self._constructed:
-            self._constructed = False
-        self._complexity_level = level
 
     # ------------------------------------------------------------------ sizing / buffers
 
@@ -186,6 +187,86 @@ class BallCoverFilter(Filter):
 
     def _log_J_tau(self, radii: np.ndarray, tau: float) -> float:
         return ball_geometry.log_J_tau(radii, self.dim, tau)
+
+    def _pairwise_merge_keys(self, ci: np.ndarray, ri: np.ndarray,
+                             cj: np.ndarray, rj: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Vectorized (bucket, key, merged_radius) for merging ball(s) (ci, ri) with
+        ball(s) (cj, rj). bucket 0 = beneficial merge (cost < 0), key ascending
+        = most beneficial first; bucket 1 = neutral/harmful, key ascending =
+        least harmful first. Cost function is pluggable via self.merge_criterion
+        (see MERGE_CRITERIA and the _merge_cost_* helpers below); geometry
+        (r_merged) is identical across criteria.
+        """
+        diff = ci - cj
+        delta = np.sqrt(np.maximum(np.sum(diff * diff, axis=-1), 0.0))
+        contain_j_in_i = delta + rj <= ri
+        contain_i_in_j = delta + ri <= rj
+        r_general = (delta + ri + rj) / 2.0
+        r_merged = np.where(contain_i_in_j, rj, np.where(contain_j_in_i, ri, r_general))
+
+        if self.merge_criterion == "log_space":
+            bucket, key = self._merge_cost_log_space(ri, rj, r_merged)
+        elif self.merge_criterion == "r_pow_d":
+            bucket, key = self._merge_cost_r_pow_d(ri, rj, r_merged)
+        elif self.merge_criterion == "sum_radii":
+            bucket, key = self._merge_cost_sum_radii(ri, rj, r_merged)
+        elif self.merge_criterion == "min_radius_increase":
+            bucket, key = self._merge_cost_min_radius_increase(ri, rj, r_merged)
+        else:
+            raise ValueError(f"Unknown merge_criterion {self.merge_criterion!r}")
+
+        return bucket, key, r_merged
+
+    def _merge_cost_log_space(self, ri: np.ndarray, rj: np.ndarray,
+                              r_merged: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Delta = M^d * (a_ij - a_i - a_j) with M = max(r_i, r_j, r_ij) and
+        a_x = exp(d * log(r_x / M)) (safe underflow to 0); never materializes r^d."""
+        return ball_geometry.merge_cost_log_space(ri, rj, r_merged, self.dim)
+
+    def _merge_cost_r_pow_d(self, ri: np.ndarray, rj: np.ndarray,
+                            r_merged: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Delta = r_merged^d - r_i^d - r_j^d under the direct (non-log)
+        objective J = sum r_i^d. Same log-domain evaluation as
+        _merge_cost_log_space (never materializes r^d, which overflows well
+        within realistic radii at d ~ 384) since it's the same real-valued
+        Delta either way -- this criterion differs from "log_space" only in
+        name, kept as its own MERGE_CRITERIA entry for callers that select
+        by that name."""
+        return ball_geometry.merge_cost_log_space(ri, rj, r_merged, self.dim)
+
+    def _merge_cost_sum_radii(self, ri: np.ndarray, rj: np.ndarray,
+                              r_merged: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Delta = r_merged - r_i - r_j under the linear objective J = sum r_i."""
+        delta = r_merged - ri - rj
+        sign = np.sign(delta)
+        bucket = np.where(sign < 0, 0, 1).astype(np.int8)
+        key = np.where(sign < 0, -delta, delta)
+        return bucket, key
+
+    def _merge_cost_min_radius_increase(self, ri: np.ndarray, rj: np.ndarray,
+                                        r_merged: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Cost = growth of the merged radius past the larger constituent ball;
+        always >= 0 by construction of r_merged, so bucket is always 1 (never
+        "strictly beneficial") -- smallest growth first."""
+        delta = r_merged - np.maximum(ri, rj)
+        bucket = np.ones_like(delta, dtype=np.int8)
+        key = delta
+        return bucket, key
+
+    def _all_pairs_merge_keys(self, centers: np.ndarray, radii: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        c64 = centers.astype(np.float64)
+        r64 = radii.astype(np.float64)
+        bucket, key, _ = self._pairwise_merge_keys(c64[:, None, :], r64[:, None], c64[None, :, :], r64[None, :])
+        n = len(centers)
+        idx = np.arange(n)
+        bucket[idx, idx] = 2
+        key[idx, idx] = np.inf
+        return bucket, key
+
+    @staticmethod
+    def _merged_ball(ci: np.ndarray, ri: float, cj: np.ndarray, rj: float) -> Tuple[np.ndarray, float]:
+        return ball_geometry.merged_ball(ci, ri, cj, rj)
 
     # ------------------------------------------------------------------ chunked distances
 
@@ -259,56 +340,6 @@ class BallCoverFilter(Filter):
 
     # ------------------------------------------------------------------ clustering
 
-    def _kmeanspp_seed(self, vectors: np.ndarray, sq_norms: np.ndarray, k: int,
-                       stop_sq: float, rng: np.random.Generator) -> Tuple[np.ndarray, bool]:
-        n = len(vectors)
-        mean = vectors.mean(axis=0)
-        first = int((sq_norms - 2.0 * (vectors @ mean)).argmax())
-
-        idx = [first]
-        c = vectors[first]
-        nearest_sq = np.maximum(sq_norms - 2.0 * (vectors @ c) + c @ c, 0.0)
-
-        for _ in range(1, k):
-            if float(nearest_sq.max()) <= stop_sq:
-                return np.array(idx, dtype=np.int64), True
-            total = float(nearest_sq.sum())
-            if total <= 0.0:
-                break
-            probs = nearest_sq.astype(np.float64) / total
-            probs /= probs.sum()  # guard against float64 sum drifting off 1.0
-            next_idx = int(rng.choice(n, p=probs))
-            idx.append(next_idx)
-            c = vectors[next_idx]
-            new_sq = np.maximum(sq_norms - 2.0 * (vectors @ c) + c @ c, 0.0)
-            np.minimum(nearest_sq, new_sq, out=nearest_sq)
-
-        return np.array(idx, dtype=np.int64), False
-
-    def _lloyd_refine(self, vectors: np.ndarray, sq_norms: np.ndarray, centers: np.ndarray) -> np.ndarray:
-        k = len(centers)
-
-        for _ in range(self._LLOYD_ITERATIONS):
-            assignment, nearest_sq = self._chunked_assign(vectors, sq_norms, centers)
-
-            new_centers = np.empty_like(centers)
-            farthest_order = None
-            for i in range(k):
-                members = assignment == i
-                if np.any(members):
-                    new_centers[i] = vectors[members].mean(axis=0)
-                else:
-                    if farthest_order is None:
-                        farthest_order = list(np.argsort(-nearest_sq))
-                    new_centers[i] = vectors[farthest_order.pop(0)]
-
-            converged = np.allclose(new_centers, centers, atol=1e-5)
-            centers = new_centers
-            if converged:
-                break
-
-        return centers
-
     def _minimum_enclosing_ball(self, points: np.ndarray, sq_norms: np.ndarray) -> Tuple[np.ndarray, float]:
         if len(points) == 1:
             return points[0].astype(np.float32), 0.0
@@ -344,39 +375,245 @@ class BallCoverFilter(Filter):
             return -np.inf, -np.inf
         return estimate_hypersphere_volume(self.all_centers, self.all_radiuses, return_log=True)
 
-    # ------------------------------------------------------------------ level 1: initial cover
+    # ------------------------------------------------------------------ init: shared helpers
 
-    def _level1_initial_cover(self, vectors: np.ndarray, sq_norms: np.ndarray,
-                              k: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        stop_sq = float(self.distance_threshold) ** 2
-        rng = np.random.default_rng(self._seed)
-
-        seed_idx, early_stop = self._kmeanspp_seed(vectors, sq_norms, k, stop_sq, rng)
-        centers = vectors[seed_idx].copy()
-        if not early_stop:
-            centers = self._lloyd_refine(vectors, sq_norms, centers)
-
-        raw_assignment, _ = self._chunked_assign(vectors, sq_norms, centers)
-        unique_labels, assignment = np.unique(raw_assignment, return_inverse=True)
-        num_spheres = len(unique_labels)
-        groups = self._groups_from_assignment(assignment, num_spheres)
-
-        centers_out = np.empty((num_spheres, self.dim), dtype=np.float32)
-        radii_out = np.empty(num_spheres, dtype=np.float32)
+    def _exact_centroids_from_groups(self, vectors: np.ndarray, groups: List[np.ndarray]
+                                     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Center = exact centroid of a group, radius = exact max distance to
+        any member -- never carried forward from whatever produced the
+        grouping (invariant #1). Shared final-recompute step for all three
+        init strategies."""
+        m = len(groups)
+        centers = np.empty((m, self.dim), dtype=np.float32)
+        radii = np.empty(m, dtype=np.float32)
+        counts = np.empty(m, dtype=np.int32)
         for i, idx in enumerate(groups):
-            pts = vectors[idx]
-            c32 = pts.mean(axis=0, dtype=np.float64).astype(np.float32)
-            c = c32.astype(np.float64)  # radius must match the center as actually stored
-            d = np.sqrt(np.maximum(np.einsum('ij,ij->i', pts.astype(np.float64) - c, pts.astype(np.float64) - c), 0.0))
-            centers_out[i] = c32
-            radii_out[i] = self._safe_radius(d.max())
+            pts = vectors[idx].astype(np.float64)
+            c64 = pts.mean(axis=0)
+            c32 = c64.astype(np.float32)
+            c64 = c32.astype(np.float64)  # radius must match the center as actually stored
+            d = np.sqrt(np.maximum(np.einsum('ij,ij->i', pts - c64, pts - c64), 0.0))
+            centers[i] = c32
+            radii[i] = self._safe_radius(d.max())
+            counts[i] = len(idx)
+        return centers, radii, counts
 
-        return centers_out, radii_out, assignment.astype(np.int32)
+    def _assign_and_recompute(self, vectors: np.ndarray, sq_norms: np.ndarray, raw_centers: np.ndarray
+                              ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """One nearest-center pass against `raw_centers`, then centers/radii
+        recomputed exactly (never carried forward) from that assignment.
+        Used by the streaming-merge (level 1) and Gonzalez (level 3) init
+        strategies, whose raw output is a set of centers with no exact
+        per-point assignment yet."""
+        raw_assignment, _ = self._chunked_assign(vectors, sq_norms, raw_centers)
+        unique_labels, assignment = np.unique(raw_assignment, return_inverse=True)
+        groups = self._groups_from_assignment(assignment, len(unique_labels))
+        centers, radii, counts = self._exact_centroids_from_groups(vectors, groups)
+        return centers, radii, counts, assignment.astype(np.int32)
 
-    # ------------------------------------------------------------------ level 2: ball refinement
+    def _farthest_pair_split(self, idx: np.ndarray, vectors: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Split point-index group `idx` into two: farthest-from-centroid
+        point A, then farthest-from-A point B, then assign every member to
+        whichever of {A, B} is nearer. Falls back to an index bisection when
+        all members are coincident (A==B at distance 0) or the geometric
+        split would strand one side empty, so a degenerate cluster still
+        yields two non-empty children."""
+        pts = vectors[idx].astype(np.float64)
+        centroid = pts.mean(axis=0)
+        d_centroid = np.einsum('ij,ij->i', pts - centroid, pts - centroid)
+        a_local = int(d_centroid.argmax())
+        a = pts[a_local]
+        d_a = np.einsum('ij,ij->i', pts - a, pts - a)
+        b_local = int(d_a.argmax())
+        if d_a[b_local] <= 0.0:
+            half = len(idx) // 2
+            return idx[:half], idx[half:]
+        b = pts[b_local]
+        d_b = np.einsum('ij,ij->i', pts - b, pts - b)
+        nearer_a = d_a <= d_b
+        left, right = idx[nearer_a], idx[~nearer_a]
+        if len(left) == 0 or len(right) == 0:
+            half = len(idx) // 2
+            return idx[:half], idx[half:]
+        return left, right
 
-    def _level2_ball_refine(self, vectors: np.ndarray, sq_norms: np.ndarray, centers: np.ndarray,
-                            radii: np.ndarray, assignment: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    def _saturate_to_k(self, groups: List[np.ndarray], vectors: np.ndarray, k: int) -> List[np.ndarray]:
+        """Invariant #2: repeatedly split the largest-population group until
+        exactly k groups exist (a no-op if a level already produced k).
+        Population, not radius, is the split key here since callers reach
+        this after already discarding whatever intermediate radii they had."""
+        groups = list(groups)
+        while len(groups) < k:
+            sizes = [len(g) for g in groups]
+            largest = int(np.argmax(sizes))
+            if sizes[largest] < 2:
+                break  # fewer distinct points than k; cannot split further
+            left, right = self._farthest_pair_split(groups[largest], vectors)
+            groups[largest] = left
+            groups.append(right)
+        return groups
+
+    # ------------------------------------------------------------------ level 1: streaming merge
+
+    def _init_streaming_merge(self, vectors: np.ndarray, sq_norms: np.ndarray, k: int
+                              ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Single pass, O(kd) working memory: insert every point as a
+        zero-radius singleton (arrival order, optionally shuffled) and, each
+        time the cover exceeds k, merge the pair minimizing the existing
+        merge cost (self._pairwise_merge_keys / self._merged_ball -- the
+        same cost function and geometry BallCoverFilter.add() uses, just
+        driven over local arrays instead of the instance's incremental
+        O(1)-amortized cache, since that cache is tied to the persistent
+        instance buffers and construction shouldn't mutate those as scratch
+        space). Produces no assignment during the pass; recovered by one
+        nearest-center pass at the end via _assign_and_recompute, which also
+        recomputes radii exactly."""
+        n = len(vectors)
+        order = np.arange(n)
+        if self.streaming_shuffle:
+            order = np.random.default_rng(self._seed).permutation(n)
+
+        cap = min(k, n) + 1
+        centers = np.empty((cap, self.dim), dtype=np.float64)
+        radii = np.zeros(cap, dtype=np.float64)
+        size = 0
+        n_candidates = self.streaming_n_candidates
+
+        for i in order:
+            new_idx = size
+            centers[size] = vectors[i].astype(np.float64)
+            radii[size] = 0.0
+            size += 1
+            if size <= k:
+                continue
+
+            active_c, active_r = centers[:size], radii[:size]
+            if n_candidates > 0 and size > n_candidates + 1:
+                # restricted: only the new singleton vs. its n_candidates
+                # nearest existing balls -- O(kd) distances + O(kappa*d) cost
+                # evaluation, instead of the O(k^2 d) all-pairs scan below.
+                others = np.delete(np.arange(size), new_idx)
+                d = np.linalg.norm(active_c[others] - active_c[new_idx], axis=1)
+                kappa = min(n_candidates, len(others))
+                nearest = others[np.argpartition(d, kappa - 1)[:kappa]]
+                ii = np.full(kappa, new_idx)
+                jj = nearest
+            else:
+                ii, jj = np.triu_indices(size, k=1)
+
+            bucket, key, _ = self._pairwise_merge_keys(active_c[ii], active_r[ii], active_c[jj], active_r[jj])
+            best = int(ball_geometry.argmin_bucket_key(bucket, key))
+            a, b = int(ii[best]), int(jj[best])
+            c_new, r_new = self._merged_ball(active_c[a], active_r[a], active_c[b], active_r[b])
+            centers[a] = c_new
+            radii[a] = self._safe_radius(r_new)
+            last = size - 1
+            if b != last:
+                centers[b] = centers[last]
+                radii[b] = radii[last]
+            size -= 1
+
+        raw_centers = centers[:size].astype(np.float32)
+        return self._assign_and_recompute(vectors, sq_norms, raw_centers)
+
+    # ------------------------------------------------------------------ level 2: hierarchical split
+
+    def _init_hierarchical_split(self, vectors: np.ndarray, sq_norms: np.ndarray, k: int
+                                 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """log k passes: a max-heap of clusters keyed by (approximate)
+        radius, starting from one cluster holding every point. Each of k-1
+        iterations pops the largest-radius cluster and 2-center splits it
+        (_farthest_pair_split); children are pushed back keyed by their own
+        approximate radius. If splitting plateaus (a cluster of coincident
+        points, farthest-pair distance 0) _farthest_pair_split's index
+        bisection keeps the loop progressing toward k without further
+        distance work. Exact centers/radii are only computed once, at the
+        end, from the final k leaf groups (invariant #1)."""
+        n = len(vectors)
+        all_idx = np.arange(n, dtype=np.int64)
+        vectors64 = vectors.astype(np.float64)
+        centroid = vectors64.mean(axis=0)
+        d0 = np.sqrt(np.maximum(np.einsum('ij,ij->i', vectors64 - centroid, vectors64 - centroid), 0.0))
+        # heap entries: (-approx_radius, insertion_counter, index_array) --
+        # the counter breaks ties without numpy ever comparing two arrays.
+        heap: List[Tuple[float, int, np.ndarray]] = [(-float(d0.max()), 0, all_idx)]
+        counter = 1
+
+        while len(heap) < k:
+            neg_r, _, idx = heapq.heappop(heap)
+            if len(idx) < 2:
+                heapq.heappush(heap, (neg_r, -1, idx))
+                break  # unreachable when n > k (pigeonhole), kept as a guard
+            left, right = self._farthest_pair_split(idx, vectors)
+            for child in (left, right):
+                pts = vectors64[child]
+                c = pts.mean(axis=0)
+                r = float(np.sqrt(np.maximum(np.einsum('ij,ij->i', pts - c, pts - c), 0.0)).max())
+                heapq.heappush(heap, (-r, counter, child))
+                counter += 1
+
+        groups = self._saturate_to_k([idx for _, _, idx in heap], vectors, k)
+        centers, radii, counts = self._exact_centroids_from_groups(vectors, groups)
+        assignment = np.empty(n, dtype=np.int32)
+        for label, idx in enumerate(groups):
+            assignment[idx] = label
+        return centers, radii, counts, assignment
+
+    # ------------------------------------------------------------------ level 3: gonzalez
+
+    def _init_gonzalez(self, vectors: np.ndarray, sq_norms: np.ndarray, k: int
+                       ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """k passes of farthest-point (Gonzalez) traversal: the first center
+        is the point farthest from the mean, each subsequent center is the
+        point farthest from its nearest already-chosen center. One extra
+        (k+1-th) selection step beyond the k needed records D, the
+        (k+1)-th insertion distance -- by pigeonhole any k-ball cover must
+        have some ball of radius >= D/2 (the (k+1)-th farthest point and its
+        nearest of the first k centers are each >= D apart from every other
+        chosen center, so no single ball of radius < D/2 can cover two of
+        them), certifying lower_bound = d * log(D/2) as a lower bound on
+        log J -- only this level can report it (see class docstring)."""
+        n = len(vectors)
+        mean = vectors.astype(np.float64).mean(axis=0)
+        first = int((sq_norms - 2.0 * (vectors @ mean)).argmax())
+
+        chosen = [first]
+        c = vectors[first]
+        nearest_sq = np.maximum(sq_norms - 2.0 * (vectors @ c) + c @ c, 0.0)
+
+        n_steps = min(k + 1, n)
+        farthest_d = 0.0
+        for step in range(1, n_steps):
+            far_idx = int(nearest_sq.argmax())
+            farthest_d = float(np.sqrt(max(float(nearest_sq[far_idx]), 0.0)))
+            if step >= k:
+                break  # certificate-only (k+1)-th selection; not added as a center
+            chosen.append(far_idx)
+            c = vectors[far_idx]
+            new_sq = np.maximum(sq_norms - 2.0 * (vectors @ c) + c @ c, 0.0)
+            np.minimum(nearest_sq, new_sq, out=nearest_sq)
+
+        self.lower_bound = float(self.dim * np.log(farthest_d / 2.0)) if farthest_d > 0 else float('-inf')
+
+        raw_centers = vectors[np.array(chosen, dtype=np.int64)]
+        return self._assign_and_recompute(vectors, sq_norms, raw_centers)
+
+    def _run_init(self, vectors: np.ndarray, sq_norms: np.ndarray, k: int
+                 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        self.lower_bound = None
+        if self.level == 1:
+            return self._init_streaming_merge(vectors, sq_norms, k)
+        elif self.level == 2:
+            return self._init_hierarchical_split(vectors, sq_norms, k)
+        elif self.level == 3:
+            return self._init_gonzalez(vectors, sq_norms, k)
+        raise ValueError(f"Unknown level {self.level!r}; expected one of {self.LEVELS}")
+
+    # ------------------------------------------------------------------ stage II: ball refinement
+
+    def _meb_refine(self, vectors: np.ndarray, sq_norms: np.ndarray, centers: np.ndarray,
+                    radii: np.ndarray, counts: np.ndarray,
+                    assignment: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
         prev_log_J = self._log_J(radii)
         accepted = 0
 
@@ -443,8 +680,8 @@ class BallCoverFilter(Filter):
         self._quantizer_name = None
         self._quantizer_bytes_per_vector = None
         self._quantizer_stats = None
+        self.lower_bound = None
         retain = bool(retain_assignments)
-        levels_to_run = min(self._complexity_level, 2)
 
         if len(vectors) == 0 or self.max_spheres == 0:
             self._reset_buffers(0)
@@ -452,9 +689,9 @@ class BallCoverFilter(Filter):
             self._retain_assignments = retain
             self._X = vectors_arr if retain else None
             self._assignment = np.empty(0, dtype=np.int32) if retain else None
-            for lvl in range(1, levels_to_run + 1):
-                t0 = time.perf_counter()
-                self._record_stage(lvl, self._LEVEL_NAMES[lvl], t0, np.empty(0, dtype=np.float32), 0)
+            t0 = time.perf_counter()
+            self._record_stage(1, self._STAGE1_NAMES[self.level], t0, np.empty(0, dtype=np.float32), 0)
+            self._record_stage(2, self._STAGE2_NAME, t0, np.empty(0, dtype=np.float32), 0)
             self._constructed = True
             return self._log_volume_bounds()
 
@@ -489,37 +726,37 @@ class BallCoverFilter(Filter):
     def _build_cover(self, vectors: np.ndarray, sq_norms: np.ndarray,
                      k: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Dict[str, Any]]]:
         """
-        Run the (up to 2-level) construction ladder for an arbitrary ball
-        budget k against already-preprocessed vectors, touching no instance
-        state. Used both for a plain (non-quantized) construct() and, once
-        per quantization candidate, to rebuild at that candidate's own larger
+        Run the fixed two-stage construction pipeline (init strategy
+        self.level, then MEB refinement) for an arbitrary ball budget k
+        against already-preprocessed vectors, touching no instance state.
+        Used both for a plain (non-quantized) construct() and, once per
+        quantization candidate, to rebuild at that candidate's own larger
         effective_k (see _construct_with_quantization). Returns
         centers/radii/counts/assignment plus this build's own stage records,
         the same shape _record_stage would append to self._stage_stats for a
         normal top-level build.
         """
         n = len(vectors)
-        levels_to_run = min(self._complexity_level, 2)
         stage_records: List[Dict[str, Any]] = []
 
         if k >= n:
             centers = vectors.copy()
             radii = np.zeros(n, dtype=np.float32)
             assignment = np.arange(n, dtype=np.int32)
-            for lvl in range(1, levels_to_run + 1):
-                stage_records.append(self._make_stage_record(lvl, self._LEVEL_NAMES[lvl], 0.0, radii, 0))
-            return centers, radii, assignment, stage_records
+            stage_records.append(self._make_stage_record(1, self._STAGE1_NAMES[self.level], 0.0, radii, 0))
+            stage_records.append(self._make_stage_record(2, self._STAGE2_NAME, 0.0, radii, 0))
+            return centers, radii, counts, assignment, stage_records
 
         t0 = time.perf_counter()
-        centers, radii, assignment = self._level1_initial_cover(vectors, sq_norms, k)
-        stage_records.append(self._make_stage_record(1, "initial_cover", time.perf_counter() - t0, radii, 0))
+        centers, radii, counts, assignment = self._run_init(vectors, sq_norms, k)
+        stage_records.append(
+            self._make_stage_record(1, self._STAGE1_NAMES[self.level], time.perf_counter() - t0, radii, 0))
 
-        if levels_to_run >= 2:
-            t0 = time.perf_counter()
-            centers, radii, assignment, accepted = self._level2_ball_refine(
-                vectors, sq_norms, centers, radii, assignment)
-            stage_records.append(
-                self._make_stage_record(2, "ball_refine", time.perf_counter() - t0, radii, accepted))
+        t0 = time.perf_counter()
+        centers, radii, counts, assignment, accepted = self._meb_refine(
+            vectors, sq_norms, centers, radii, counts, assignment)
+        stage_records.append(
+            self._make_stage_record(2, self._STAGE2_NAME, time.perf_counter() - t0, radii, accepted))
 
         return centers, radii, assignment, stage_records
 
@@ -720,7 +957,37 @@ class BallCoverFilter(Filter):
             result[start:end] = np.any(sq_d <= (eff_r[None, :]) ** 2, axis=1)
         return result.tolist()
 
-    # ------------------------------------------------------------------ streaming / dynamic merge
+    def query_multi_tau(self, vectors: np.ndarray, taus: List[float]) -> Dict[float, List[bool]]:
+        """Same containment test as query(), evaluated at several tau at
+        once. The query-to-center distance pass (O(n*k*d), the expensive
+        part) doesn't depend on tau -- only the per-ball threshold (radius +
+        tau) does -- so it's computed once per chunk and reused for every
+        tau's containment test, instead of re-querying once per tau. Results
+        are identical to calling query(vectors, tau=t) separately for each
+        t in taus."""
+        if not self._constructed:
+            raise ValueError("BallCoverFilter has not been constructed.")
+        taus = list(taus)
+        q = np.ascontiguousarray(vectors, dtype=np.float32)
+        n = len(q)
+
+        if self._size == 0 or n == 0:
+            return {t: [False] * n for t in taus}
+
+        centers = self.all_spheres
+        radii64 = self.all_radiuses.astype(np.float64)
+        q_sq_norms = np.einsum('ij,ij->i', q, q, dtype=np.float64)
+
+        result = {t: np.zeros(n, dtype=bool) for t in taus}
+        for start in range(0, n, self._CHUNK_SIZE):
+            end = min(start + self._CHUNK_SIZE, n)
+            sq_d = self._sq_dists_to_centers(q[start:end], q_sq_norms[start:end], centers)
+            for t in taus:
+                eff_r = radii64 + float(t)
+                result[t][start:end] = np.any(sq_d <= (eff_r[None, :]) ** 2, axis=1)
+        return {t: arr.tolist() for t, arr in result.items()}
+
+    # ------------------------------------------------------------------ streaming add/remove
 
     def _add_sphere(self, center: np.ndarray, radius: float) -> None:
         current_spheres = self.all_spheres

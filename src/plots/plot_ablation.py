@@ -33,14 +33,38 @@ K = 256
 TAU: Optional[float] = None  # None => median tau present in the data
 DPI = 400
 EMIT_PDF = False
-DEMO = False
 
-STAGES = ["ball", "quantizing"]
+# BallCoverFilter.LEVELS (1=streaming merge, 2=hierarchical split,
+# 3=Gonzalez) crossed with PHASES (pre-/post-quantization) -- quantizing
+# runs per level, independently on each level's own cover, so every level
+# gets its own "ball"/"quantizing" pair rather than sharing one.
+LEVELS = (1, 2, 3)
+PHASES = ("ball", "quantizing")
+STAGES_EMPIRICAL = [(level, phase) for level in LEVELS for phase in PHASES]
+# level=0 is a reserved sentinel (not a real construction level): the
+# theoretical floor certified by level 3's Gonzalez certificate
+# (BallCoverFilter.lower_bound), reported once as "Bound Ball" and once as
+# "Bound Quant" so it lines up visually against both stage groups -- see
+# ablation_worker's docstring for why the same floor is used for both. It
+# has no real FPR/construction-time, so it's excluded from those two panels
+# and only appears in the geometric/threshold objective panels.
+BOUND_STAGES = [(0, "ball"), (0, "quantizing")]
+STAGES_OBJECTIVE = BOUND_STAGES + STAGES_EMPIRICAL
 STAGE_LABELS = {
-    "ball": "Ball",
-    "quantizing": "Quant",
+    (level, phase): (
+        f"Bnd {'Ball' if phase == 'ball' else 'Quant'}" if level == 0
+        else f"L{level} {'Ball' if phase == 'ball' else 'Quant'}"
+    )
+    for level, phase in STAGES_OBJECTIVE
 }
-STAGE_INDEX = {s: i + 1 for i, s in enumerate(STAGES)}
+STAGE_INDEX = {s: i + 1 for i, s in enumerate(STAGES_OBJECTIVE)}
+# Reference stage for the two relative-objective panels: level 3 (Gonzalez),
+# unquantized -- matches this pipeline's default level, keeping the panels'
+# "reduction relative to the ball cover" reading consistent with how they
+# read before per-level ablation existed. The Bound rows plot below this
+# baseline (they're a lower bound on the "ball" stage's own log10_J), making
+# the optimality gap directly readable off the bars.
+BASELINE_STAGE = (3, "ball")
 
 BAR_WIDTH = 0.26
 D_DIM = 384  # embedding dimensionality; objectives are stored pre-logged
@@ -70,13 +94,20 @@ def _style_axes(ax: plt.Axes) -> None:
         ax.spines[spine].set_linewidth(0.5)
 
 
-def _set_stage_xaxis(ax: plt.Axes) -> None:
-    x = np.arange(len(STAGES))
+def _set_stage_xaxis(ax: plt.Axes, stages: list) -> None:
+    x = np.arange(len(stages))
     ax.set_xticks(x)
+    # The objective panels' 8-tick STAGES_OBJECTIVE (Bound + 3 levels x 2
+    # phases) is denser than STAGES_EMPIRICAL's 6, so it gets a smaller
+    # label font and steeper rotation to keep two-line labels from
+    # overlapping their neighbors at this figure width.
+    dense = len(stages) > len(STAGES_EMPIRICAL)
     ax.set_xticklabels(
-        [STAGE_LABELS[s] for s in STAGES], rotation=30, ha="right", rotation_mode="anchor"
+        [STAGE_LABELS[s] for s in stages],
+        rotation=45 if dense else 30, ha="right", rotation_mode="anchor",
+        fontsize=5 if dense else None,
     )
-    ax.set_xlim(-0.5, len(STAGES) - 0.5)
+    ax.set_xlim(-0.5, len(stages) - 0.5)
 
 
 def _dataset_offsets() -> dict:
@@ -86,12 +117,13 @@ def _dataset_offsets() -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Data loading / synthesis
+# Data loading
 # --------------------------------------------------------------------------- #
 
 _REQUIRED_COLUMNS = [
     "dataset",
     "k",
+    "level",
     "stage",
     "stage_index",
     "tau",
@@ -104,74 +136,6 @@ _REQUIRED_COLUMNS = [
     "n_balls",
     "seed",
 ]
-
-
-def _synthesize_demo_data() -> pd.DataFrame:
-    rng = np.random.default_rng(0)
-    ks = [64, 128, 256, 512]
-    taus = [0.20, 0.35, 0.50]
-    seeds = [0, 1, 2]
-
-    # Per-dataset base scale for the objective (log10 space) and a per-stage
-    # fractional reduction schedule, so every dataset improves monotonically
-    # stage over stage while keeping distinct absolute magnitudes.
-    base_log10_j = {"eli5": 145.0, "mmlu": 132.0, "wildchat": 118.0}
-    stage_reduction = {
-        "ball": 0.000,
-        "quantizing": 0.020,
-    }
-    stage_fpr = {
-        "ball": 1.2e-2,
-        "quantizing": 3.0e-3,
-    }
-    stage_time = {
-        "ball": 5.3,
-        "quantizing": 1.8,
-    }
-
-    rows = []
-    for dataset in DATASETS:
-        d_scale = base_log10_j[dataset]
-        for k in ks:
-            k_factor = np.log2(k / 64.0) * 0.01
-            for tau in taus:
-                tau_factor = tau * 0.02
-                for seed in seeds:
-                    cum_time = 0.0
-                    for stage in STAGES:
-                        noise = rng.normal(0, 0.15)
-                        red = stage_reduction[stage] + k_factor + noise * 0.002
-                        log10_j = d_scale * (1.0 - red)
-                        log10_j_tau = log10_j * (1.0 + tau_factor) - tau * 0.5
-
-                        fpr_noise = rng.uniform(0.85, 1.15)
-                        fpr = stage_fpr[stage] * fpr_noise
-                        if stage_fpr[stage] == 0.0:
-                            fpr = 0.0
-                        fpr = fpr / (1.0 + k / 512.0)  # bigger k budget -> lower fpr
-
-                        st_noise = rng.uniform(0.9, 1.1)
-                        stage_time_s = stage_time[stage] * st_noise * (1.0 + k / 1024.0)
-                        cum_time += stage_time_s
-
-                        rows.append(
-                            {
-                                "dataset": dataset,
-                                "k": k,
-                                "stage": stage,
-                                "stage_index": STAGE_INDEX[stage],
-                                "tau": tau,
-                                "log10_J": log10_j,
-                                "log10_J_tau": log10_j_tau,
-                                "fpr": fpr,
-                                "fnr": 0.0,
-                                "stage_time_s": stage_time_s,
-                                "cum_time_s": cum_time,
-                                "n_balls": int(k * (0.4 + 0.15 * STAGE_INDEX[stage])),
-                                "seed": seed,
-                            }
-                        )
-    return pd.DataFrame(rows)
 
 
 def _validate_schema(df: pd.DataFrame) -> None:
@@ -196,27 +160,25 @@ def _validate_schema(df: pd.DataFrame) -> None:
             f"Available: {sorted(df['dataset'].unique())}"
         )
 
-    missing_stages = set(STAGES) - set(df["stage"].unique())
-    if missing_stages:
+    present = set(zip(df["level"], df["stage"]))
+    missing_combos = [s for s in STAGES_OBJECTIVE if s not in present]
+    if missing_combos:
         raise ValueError(
-            f"Missing stage(s) {sorted(missing_stages)} in data. "
-            f"Available: {sorted(df['stage'].unique())}"
+            f"Missing (level, stage) combination(s) {missing_combos} in data. "
+            f"Available: {sorted(present)}"
         )
 
 
 def load_data() -> pd.DataFrame:
-    if DEMO:
-        df = _synthesize_demo_data()
+    if not os.path.exists(INPUT_PATH):
+        raise FileNotFoundError(
+            f"Input file not found: {INPUT_PATH!r}. Run generate_ablation() (main.py) "
+            "first, or point INPUT_PATH at a real results file."
+        )
+    if INPUT_PATH.endswith(".parquet"):
+        df = pd.read_parquet(INPUT_PATH)
     else:
-        if not os.path.exists(INPUT_PATH):
-            raise FileNotFoundError(
-                f"Input file not found: {INPUT_PATH!r}. Set DEMO = True to render "
-                "with synthetic data, or point INPUT_PATH at a real results file."
-            )
-        if INPUT_PATH.endswith(".parquet"):
-            df = pd.read_parquet(INPUT_PATH)
-        else:
-            df = pd.read_csv(INPUT_PATH)
+        df = pd.read_csv(INPUT_PATH)
 
     _validate_schema(df)
     return df
@@ -249,16 +211,23 @@ def resolve_config(
 # Aggregation
 # --------------------------------------------------------------------------- #
 
-def aggregate(df: pd.DataFrame, value_col: str, cfg: Config, use_tau: bool = False) -> pd.DataFrame:
-    """Mean + 95% CI of `value_col` over seed, per (dataset, stage), at cfg.k
-    (and cfg.tau if use_tau)."""
+def aggregate(df: pd.DataFrame, value_col: str, cfg: Config, use_tau: bool = False,
+             stages: list = STAGES_EMPIRICAL) -> pd.DataFrame:
+    """Mean + 95% CI of `value_col` over seed, per (dataset, level, stage),
+    at cfg.k (and cfg.tau if use_tau), restricted to the given `stages`
+    (level, stage) combinations -- e.g. the Bound rows carry placeholder
+    fpr/time values and are excluded from panel_fpr/panel_construction_time
+    by leaving `stages` at its STAGES_EMPIRICAL default; the two objective
+    panels pass stages=STAGES_OBJECTIVE to include them."""
     sel = df[df["k"] == cfg.k]
     if use_tau:
         sel = sel[sel["tau"] == cfg.tau]
+    combo = pd.MultiIndex.from_tuples(list(zip(sel["level"], sel["stage"])))
+    sel = sel[combo.isin(stages)]
 
     bad_raw = sel[~np.isfinite(sel[value_col])]
     if len(bad_raw):
-        cols = [c for c in ("dataset", "k", "tau", "stage", "seed", value_col) if c in bad_raw.columns]
+        cols = [c for c in ("dataset", "k", "level", "tau", "stage", "seed", value_col) if c in bad_raw.columns]
         raise ValueError(
             f"Non-finite {value_col!r} values at k={cfg.k}"
             + (f", tau={cfg.tau}" if use_tau else "") + f":\n{bad_raw[cols].to_string(index=False)}\n"
@@ -267,22 +236,22 @@ def aggregate(df: pd.DataFrame, value_col: str, cfg: Config, use_tau: bool = Fal
             "construct-set-relative k sweep in the data-generation step."
         )
 
-    grouped = sel.groupby(["dataset", "stage"])[value_col]
+    grouped = sel.groupby(["dataset", "level", "stage"])[value_col]
     agg = grouped.agg(mean="mean", sem="sem", n="count").reset_index()
     agg["ci95"] = np.where(agg["n"] > 1, 1.96 * agg["sem"].fillna(0.0), 0.0)
 
     for dataset in DATASETS:
-        for stage in STAGES:
-            if not ((agg["dataset"] == dataset) & (agg["stage"] == stage)).any():
+        for level, stage in stages:
+            if not ((agg["dataset"] == dataset) & (agg["level"] == level) & (agg["stage"] == stage)).any():
                 raise ValueError(
-                    f"No rows for dataset={dataset!r}, stage={stage!r} at "
+                    f"No rows for dataset={dataset!r}, level={level}, stage={stage!r} at "
                     f"k={cfg.k}" + (f", tau={cfg.tau}" if use_tau else "") + "."
                 )
     return agg
 
 
-def _lookup(agg: pd.DataFrame, dataset: str, stage: str) -> tuple:
-    row = agg[(agg["dataset"] == dataset) & (agg["stage"] == stage)].iloc[0]
+def _lookup(agg: pd.DataFrame, dataset: str, level: int, stage: str) -> tuple:
+    row = agg[(agg["dataset"] == dataset) & (agg["level"] == level) & (agg["stage"] == stage)].iloc[0]
     return float(row["mean"]), float(row["ci95"])
 
 
@@ -291,13 +260,13 @@ def _lookup(agg: pd.DataFrame, dataset: str, stage: str) -> tuple:
 # --------------------------------------------------------------------------- #
 
 def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    agg = aggregate(df, "log10_J", cfg, use_tau=False)
+    agg = aggregate(df, "log10_J", cfg, use_tau=False, stages=STAGES_OBJECTIVE)
 
     rel = agg.copy()
     rel["rel_mean"] = np.nan
     rel["rel_ci95"] = np.nan
     for dataset in DATASETS:
-        base_mean, _ = _lookup(agg, dataset, "ball")
+        base_mean, _ = _lookup(agg, dataset, *BASELINE_STAGE)
         mask = rel["dataset"] == dataset
         rel.loc[mask, "rel_mean"] = rel.loc[mask, "mean"] - base_mean
         rel.loc[mask, "rel_ci95"] = rel.loc[mask, "ci95"]
@@ -310,6 +279,7 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         filename="ablation-geometric-objective.png",
         cfg=cfg,
         zero_line=True,
+        stages=STAGES_OBJECTIVE,
     )
     return rel
 
@@ -319,13 +289,13 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 
 def panel_threshold_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    agg = aggregate(df, "log10_J_tau", cfg, use_tau=True)
+    agg = aggregate(df, "log10_J_tau", cfg, use_tau=True, stages=STAGES_OBJECTIVE)
 
     rel = agg.copy()
     rel["rel_mean"] = np.nan
     rel["rel_ci95"] = np.nan
     for dataset in DATASETS:
-        base_mean, _ = _lookup(agg, dataset, "ball")
+        base_mean, _ = _lookup(agg, dataset, *BASELINE_STAGE)
         mask = rel["dataset"] == dataset
         rel.loc[mask, "rel_mean"] = rel.loc[mask, "mean"] - base_mean
         rel.loc[mask, "rel_ci95"] = rel.loc[mask, "ci95"]
@@ -350,6 +320,7 @@ def panel_threshold_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         cfg=cfg,
         zero_line=True,
         extra=annotate,
+        stages=STAGES_OBJECTIVE,
     )
     return rel
 
@@ -363,16 +334,17 @@ def _bar_panel(
     cfg: Config,
     zero_line: bool = False,
     extra=None,
+    stages: list = STAGES_EMPIRICAL,
 ) -> None:
     apply_style()
     fig, ax = plt.subplots()
-    x = np.arange(len(STAGES))
+    x = np.arange(len(stages))
     offsets = _dataset_offsets()
 
     for dataset in DATASETS:
         means, cis = [], []
-        for stage in STAGES:
-            row = agg[(agg["dataset"] == dataset) & (agg["stage"] == stage)].iloc[0]
+        for level, stage in stages:
+            row = agg[(agg["dataset"] == dataset) & (agg["level"] == level) & (agg["stage"] == stage)].iloc[0]
             means.append(row[value_col])
             cis.append(row[ci_col])
         means = np.array(means)
@@ -408,7 +380,7 @@ def _bar_panel(
         ax.set_ylim(1.1 * min(ymin, 0.0), 0.0)
 
     ax.set_ylabel(ylabel)
-    _set_stage_xaxis(ax)
+    _set_stage_xaxis(ax, stages)
     _style_axes(ax)
     if extra is not None:
         extra(ax)
@@ -430,13 +402,13 @@ def panel_fpr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     apply_style()
     fig, ax = plt.subplots()
-    x = np.arange(len(STAGES))
+    x = np.arange(len(STAGES_EMPIRICAL))
     offsets = _dataset_offsets()
 
     for dataset in DATASETS:
         means, cis, is_zero = [], [], []
-        for stage in STAGES:
-            row = agg[(agg["dataset"] == dataset) & (agg["stage"] == stage)].iloc[0]
+        for level, stage in STAGES_EMPIRICAL:
+            row = agg[(agg["dataset"] == dataset) & (agg["level"] == level) & (agg["stage"] == stage)].iloc[0]
             m = row["mean"]
             is_zero.append(m == 0)
             means.append(floor if m == 0 else m)
@@ -484,7 +456,7 @@ def panel_fpr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     ax.tick_params(axis="y", which="minor", length=1.2, width=0.4)
 
     ax.set_ylabel("FPR")
-    _set_stage_xaxis(ax)
+    _set_stage_xaxis(ax, STAGES_EMPIRICAL)
     _style_axes(ax)
 
     _save(fig, "ablation-false-positive-rate.png", cfg)
@@ -501,13 +473,14 @@ def panel_construction_time(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     apply_style()
     fig, ax = plt.subplots()
-    x = np.arange(len(STAGES))
+    x = np.arange(len(STAGES_EMPIRICAL))
     offsets = _dataset_offsets()
 
     for dataset in DATASETS:
         means, cis = [], []
-        for stage in STAGES:
-            row = agg_stage[(agg_stage["dataset"] == dataset) & (agg_stage["stage"] == stage)].iloc[0]
+        for level, stage in STAGES_EMPIRICAL:
+            row = agg_stage[(agg_stage["dataset"] == dataset) & (agg_stage["level"] == level)
+                            & (agg_stage["stage"] == stage)].iloc[0]
             means.append(row["mean"])
             cis.append(row["ci95"])
         means = np.array(means)
@@ -538,8 +511,9 @@ def panel_construction_time(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             )
 
         cum_means = [
-            agg_cum[(agg_cum["dataset"] == dataset) & (agg_cum["stage"] == stage)].iloc[0]["mean"]
-            for stage in STAGES
+            agg_cum[(agg_cum["dataset"] == dataset) & (agg_cum["level"] == level)
+                   & (agg_cum["stage"] == stage)].iloc[0]["mean"]
+            for level, stage in STAGES_EMPIRICAL
         ]
         ax.plot(
             x,
@@ -560,7 +534,7 @@ def panel_construction_time(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     ax.tick_params(axis="y", which="minor", length=1.2, width=0.4)
 
     ax.set_ylabel("Time (s)")
-    _set_stage_xaxis(ax)
+    _set_stage_xaxis(ax, STAGES_EMPIRICAL)
     _style_axes(ax)
 
     _save(fig, "ablation-construction-time.png", cfg)
@@ -589,7 +563,8 @@ def _save(fig: plt.Figure, filename: str, cfg: Config) -> None:
 
 def print_summary(df: pd.DataFrame, cfg: Config) -> None:
     print("\n--- Ablation summary (k={}, tau={:g}) ---".format(cfg.k, cfg.tau))
-    header = f"{'dataset':<10} {'d(log10 J) ball->quant':>18} {'final FPR':>12} {'total time (s)':>16}"
+    header = (f"{'dataset':<10} {'level':>5} {'d(log10 J) ball->quant':>22} "
+              f"{'final FPR':>12} {'total time (s)':>16}")
     print(header)
     print("-" * len(header))
 
@@ -598,14 +573,15 @@ def print_summary(df: pd.DataFrame, cfg: Config) -> None:
     time_agg = aggregate(df, "cum_time_s", cfg, use_tau=False)
 
     for dataset in DATASETS:
-        base_j, _ = _lookup(j_agg, dataset, "ball")
-        final_j, _ = _lookup(j_agg, dataset, "quantizing")
-        final_fpr, _ = _lookup(fpr_agg, dataset, "quantizing")
-        total_time, _ = _lookup(time_agg, dataset, "quantizing")
-        print(
-            f"{DATASET_LABELS[dataset]:<10} {final_j - base_j:>18.3f} "
-            f"{final_fpr:>12.2e} {total_time:>16.2f}"
-        )
+        for level in LEVELS:
+            base_j, _ = _lookup(j_agg, dataset, level, "ball")
+            final_j, _ = _lookup(j_agg, dataset, level, "quantizing")
+            final_fpr, _ = _lookup(fpr_agg, dataset, level, "quantizing")
+            total_time, _ = _lookup(time_agg, dataset, level, "quantizing")
+            print(
+                f"{DATASET_LABELS[dataset]:<10} {level:>5} {final_j - base_j:>22.3f} "
+                f"{final_fpr:>12.2e} {total_time:>16.2f}"
+            )
     print()
 
 
@@ -626,7 +602,7 @@ def generate_ablation_figures(
     in-memory long-format DataFrame, the same way `plot_results` in plots.py
     is called directly on a results list instead of round-tripping through a
     file. If `df` is omitted, falls back to `load_data()` (CONFIG-driven,
-    honors DEMO/INPUT_PATH) so the script still works standalone.
+    reads INPUT_PATH) so the script still works standalone.
     """
     if df is None:
         df = load_data()
