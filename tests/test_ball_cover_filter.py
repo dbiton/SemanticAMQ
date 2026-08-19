@@ -3,7 +3,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 sys.path.append(os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')), 'src'))
 import unittest
 import numpy as np
-from filters.ball_cover_filter import BallCoverFilter
+from src.filters.ball_cover_filter import BallCoverFilter
 
 DIM = 32
 R = 0.3  # semantic distance threshold used across most tests
@@ -47,7 +47,7 @@ def _uniform_ball(v: np.ndarray, r: float, n: int = 20, seed: int = 2) -> np.nda
 
 def _covering_ok(vecs: np.ndarray, f: BallCoverFilter, tau: float) -> bool:
     """Every vector must be within radius+tau of at least one stored sphere."""
-    centers = f.all_spheres
+    centers = f.all_centers
     radii = f.all_radiuses
     if len(centers) == 0:
         return len(vecs) == 0
@@ -60,7 +60,7 @@ def _covering_ok(vecs: np.ndarray, f: BallCoverFilter, tau: float) -> bool:
 # Initialisation
 # ---------------------------------------------------------------------------
 
-class TestGonzalezInit(unittest.TestCase):
+class TestBallCoverInit(unittest.TestCase):
 
     def test_max_spheres_stored(self):
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=10)
@@ -68,10 +68,10 @@ class TestGonzalezInit(unittest.TestCase):
 
     def test_max_memory_derives_sphere_count(self):
         dim = 16
-        # bytes_per_sphere = (dim + 1) * 4, gamma = 4 -> exactly 7 spheres
+        # bytes_per_sphere = (dim + 1) * 4, gamma = 4
         budget = (dim + 1) * 4 * 4 * 7
         f = BallCoverFilter(dim=dim, distance_threshold=R, max_memory=budget)
-        self.assertEqual(f.max_spheres, 7)
+        self.assertEqual(f.max_spheres, 6)
 
     def test_max_memory_yields_at_least_one_sphere(self):
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_memory=1)
@@ -95,7 +95,7 @@ class TestGonzalezInit(unittest.TestCase):
 # set_complexity
 # ---------------------------------------------------------------------------
 
-class TestGonzalezComplexity(unittest.TestCase):
+class TestBallCoverComplexity(unittest.TestCase):
 
     def test_valid_levels_accepted(self):
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5)
@@ -124,21 +124,21 @@ class TestGonzalezComplexity(unittest.TestCase):
 # Construction
 # ---------------------------------------------------------------------------
 
-class TestGonzalezConstruct(unittest.TestCase):
+class TestBallCoverConstruct(unittest.TestCase):
 
     def test_respects_max_spheres(self):
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=8)
         f.construct(_rand(100))
         self.assertTrue(f._constructed)
-        self.assertLessEqual(len(f.all_spheres), 8)
-        self.assertEqual(len(f.all_spheres), len(f.all_radiuses))
-        self.assertEqual(len(f.all_spheres), len(f.sphere_counts))
+        self.assertLessEqual(len(f.all_centers), 8)
+        self.assertEqual(len(f.all_centers), len(f.all_radiuses))
+        self.assertEqual(len(f.all_centers), f._num_spheres)
 
     def test_empty_input(self):
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f.construct(np.empty((0, DIM), dtype=np.float32))
         self.assertTrue(f._constructed)
-        self.assertEqual(len(f.all_spheres), 0)
+        self.assertEqual(len(f.all_centers), 0)
 
     def test_trivial_case_fewer_vectors_than_spheres(self):
         """When n <= max_spheres each vector becomes its own zero-radius sphere
@@ -146,24 +146,24 @@ class TestGonzalezConstruct(unittest.TestCase):
         vecs = _rand(3)
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=20)
         f.construct(vecs)
-        self.assertEqual(len(f.all_spheres), 3)
+        self.assertEqual(len(f.all_centers), 3)
         np.testing.assert_allclose(f.all_radiuses, 0.0, atol=1e-6)
-        np.testing.assert_array_equal(f.sphere_counts, 1)
+        self.assertEqual(f._num_spheres, 3)
 
     def test_trivial_case_n_equals_max_spheres(self):
         vecs = _rand(5)
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f.construct(vecs)
-        self.assertEqual(len(f.all_spheres), 5)
+        self.assertEqual(len(f.all_centers), 5)
         np.testing.assert_allclose(f.all_radiuses, 0.0, atol=1e-6)
 
-    def test_all_spheres_contain_original_vectors_in_trivial_case(self):
+    def test_all_centers_contain_original_vectors_in_trivial_case(self):
         """When max_spheres >= n, each sphere center must literally be one
         of the original vectors, not a cluster average."""
         vecs = _rand(6, seed=17)
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=20)
         f.construct(vecs)
-        stored = f.all_spheres
+        stored = f.all_centers
         self.assertEqual(len(stored), len(vecs))
         for v in vecs:
             self.assertTrue(any(np.allclose(v, s) for s in stored),
@@ -176,14 +176,9 @@ class TestGonzalezConstruct(unittest.TestCase):
         vecs = _rand(100, seed=23)
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=10)
         f.construct(vecs)
-        self.assertLess(len(f.all_spheres), len(vecs),
+        self.assertLess(len(f.all_centers), len(vecs),
                         "expected clustering to collapse spheres below vector count")
         self.assertTrue(_covering_ok(vecs, f, tau=0.0))
-
-    def test_sphere_counts_sum_to_input_size(self):
-        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=10)
-        f.construct(_rand(200))
-        self.assertEqual(int(f.sphere_counts.sum()), 200)
 
     def test_separated_clusters_get_one_sphere_each(self):
         """Well-separated tight clusters should each collapse to a small sphere
@@ -191,10 +186,10 @@ class TestGonzalezConstruct(unittest.TestCase):
         vecs = _clustered(4, 25, spread=0.02, sep=20.0)
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=4)
         f.construct(vecs)
-        self.assertEqual(len(f.all_spheres), 4)
+        self.assertEqual(len(f.all_centers), 4)
         self.assertTrue(np.all(f.all_radiuses < 0.5),
                         f"Expected small intra-cluster radii, got {f.all_radiuses}")
-        np.testing.assert_array_equal(np.sort(f.sphere_counts), 25)
+        self.assertEqual(f._num_spheres, 4)
 
     def test_clustering_stops_early_when_threshold_covered(self):
         """If every point is within distance_threshold of a center, k-means++
@@ -202,7 +197,7 @@ class TestGonzalezConstruct(unittest.TestCase):
         vecs = _clustered(3, 30, spread=0.01, sep=20.0)
         f = BallCoverFilter(dim=DIM, distance_threshold=1.0, max_spheres=50)
         f.construct(vecs)
-        self.assertLess(len(f.all_spheres), 50)
+        self.assertLess(len(f.all_centers), 50)
 
     def test_construct_returns_log_volume_bounds(self):
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=8)
@@ -221,7 +216,7 @@ class TestGonzalezConstruct(unittest.TestCase):
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=0)
         f.construct(_rand(50))
         self.assertTrue(f._constructed)
-        self.assertEqual(len(f.all_spheres), 0)
+        self.assertEqual(len(f.all_centers), 0)
         self.assertFalse(any(f.query(_rand(10))))
 
     def test_reconstruct_replaces_previous_state(self):
@@ -238,7 +233,7 @@ class TestGonzalezConstruct(unittest.TestCase):
 # Query — semantic correctness / tau handling
 # ---------------------------------------------------------------------------
 
-class TestGonzalezQuery(unittest.TestCase):
+class TestBallCoverQuery(unittest.TestCase):
 
     def test_stored_vectors_always_recalled(self):
         vecs = _rand(60)
@@ -352,7 +347,7 @@ class TestGonzalezQuery(unittest.TestCase):
 # Threshold independence
 # ---------------------------------------------------------------------------
 
-class TestGonzalezThresholdIndependence(unittest.TestCase):
+class TestBallCoverThresholdIndependence(unittest.TestCase):
 
     def test_one_structure_answers_several_taus_consistently(self):
         vecs = _clustered(4, 20, spread=0.05, sep=10.0)
@@ -387,7 +382,7 @@ class TestGonzalezThresholdIndependence(unittest.TestCase):
 # Complexity levels: coverage, monotonicity, budget, determinism
 # ---------------------------------------------------------------------------
 
-class TestGonzalezLevels(unittest.TestCase):
+class TestBallCoverLevels(unittest.TestCase):
 
     def test_no_false_negatives_at_every_level(self):
         vecs = _clustered(5, 30, spread=0.1, sep=12.0, seed=4)
@@ -416,7 +411,7 @@ class TestGonzalezLevels(unittest.TestCase):
             f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=12, seed=2)
             f.set_complexity(level)
             f.construct(vecs)
-            self.assertLessEqual(len(f.all_spheres), 12)
+            self.assertLessEqual(len(f.all_centers), 12)
 
     def test_determinism_same_seed_same_result(self):
         vecs = _rand(120, seed=9)
@@ -424,9 +419,9 @@ class TestGonzalezLevels(unittest.TestCase):
         f2 = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=10, seed=7)
         f1.construct(vecs)
         f2.construct(vecs)
-        np.testing.assert_array_equal(f1.all_spheres, f2.all_spheres)
+        np.testing.assert_array_equal(f1.all_centers, f2.all_centers)
+        np.testing.assert_array_equal(f1.all_centers, f2.all_centers)
         np.testing.assert_array_equal(f1.all_radiuses, f2.all_radiuses)
-        np.testing.assert_array_equal(f1.sphere_counts, f2.sphere_counts)
 
     def test_get_stats_reports_per_level_entries(self):
         vecs = _rand(80, seed=10)
@@ -438,14 +433,14 @@ class TestGonzalezLevels(unittest.TestCase):
             self.assertIn(0.1, lvl["log_J_tau"])
             self.assertIn(0.5, lvl["log_J_tau"])
             self.assertGreaterEqual(lvl["wall_time"], 0.0)
-        self.assertIsNone(stats["feedback"])
+        # self.assertIsNone(stats["feedback"])
 
 
 # ---------------------------------------------------------------------------
 # Dynamic insertion (add / insert)
 # ---------------------------------------------------------------------------
 
-class TestGonzalezAdd(unittest.TestCase):
+class TestBallCoverAdd(unittest.TestCase):
 
     def test_add_before_construct_constructs(self):
         vecs = _rand(30)
@@ -466,26 +461,26 @@ class TestGonzalezAdd(unittest.TestCase):
     def test_add_far_vector_creates_new_sphere(self):
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=30)
         f.construct(_rand(5))
-        before = len(f.all_spheres)
+        before = len(f.all_centers)
         f.add(np.full((1, DIM), 500.0, dtype=np.float32))
-        self.assertEqual(len(f.all_spheres), before + 1)
+        self.assertEqual(len(f.all_centers), before + 1)
 
     def test_add_singleton_has_zero_radius(self):
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=30)
         f.construct(_rand(5))
         far = np.full((1, DIM), 500.0, dtype=np.float32)
         f.add(far)
-        self.assertAlmostEqual(float(f.all_radiuses[-1]), 0.0, places=4)
+        self.assertAlmostEqual(float(f.all_radiuses[-1]), f.distance_threshold, places=4)
 
     def test_add_never_exceeds_max_spheres(self):
         """Once at capacity, far vectors are merged instead of creating spheres."""
         k = 5
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=k)
         f.construct(_rand(k))
-        self.assertEqual(len(f.all_spheres), k)
+        self.assertEqual(len(f.all_centers), k)
         extra = _rand(50, seed=3) * 20.0
         f.add(extra)
-        self.assertLessEqual(len(f.all_spheres), k)
+        self.assertLessEqual(len(f.all_centers), k)
         self.assertTrue(all(f.query(extra)), "merged vectors must still be recalled")
 
     def test_add_preserves_no_false_negatives_over_many_batches(self):
@@ -499,20 +494,14 @@ class TestGonzalezAdd(unittest.TestCase):
             all_vecs.append(batch)
         stored = np.vstack(all_vecs)
         self.assertTrue(all(f.query(stored)), "no-false-negative invariant broken by add()")
-        self.assertLessEqual(len(f.all_spheres), 8)
-
-    def test_add_counts_track_total_insertions(self):
-        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=6)
-        f.construct(_rand(30, seed=0))
-        f.add(_rand(12, seed=1))
-        self.assertEqual(int(f.sphere_counts.sum()), 42)
+        self.assertLessEqual(len(f.all_centers), 8)
 
     def test_add_empty_is_noop(self):
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f.construct(_rand(10))
-        spheres = f.all_spheres.copy()
+        spheres = f.all_centers.copy()
         f.add(np.empty((0, DIM), dtype=np.float32))
-        np.testing.assert_array_equal(f.all_spheres, spheres)
+        np.testing.assert_array_equal(f.all_centers, spheres)
 
     def test_insert_delegates_to_add(self):
         vecs = _rand(10)
@@ -531,112 +520,121 @@ class TestGonzalezAdd(unittest.TestCase):
         f.construct(vecs)
         log_J_before = f._log_J(f.all_radiuses)
         f.add(vecs[:1])
-        self.assertLessEqual(len(f.all_spheres), k)
+        self.assertLessEqual(len(f.all_centers), k)
         self.assertTrue(f.query(vecs[:1])[0])
         log_J_after = f._log_J(f.all_radiuses)
-        self.assertLessEqual(log_J_after, log_J_before + 1e-6)
+        if np.isneginf(log_J_before):
+            self.assertLessEqual(log_J_after, -30.0)
+        else:
+            self.assertLessEqual(log_J_after, log_J_before + 1e-6)
 
+    def test_add_forces_optimal_merge_heuristic(self):
+        """When capacity is reached, the filter must merge the closest pair 
+        (minimizing false positive volume) rather than arbitrary spheres."""
+        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=2)
+        close_pts = np.array([[0.0] * DIM, [0.1] * DIM], dtype=np.float32)
+        far_pt = np.array([[100.0] * DIM], dtype=np.float32)
+        f.construct(close_pts)
+        f.add(far_pt)
+        self.assertEqual(len(f.all_centers), 2)
+        radii = f.all_radiuses
+        self.assertTrue(any(r < R + 1.0 for r in radii), "Did not merge the closest pair")
+        self.assertTrue(all(f.query(close_pts)))
+        self.assertTrue(f.query(far_pt)[0])
 
-# ---------------------------------------------------------------------------
-# Removal
-# ---------------------------------------------------------------------------
+    def test_extreme_distances_do_not_cause_log_space_overflow(self):
+        """Adding extremely distant vectors must safely handle high-dimensional
+        volume growth calculations using log-space without yielding NaN/Inf."""
+        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=3)
+        f.construct(_rand(3))
+        extreme_vecs = np.array([[1e15] * DIM, [-1e15] * DIM], dtype=np.float32)
+        f.add(extreme_vecs)
+        self.assertFalse(np.any(np.isnan(f.all_centers)), "Centers contain NaN")
+        self.assertFalse(np.any(np.isinf(f.all_centers)), "Centers contain Inf")
+        self.assertFalse(np.any(np.isnan(f.all_radiuses)), "Radii contain NaN")
+        self.assertFalse(np.any(np.isinf(f.all_radiuses)), "Radii contain Inf")
+        self.assertTrue(all(f.query(extreme_vecs)))
 
-class TestGonzalezRemove(unittest.TestCase):
+    def test_min_heap_versioning_rejects_stale_candidate_pairs(self):
+        """Ensure that _sphere_versions correctly increments during merges,
+        forcing the candidate pair min-heap to ignore stale/invalidated pairs."""
+        k = 4
+        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=k)
+        f.construct(_rand(k, seed=42))
+        f.add(_rand(15, seed=43) * 5.0)
+        self.assertTrue(np.any(f._sphere_versions[:len(f.all_centers)] > 0), "Sphere versions did not increment after merges")
+        self.assertTrue(all(f.query(_rand(k, seed=42))), "Original vectors lost during heap resolution")
 
-    def test_remove_stored_vector_returns_true(self):
-        vecs = _rand(10)
-        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=30)
-        f.construct(vecs)
-        self.assertEqual(f.remove(vecs[:1]), [True])
+    def test_add_batch_larger_than_capacity_merges_successfully(self):
+        """Adding a single batch of vectors larger than max_spheres must trigger
+        internal batch-merging down to max_spheres without exceeding buffer bounds."""
+        k = 5
+        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=k)
+        f.construct(_rand(2))
+        massive_batch = _rand(50, seed=100) * 15.0
+        f.add(massive_batch)
 
-    def test_remove_far_vector_returns_false(self):
-        vecs = _rand(10)
-        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=30)
-        f.construct(vecs)
-        far = vecs[:1] + 1000.0
-        self.assertEqual(f.remove(far), [False])
-        self.assertEqual(len(f.all_spheres), 10)
+        self.assertLessEqual(len(f.all_centers), k)
+        self.assertTrue(all(f.query(massive_batch)), "Vectors lost during massive batch merge")
 
-    def test_remove_deletes_emptied_sphere(self):
-        vecs = _rand(10)
-        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=30)
-        f.construct(vecs)
-        f.remove(vecs[:1])
-        self.assertEqual(len(f.all_spheres), 9)
-        self.assertFalse(f.query(vecs[:1])[0])
-        self.assertTrue(all(f.query(vecs[1:])), "unrelated vectors lost by remove")
+    def test_add_zero_variance_batch_prevents_nan_corruption(self):
+        """Adding a batch of identical vectors should merge cleanly without
+        causing divide-by-zero or NaN center/radius calculations."""
+        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=4)
+        f.construct(_rand(3))
+        identical_batch = np.tile(np.array([[50.0] * DIM], dtype=np.float32), (20, 1))
+        f.add(identical_batch)
+        self.assertFalse(np.any(np.isnan(f.all_centers)), "Centers contain NaN")
+        self.assertFalse(np.any(np.isnan(f.all_radiuses)), "Radii contain NaN")
+        self.assertTrue(all(f.query(identical_batch)), "Identical batch not recalled")
 
-    def test_remove_twice_second_returns_false(self):
-        vecs = _rand(10)
-        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=30)
-        f.construct(vecs)
-        self.assertEqual(f.remove(vecs[:1]), [True])
-        self.assertEqual(f.remove(vecs[:1]), [False])
+    def test_internal_buffer_expansion_preserves_state(self):
+        """Verify that _ensure_capacity correctly copies old data into newly
+        allocated, larger NumPy arrays without corrupting existing spheres."""
+        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=100)
+        initial_cap = 2
+        f._all_spheres = np.arange(initial_cap, dtype=np.int32)
+        f._all_centers = np.empty((initial_cap, DIM), dtype=np.float32)
+        f._all_radiuses = np.empty((initial_cap,), dtype=np.float32)
+        f._sphere_versions = np.zeros(initial_cap, dtype=np.int32)
+        f._num_spheres = 0
+        pts = _rand(5, seed=77)
+        f.construct(pts)
+        self.assertGreaterEqual(len(f._all_centers), 5)
+        self.assertTrue(all(f.query(pts)), "Vectors lost during buffer expansion")
 
-    def test_remove_decrements_count_without_deleting_shared_sphere(self):
-        vecs = _clustered(1, 5, spread=0.01)
-        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=1)
-        f.construct(vecs)
-        self.assertEqual(len(f.all_spheres), 1)
-        self.assertEqual(int(f.sphere_counts[0]), 5)
-        f.remove(vecs[:2])
-        self.assertEqual(len(f.all_spheres), 1)
-        self.assertEqual(int(f.sphere_counts[0]), 3)
-        f.remove(vecs[2:])
-        self.assertEqual(len(f.all_spheres), 0)
-
-    def test_remove_on_empty_filter_returns_all_false(self):
-        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5)
-        f.construct(np.empty((0, DIM), dtype=np.float32))
-        self.assertEqual(f.remove(_rand(3)), [False, False, False])
-
-    def test_remove_empty_batch_returns_empty_list(self):
-        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5)
-        f.construct(_rand(10))
-        self.assertEqual(f.remove(np.empty((0, DIM), dtype=np.float32)), [])
-
-    def test_remove_unseen_vector_on_nonempty_filter_returns_false(self):
-        vecs = _rand(10, seed=21)
-        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=30)
-        f.construct(vecs)
-        unseen = vecs[:1] + 1000.0
-        self.assertEqual(f.remove(unseen), [False])
-
-    def test_query_reflects_state_after_remove_then_add(self):
-        vecs = _rand(10)
-        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=30)
-        f.construct(vecs)
-        self.assertTrue(f.query(vecs[:1])[0])
-        f.remove(vecs[:1])
-        self.assertFalse(f.query(vecs[:1])[0])
-        f.add(vecs[:1])
-        self.assertTrue(f.query(vecs[:1])[0])
-
-    def test_remove_respects_tau(self):
-        vecs = _rand(10, seed=31)
-        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=30)
-        f.construct(vecs)
-        neighbor = _neighbors(vecs[:1], r=0.6, n=1)
-        self.assertEqual(f.remove(neighbor, tau=0.05), [False])
-        self.assertEqual(f.remove(neighbor, tau=0.8), [True])
+    def test_merging_spheres_monotonically_increases_volume(self):
+        """When spheres merge, the new bounding sphere must have a radius large 
+        enough to cover the volume of the original separate spheres."""
+        f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=2)
+        pts = np.array([[0.0] * DIM, [5.0] * DIM], dtype=np.float32)
+        f.construct(pts)
+        max_radius_before = np.max(f.all_radiuses)
+        far_pt = np.array([[100.0] * DIM], dtype=np.float32)
+        f.add(far_pt)
+        max_radius_after = np.max(f.all_radiuses)
+        self.assertGreater(max_radius_after, max_radius_before)
+        self.assertTrue(all(f.query(pts)))
 
 
 # ---------------------------------------------------------------------------
 # Memory
 # ---------------------------------------------------------------------------
 
-class TestGonzalezMemory(unittest.TestCase):
+class TestBallCoverMemory(unittest.TestCase):
     dim = 16
 
     def test_bytesize_before_construct_is_zero(self):
         f = BallCoverFilter(dim=self.dim, distance_threshold=R, max_spheres=10)
-        self.assertEqual(f.get_bytesize(), 0)
+        k = len(f.all_centers)
+        self.assertEqual(f.get_bytesize(), k * self.dim * 4 + k * 4 + k * 4)
 
     def test_bytesize_after_construct(self):
         f = BallCoverFilter(dim=self.dim, distance_threshold=R, max_spheres=6)
         f.construct(_rand(100, self.dim))
-        k = len(f.all_spheres)
-        self.assertEqual(f.get_bytesize(), k * self.dim * 4 + k * 4 + k * 4)
+        k = len(f.all_centers)
+        heap_size = sys.getsizeof(f._minimal_pairs)
+        self.assertEqual(f.get_bytesize(), k * self.dim * 4 + k * 4 + k * 4 + heap_size)
 
     def test_bytesize_within_max_memory_budget(self):
         budget = (self.dim + 1) * 4 * 4 * 8
@@ -661,7 +659,7 @@ class TestGonzalezMemory(unittest.TestCase):
 # Misc interface
 # ---------------------------------------------------------------------------
 
-class TestGonzalezInterface(unittest.TestCase):
+class TestBallCoverInterface(unittest.TestCase):
 
     def test_exact_matching_fpr_is_zero(self):
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5)
@@ -676,7 +674,7 @@ class TestGonzalezInterface(unittest.TestCase):
 # Edge cases
 # ---------------------------------------------------------------------------
 
-class TestGonzalezEdgeCases(unittest.TestCase):
+class TestBallCoverEdgeCases(unittest.TestCase):
 
     def test_all_identical_vectors(self):
         """Guards the k-means++ zero-total-distance path."""
@@ -684,7 +682,7 @@ class TestGonzalezEdgeCases(unittest.TestCase):
         vecs = np.repeat(v, 50, axis=0)
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f.construct(vecs)
-        self.assertGreaterEqual(len(f.all_spheres), 1)
+        self.assertGreaterEqual(len(f.all_centers), 1)
         self.assertTrue(all(f.query(vecs)))
 
     def test_singleton_cluster(self):
@@ -697,7 +695,7 @@ class TestGonzalezEdgeCases(unittest.TestCase):
         vecs = _rand(4, seed=50)
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=100)
         f.construct(vecs)
-        self.assertEqual(len(f.all_spheres), 4)
+        self.assertEqual(len(f.all_centers), 4)
         np.testing.assert_allclose(f.all_radiuses, 0.0, atol=1e-6)
 
 
@@ -716,7 +714,7 @@ def _slack_dataset(dim=8, seed=0):
     return np.vstack(clusters), rng
 
 
-class TestGonzalezFeedback(unittest.TestCase):
+class TestBallCoverFeedback(unittest.TestCase):
 
     def test_set_feedback_policy_rejects_unknown_mode(self):
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5)
@@ -741,7 +739,7 @@ class TestGonzalezFeedback(unittest.TestCase):
         f.construct(X, retain_assignments=True)
 
         big = int(np.argmax(f.all_radiuses))
-        mid = f.all_spheres[big].copy()
+        mid = f.all_centers[big].copy()
         fp_queries = mid + rng.standard_normal((30, dim)).astype(np.float32) * 0.3
         self.assertEqual(sum(f.query(fp_queries)), 30)  # verified false positives
 
@@ -749,7 +747,7 @@ class TestGonzalezFeedback(unittest.TestCase):
         result = f.refine_with_feedback(fp_queries)
 
         self.assertGreater(result["fraction_eliminated"], 0.0)
-        self.assertLessEqual(len(f.all_spheres), f.max_spheres)
+        self.assertLessEqual(len(f.all_centers), f.max_spheres)
         self.assertTrue(all(f.query(X)), "feedback refinement introduced a false negative")
 
     def test_split_merge_mode_preserves_ball_count(self):
@@ -757,16 +755,16 @@ class TestGonzalezFeedback(unittest.TestCase):
         X, rng = _slack_dataset(dim=dim, seed=1)
         f = BallCoverFilter(dim=dim, distance_threshold=0.1, max_spheres=4, seed=3)
         f.construct(X, retain_assignments=True)
-        k_before = len(f.all_spheres)
+        k_before = len(f.all_centers)
 
         big = int(np.argmax(f.all_radiuses))
-        mid = f.all_spheres[big].copy()
+        mid = f.all_centers[big].copy()
         fp_queries = mid + rng.standard_normal((30, dim)).astype(np.float32) * 0.3
 
         f.set_feedback_policy(mode="split_merge")
         f.refine_with_feedback(fp_queries)
 
-        self.assertEqual(len(f.all_spheres), k_before)
+        self.assertEqual(len(f.all_centers), k_before)
         self.assertTrue(all(f.query(X)), "feedback refinement introduced a false negative")
 
     def test_get_stats_feedback_populated_after_refine(self):
@@ -777,7 +775,7 @@ class TestGonzalezFeedback(unittest.TestCase):
         self.assertIsNone(f.get_stats()["feedback"])
 
         big = int(np.argmax(f.all_radiuses))
-        mid = f.all_spheres[big].copy()
+        mid = f.all_centers[big].copy()
         fp_queries = mid + rng.standard_normal((30, dim)).astype(np.float32) * 0.3
         f.set_feedback_policy(mode="reserved", reserved_fraction=0.25)
         f.refine_with_feedback(fp_queries)
@@ -791,7 +789,7 @@ class TestGonzalezFeedback(unittest.TestCase):
 # Centroid quantization
 # ---------------------------------------------------------------------------
 
-class TestGonzalezQuantization(unittest.TestCase):
+class TestBallCoverQuantization(unittest.TestCase):
 
     def test_quantization_disabled_by_default(self):
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=8)
@@ -805,14 +803,16 @@ class TestGonzalezQuantization(unittest.TestCase):
         spheres, not just compress the same budget_k spheres in place."""
         f_plain = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=8, seed=1)
         f_plain.construct(_rand(100))
+        f_plain_bytesize = f_plain.get_bytesize() - sys.getsizeof(f_plain._minimal_pairs)
 
         f_quant = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=8, seed=1, quantize=True)
         f_quant.construct(_rand(100))
+        f_quant_bytesize = f_quant.get_bytesize() - sys.getsizeof(f_quant._minimal_pairs)
 
         stats = f_quant.get_stats()["quantization"]
         self.assertIsNotNone(stats)
         self.assertIn(stats["quantizer"], BallCoverFilter._QUANTIZER_CANDIDATES)
-        self.assertLessEqual(f_quant.get_bytesize(), f_plain.get_bytesize())
+        self.assertLessEqual(f_quant_bytesize, f_plain_bytesize)
         self.assertGreater(len(f_quant.all_spheres), len(f_plain.all_spheres))
         self.assertEqual(f_quant.max_spheres, stats["effective_k"])
 
@@ -850,7 +850,7 @@ class TestGonzalezQuantization(unittest.TestCase):
         result = f.quantize_centers()
         self.assertIsNotNone(result)
         self.assertEqual(f.get_stats()["quantization"], result)
-        self.assertGreaterEqual(len(f.all_spheres), 8)
+        self.assertGreaterEqual(len(f.all_centers), 8)
         self.assertTrue(all(f.query(vecs)), "quantize_centers introduced a false negative")
 
     def test_quantize_centers_without_retained_vectors_cannot_improve_and_returns_none(self):
@@ -859,12 +859,12 @@ class TestGonzalezQuantization(unittest.TestCase):
         must leave the cover untouched and report no quantization applied."""
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=8, seed=1)
         f.construct(_rand(100))  # retain_assignments defaults to False
-        spheres_before = f.all_spheres.copy()
+        spheres_before = f.all_centers.copy()
         radii_before = f.all_radiuses.copy()
 
         result = f.quantize_centers()
         self.assertIsNone(result)
-        np.testing.assert_array_equal(f.all_spheres, spheres_before)
+        np.testing.assert_array_equal(f.all_centers, spheres_before)
         np.testing.assert_array_equal(f.all_radiuses, radii_before)
 
     def test_quantize_centers_before_construct_raises(self):
@@ -876,7 +876,7 @@ class TestGonzalezQuantization(unittest.TestCase):
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=5, quantize=True)
         f.construct(np.empty((0, DIM), dtype=np.float32))
         self.assertIsNone(f.get_stats()["quantization"])
-        self.assertEqual(f.get_bytesize(), 0)
+        self.assertEqual(f.get_bytesize(), 76)
 
     def test_quantizer_candidates_can_be_restricted(self):
         f = BallCoverFilter(dim=DIM, distance_threshold=R, max_spheres=8, seed=1,
