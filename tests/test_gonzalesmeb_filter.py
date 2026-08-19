@@ -3,7 +3,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 sys.path.append(os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')), 'src'))
 import unittest
 import numpy as np
-from src.filters.gonzales_filter import GonzalezMEBFilter
+from src.filters.gonzalesmeb_filter import GonzalezMEBFilter
 
 DIM = 32
 R = 0.3  # semantic distance threshold used across most tests

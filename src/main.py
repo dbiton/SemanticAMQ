@@ -8,7 +8,7 @@ from filters.cuckoo_filter import CuckooFilter
 from filters.gcs_filter import GCSFilter
 from filters.kdbox_filter import KDBoxFilter
 from filters.gonzalesbox_filter import GonzalezBoxFilter
-from filters.gonzales_filter import GonzalezMEBFilter
+from src.filters.gonzalesmeb_filter import GonzalezMEBFilter
 from filters.pyfusefilter_filters import Fuse8Filter, Xor8Filter
 from filters.quotient_filter import QuotientFilterWrapper
 from lsh import FaissSimHashLSH, LSH
