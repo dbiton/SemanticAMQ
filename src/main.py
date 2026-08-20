@@ -362,7 +362,7 @@ def generate_system() -> Tuple[pd.DataFrame, int]:
     plot_system() needs it for the per-panel annotation and there's nothing
     to derive it from -- k is fixed by construction, not swept.
     """
-    num_vectors               = 10_000
+    num_vectors               = 1_000
     dim                       = 384
     percentage_construct      = 20
     # k is scaled off the construct-set size rather than a fixed constant.
@@ -1162,12 +1162,12 @@ def generate_and_plot_all() -> None:
     below). The early return currently isolates system for standalone
     testing; remove it to also run the other 5.
     """
-    plot_ablation(*generate_ablation())
+    # plot_ablation(*generate_ablation())
     #plot_streaming(*generate_streaming())
     #plot_static(generate_static())
     #plot_dynamic(generate_dynamic())
     #plot_equal_memory(generate_equal_memory()) // failed on 100K
-    #plot_system(*generate_system())
+    plot_system(*generate_system())
     #plot_system_tau(*generate_system_tau())
     return
     try:
@@ -1249,5 +1249,5 @@ def plot_all() -> None:
 
 
 if __name__ == "__main__":
-    # generate_and_plot_all()
-    plot_all()
+    generate_and_plot_all()
+    # plot_all()

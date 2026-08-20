@@ -14,9 +14,12 @@ from scipy.special import logsumexp
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 
 from filters.ball_cover_filter import BallCoverFilter
-from filters import streaming_insertion
 from hyperspheres_volume import estimate_hypersphere_volume
 from vector_source import VectorSource
+
+# filters.streaming_insertion pulls in filters.ball_geometry, which no longer
+# exists -- imported lazily inside the few workers that use it (the M1-M5
+# insertion-method comparisons) so the rest of this module stays usable.
 
 VectorInput = Union[np.ndarray, VectorSource]
 _QUERY_BATCH = 4096
@@ -719,6 +722,8 @@ def streaming_method_worker(
     sweep (sweep="k_sweep"); rows are tagged with sweep/method/fold_offset so
     they're self-describing regardless of completion order. FNR is asserted
     (raises on violation), never plotted."""
+    from filters import streaming_insertion
+
     stream_arr = _to_construct_array(vectors_stream_pool)[:stream_len]
     negative_arr = _to_construct_array(vectors_negative)
     n = len(stream_arr)
@@ -776,6 +781,8 @@ def stream_m4_exactness_worker(
     """Runs CachedHeapMerge (M4) and the exhaustive Algorithm 2 reference in
     lockstep, comparing resulting ball sets (sorted radii) after every
     post-bootstrap insertion. Feeds the paper's "M4 exactness" text sentence."""
+    from filters import streaming_insertion
+
     stream_arr = _to_construct_array(vectors_stream_pool)[:stream_len]
     n = len(stream_arr)
 
@@ -822,6 +829,8 @@ def stream_m3_gap_worker(
     """Runs RestrictedMerge (M3, track_gap=True); returns the fraction of
     post-bootstrap insertions where the unrestricted argmin would have
     excluded the arriving singleton. Feeds the paper's "M3 gap" sentence."""
+    from filters import streaming_insertion
+
     stream_arr = _to_construct_array(vectors_stream_pool)[:stream_len]
     m3 = streaming_insertion.make_method("M3", dim=dim, k=k, seed=seed, track_gap=True)
     for x in stream_arr:
@@ -846,6 +855,8 @@ def stream_delta_distribution_worker(
     """Streams `method` in {"M3","M4","ref_exhaustive"} and summarizes the
     distribution of realized merge Deltas (mean/median/percentiles/beneficial
     fraction). Feeds the paper's Delta-distribution text statistics."""
+    from filters import streaming_insertion
+
     stream_arr = _to_construct_array(vectors_stream_pool)[:stream_len]
 
     if method == "ref_exhaustive":
