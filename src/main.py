@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from lsh import LSH, DummyLSH
-from runner import Runner
+from runner import Runner, ABLATION_QUANTIZE_SWEEP
 from plots.legacy import plot_results, plot_throughput_results, plot_equal_memory_results
 from plots.plot_ablation import generate_ablation_figures
 from plots.plot_query_performance import generate_query_performance_figures
@@ -362,7 +362,7 @@ def generate_system() -> Tuple[pd.DataFrame, int]:
     plot_system() needs it for the per-panel annotation and there's nothing
     to derive it from -- k is fixed by construction, not swept.
     """
-    num_vectors               = 1_000
+    num_vectors               = 10_000
     dim                       = 384
     percentage_construct      = 20
     # k is scaled off the construct-set size rather than a fixed constant.
@@ -482,11 +482,11 @@ def generate_system_tau() -> Tuple[pd.DataFrame, int]:
     """
     num_vectors           = 100_000
     dim                   = 384
-    percentage_construct  = 20
+    percentage_construct  = 10
     # Same k-scaling rationale as generate_system (see its comment): k is a
     # fraction of the smallest construct set, not a fixed constant.
-    k_fraction             = 0.5
-    tau_values              = [float(t) for t in np.linspace(0.1, 0.5, 10)]
+    k_fraction              = 0.1
+    tau_values              = [float(t) for t in np.linspace(0.01, 0.15, 10)]
     seeds                   = [0]
     output_csv              = "results/system_tau.csv"
 
@@ -558,11 +558,13 @@ def plot_system_tau(df: pd.DataFrame, k: int) -> None:
 
 def generate_ablation() -> Tuple[pd.DataFrame, int]:
     """
-    Generate the per-(level, stage) construction data for BallCoverFilter
-    (each of the 3 init levels, ball cover -> quantizing) across the 3
-    datasets the ablation figure needs, and write it to results/ablation.csv.
-    Quantizing is run per level (each level's own cover is quantized
-    independently), not once on a single shared cover. Returns the
+    Generate the per-quantize-variant construction data for BallCoverFilter
+    (ABLATION_QUANTIZE_SWEEP: the raw/unquantized cover plus every scalar/
+    product quantizer) across the 3 datasets the ablation figure needs, and
+    write it to results/ablation.csv. Every candidate in the sweep shares one
+    memory budget (derived from k against the unquantized cover's byte-per-
+    ball size), so a more compact quantizer's realized ball count can exceed
+    k -- that's the point of the ablation-n-balls panel. Returns the
     long-format df plus the largest k used.
 
     k and tau are both derived from num_vectors/percentage_construct rather
@@ -583,7 +585,7 @@ def generate_ablation() -> Tuple[pd.DataFrame, int]:
         that dataset's own distribution) is what actually stays meaningful
         as num_vectors/percentage_construct change -- not the raw float.
     """
-    num_vectors            = 10_000
+    num_vectors            = 100_000
     dim                    = 384
     percentage_construct   = 20
     k_fractions            = [0.03, 0.06, 0.125, 0.25]
@@ -624,9 +626,9 @@ def generate_ablation() -> Tuple[pd.DataFrame, int]:
     tau_values = [float(np.mean([per_dataset_tau[d][i] for d in datasets])) for i in range(len(duplicate_percentages))]
     print(f"Scaling tau_values to {tau_values} (mean {duplicate_percentages}-th percentile NN distance across datasets)")
 
-    # A single, sweep-independent construction tightness knob (see
-    # ablation_worker's docstring for why tau can't double as this and stay
-    # tau-independent for log10_J). The sweep's median is a reasonable default.
+    # Kept for interface parity with ablation_worker's signature; unused there
+    # now that BallCoverFilter's Gonzalez construction has no distance-
+    # threshold knob to feed (only quantize varies the cover, not tau).
     construct_tau = float(np.median(tau_values))
 
     runner = Runner(num_workers=MAX_WORKERS)
@@ -648,11 +650,11 @@ def generate_ablation() -> Tuple[pd.DataFrame, int]:
         }
         for k in k_values:
             for seed in seeds:
-                for level in BallCoverFilter.LEVELS:
+                for quantize in ABLATION_QUANTIZE_SWEEP:
                     runner.submit(
                         'ablation',
                         dim=dim, dataset=DATASET_KEYS[dataset],
-                        k=k, level=level, tau_values=tau_values, seed=seed, construct_tau=construct_tau,
+                        k=k, quantize=quantize, tau_values=tau_values, seed=seed, construct_tau=construct_tau,
                         vectors_construct=construct_source, vectors_query=query_source,
                         actual_results_by_tau=actual_results_by_tau,
                     )
@@ -757,95 +759,150 @@ def plot_query_performance(df: pd.DataFrame) -> None:
     generate_query_performance_figures(df)
 
 
-def generate_scaling() -> Tuple[pd.DataFrame, int]:
+# These panels compare across batch_size/stream_size, not across datasets,
+# so sweeping all 3 datasets would only add runtime, not a comparison axis --
+# one representative dataset (same single-dataset pattern as
+# _STREAMING_REPRESENTATIVE_DATASET) is enough.
+_SCALING_DATASET = "ELI5"
+
+
+def generate_scaling() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Fix filter size k and sweep indexed-set size n: memory and query latency
-    should stay flat, construction time and FPR may grow with n. One job per
-    (dataset, n, seed); a fixed query holdout is reused across every n.
+    Measures three BallCoverFilter throughput surfaces, all plotted against
+    filter size k on the x-axis:
+      - query throughput: k x batch_size grid (batch_size -> one line each,
+        6 lines), querying a fixed-size stream held constant across the
+        whole batch_size sweep -- only k and batch_size vary here.
+      - insertion throughput: the same k x batch_size grid/lines, timing
+        add() instead of query().
+      - construction throughput: k x n grid (n, the stream/indexed-set
+        size -> one line each, 6 lines) -- this is the one panel where the
+        indexed-set size itself varies instead of being held fixed.
+    Runs on a single dataset (_SCALING_DATASET) -- see its comment above.
+
+    Edit `stream_size` alone to rescale the construction sweep and the fixed
+    stream query/insertion throughput measure against: stream_sizes (halved
+    n_steps-1 times, the 6 construction lines) derives from it, the same
+    single-knob pattern used elsewhere in this file. k_values/batch_sizes
+    are the two other swept axes and stay independent knobs (they're not
+    size-of-data parameters); dim/tau_mid/seeds are independent too.
     """
-    num_vectors_pool = 100_000
+    stream_size      = 90_000
     dim              = 384
-    k_fixed          = 256
-    n_values         = [1024, 2048, 4096, 8192, 16384, 32768, 65536]
-    query_holdout    = 10_000
+    n_steps          = 6
+    k_values         = [16, 32, 64, 128, 256, 512]
+    batch_sizes      = [1, 4, 16, 64, 256, 1024]
     tau_mid          = 0.35
-    seeds            = [0, 1, 2, 3, 4]
-    single_query_limit = 2000
-    output_csv       = "results/scaling.csv"
+    seeds            = [0, 1, 2]
+    n_query_vectors  = 8192
+    n_insert_vectors = 8192
+    query_csv        = "results/scaling_query.csv"
+    insert_csv       = "results/scaling_insert.csv"
+    construction_csv = "results/scaling_construction.csv"
 
-    datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
-    missing = [d for d in DATASET_KEYS if d not in datasets]
-    if missing:
-        print(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
-    if set(datasets) != set(DATASET_KEYS):
+    if _SCALING_DATASET not in DATASET_KEYS:
+        raise RuntimeError(f"_SCALING_DATASET={_SCALING_DATASET!r} must be one of {sorted(DATASET_KEYS)}")
+    dataset_key = _SCALING_DATASET
+    if not os.path.exists(dataset_filenames[dataset_key]):
         raise RuntimeError(
-            "generate_scaling needs all 3 datasets "
-            f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
+            f"generate_scaling needs {_SCALING_DATASET} on disk "
+            f"(looked for {dataset_filenames[dataset_key]})."
         )
 
-    # n must leave room for the query holdout, and k must stay below every n.
-    pool_sizes = {d: len(load_embeds(d, num_vectors_pool)[0]) for d in datasets}
-    max_usable_n = min(pool_sizes.values()) - query_holdout
-    usable_n_values = [n for n in n_values if n <= max_usable_n]
-    dropped_n = sorted(set(n_values) - set(usable_n_values))
-    if dropped_n:
-        print(
-            f"Dropping n value(s) that don't leave room for a {query_holdout}-vector "
-            f"query holdout (smallest dataset pool: {min(pool_sizes.values())} vectors, "
-            f"from {min(pool_sizes, key=pool_sizes.get)}): {dropped_n}"
-        )
-    if not usable_n_values:
+    stream_sizes = sorted({max(1, stream_size // (2 ** i)) for i in range(n_steps)})
+    max_stream = max(stream_sizes)
+
+    # k_values/batch_sizes must each stay below stream_size (max_stream):
+    # k needs room to be a strictly smaller filter-size budget than the
+    # indexed set, and batch_size chunks a stream sized off the same
+    # stream_size, so shrinking stream_size can put either sweep list out of
+    # range -- drop whatever no longer fits rather than raising, so changing
+    # stream_size alone never requires hand-editing k_values/batch_sizes too.
+    def _below_stream(values: list[int], name: str) -> list[int]:
+        usable = sorted(v for v in values if v < max_stream)
+        dropped = sorted(set(values) - set(usable))
+        if dropped:
+            print(f"Dropping {name} value(s) >= stream_size ({max_stream}): {dropped}")
+        if not usable:
+            raise RuntimeError(
+                f"No {name} value in {values} is below stream_size ({max_stream}). "
+                f"Raise stream_size or lower {name}."
+            )
+        return usable
+
+    k_values = _below_stream(k_values, "k_values")
+    batch_sizes = _below_stream(batch_sizes, "batch_sizes")
+
+    # Fixed construct set (the largest stream size) + a disjoint holdout,
+    # reused as both the query and insert stream for every (k, batch_size)
+    # job below -- only k/batch_size vary in those two sweeps.
+    holdout_size = max(n_query_vectors, n_insert_vectors)
+    pool_needed = max_stream + holdout_size
+    vectors = load_embeds(dataset_key, pool_needed)[0]
+    total = len(vectors)
+    if total < pool_needed:
         raise RuntimeError(
-            f"No n value in {n_values} leaves room for a {query_holdout}-vector query "
-            f"holdout out of the smallest dataset pool ({min(pool_sizes.values())} vectors). "
-            "Raise num_vectors_pool or lower n_values/query_holdout."
+            f"{_SCALING_DATASET} only has {total} vectors on disk; need >= {pool_needed} "
+            f"(stream_size's max {max_stream} + a {holdout_size}-vector holdout). "
+            "Lower stream_size."
         )
-    n_values = usable_n_values
-    if k_fixed >= min(n_values):
-        raise RuntimeError(
-            f"k_fixed={k_fixed} must be smaller than every n in {n_values} "
-            "(k stays fixed across the whole sweep)."
-        )
+
+    fixed_construct_source = VectorSource(dataset_key, 0, max_stream)
+    holdout_source = VectorSource(dataset_key, max_stream, max_stream + holdout_size)
 
     runner = Runner(num_workers=MAX_WORKERS)
 
-    for dataset in datasets:
-        vectors = load_embeds(dataset, num_vectors_pool)[0]
-        total = len(vectors)  # a dataset may hold fewer than num_vectors_pool
-        query_start = total - query_holdout
-        vectors_query = vectors[query_start:]
-        query_source = VectorSource(dataset, query_start, total)
-
-        for n in n_values:
-            vectors_construct_n = vectors[:n]
-            construct_source_n = VectorSource(dataset, 0, n)
-
-            print(f"{dataset}: computing ground truth at n={n}, tau_mid={tau_mid}...")
-            actual_results_n = compute_static_actual_results(vectors_construct_n, vectors_query, tau_mid)
-
+    for k in k_values:
+        for batch_size in batch_sizes:
             for seed in seeds:
                 runner.submit(
-                    'scaling',
-                    dim=dim, dataset=DATASET_KEYS[dataset],
-                    k=k_fixed, seed=seed, tau_mid=tau_mid,
-                    vectors_construct=construct_source_n, vectors_query=query_source,
-                    actual_results=actual_results_n, single_query_limit=single_query_limit,
+                    'scaling_query',
+                    dim=dim, dataset=_SCALING_DATASET, k=k, batch_size=batch_size, seed=seed,
+                    tau_mid=tau_mid,
+                    vectors_construct=fixed_construct_source, vectors_query=holdout_source,
+                    n_query_vectors=n_query_vectors,
+                )
+                runner.submit(
+                    'scaling_insert',
+                    dim=dim, dataset=_SCALING_DATASET, k=k, batch_size=batch_size, seed=seed,
+                    vectors_construct=fixed_construct_source, vectors_insert=holdout_source,
+                    n_insert_vectors=n_insert_vectors,
+                )
+
+    for k in k_values:
+        for n in stream_sizes:
+            if k >= n:
+                continue
+            construct_source_n = VectorSource(dataset_key, 0, n)
+            for seed in seeds:
+                runner.submit(
+                    'scaling_construction',
+                    dim=dim, dataset=_SCALING_DATASET, k=k, n=n, seed=seed,
+                    vectors_construct=construct_source_n,
                 )
 
     job_results = runner.run()
     print("Scaling evaluation completed.")
 
-    df = pd.DataFrame(job_results)
+    # Jobs interleave all three modes and Runner.run() returns results in
+    # completion order, not submission order -- split by each mode's own
+    # rate column (self-describing) rather than by position.
+    df_query = pd.DataFrame([r for r in job_results if "throughput_qps" in r])
+    df_insert = pd.DataFrame([r for r in job_results if "throughput_ips" in r])
+    df_construction = pd.DataFrame([r for r in job_results if "throughput_vps" in r])
 
-    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
-    df.to_csv(output_csv, index=False)
-    print(f"Wrote {output_csv}")
+    for df, path in (
+        (df_query, query_csv), (df_insert, insert_csv), (df_construction, construction_csv),
+    ):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        df.to_csv(path, index=False)
+        print(f"Wrote {path}")
 
-    return df, k_fixed
+    return df_query, df_insert, df_construction
 
 
-def plot_scaling(df: pd.DataFrame, k_fixed: int) -> None:
-    generate_scaling_figures(df, k_fixed=k_fixed)
+def plot_scaling(df_query: pd.DataFrame, df_insert: pd.DataFrame, df_construction: pd.DataFrame) -> None:
+    generate_scaling_figures(df_query, df_insert, df_construction)
 
 
 # Panels (b)/(c)/(d) collapse to one representative dataset.
@@ -1163,12 +1220,13 @@ def generate_and_plot_all() -> None:
     testing; remove it to also run the other 5.
     """
     # plot_ablation(*generate_ablation())
+    plot_scaling(*generate_scaling())
     #plot_streaming(*generate_streaming())
     #plot_static(generate_static())
     #plot_dynamic(generate_dynamic())
     #plot_equal_memory(generate_equal_memory()) // failed on 100K
-    plot_system(*generate_system())
-    #plot_system_tau(*generate_system_tau())
+    #plot_system(*generate_system())
+    # plot_system_tau(*generate_system_tau())
     return
     try:
         plot_ablation(*generate_ablation())
@@ -1228,8 +1286,10 @@ def plot_all() -> None:
         print(f"An error occurred: {e}")
 
     try:
-        df = pd.read_csv("results/scaling.csv")
-        plot_scaling(df, k_fixed=int(df["k"].iloc[0]))
+        df_query = pd.read_csv("results/scaling_query.csv")
+        df_insert = pd.read_csv("results/scaling_insert.csv")
+        df_construction = pd.read_csv("results/scaling_construction.csv")
+        plot_scaling(df_query, df_insert, df_construction)
     except Exception as e:
         print(f"An error occurred: {e}")
 

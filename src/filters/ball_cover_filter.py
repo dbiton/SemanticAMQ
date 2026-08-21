@@ -34,13 +34,13 @@ class BallCoverFilter:
         dim: int,
         max_memory: int | None  = None,
         quantize: Quantize = Quantize.NONE,
-        level: int = 3,
-        merge_criterion: str | None = None,
+        construction_level: int = 3,
+        insertion_level: str | None = None,
     ) -> None:
         self.dim = dim
         self.quantize = quantize
-        self.level = level
-        self.merge_criterion = merge_criterion
+        self.construction_level = construction_level
+        self.insertion_level = insertion_level
         self.index = self._make_index(quantize)
         self.max_count_balls = self.calculate_max_balls(max_memory)
         self.count_balls = 0
@@ -176,8 +176,11 @@ class BallCoverFilter:
     def insert(self, vectors: np.ndarray) -> None:
         """Alias for add(), kept for compatibility with the evaluation harness."""
         self.add(vectors)
-
+    
     def add(self, vectors: np.ndarray) -> None:
+        self.add_nearest(vectors)
+    
+    def add_nearest(self, vectors: np.ndarray) -> None:
         """Absorb each vector into one existing ball, inflating it if needed.
         Bootstraps via construct() when there's nothing to absorb into yet."""
         if self.count_balls == 0:

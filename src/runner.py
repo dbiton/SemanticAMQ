@@ -13,7 +13,7 @@ import inspect
 from scipy.special import logsumexp
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 
-from filters.ball_cover_filter import BallCoverFilter
+from filters.ball_cover_filter import BallCoverFilter, Quantize
 from hyperspheres_volume import estimate_hypersphere_volume
 from vector_source import VectorSource
 
@@ -103,6 +103,50 @@ _DIRECT_TAU_FILTERS = {
 }
 
 
+def _ball_cover_max_memory(dim: int, k: int, quantize: Quantize = Quantize.NONE) -> int:
+    """BallCoverFilter sizes its ball budget from a byte budget (max_memory),
+    not a raw ball count -- this converts a desired count k into the
+    max_memory that yields exactly k balls for the given quantize type."""
+    bytes_per_ball = BallCoverFilter(dim=dim, max_memory=1, quantize=quantize).bytes_per_ball()
+    return bytes_per_ball * k
+
+
+class _BallCoverFilterEvalAdapter:
+    """BallCoverFilter.query() takes an explicit per-call distance_threshold
+    rather than baking one in at construction time, unlike the other
+    _DIRECT_TAU_FILTERS below -- this adapter captures the threshold once at
+    construction so the generic single-arg `filter_instance.query(block)`
+    call sites elsewhere in this module (static/dynamic/system/equal_memory
+    workers) keep working unchanged."""
+
+    def __init__(self, dim: int, max_memory: int, distance_threshold: float,
+                 max_spheres: Optional[int] = None, **extra_kwargs: Any) -> None:
+        self.distance_threshold = distance_threshold
+        quantize = extra_kwargs.get("quantize", Quantize.NONE)
+        if max_spheres is not None:
+            max_memory = _ball_cover_max_memory(dim, max_spheres, quantize)
+        self._filt = BallCoverFilter(dim=dim, max_memory=max_memory, **extra_kwargs)
+
+    def construct(self, vectors: np.ndarray) -> None:
+        return self._filt.construct(vectors)
+
+    def query(self, vectors: np.ndarray) -> List[bool]:
+        return self._filt.query(vectors, distance_threshold=self.distance_threshold)
+
+    def insert(self, vectors: np.ndarray) -> None:
+        self._filt.insert(vectors)
+
+    def add(self, vectors: np.ndarray) -> None:
+        self._filt.add(vectors)
+
+    def get_bytesize(self) -> int:
+        return self._filt.get_bytesize()
+
+    @property
+    def all_radiuses(self) -> np.ndarray:
+        return self._filt.all_radiuses
+
+
 def _instantiate_filter(filter_cls: Any, dim: int, lsh: Any, memory_budget: int, distance_threshold: float = None,
                         max_spheres: int = None, extra_kwargs: Optional[Dict[str, Any]] = None) -> Any:
     extra_kwargs = extra_kwargs or {}
@@ -111,6 +155,10 @@ def _instantiate_filter(filter_cls: Any, dim: int, lsh: Any, memory_budget: int,
             return filter_cls(dim=dim, lsh=lsh, max_memory=memory_budget, **extra_kwargs)
         except TypeError:
             return filter_cls(dim=dim, lsh=lsh, **extra_kwargs)
+    elif filter_cls is BallCoverFilter:
+        return _BallCoverFilterEvalAdapter(dim=dim, max_memory=memory_budget,
+                                            distance_threshold=distance_threshold,
+                                            max_spheres=max_spheres, **extra_kwargs)
     else:
         return filter_cls(dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold,
                           max_spheres=max_spheres, **extra_kwargs)
@@ -412,19 +460,6 @@ def _J_tau(radii: np.ndarray, dim: int, tau: float = 0.0) -> float:
         return float(np.sum(r ** dim))
 
 
-def _gonzalez_bound_log10_J_tau(lower_bound_nats: float, dim: int, tau: float) -> float:
-    """Extend BallCoverFilter's level-3 certificate (lower_bound = d*log(D/2),
-    natural log, tau=0) to tau > 0 in log10 space. The pigeonhole argument
-    guarantees some ball has raw radius >= D/2 regardless of tau, and
-    log_J_tau is a logsumexp (>= any single term) over (r_i + tau)^d, so
-    d*log(D/2 + tau) lower-bounds log_J_tau too -- D/2 is recovered from the
-    stored bound via D/2 = exp(lower_bound/d) rather than re-deriving D."""
-    if not np.isfinite(lower_bound_nats):
-        return float('-inf')
-    half_d = float(np.exp(lower_bound_nats / dim))
-    return float(dim * np.log(half_d + float(tau))) / _LN10
-
-
 def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, float]:
     tp, fp, fn, tn = _binary_confusion(predicted, actual)
     return {
@@ -433,11 +468,23 @@ def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, flo
     }
 
 
+# The ablation sweep now varies BallCoverFilter's quantize choice rather than
+# the retired per-level construction strategies. NONE is included as the
+# raw/unquantized baseline point in this same sweep (tagged stage="ball")
+# rather than a separate per-candidate stage: Gonzalez construction no
+# longer varies by quantize choice, so there's exactly one "ball" cover to
+# compare every real quantizer against, not one per candidate.
+ABLATION_QUANTIZE_SWEEP = (
+    Quantize.NONE, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
+    Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.PQ,
+)
+
+
 def ablation_worker(
     dim: int,
     dataset: str,
     k: int,
-    level: int,
+    quantize: Quantize,
     tau_values: List[float],
     seed: int,
     construct_tau: float,
@@ -445,24 +492,26 @@ def ablation_worker(
     vectors_query: VectorInput,
     actual_results_by_tau: Dict[float, List[bool]],
 ) -> List[Dict[str, Any]]:
-    """Builds one BallCoverFilter cover per (dataset, k, seed, level) using
-    the given init strategy `level` (1-3, see BallCoverFilter), then
-    quantizes THAT level's own cover and evaluates both the unquantized and
-    quantized cover at every tau. Returns one row per (stage, tau) for
-    stages ["ball", "quantizing"], each row tagged with `level` so a caller
-    sweeping level=1,2,3 gets quantizing-per-level rather than one shared
-    quantizing pass; construct_tau is a sweep-independent construction knob,
-    kept separate from the evaluated tau's so log10_J stays tau-independent
-    for a given cover.
+    """Builds one BallCoverFilter cover per (dataset, k, seed, quantize),
+    where `quantize` selects the scalar/product quantizer BallCoverFilter
+    applies during construction (Quantize.NONE for the raw, unquantized
+    Gonzalez cover), then evaluates it at every tau. Returns one row per tau,
+    tagged stage="ball" for quantize=Quantize.NONE and stage="quantizing"
+    otherwise, so a caller sweeping every ABLATION_QUANTIZE_SWEEP member gets
+    one row group per member, with NONE serving as the baseline point in that
+    same sweep rather than a value repeated across jobs.
 
-    When level == 3, ALSO emits a "Bound Ball" / "Bound Quant" pair (tagged
-    level=0, a reserved sentinel -- not a real construction level) using the
-    Gonzalez certificate (filt.lower_bound) captured right after construct(),
-    before quantize_centers() can overwrite it while searching quantizer
-    candidates at other k's. The same certified floor is used for both
-    stages: quantization can only inflate radii at a fixed k, so it can't
-    certifiably beat the unquantized bound, and this is the only level that
-    can produce a bound at all (see BallCoverFilter's class docstring)."""
+    max_memory is derived from k using Quantize.NONE's byte-per-ball size and
+    then held fixed across every quantize candidate in the sweep (not
+    re-derived per candidate) -- this is what makes n_balls meaningfully
+    different per quantize choice (a more compact code packs more balls into
+    the same byte budget) rather than trivially equal to k for every
+    candidate. construct_tau is accepted for interface parity with the other
+    tau-sweep workers but unused: BallCoverFilter's own construction has no
+    distance-threshold knob to feed it (Gonzalez construction only takes the
+    vectors and a ball budget).
+
+    FNR is asserted (raises on violation), never plotted."""
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
     n_q = len(query_arr)
@@ -473,65 +522,34 @@ def ablation_worker(
             )
 
     actual_by_tau = {t: np.asarray(a, dtype=bool) for t, a in actual_results_by_tau.items()}
+    stage = "ball" if quantize == Quantize.NONE else "quantizing"
 
     rows: List[Dict[str, Any]] = []
 
-    filt = BallCoverFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed, level=level)
-    filt.construct(construct_arr, retain_assignments=True)
-    lower_bound = filt.lower_bound  # capture before quantize_centers() can overwrite it
-    levels = filt.get_stats(taus=tau_values)["levels"]
-    ball_level = levels[-1]
-    ball_cum_time = sum(s["wall_time"] for s in levels)
-    ball_log10_J = ball_level["log_J"] / _LN10
-
-    ball_predicted_by_tau = filt.query_multi_tau(query_arr, tau_values)
-    for t in tau_values:
-        rates = _confusion_rates(ball_predicted_by_tau[t], actual_by_tau[t])
-        rows.append({
-            "dataset": dataset, "k": k, "level": level, "stage": "ball", "stage_index": 1, "tau": t,
-            "log10_J": ball_log10_J,
-            "log10_J_tau": ball_level["log_J_tau"][t] / _LN10,
-            "fpr": rates["fpr"], "fnr": rates["fnr"],
-            "stage_time_s": ball_cum_time, "cum_time_s": ball_cum_time,
-            "n_balls": ball_level["ball_count"], "seed": seed,
-        })
-
+    max_memory = _ball_cover_max_memory(dim, k, Quantize.NONE)
     t0 = time.perf_counter()
-    filt.quantize_centers()
-    quant_time = time.perf_counter() - t0
-    quant_cum_time = ball_cum_time + quant_time
-    quant_radii = filt.all_radiuses
-    quant_log10_J = _log10_J(quant_radii, dim)
+    filt = BallCoverFilter(dim=dim, max_memory=max_memory, quantize=quantize)
+    filt.construct(construct_arr)
+    stage_time = time.perf_counter() - t0
+    radii = filt.all_radiuses
+    log10_J = _log10_J(radii, dim)
 
-    quant_predicted_by_tau = filt.query_multi_tau(query_arr, tau_values)
+    predicted_by_tau = {t: filt.query(query_arr, distance_threshold=t) for t in tau_values}
     for t in tau_values:
-        rates = _confusion_rates(quant_predicted_by_tau[t], actual_by_tau[t])
+        rates = _confusion_rates(predicted_by_tau[t], actual_by_tau[t])
         rows.append({
-            "dataset": dataset, "k": k, "level": level, "stage": "quantizing", "stage_index": 2, "tau": t,
-            "log10_J": quant_log10_J,
-            "log10_J_tau": _log10_J(quant_radii, dim, tau=t),
+            "dataset": dataset, "k": k, "quantize": quantize.value, "stage": stage, "tau": t,
+            "log10_J": log10_J,
+            "log10_J_tau": _log10_J(radii, dim, tau=t),
             "fpr": rates["fpr"], "fnr": rates["fnr"],
-            "stage_time_s": quant_time, "cum_time_s": quant_cum_time,
-            "n_balls": len(quant_radii), "seed": seed,
+            "stage_time_s": stage_time, "cum_time_s": stage_time,
+            "n_balls": filt.count_balls, "seed": seed,
         })
-
-    if level == 3 and lower_bound is not None and np.isfinite(lower_bound):
-        bound_log10_J = lower_bound / _LN10
-        for bound_stage in ("ball", "quantizing"):
-            for t in tau_values:
-                rows.append({
-                    "dataset": dataset, "k": k, "level": 0, "stage": bound_stage, "stage_index": 0, "tau": t,
-                    "log10_J": bound_log10_J,
-                    "log10_J_tau": _gonzalez_bound_log10_J_tau(lower_bound, dim, t),
-                    "fpr": 0.0, "fnr": 0.0,
-                    "stage_time_s": 0.0, "cum_time_s": 0.0,
-                    "n_balls": k, "seed": seed,
-                })
 
     bad = [r for r in rows if r["fnr"] != 0]
     if bad:
         raise ValueError(
-            f"Zero-false-negative invariant violated (dataset={dataset}, k={k}, level={level}, seed={seed}): "
+            f"Zero-false-negative invariant violated (dataset={dataset}, k={k}, quantize={quantize}, seed={seed}): "
             f"{bad[:3]}"
         )
 
@@ -566,7 +584,7 @@ def system_tau_worker(
     index = faiss.IndexFlatL2(dim)
     index.add(construct_arr)
 
-    filt = BallCoverFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed)
+    filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
     filt.construct(construct_arr)
     radii = filt.all_radiuses
 
@@ -580,7 +598,7 @@ def system_tau_worker(
         time_without = time.perf_counter() - start
 
         start = time.perf_counter()
-        predicted = np.asarray(filt.query(query_arr, tau=t), dtype=bool)
+        predicted = np.asarray(filt.query(query_arr, distance_threshold=t), dtype=bool)
         n_index_accesses = int(predicted.sum())
         if n_index_accesses > 0:
             index.search(query_arr[predicted], 1)
@@ -619,7 +637,7 @@ def query_performance_worker(
     query), batched mode is left uncapped. Returns one row per mode."""
     construct_arr = _to_construct_array(vectors_construct)
 
-    filt = BallCoverFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed)
+    filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
     filt.construct(construct_arr)
 
     rows: List[Dict[str, Any]] = []
@@ -629,7 +647,7 @@ def query_performance_worker(
     for v in _iter_query_vectors(vectors_query):
         if n_single >= single_query_limit:
             break
-        filt.query(v[np.newaxis, :], tau=query_tau)
+        filt.query(v[np.newaxis, :], distance_threshold=query_tau)
         n_single += 1
     elapsed_single = time.perf_counter() - start
     rows.append({
@@ -642,7 +660,7 @@ def query_performance_worker(
     n_batched = 0
     start = time.perf_counter()
     for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
-        filt.query(block, tau=query_tau)
+        filt.query(block, distance_threshold=query_tau)
         n_batched += len(block)
     elapsed_batched = time.perf_counter() - start
     rows.append({
@@ -655,48 +673,100 @@ def query_performance_worker(
     return rows
 
 
-def scaling_worker(
+def scaling_query_worker(
     dim: int,
     dataset: str,
     k: int,
+    batch_size: int,
     seed: int,
     tau_mid: float,
     vectors_construct: VectorInput,
     vectors_query: VectorInput,
-    actual_results: List[bool],
-    single_query_limit: int = 2000,
+    n_query_vectors: int = 8192,
 ) -> Dict[str, Any]:
-    """Builds one BallCoverFilter at fixed k over n=len(vectors_construct)
-    vectors; reports construction time, single-query latency, memory, FPR."""
+    """Measures batched-query throughput (queries/sec) for a BallCoverFilter
+    built at filter size k (over a fixed stream held constant across the
+    whole batch_size sweep -- only k and batch_size vary here), querying in
+    batches of `batch_size`. The query pool is cycled up to n_query_vectors
+    so every batch_size times the same total query count."""
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
-    n = len(construct_arr)
 
-    construct_start = time.perf_counter()
-    filt = BallCoverFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed)
+    filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
     filt.construct(construct_arr)
-    construct_time_s = time.perf_counter() - construct_start
 
-    memory_bytes = filt.get_bytesize()
+    stream = query_arr[np.arange(n_query_vectors) % len(query_arr)]
 
-    n_single = min(single_query_limit, len(query_arr))
     start = time.perf_counter()
-    for v in query_arr[:n_single]:
-        filt.query(v[np.newaxis, :], tau=tau_mid)
-    elapsed_single = time.perf_counter() - start
-    query_latency_us = elapsed_single / max(n_single, 1) * 1e6
-
-    predicted: List[bool] = []
-    for block in _iter_query_batches(query_arr, _QUERY_BATCH):
-        predicted.extend(filt.query(block, tau=tau_mid))
-    rates = _confusion_rates(predicted, np.asarray(actual_results, dtype=bool))
+    for i in range(0, len(stream), batch_size):
+        filt.query(stream[i:i + batch_size], distance_threshold=tau_mid)
+    elapsed = time.perf_counter() - start
 
     return {
-        "dataset": dataset, "n": n, "k": k, "seed": seed,
-        "construct_time_s": construct_time_s,
-        "query_latency_us": query_latency_us,
-        "fpr": rates["fpr"],
-        "memory_bytes": memory_bytes,
+        "dataset": dataset, "k": k, "batch_size": batch_size, "seed": seed,
+        "n_queries": len(stream),
+        "throughput_qps": len(stream) / max(elapsed, 1e-9),
+    }
+
+
+def scaling_insert_worker(
+    dim: int,
+    dataset: str,
+    k: int,
+    batch_size: int,
+    seed: int,
+    vectors_construct: VectorInput,
+    vectors_insert: VectorInput,
+    n_insert_vectors: int = 8192,
+) -> Dict[str, Any]:
+    """Measures batched-insertion throughput (vectors/sec) for a
+    BallCoverFilter built at filter size k (same fixed-stream setup as
+    scaling_query_worker), inserting via add() in batches of `batch_size`
+    after the initial construct(). The insert pool is cycled up to
+    n_insert_vectors so every batch_size inserts the same total count."""
+    construct_arr = _to_construct_array(vectors_construct)
+    insert_arr = _to_construct_array(vectors_insert)
+
+    filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
+    filt.construct(construct_arr)
+
+    stream = insert_arr[np.arange(n_insert_vectors) % len(insert_arr)]
+
+    start = time.perf_counter()
+    for i in range(0, len(stream), batch_size):
+        filt.add(stream[i:i + batch_size])
+    elapsed = time.perf_counter() - start
+
+    return {
+        "dataset": dataset, "k": k, "batch_size": batch_size, "seed": seed,
+        "n_inserted": len(stream),
+        "throughput_ips": len(stream) / max(elapsed, 1e-9),
+    }
+
+
+def scaling_construction_worker(
+    dim: int,
+    dataset: str,
+    k: int,
+    n: int,
+    seed: int,
+    vectors_construct: VectorInput,
+) -> Dict[str, Any]:
+    """Measures construction throughput (vectors/sec) for a BallCoverFilter
+    at filter size k built over n indexed vectors -- the (k, n) grid this is
+    swept over is the ablation-style basis for the construction-throughput-
+    vs-filter-size plot's per-stream-size lines."""
+    construct_arr = _to_construct_array(vectors_construct)[:n]
+
+    start = time.perf_counter()
+    filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
+    filt.construct(construct_arr)
+    elapsed = time.perf_counter() - start
+
+    return {
+        "dataset": dataset, "k": k, "n": n, "seed": seed,
+        "construct_time_s": elapsed,
+        "throughput_vps": n / max(elapsed, 1e-9),
     }
 
 
@@ -929,12 +999,12 @@ def stream_rebuild_worker(
     cumulative_time_s = 0.0
 
     def _fpr(filt: BallCoverFilter) -> float:
-        predicted = filt.query(negative_arr, tau=tau_mid)
+        predicted = filt.query(negative_arr, distance_threshold=tau_mid)
         return float(np.mean(predicted)) if len(predicted) else 0.0
 
     if policy == "oracle":
         for c in checkpoint_set:
-            filt = BallCoverFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
+            filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k),
                                      merge_criterion=merge_criterion)
             t0 = time.perf_counter()
             filt.construct(stream_arr[:c])
@@ -955,7 +1025,7 @@ def stream_rebuild_worker(
         raise ValueError(f"Unknown policy {policy!r}; expected 'streaming', 'periodic', or 'oracle'")
 
     rebuild_every = T if (policy == "periodic" and T is not None) else None
-    filt = BallCoverFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
+    filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k),
                              merge_criterion=merge_criterion)
     t0 = time.perf_counter()
     filt.construct(np.empty((0, dim), dtype=np.float32))
@@ -995,7 +1065,9 @@ _WORKER_FNS: Dict[str, Any] = {
     'ablation': ablation_worker,
     'query_performance': query_performance_worker,
     'equal_memory': equal_memory_worker,
-    'scaling': scaling_worker,
+    'scaling_query': scaling_query_worker,
+    'scaling_insert': scaling_insert_worker,
+    'scaling_construction': scaling_construction_worker,
     'stream_rebuild': stream_rebuild_worker,
     'streaming_method': streaming_method_worker,
     'stream_m4_exactness': stream_m4_exactness_worker,

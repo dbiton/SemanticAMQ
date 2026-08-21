@@ -1,4 +1,4 @@
-"""Generate the four ablation-figure panels (+ shared legend) for the PVLDB paper.
+"""Generate the five ablation-figure panels (+ shared legend) for the PVLDB paper.
 
 Self-contained: reads a long-format results file, aggregates over seeds, and
 writes PNG (optionally PDF) panels sized for `\\includegraphics[width=\\linewidth]`
@@ -21,6 +21,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 
+from filters.ball_cover_filter import Quantize
 from plots.plot_common import DATASETS, DATASET_LABELS, DATASET_COLORS, DATASET_HATCHES, apply_style as _apply_style, save_figure, save_dataset_legend
 
 # --------------------------------------------------------------------------- #
@@ -34,37 +35,33 @@ TAU: Optional[float] = None  # None => median tau present in the data
 DPI = 400
 EMIT_PDF = False
 
-# BallCoverFilter.LEVELS (1=streaming merge, 2=hierarchical split,
-# 3=Gonzalez) crossed with PHASES (pre-/post-quantization) -- quantizing
-# runs per level, independently on each level's own cover, so every level
-# gets its own "ball"/"quantizing" pair rather than sharing one.
-LEVELS = (1, 2, 3)
-PHASES = ("ball", "quantizing")
-STAGES_EMPIRICAL = [(level, phase) for level in LEVELS for phase in PHASES]
-# level=0 is a reserved sentinel (not a real construction level): the
-# theoretical floor certified by level 3's Gonzalez certificate
-# (BallCoverFilter.lower_bound), reported once as "Bound Ball" and once as
-# "Bound Quant" so it lines up visually against both stage groups -- see
-# ablation_worker's docstring for why the same floor is used for both. It
-# has no real FPR/construction-time, so it's excluded from those two panels
-# and only appears in the geometric/threshold objective panels.
-BOUND_STAGES = [(0, "ball"), (0, "quantizing")]
-STAGES_OBJECTIVE = BOUND_STAGES + STAGES_EMPIRICAL
+# runner.ABLATION_QUANTIZE_SWEEP, mirrored here (rather than imported) so
+# this module has no dependency on runner.py's multiprocessing/harness
+# machinery -- just the Quantize enum both sides already agree on. NONE is
+# the raw/unquantized cover (tagged stage="ball" by ablation_worker); every
+# other entry is a real quantizer sharing that same cover's memory budget
+# (tagged stage="quantizing"), which is what makes the n-balls panel
+# meaningful: a more compact code packs more balls into the same budget.
+QUANTIZE_SWEEP = (
+    Quantize.NONE, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
+    Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.PQ,
+)
+STAGES = [q.value for q in QUANTIZE_SWEEP]
 STAGE_LABELS = {
-    (level, phase): (
-        f"Bnd {'Ball' if phase == 'ball' else 'Quant'}" if level == 0
-        else f"L{level} {'Ball' if phase == 'ball' else 'Quant'}"
-    )
-    for level, phase in STAGES_OBJECTIVE
+    Quantize.NONE.value: "None",
+    Quantize.SQ8.value: "SQ8",
+    Quantize.SQ6.value: "SQ6",
+    Quantize.SQ4.value: "SQ4",
+    Quantize.FP16.value: "FP16",
+    Quantize.BF16.value: "BF16",
+    Quantize.SQ4T.value: "SQ4-T",
+    Quantize.SQ8T.value: "SQ8-T",
+    Quantize.PQ.value: "PQ",
 }
-STAGE_INDEX = {s: i + 1 for i, s in enumerate(STAGES_OBJECTIVE)}
-# Reference stage for the two relative-objective panels: level 3 (Gonzalez),
-# unquantized -- matches this pipeline's default level, keeping the panels'
-# "reduction relative to the ball cover" reading consistent with how they
-# read before per-level ablation existed. The Bound rows plot below this
-# baseline (they're a lower bound on the "ball" stage's own log10_J), making
-# the optimality gap directly readable off the bars.
-BASELINE_STAGE = (3, "ball")
+# Reference stage for the two relative-objective panels: the raw/unquantized
+# cover, matching the "reduction relative to the ball cover" reading the
+# panels had before per-quantize ablation existed.
+BASELINE_STAGE = Quantize.NONE.value
 
 BAR_WIDTH = 0.26
 D_DIM = 384  # embedding dimensionality; objectives are stored pre-logged
@@ -94,18 +91,12 @@ def _style_axes(ax: plt.Axes) -> None:
         ax.spines[spine].set_linewidth(0.5)
 
 
-def _set_stage_xaxis(ax: plt.Axes, stages: list) -> None:
+def _set_quantize_xaxis(ax: plt.Axes, stages: list) -> None:
     x = np.arange(len(stages))
     ax.set_xticks(x)
-    # The objective panels' 8-tick STAGES_OBJECTIVE (Bound + 3 levels x 2
-    # phases) is denser than STAGES_EMPIRICAL's 6, so it gets a smaller
-    # label font and steeper rotation to keep two-line labels from
-    # overlapping their neighbors at this figure width.
-    dense = len(stages) > len(STAGES_EMPIRICAL)
     ax.set_xticklabels(
         [STAGE_LABELS[s] for s in stages],
-        rotation=45 if dense else 30, ha="right", rotation_mode="anchor",
-        fontsize=5 if dense else None,
+        rotation=30, ha="right", rotation_mode="anchor",
     )
     ax.set_xlim(-0.5, len(stages) - 0.5)
 
@@ -123,9 +114,8 @@ def _dataset_offsets() -> dict:
 _REQUIRED_COLUMNS = [
     "dataset",
     "k",
-    "level",
+    "quantize",
     "stage",
-    "stage_index",
     "tau",
     "log10_J",
     "log10_J_tau",
@@ -160,11 +150,11 @@ def _validate_schema(df: pd.DataFrame) -> None:
             f"Available: {sorted(df['dataset'].unique())}"
         )
 
-    present = set(zip(df["level"], df["stage"]))
-    missing_combos = [s for s in STAGES_OBJECTIVE if s not in present]
+    present = set(df["quantize"].unique())
+    missing_combos = [s for s in STAGES if s not in present]
     if missing_combos:
         raise ValueError(
-            f"Missing (level, stage) combination(s) {missing_combos} in data. "
+            f"Missing quantize value(s) {missing_combos} in data. "
             f"Available: {sorted(present)}"
         )
 
@@ -178,7 +168,10 @@ def load_data() -> pd.DataFrame:
     if INPUT_PATH.endswith(".parquet"):
         df = pd.read_parquet(INPUT_PATH)
     else:
-        df = pd.read_csv(INPUT_PATH)
+        # keep_default_na=False: Quantize.NONE.value == "None", which pandas'
+        # default na_values list otherwise silently reads back as NaN,
+        # corrupting the quantize column into a mixed float/str dtype.
+        df = pd.read_csv(INPUT_PATH, keep_default_na=False)
 
     _validate_schema(df)
     return df
@@ -212,22 +205,18 @@ def resolve_config(
 # --------------------------------------------------------------------------- #
 
 def aggregate(df: pd.DataFrame, value_col: str, cfg: Config, use_tau: bool = False,
-             stages: list = STAGES_EMPIRICAL) -> pd.DataFrame:
-    """Mean + 95% CI of `value_col` over seed, per (dataset, level, stage),
+             stages: list = STAGES) -> pd.DataFrame:
+    """Mean + 95% CI of `value_col` over seed, per (dataset, quantize),
     at cfg.k (and cfg.tau if use_tau), restricted to the given `stages`
-    (level, stage) combinations -- e.g. the Bound rows carry placeholder
-    fpr/time values and are excluded from panel_fpr/panel_construction_time
-    by leaving `stages` at its STAGES_EMPIRICAL default; the two objective
-    panels pass stages=STAGES_OBJECTIVE to include them."""
+    (quantize values)."""
     sel = df[df["k"] == cfg.k]
     if use_tau:
         sel = sel[sel["tau"] == cfg.tau]
-    combo = pd.MultiIndex.from_tuples(list(zip(sel["level"], sel["stage"])))
-    sel = sel[combo.isin(stages)]
+    sel = sel[sel["quantize"].isin(stages)]
 
     bad_raw = sel[~np.isfinite(sel[value_col])]
     if len(bad_raw):
-        cols = [c for c in ("dataset", "k", "level", "tau", "stage", "seed", value_col) if c in bad_raw.columns]
+        cols = [c for c in ("dataset", "k", "quantize", "tau", "stage", "seed", value_col) if c in bad_raw.columns]
         raise ValueError(
             f"Non-finite {value_col!r} values at k={cfg.k}"
             + (f", tau={cfg.tau}" if use_tau else "") + f":\n{bad_raw[cols].to_string(index=False)}\n"
@@ -236,22 +225,22 @@ def aggregate(df: pd.DataFrame, value_col: str, cfg: Config, use_tau: bool = Fal
             "construct-set-relative k sweep in the data-generation step."
         )
 
-    grouped = sel.groupby(["dataset", "level", "stage"])[value_col]
+    grouped = sel.groupby(["dataset", "quantize"])[value_col]
     agg = grouped.agg(mean="mean", sem="sem", n="count").reset_index()
     agg["ci95"] = np.where(agg["n"] > 1, 1.96 * agg["sem"].fillna(0.0), 0.0)
 
     for dataset in DATASETS:
-        for level, stage in stages:
-            if not ((agg["dataset"] == dataset) & (agg["level"] == level) & (agg["stage"] == stage)).any():
+        for stage in stages:
+            if not ((agg["dataset"] == dataset) & (agg["quantize"] == stage)).any():
                 raise ValueError(
-                    f"No rows for dataset={dataset!r}, level={level}, stage={stage!r} at "
+                    f"No rows for dataset={dataset!r}, quantize={stage!r} at "
                     f"k={cfg.k}" + (f", tau={cfg.tau}" if use_tau else "") + "."
                 )
     return agg
 
 
-def _lookup(agg: pd.DataFrame, dataset: str, level: int, stage: str) -> tuple:
-    row = agg[(agg["dataset"] == dataset) & (agg["level"] == level) & (agg["stage"] == stage)].iloc[0]
+def _lookup(agg: pd.DataFrame, dataset: str, quantize: str) -> tuple:
+    row = agg[(agg["dataset"] == dataset) & (agg["quantize"] == quantize)].iloc[0]
     return float(row["mean"]), float(row["ci95"])
 
 
@@ -260,13 +249,13 @@ def _lookup(agg: pd.DataFrame, dataset: str, level: int, stage: str) -> tuple:
 # --------------------------------------------------------------------------- #
 
 def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    agg = aggregate(df, "log10_J", cfg, use_tau=False, stages=STAGES_OBJECTIVE)
+    agg = aggregate(df, "log10_J", cfg, use_tau=False)
 
     rel = agg.copy()
     rel["rel_mean"] = np.nan
     rel["rel_ci95"] = np.nan
     for dataset in DATASETS:
-        base_mean, _ = _lookup(agg, dataset, *BASELINE_STAGE)
+        base_mean, _ = _lookup(agg, dataset, BASELINE_STAGE)
         mask = rel["dataset"] == dataset
         rel.loc[mask, "rel_mean"] = rel.loc[mask, "mean"] - base_mean
         rel.loc[mask, "rel_ci95"] = rel.loc[mask, "ci95"]
@@ -279,7 +268,6 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         filename="ablation-geometric-objective.png",
         cfg=cfg,
         zero_line=True,
-        stages=STAGES_OBJECTIVE,
     )
     return rel
 
@@ -289,13 +277,13 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 
 def panel_threshold_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    agg = aggregate(df, "log10_J_tau", cfg, use_tau=True, stages=STAGES_OBJECTIVE)
+    agg = aggregate(df, "log10_J_tau", cfg, use_tau=True)
 
     rel = agg.copy()
     rel["rel_mean"] = np.nan
     rel["rel_ci95"] = np.nan
     for dataset in DATASETS:
-        base_mean, _ = _lookup(agg, dataset, *BASELINE_STAGE)
+        base_mean, _ = _lookup(agg, dataset, BASELINE_STAGE)
         mask = rel["dataset"] == dataset
         rel.loc[mask, "rel_mean"] = rel.loc[mask, "mean"] - base_mean
         rel.loc[mask, "rel_ci95"] = rel.loc[mask, "ci95"]
@@ -320,7 +308,6 @@ def panel_threshold_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         cfg=cfg,
         zero_line=True,
         extra=annotate,
-        stages=STAGES_OBJECTIVE,
     )
     return rel
 
@@ -334,7 +321,7 @@ def _bar_panel(
     cfg: Config,
     zero_line: bool = False,
     extra=None,
-    stages: list = STAGES_EMPIRICAL,
+    stages: list = STAGES,
 ) -> None:
     apply_style()
     fig, ax = plt.subplots()
@@ -343,8 +330,8 @@ def _bar_panel(
 
     for dataset in DATASETS:
         means, cis = [], []
-        for level, stage in stages:
-            row = agg[(agg["dataset"] == dataset) & (agg["level"] == level) & (agg["stage"] == stage)].iloc[0]
+        for stage in stages:
+            row = agg[(agg["dataset"] == dataset) & (agg["quantize"] == stage)].iloc[0]
             means.append(row[value_col])
             cis.append(row[ci_col])
         means = np.array(means)
@@ -380,7 +367,7 @@ def _bar_panel(
         ax.set_ylim(1.1 * min(ymin, 0.0), 0.0)
 
     ax.set_ylabel(ylabel)
-    _set_stage_xaxis(ax, stages)
+    _set_quantize_xaxis(ax, stages)
     _style_axes(ax)
     if extra is not None:
         extra(ax)
@@ -402,13 +389,13 @@ def panel_fpr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     apply_style()
     fig, ax = plt.subplots()
-    x = np.arange(len(STAGES_EMPIRICAL))
+    x = np.arange(len(STAGES))
     offsets = _dataset_offsets()
 
     for dataset in DATASETS:
         means, cis, is_zero = [], [], []
-        for level, stage in STAGES_EMPIRICAL:
-            row = agg[(agg["dataset"] == dataset) & (agg["level"] == level) & (agg["stage"] == stage)].iloc[0]
+        for stage in STAGES:
+            row = agg[(agg["dataset"] == dataset) & (agg["quantize"] == stage)].iloc[0]
             m = row["mean"]
             is_zero.append(m == 0)
             means.append(floor if m == 0 else m)
@@ -456,7 +443,7 @@ def panel_fpr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     ax.tick_params(axis="y", which="minor", length=1.2, width=0.4)
 
     ax.set_ylabel("FPR")
-    _set_stage_xaxis(ax, STAGES_EMPIRICAL)
+    _set_quantize_xaxis(ax, STAGES)
     _style_axes(ax)
 
     _save(fig, "ablation-false-positive-rate.png", cfg)
@@ -473,14 +460,13 @@ def panel_construction_time(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     apply_style()
     fig, ax = plt.subplots()
-    x = np.arange(len(STAGES_EMPIRICAL))
+    x = np.arange(len(STAGES))
     offsets = _dataset_offsets()
 
     for dataset in DATASETS:
         means, cis = [], []
-        for level, stage in STAGES_EMPIRICAL:
-            row = agg_stage[(agg_stage["dataset"] == dataset) & (agg_stage["level"] == level)
-                            & (agg_stage["stage"] == stage)].iloc[0]
+        for stage in STAGES:
+            row = agg_stage[(agg_stage["dataset"] == dataset) & (agg_stage["quantize"] == stage)].iloc[0]
             means.append(row["mean"])
             cis.append(row["ci95"])
         means = np.array(means)
@@ -511,9 +497,8 @@ def panel_construction_time(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             )
 
         cum_means = [
-            agg_cum[(agg_cum["dataset"] == dataset) & (agg_cum["level"] == level)
-                   & (agg_cum["stage"] == stage)].iloc[0]["mean"]
-            for level, stage in STAGES_EMPIRICAL
+            agg_cum[(agg_cum["dataset"] == dataset) & (agg_cum["quantize"] == stage)].iloc[0]["mean"]
+            for stage in STAGES
         ]
         ax.plot(
             x,
@@ -534,11 +519,75 @@ def panel_construction_time(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     ax.tick_params(axis="y", which="minor", length=1.2, width=0.4)
 
     ax.set_ylabel("Time (s)")
-    _set_stage_xaxis(ax, STAGES_EMPIRICAL)
+    _set_quantize_xaxis(ax, STAGES)
     _style_axes(ax)
 
     _save(fig, "ablation-construction-time.png", cfg)
     return agg_stage
+
+
+# --------------------------------------------------------------------------- #
+# Panel (e): ball count per quantize variant
+# --------------------------------------------------------------------------- #
+
+def panel_n_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Realized ball count per quantize variant, at the one memory budget
+    shared by the whole sweep (derived from cfg.k against the unquantized
+    cover's byte-per-ball size). Unlike a per-level sweep -- where n_balls
+    would always equal k regardless of construction strategy -- this is
+    genuinely informative here: a quantizer with a smaller per-center code
+    packs more balls into the same budget, so bars are expected to rise as
+    the code gets more compact (PQ/SQ4 highest, None/FP16/BF16 lowest, at
+    k itself)."""
+    agg = aggregate(df, "n_balls", cfg, use_tau=False)
+
+    apply_style()
+    fig, ax = plt.subplots()
+    x = np.arange(len(STAGES))
+    offsets = _dataset_offsets()
+
+    for dataset in DATASETS:
+        means, cis = [], []
+        for stage in STAGES:
+            row = agg[(agg["dataset"] == dataset) & (agg["quantize"] == stage)].iloc[0]
+            means.append(row["mean"])
+            cis.append(row["ci95"])
+        means = np.array(means)
+        cis = np.array(cis)
+        has_ci = np.any(cis > 0)
+
+        ax.bar(
+            x + offsets[dataset],
+            means,
+            width=BAR_WIDTH,
+            color=DATASET_COLORS[dataset],
+            hatch=DATASET_HATCHES[dataset],
+            edgecolor="black",
+            linewidth=0.4,
+            zorder=2,
+        )
+        if has_ci:
+            ax.errorbar(
+                x + offsets[dataset],
+                means,
+                yerr=cis,
+                fmt="none",
+                ecolor="black",
+                elinewidth=0.5,
+                capsize=1.5,
+                capthick=0.5,
+                zorder=3,
+            )
+
+    ax.axhline(cfg.k, color="black", linewidth=0.6, linestyle=":", zorder=1)
+    ax.text(len(STAGES) - 0.5, cfg.k, f"k={cfg.k}", fontsize=5, ha="right", va="bottom")
+
+    ax.set_ylabel("Number of balls")
+    _set_quantize_xaxis(ax, STAGES)
+    _style_axes(ax)
+
+    _save(fig, "ablation-n-balls.png", cfg)
+    return agg
 
 
 # --------------------------------------------------------------------------- #
@@ -563,24 +612,26 @@ def _save(fig: plt.Figure, filename: str, cfg: Config) -> None:
 
 def print_summary(df: pd.DataFrame, cfg: Config) -> None:
     print("\n--- Ablation summary (k={}, tau={:g}) ---".format(cfg.k, cfg.tau))
-    header = (f"{'dataset':<10} {'level':>5} {'d(log10 J) ball->quant':>22} "
-              f"{'final FPR':>12} {'total time (s)':>16}")
+    header = (f"{'dataset':<10} {'quantize':>9} {'d(log10 J) vs None':>20} "
+              f"{'fpr':>12} {'time (s)':>10} {'n_balls':>8}")
     print(header)
     print("-" * len(header))
 
     j_agg = aggregate(df, "log10_J", cfg, use_tau=False)
     fpr_agg = aggregate(df, "fpr", cfg, use_tau=True)
     time_agg = aggregate(df, "cum_time_s", cfg, use_tau=False)
+    balls_agg = aggregate(df, "n_balls", cfg, use_tau=False)
 
     for dataset in DATASETS:
-        for level in LEVELS:
-            base_j, _ = _lookup(j_agg, dataset, level, "ball")
-            final_j, _ = _lookup(j_agg, dataset, level, "quantizing")
-            final_fpr, _ = _lookup(fpr_agg, dataset, level, "quantizing")
-            total_time, _ = _lookup(time_agg, dataset, level, "quantizing")
+        base_j, _ = _lookup(j_agg, dataset, BASELINE_STAGE)
+        for stage in STAGES:
+            this_j, _ = _lookup(j_agg, dataset, stage)
+            this_fpr, _ = _lookup(fpr_agg, dataset, stage)
+            this_time, _ = _lookup(time_agg, dataset, stage)
+            this_balls, _ = _lookup(balls_agg, dataset, stage)
             print(
-                f"{DATASET_LABELS[dataset]:<10} {level:>5} {final_j - base_j:>22.3f} "
-                f"{final_fpr:>12.2e} {total_time:>16.2f}"
+                f"{DATASET_LABELS[dataset]:<10} {STAGE_LABELS[stage]:>9} {this_j - base_j:>20.3f} "
+                f"{this_fpr:>12.2e} {this_time:>10.3f} {this_balls:>8.1f}"
             )
     print()
 
@@ -598,7 +649,7 @@ def generate_ablation_figures(
     emit_pdf: bool = EMIT_PDF,
 ) -> None:
     """
-    Library entry point: render the four ablation panels (+ legend) from an
+    Library entry point: render the five ablation panels (+ legend) from an
     in-memory long-format DataFrame, the same way `plot_results` in plots.py
     is called directly on a results list instead of round-tripping through a
     file. If `df` is omitted, falls back to `load_data()` (CONFIG-driven,
@@ -615,6 +666,7 @@ def generate_ablation_figures(
     panel_threshold_objective(df, cfg)
     panel_fpr(df, cfg)
     panel_construction_time(df, cfg)
+    panel_n_balls(df, cfg)
     save_legend(cfg)
 
     print_summary(df, cfg)
@@ -643,6 +695,11 @@ def generate_ablation_figures(
     \centering
     \includegraphics[width=\linewidth]{figures/ablation-construction-time.png}
     \caption{Construction time}
+\end{subfigure}
+\begin{subfigure}[b]{0.24\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/ablation-n-balls.png}
+    \caption{Ball count}
 \end{subfigure}
 """.strip("\n")
     print("--- subfigure snippet (paste above the panel row) ---")
