@@ -546,15 +546,14 @@ class TestQuantizePQ(unittest.TestCase):
 
 class TestMiscInterface(unittest.TestCase):
 
-    def test_level_and_merge_criterion_are_accepted_and_ignored(self):
+    def test_construction_level_is_accepted_and_ignored(self):
         bytes_per_ball = (DIM + 1) * 4
-        f1 = BallCoverFilter(dim=DIM, max_memory=bytes_per_ball * 6, level=1, quantize=Quantize.NONE)
-        f2 = BallCoverFilter(dim=DIM, max_memory=bytes_per_ball * 6, level=2,
-                             merge_criterion="log_space", quantize=Quantize.NONE)
+        f1 = BallCoverFilter(dim=DIM, max_memory=bytes_per_ball * 6, construction_level=1, quantize=Quantize.NONE)
+        f2 = BallCoverFilter(dim=DIM, max_memory=bytes_per_ball * 6, construction_level=2, quantize=Quantize.NONE)
         vecs = _rand(40, seed=3)
         f1.construct(vecs)
         f2.construct(vecs)
-        # same construction algorithm regardless of level/merge_criterion
+        # same construction algorithm regardless of construction_level
         np.testing.assert_array_equal(f1.radii[:f1.count_balls], f2.radii[:f2.count_balls])
 
     def test_insert_is_an_alias_for_add(self):
@@ -580,6 +579,158 @@ class TestMiscInterface(unittest.TestCase):
         for v in stream:
             f.add(v[np.newaxis, :])
         self.assertTrue(all(f.query(stream, distance_threshold=1e-2)))
+
+
+# ---------------------------------------------------------------------------
+# Insertion methods (insertion_level: nearest / least_inflation / merge / doubling)
+# ---------------------------------------------------------------------------
+
+_INSERTION_LEVELS = ("nearest", "least_inflation", "merge", "doubling")
+
+
+def _stream_insert(f: BallCoverFilter, base: np.ndarray, stream: np.ndarray, batch: int = 3) -> np.ndarray:
+    f.construct(base)
+    all_vecs = [base]
+    for i in range(0, len(stream), batch):
+        chunk = stream[i:i + batch]
+        f.add(chunk)
+        all_vecs.append(chunk)
+    return np.vstack(all_vecs)
+
+
+class TestInsertionLevels(unittest.TestCase):
+
+    def test_default_insertion_level_is_none_and_dispatches_to_nearest(self):
+        f = BallCoverFilter(dim=DIM, max_memory=10_000, quantize=Quantize.NONE)
+        self.assertIsNone(f.insertion_level)
+        vecs = _rand(5, seed=1)
+        f.construct(vecs)
+        far = np.full((1, DIM), 500.0, dtype=np.float32)
+        f.add(far)  # must not raise, and must behave like add_nearest
+        self.assertTrue(f.query(far, distance_threshold=1e-2)[0])
+
+    def test_unknown_insertion_level_raises(self):
+        f = BallCoverFilter(dim=DIM, max_memory=10_000, quantize=Quantize.NONE, insertion_level="bogus")
+        f.construct(_rand(5))
+        with self.assertRaises(ValueError):
+            f.add(_rand(1, seed=9))
+
+    def test_no_false_negatives_across_all_levels(self):
+        bytes_per_ball = (DIM + 1) * 4
+        for level in _INSERTION_LEVELS:
+            f = BallCoverFilter(dim=DIM, max_memory=bytes_per_ball * 8, quantize=Quantize.NONE, insertion_level=level)
+            base = _rand(8, seed=1)
+            stream = _rand(60, seed=2)
+            stored = _stream_insert(f, base, stream)
+            recalled = f.query(stored, distance_threshold=1e-2)
+            self.assertTrue(all(recalled), f"insertion_level={level!r} produced a false negative")
+
+    def test_merge_and_doubling_never_exceed_budget(self):
+        bytes_per_ball = (DIM + 1) * 4
+        for level in ("merge", "doubling"):
+            f = BallCoverFilter(dim=DIM, max_memory=bytes_per_ball * 6, quantize=Quantize.NONE, insertion_level=level)
+            base = _rand(6, seed=3)
+            stream = _rand(80, seed=4)
+            _stream_insert(f, base, stream, batch=1)
+            self.assertLessEqual(f.count_balls, f.max_count_balls)
+
+    def test_no_false_negatives_under_quantization(self):
+        for level in ("merge", "doubling"):
+            for q in (Quantize.SQ8, Quantize.PQ):
+                f = BallCoverFilter(dim=DIM, max_memory=10_000, quantize=q, insertion_level=level)
+                base = _rand(10, seed=1)
+                stream = _rand(40, seed=2) * 3
+                stored = _stream_insert(f, base, stream, batch=4)
+                recalled = f.query(stored, distance_threshold=1e-2)
+                self.assertTrue(all(recalled), f"insertion_level={level!r} quantize={q} produced a false negative")
+
+    def test_least_inflation_diverges_from_nearest_when_cheaper(self):
+        """A concrete case where the raw-nearest ball is NOT the cheapest to
+        grow: ball A is nearer (dist=5.0) but a bare singleton (r=0), while
+        ball B is fractionally farther (dist=5.01) but already almost as
+        large as the new distance (r=4.05) -- growing B costs far less
+        volume than blowing up A from 0. add_nearest must grow A (raw
+        nearest); add_least_inflation must grow B instead."""
+        dim = 16
+
+        def make(level):
+            f = BallCoverFilter(dim=dim, max_memory=10_000, quantize=Quantize.NONE, insertion_level=level)
+            a = np.zeros(dim, dtype=np.float32)
+            b = np.zeros(dim, dtype=np.float32)
+            b[0] = 10.01
+            f.construct(np.vstack([a, b]))
+            f.radii[0] = 0.0
+            f.radii[1] = 4.05
+            return f
+
+        x = np.zeros((1, dim), dtype=np.float32)
+        x[0, 0] = 5.0  # dist to A = 5.0, dist to B = 5.01
+
+        f_nearest = make("nearest")
+        f_least = make("least_inflation")
+        f_nearest.add_nearest(x)
+        f_least.add_least_inflation(x)
+
+        self.assertAlmostEqual(float(f_nearest.radii[0]), 5.0, places=4)
+        self.assertAlmostEqual(float(f_nearest.radii[1]), 4.05, places=4)
+        self.assertAlmostEqual(float(f_least.radii[0]), 0.0, places=4)
+        self.assertAlmostEqual(float(f_least.radii[1]), 5.01, places=4)
+
+    def test_merge_evicts_cheapest_pair_globally_not_just_the_new_point(self):
+        """Two existing balls are near-duplicates (essentially free to
+        merge) and a third is far away; a new point lands in genuinely new
+        territory. The globally cheapest eviction is the two near-duplicate
+        EXISTING balls, not anything involving the new point -- both the far
+        ball and the new point must survive as their own balls."""
+        dim = 8
+        f = BallCoverFilter(dim=dim, max_memory=10_000, quantize=Quantize.NONE, insertion_level="merge")
+        f.max_count_balls = 3
+        f.radii = np.zeros(3, dtype=np.float32)
+        near1 = np.zeros(dim, dtype=np.float32)
+        near2 = np.full(dim, 0.05, dtype=np.float32)
+        far = np.full(dim, 100.0, dtype=np.float32)
+        f.construct(np.vstack([near1, near2, far]))
+
+        new_point = np.full((1, dim), -100.0, dtype=np.float32)
+        f.add_merge(new_point)
+
+        self.assertEqual(f.count_balls, 3)
+        self.assertTrue(f.query(new_point, distance_threshold=1e-2)[0], "new point in new territory was lost")
+        self.assertTrue(f.query(far[None, :], distance_threshold=1e-2)[0], "far existing ball was lost")
+
+    def test_doubling_does_not_collapse_past_budget_on_first_double(self):
+        """Regression test: the first R-doubling used to merge every pair
+        within the (now much larger) threshold unconditionally, collapsing
+        the whole cover to ~1 ball on the very first doubling instead of
+        stopping once back at budget. Constructing directly (not via add())
+        then switching to add() also regression-tests that _doubling_R gets
+        initialized from the actual ball geometry even when add_doubling's
+        own from-empty bootstrap branch is bypassed."""
+        dim = 32
+        bytes_per_ball = (dim + 1) * 4
+        f = BallCoverFilter(dim=dim, max_memory=bytes_per_ball * 20, quantize=Quantize.NONE, insertion_level="doubling")
+        base = _rand(20, dim=dim, seed=0)
+        f.construct(base)
+        stream = _rand(100, dim=dim, seed=1) * 3
+        f.add(stream)
+        self.assertGreater(f.count_balls, 2, "doubling collapsed the cover far below its budget")
+        self.assertLessEqual(f.count_balls, f.max_count_balls)
+        stored = np.vstack([base, stream])
+        self.assertTrue(all(f.query(stored, distance_threshold=1e-2)))
+
+    def test_cheapest_pair_scaling_handles_merged_radius_larger_than_any_existing(self):
+        """Regression test: _cheapest_pair's log-space scale M used to be
+        computed only from existing radii, but a merged ball's radius can
+        exceed every existing radius -- scaling by too-small an M let
+        (r_merged/M)**d exceed 1 and overflow exp() at high dim."""
+        dim = 384
+        f = BallCoverFilter(dim=dim, max_memory=(dim + 1) * 4 * 10, quantize=Quantize.NONE, insertion_level="merge")
+        base = _rand(10, dim=dim, seed=0)
+        f.construct(base)
+        with np.errstate(over="raise"):
+            f.add(_rand(5, dim=dim, seed=1) * 3)
+        self.assertFalse(np.any(np.isnan(f.radii[:f.count_balls])))
+        self.assertFalse(np.any(np.isinf(f.radii[:f.count_balls])))
 
 
 if __name__ == "__main__":

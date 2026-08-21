@@ -770,202 +770,18 @@ def scaling_construction_worker(
     }
 
 
-def streaming_method_worker(
-    dim: int,
-    dataset: str,
-    k: int,
-    seed: int,
-    fold_offset: int,
-    tau_mid: float,
-    method: str,
-    method_kwargs: Dict[str, Any],
-    vectors_stream_pool: VectorInput,
-    stream_len: int,
-    vectors_negative: VectorInput,
-    checkpoints: List[int],
-    sweep: str,
-) -> List[Dict[str, Any]]:
-    """Streams one insertion method (M1-M5, see filters.streaming_insertion)
-    over a fold_offset-windowed slice of vectors_stream_pool; at each
-    checkpoint, reports FPR, log10_j_tau, ball count, and amortized cost per
-    insertion. Serves both the position sweep (sweep="position") and the k
-    sweep (sweep="k_sweep"); rows are tagged with sweep/method/fold_offset so
-    they're self-describing regardless of completion order. FNR is asserted
-    (raises on violation), never plotted."""
-    from filters import streaming_insertion
-
-    stream_arr = _to_construct_array(vectors_stream_pool)[:stream_len]
-    negative_arr = _to_construct_array(vectors_negative)
-    n = len(stream_arr)
-    checkpoint_set = sorted(set(c for c in checkpoints if 0 < c <= n))
-
-    m = streaming_insertion.make_method(method, dim=dim, k=k, seed=seed, **method_kwargs)
-
-    rows: List[Dict[str, Any]] = []
-    cumulative_time_s = 0.0
-    ci = 0
-    for t in range(n):
-        pos = t + 1
-        t0 = time.perf_counter()
-        m.insert(stream_arr[t])
-        cumulative_time_s += time.perf_counter() - t0
-
-        if ci < len(checkpoint_set) and pos == checkpoint_set[ci]:
-            predicted_neg = m.query(negative_arr, tau=tau_mid)
-            actual_neg = np.zeros(len(negative_arr), dtype=bool)
-            rates = _confusion_rates(predicted_neg.tolist(), actual_neg)
-
-            predicted_seen = np.asarray(m.query(stream_arr[:pos], tau=tau_mid), dtype=bool)
-            fnr = float(np.mean(~predicted_seen)) if pos else 0.0
-            if fnr != 0.0:
-                raise ValueError(
-                    f"Zero-false-negative invariant violated (method={method}, dataset={dataset}, "
-                    f"k={k}, seed={seed}, fold_offset={fold_offset}, position={pos}): fnr={fnr}"
-                )
-
-            radii = m.all_radiuses
-            rows.append({
-                "dataset": dataset, "method": method, "k": k, "seed": seed, "fold_offset": fold_offset,
-                "b": method_kwargs.get("b"), "position": pos,
-                "fpr": rates["fpr"],
-                "log10_j_tau": _log10_J(radii, dim, tau=tau_mid),
-                "n_balls": len(radii),
-                "cumulative_time_s": cumulative_time_s,
-                "amortized_cost_s": cumulative_time_s / pos,
-                "metric": "checkpoint", "sweep": sweep,
-            })
-            ci += 1
-
-    return rows
-
-
-def stream_m4_exactness_worker(
-    dim: int,
-    dataset: str,
-    k: int,
-    seed: int,
-    tau_mid: float,
-    vectors_stream_pool: VectorInput,
-    stream_len: int,
-) -> Dict[str, Any]:
-    """Runs CachedHeapMerge (M4) and the exhaustive Algorithm 2 reference in
-    lockstep, comparing resulting ball sets (sorted radii) after every
-    post-bootstrap insertion. Feeds the paper's "M4 exactness" text sentence."""
-    from filters import streaming_insertion
-
-    stream_arr = _to_construct_array(vectors_stream_pool)[:stream_len]
-    n = len(stream_arr)
-
-    m4 = streaming_insertion.make_method("M4", dim=dim, k=k, seed=seed)
-    ref = BallCoverFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
-                            merge_criterion="log_space")
-    ref.construct(np.empty((0, dim), dtype=np.float32))
-
-    n_checked = 0
-    n_mismatches = 0
-    first_mismatch_position: Optional[int] = None
-    for t in range(n):
-        x = stream_arr[t]
-        m4.insert(x)
-        streaming_insertion.exhaustive_algo2_step(ref, x)
-
-        pos = t + 1
-        if pos > k:
-            n_checked += 1
-            r_m4 = np.sort(np.round(m4.all_radiuses.astype(np.float64), 6))
-            r_ref = np.sort(np.round(ref.all_radiuses.astype(np.float64), 6))
-            same = len(r_m4) == len(r_ref) and np.allclose(r_m4, r_ref, atol=1e-4, rtol=1e-4)
-            if not same:
-                n_mismatches += 1
-                if first_mismatch_position is None:
-                    first_mismatch_position = pos
-
-    return {
-        "dataset": dataset, "k": k, "seed": seed,
-        "n_checked": n_checked, "n_mismatches": n_mismatches,
-        "first_mismatch_position": first_mismatch_position,
-    }
-
-
-def stream_m3_gap_worker(
-    dim: int,
-    dataset: str,
-    k: int,
-    seed: int,
-    tau_mid: float,
-    vectors_stream_pool: VectorInput,
-    stream_len: int,
-) -> Dict[str, Any]:
-    """Runs RestrictedMerge (M3, track_gap=True); returns the fraction of
-    post-bootstrap insertions where the unrestricted argmin would have
-    excluded the arriving singleton. Feeds the paper's "M3 gap" sentence."""
-    from filters import streaming_insertion
-
-    stream_arr = _to_construct_array(vectors_stream_pool)[:stream_len]
-    m3 = streaming_insertion.make_method("M3", dim=dim, k=k, seed=seed, track_gap=True)
-    for x in stream_arr:
-        m3.insert(x)
-    return {
-        "dataset": dataset, "k": k, "seed": seed,
-        "n_checked": m3.n_total,
-        "fraction_excluded": (m3.n_gap / m3.n_total) if m3.n_total else 0.0,
-    }
-
-
-def stream_delta_distribution_worker(
-    dim: int,
-    dataset: str,
-    k: int,
-    seed: int,
-    tau_mid: float,
-    method: str,
-    vectors_stream_pool: VectorInput,
-    stream_len: int,
-) -> Dict[str, Any]:
-    """Streams `method` in {"M3","M4","ref_exhaustive"} and summarizes the
-    distribution of realized merge Deltas (mean/median/percentiles/beneficial
-    fraction). Feeds the paper's Delta-distribution text statistics."""
-    from filters import streaming_insertion
-
-    stream_arr = _to_construct_array(vectors_stream_pool)[:stream_len]
-
-    if method == "ref_exhaustive":
-        filt = BallCoverFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
-                                 merge_criterion="log_space")
-        filt.construct(np.empty((0, dim), dtype=np.float32))
-        deltas: List[float] = []
-        for x in stream_arr:
-            delta = streaming_insertion.exhaustive_algo2_step(filt, x)
-            if delta is not None:
-                deltas.append(delta)
-    elif method in ("M3", "M4"):
-        m = streaming_insertion.make_method(method, dim=dim, k=k, seed=seed)
-        for x in stream_arr:
-            m.insert(x)
-        deltas = list(m.accepted_deltas)
-    else:
-        raise ValueError(f"Unknown method {method!r} for delta-distribution; expected 'M3', 'M4', or 'ref_exhaustive'")
-
-    arr = np.asarray(deltas, dtype=np.float64)
-    finite = arr[np.isfinite(arr)]
-    if len(finite) == 0:
-        finite = np.array([0.0])
-    return {
-        "dataset": dataset, "k": k, "seed": seed, "method": method,
-        "n": len(arr),
-        "mean": float(np.mean(finite)), "median": float(np.median(finite)),
-        "p10": float(np.percentile(finite, 10)), "p90": float(np.percentile(finite, 90)),
-        "min": float(np.min(finite)), "max": float(np.max(finite)),
-        "frac_beneficial": float(np.mean(arr < 0)) if len(arr) else 0.0,
-    }
-
-
-# policy -> (metric, method) tag used by the streaming figure.
-_REBUILD_POLICY_TAGS = {
-    "oracle": ("static_reference", "static_reference"),
-    "streaming": ("exhaustive_reference", "ref_exhaustive"),
-    "periodic": ("exhaustive_reference", "ref_exhaustive"),
-}
+def _rebuild_policy_tags(policy: str, insertion_level: Optional[str]) -> tuple:
+    """(metric, method) tag used by the streaming figure. "oracle" is always
+    a from-scratch rebuild regardless of insertion_level, so it gets one
+    fixed reference tag; "streaming"/"periodic" report whichever
+    insertion_level they actually ran (nearest/least_inflation/merge/
+    doubling) as the method tag, so all four are plotted as regular,
+    directly comparable lines rather than one of them (the old "merge",
+    formerly the only add() behavior) needing a special "exhaustive
+    reference" tag of its own."""
+    if policy == "oracle":
+        return "static_reference", "static_rebuild"
+    return "checkpoint", insertion_level or "nearest"
 
 
 def stream_rebuild_worker(
@@ -979,21 +795,23 @@ def stream_rebuild_worker(
     vectors_negative: VectorInput,
     checkpoints: List[int],
     T: Optional[int] = None,
-    merge_criterion: str = "log_space",
+    insertion_level: Optional[str] = None,
     sweep: Optional[str] = None,
     fold_offset: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Simulates one rebuild policy over vectors_stream, reporting FPR and
     amortized cost per checkpoint.
-      "streaming": BallCoverFilter.add() per arrival, never rebuilt.
+      "streaming": BallCoverFilter.add() per arrival (using insertion_level),
+        never rebuilt.
       "periodic": like "streaming", rebuilt from scratch every T arrivals.
-      "oracle": rebuilt from scratch at every checkpoint.
+      "oracle": rebuilt from scratch at every checkpoint (insertion_level
+        doesn't apply -- there's nothing to insert into).
     sweep/fold_offset are pass-through tag columns only."""
     stream_arr = _to_construct_array(vectors_stream)
     negative_arr = _to_construct_array(vectors_negative)
     n = len(stream_arr)
     checkpoint_set = sorted(set(c for c in checkpoints if 0 < c <= n))
-    metric, method = _REBUILD_POLICY_TAGS.get(policy, (None, None))
+    metric, method = _rebuild_policy_tags(policy, insertion_level)
 
     rows: List[Dict[str, Any]] = []
     cumulative_time_s = 0.0
@@ -1002,19 +820,33 @@ def stream_rebuild_worker(
         predicted = filt.query(negative_arr, distance_threshold=tau_mid)
         return float(np.mean(predicted)) if len(predicted) else 0.0
 
+    def _assert_fnr_zero(filt: BallCoverFilter, seen: np.ndarray, pos: int) -> None:
+        """The covering invariant is a correctness requirement, not a
+        plotted quantity: every stream vector seen so far must still be
+        recalled. Raises rather than recording a violation, matching every
+        other FNR check in this module."""
+        recalled = filt.query(seen, distance_threshold=tau_mid)
+        fnr = float(np.mean(~np.asarray(recalled, dtype=bool))) if len(recalled) else 0.0
+        if fnr != 0.0:
+            raise ValueError(
+                f"Zero-false-negative invariant violated (dataset={dataset}, policy={policy}, "
+                f"insertion_level={insertion_level}, k={k}, seed={seed}, position={pos}): fnr={fnr}"
+            )
+
     if policy == "oracle":
         for c in checkpoint_set:
-            filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k),
-                                     merge_criterion=merge_criterion)
+            filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
             t0 = time.perf_counter()
             filt.construct(stream_arr[:c])
             cumulative_time_s += time.perf_counter() - t0
+            _assert_fnr_zero(filt, stream_arr[:c], c)
             radii = filt.all_radiuses
             rows.append({
                 "dataset": dataset, "policy": policy, "T": T, "k": k, "seed": seed,
                 "position": c, "fpr": _fpr(filt),
                 "log10_j_tau": _log10_J(radii, dim, tau=tau_mid),
                 "n_balls": len(radii),
+                "memory_bytes": filt.get_bytesize(),
                 "cumulative_time_s": cumulative_time_s,
                 "amortized_cost_s": cumulative_time_s / c,
                 "metric": metric, "method": method, "sweep": sweep, "fold_offset": fold_offset,
@@ -1026,13 +858,23 @@ def stream_rebuild_worker(
 
     rebuild_every = T if (policy == "periodic" and T is not None) else None
     filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k),
-                             merge_criterion=merge_criterion)
+                             insertion_level=insertion_level)
+    # Bootstrap-then-diverge: the first k arrivals always become raw
+    # zero-radius singletons via one batch construct() (identical across
+    # every insertion_level), so checkpoint k+1 onward is a genuine
+    # comparison of each method's own decision rule -- not an artifact of
+    # add_nearest/add_least_inflation never creating new balls on their own
+    # (only add_merge/add_doubling do), which would otherwise collapse this
+    # streamed-from-empty setup to a single ball for those two methods.
+    # generate_streaming()'s checkpoints all sit above k, so this never
+    # skips a requested checkpoint.
+    bootstrap_n = min(k, n)
     t0 = time.perf_counter()
-    filt.construct(np.empty((0, dim), dtype=np.float32))
+    filt.construct(stream_arr[:bootstrap_n])
     cumulative_time_s += time.perf_counter() - t0
 
     ci = 0
-    for t in range(n):
+    for t in range(bootstrap_n, n):
         pos = t + 1
         t0 = time.perf_counter()
         if rebuild_every is not None and pos % rebuild_every == 0:
@@ -1042,12 +884,14 @@ def stream_rebuild_worker(
         cumulative_time_s += time.perf_counter() - t0
 
         if ci < len(checkpoint_set) and pos == checkpoint_set[ci]:
+            _assert_fnr_zero(filt, stream_arr[:pos], pos)
             radii = filt.all_radiuses
             rows.append({
                 "dataset": dataset, "policy": policy, "T": T, "k": k, "seed": seed,
                 "position": pos, "fpr": _fpr(filt),
                 "log10_j_tau": _log10_J(radii, dim, tau=tau_mid),
                 "n_balls": len(radii),
+                "memory_bytes": filt.get_bytesize(),
                 "cumulative_time_s": cumulative_time_s,
                 "amortized_cost_s": cumulative_time_s / pos,
                 "metric": metric, "method": method, "sweep": sweep, "fold_offset": fold_offset,
@@ -1069,10 +913,6 @@ _WORKER_FNS: Dict[str, Any] = {
     'scaling_insert': scaling_insert_worker,
     'scaling_construction': scaling_construction_worker,
     'stream_rebuild': stream_rebuild_worker,
-    'streaming_method': streaming_method_worker,
-    'stream_m4_exactness': stream_m4_exactness_worker,
-    'stream_m3_gap': stream_m3_gap_worker,
-    'stream_delta_distribution': stream_delta_distribution_worker,
 }
 
 
