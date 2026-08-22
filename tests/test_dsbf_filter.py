@@ -6,7 +6,7 @@ import copy
 
 import numpy as np
 
-from filters.dsbf_filter import DSBFFilter
+from src.filters.dsbf_filter import DSBFFilter
 
 DIM = 32
 R = 0.3

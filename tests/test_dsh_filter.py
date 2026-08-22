@@ -5,7 +5,7 @@ import unittest
 
 import numpy as np
 
-from filters.dsh_filter import DSHFilter
+from src.filters.dsh_filter import DSHFilter
 
 DIM = 32
 R = 0.3

@@ -5,8 +5,8 @@ import unittest
 
 import numpy as np
 
-from filters.lsbf_filter import LSBFFilter
-from filters._hashing import stable_hash_to_int
+from src.filters.lsbf_filter import LSBFFilter
+from src.filters._hashing import stable_hash_to_int
 
 DIM = 32
 R = 0.3

@@ -19,6 +19,8 @@ from plots.plot_system import generate_system_figures
 from plots.plot_system_tau import generate_system_tau_figures
 from plots.plot_common import DATASETS, DATASET_LABELS
 from typing import Tuple, List
+from filters.kdbox_filter import KDBoxFilter
+from filters.gonzalesbox_filter import GonzalezBoxFilter
 from filters.ball_cover_filter import BallCoverFilter
 from filters.dsbf_filter import DSBFFilter
 from filters.covering_lsh_fallback_filter import CoveringLSHFallbackFilter

@@ -6,7 +6,7 @@ import unittest
 import h5py
 import numpy as np
 
-from filters.covering_lsh_fallback_filter import CoveringLSHFallbackFilter
+from src.filters.covering_lsh_fallback_filter import CoveringLSHFallbackFilter
 from src.util.dataset_paths import dataset_filenames, HDF5_DATASET_KEY
 
 DIM = 32
