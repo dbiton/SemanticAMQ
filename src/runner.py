@@ -516,10 +516,20 @@ def ablation_worker(
     re-derived per candidate) -- this is what makes n_balls meaningfully
     different per quantize choice (a more compact code packs more balls into
     the same byte budget) rather than trivially equal to k for every
-    candidate. construct_tau is accepted for interface parity with the other
-    tau-sweep workers but unused: BallCoverFilter's own construction has no
-    distance-threshold knob to feed it (Gonzalez construction only takes the
-    vectors and a ball budget).
+    candidate, and is also what the recorded memory_bytes (filt.get_bytesize())
+    tracks as plot_ablation.py's x-axis. That tracking isn't exact for every
+    quantize choice, though: BallCoverFilter caps ball count at
+    min(max_count_balls, n_construct), so a quantizer compact enough that
+    max_count_balls exceeds the construct-set size (e.g. PQ, whose ~8-12
+    byte code is roughly two orders of magnitude smaller than NONE's
+    (dim+1)*4 bytes) saturates at n_construct balls well before the nominal
+    byte budget is used -- its realized memory usage then stays flat across
+    the whole k sweep instead of tracking k, which is real information (that
+    quantizer is construct-set-bound, not budget-bound, at these k_fractions)
+    rather than a plotting artifact. construct_tau is accepted for interface
+    parity with the other tau-sweep workers but unused: BallCoverFilter's own
+    construction has no distance-threshold knob to feed it (Gonzalez
+    construction only takes the vectors and a ball budget).
 
     FNR is asserted (raises on violation), never plotted."""
     construct_arr = _to_construct_array(vectors_construct)
@@ -544,6 +554,8 @@ def ablation_worker(
     radii = filt.all_radiuses
     log10_J = _log10_J(radii, dim)
 
+    memory_bytes = filt.get_bytesize()
+
     predicted_by_tau = {t: filt.query(query_arr, distance_threshold=t) for t in tau_values}
     for t in tau_values:
         rates = _confusion_rates(predicted_by_tau[t], actual_by_tau[t])
@@ -553,7 +565,7 @@ def ablation_worker(
             "log10_J_tau": _log10_J(radii, dim, tau=t),
             "fpr": rates["fpr"], "fnr": rates["fnr"],
             "stage_time_s": stage_time, "cum_time_s": stage_time,
-            "n_balls": filt.count_balls, "seed": seed,
+            "n_balls": filt.count_balls, "memory_bytes": memory_bytes, "seed": seed,
         })
 
     bad = [r for r in rows if r["fnr"] != 0]

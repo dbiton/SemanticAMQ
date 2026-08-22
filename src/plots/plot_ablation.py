@@ -1,8 +1,18 @@
 """Generate the five ablation-figure panels (+ shared legend) for the PVLDB paper.
 
-Self-contained: reads a long-format results file, aggregates over seeds, and
-writes PNG (optionally PDF) panels sized for `\\includegraphics[width=\\linewidth]`
-inside `subfigure{0.24\\linewidth}` cells of a two-column `figure*`.
+Self-contained: reads a long-format results file (one row per (quantize, k,
+seed) on a single dataset -- see main.py::generate_ablation), aggregates over
+seeds, and writes PNG (optionally PDF) panels sized for
+`\\includegraphics[width=\\linewidth]` inside `subfigure{0.24\\linewidth}` cells
+of a two-column `figure*`.
+
+Each panel is a line plot: x-axis = memory usage (MB, log scale, driven by
+the k sweep -- see ablation_worker's docstring for how closely memory usage
+tracks k for a given quantize choice, which isn't exact for the most compact
+quantizers), one line per quantize method (color + marker), for the single
+dataset the input was generated on. This replaced an earlier per-dataset
+grouped-bar-at-fixed-k design; multi-dataset figures now belong to the other
+evaluations (plot_query_performance.py etc.), not this one.
 
 Edit the CONFIG block below to change parameters -- no CLI flags.
 """
@@ -22,7 +32,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 
 from filters.ball_cover_filter import Quantize
-from plots.plot_common import DATASETS, DATASET_LABELS, DATASET_COLORS, DATASET_HATCHES, apply_style as _apply_style, save_figure, save_dataset_legend
+from plots.plot_common import apply_style as _apply_style, save_figure
 
 # --------------------------------------------------------------------------- #
 # CONFIG
@@ -30,7 +40,6 @@ from plots.plot_common import DATASETS, DATASET_LABELS, DATASET_COLORS, DATASET_
 
 INPUT_PATH = "results/ablation.csv"
 OUTDIR = "plots/ablation/"
-K = 256
 TAU: Optional[float] = None  # None => median tau present in the data
 DPI = 400
 EMIT_PDF = False
@@ -63,13 +72,17 @@ STAGE_LABELS = {
 # panels had before per-quantize ablation existed.
 BASELINE_STAGE = Quantize.NONE.value
 
-BAR_WIDTH = 0.26
+# tab10 has 10 qualitative colors; 9 quantize variants fit with one to spare.
+_STAGE_PALETTE = plt.get_cmap("tab10").colors
+STAGE_COLORS = dict(zip(STAGES, _STAGE_PALETTE))
+_STAGE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h"]
+STAGE_MARKERS = dict(zip(STAGES, _STAGE_MARKERS))
+
 D_DIM = 384  # embedding dimensionality; objectives are stored pre-logged
 
 
 @dataclasses.dataclass
 class Config:
-    k: int
     tau: float
     dpi: int
     emit_pdf: bool
@@ -85,26 +98,10 @@ def apply_style() -> None:
 
 
 def _style_axes(ax: plt.Axes) -> None:
-    ax.grid(axis="y", linewidth=0.35, alpha=0.4, zorder=0)
+    ax.grid(axis="both", which="major", linewidth=0.35, alpha=0.4, zorder=0)
     ax.set_axisbelow(True)
     for spine in ("left", "bottom"):
         ax.spines[spine].set_linewidth(0.5)
-
-
-def _set_quantize_xaxis(ax: plt.Axes, stages: list) -> None:
-    x = np.arange(len(stages))
-    ax.set_xticks(x)
-    ax.set_xticklabels(
-        [STAGE_LABELS[s] for s in stages],
-        rotation=30, ha="right", rotation_mode="anchor",
-    )
-    ax.set_xlim(-0.5, len(stages) - 0.5)
-
-
-def _dataset_offsets() -> dict:
-    # three bars per stage, centered on the stage tick
-    offs = np.array([-1, 0, 1]) * BAR_WIDTH
-    return dict(zip(DATASETS, offs))
 
 
 # --------------------------------------------------------------------------- #
@@ -124,6 +121,7 @@ _REQUIRED_COLUMNS = [
     "stage_time_s",
     "cum_time_s",
     "n_balls",
+    "memory_bytes",
     "seed",
 ]
 
@@ -143,11 +141,11 @@ def _validate_schema(df: pd.DataFrame) -> None:
             f"{len(bad)} row(s) with fnr != 0, e.g.\n{bad.head()}"
         )
 
-    missing_ds = set(DATASETS) - set(df["dataset"].unique())
-    if missing_ds:
+    n_datasets = df["dataset"].nunique()
+    if n_datasets != 1:
         raise ValueError(
-            f"Missing dataset(s) {sorted(missing_ds)} in data. "
-            f"Available: {sorted(df['dataset'].unique())}"
+            f"Expected a single-dataset input (see generate_ablation()), found "
+            f"{n_datasets}: {sorted(df['dataset'].unique())}"
         )
 
     present = set(df["quantize"].unique())
@@ -179,16 +177,11 @@ def load_data() -> pd.DataFrame:
 
 def resolve_config(
     df: pd.DataFrame,
-    k: int = K,
     tau: Optional[float] = TAU,
     dpi: int = DPI,
     emit_pdf: bool = EMIT_PDF,
     outdir: str = OUTDIR,
 ) -> Config:
-    available_k = sorted(df["k"].unique())
-    if k not in available_k:
-        raise ValueError(f"k={k} not present in data. Available k values: {available_k}")
-
     available_tau = sorted(df["tau"].unique())
     if tau is None:
         tau = float(df["tau"].median())
@@ -197,7 +190,7 @@ def resolve_config(
     elif tau not in available_tau:
         raise ValueError(f"tau={tau} not present in data. Available tau values: {available_tau}")
 
-    return Config(k=k, tau=tau, dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
+    return Config(tau=tau, dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
 
 
 # --------------------------------------------------------------------------- #
@@ -206,42 +199,117 @@ def resolve_config(
 
 def aggregate(df: pd.DataFrame, value_col: str, cfg: Config, use_tau: bool = False,
              stages: list = STAGES) -> pd.DataFrame:
-    """Mean + 95% CI of `value_col` over seed, per (dataset, quantize),
-    at cfg.k (and cfg.tau if use_tau), restricted to the given `stages`
-    (quantize values)."""
-    sel = df[df["k"] == cfg.k]
+    """Mean + 95% CI of `value_col` over seed, per (quantize, k) -- k is the
+    real sweep/grouping key (memory_bytes is deterministic given (k,
+    quantize), so grouping by k and separately averaging memory_bytes gives
+    the same result more robustly than grouping by a float column directly),
+    restricted to the given `stages` (quantize values) and, if `use_tau`, to
+    cfg.tau."""
+    sel = df[df["quantize"].isin(stages)]
     if use_tau:
         sel = sel[sel["tau"] == cfg.tau]
-    sel = sel[sel["quantize"].isin(stages)]
 
     bad_raw = sel[~np.isfinite(sel[value_col])]
     if len(bad_raw):
-        cols = [c for c in ("dataset", "k", "quantize", "tau", "stage", "seed", value_col) if c in bad_raw.columns]
+        cols = [c for c in ("k", "quantize", "tau", "stage", "seed", value_col) if c in bad_raw.columns]
         raise ValueError(
-            f"Non-finite {value_col!r} values at k={cfg.k}"
-            + (f", tau={cfg.tau}" if use_tau else "") + f":\n{bad_raw[cols].to_string(index=False)}\n"
-            "This usually means k >= the construct-set size for that dataset (every ball "
-            "becomes a zero-radius singleton, so log10_J is -inf) -- lower k or shrink the "
+            f"Non-finite {value_col!r} values"
+            + (f" at tau={cfg.tau}" if use_tau else "") + f":\n{bad_raw[cols].to_string(index=False)}\n"
+            "This usually means k >= the construct-set size (every ball becomes a "
+            "zero-radius singleton, so log10_J is -inf) -- lower k or shrink the "
             "construct-set-relative k sweep in the data-generation step."
         )
 
-    grouped = sel.groupby(["dataset", "quantize"])[value_col]
-    agg = grouped.agg(mean="mean", sem="sem", n="count").reset_index()
+    grouped = sel.groupby(["quantize", "k"])
+    agg = grouped[value_col].agg(mean="mean", sem="sem", n="count").reset_index()
     agg["ci95"] = np.where(agg["n"] > 1, 1.96 * agg["sem"].fillna(0.0), 0.0)
+    mem = grouped["memory_bytes"].mean().reset_index(name="memory_bytes")
+    agg = agg.merge(mem, on=["quantize", "k"])
+    agg["Memory (MB)"] = agg["memory_bytes"] / (1024 * 1024)
 
-    for dataset in DATASETS:
-        for stage in stages:
-            if not ((agg["dataset"] == dataset) & (agg["quantize"] == stage)).any():
-                raise ValueError(
-                    f"No rows for dataset={dataset!r}, quantize={stage!r} at "
-                    f"k={cfg.k}" + (f", tau={cfg.tau}" if use_tau else "") + "."
-                )
+    for stage in stages:
+        if not (agg["quantize"] == stage).any():
+            raise ValueError(
+                f"No rows for quantize={stage!r}" + (f" at tau={cfg.tau}" if use_tau else "") + "."
+            )
     return agg
 
 
-def _lookup(agg: pd.DataFrame, dataset: str, quantize: str) -> tuple:
-    row = agg[(agg["dataset"] == dataset) & (agg["quantize"] == quantize)].iloc[0]
-    return float(row["mean"]), float(row["ci95"])
+def _relative_to_baseline(agg: pd.DataFrame) -> pd.DataFrame:
+    """Subtracts BASELINE_STAGE's mean (at the same k) from every stage's
+    mean, so each line reads as "how much does this quantizer cost/save
+    relative to the unquantized cover at the same memory budget" -- the
+    generalization of the old fixed-k bar chart's per-dataset baseline
+    subtraction to a k-swept line chart."""
+    base = agg[agg["quantize"] == BASELINE_STAGE][["k", "mean"]].rename(columns={"mean": "base_mean"})
+    rel = agg.merge(base, on="k", how="left")
+    rel["mean"] = rel["mean"] - rel["base_mean"]
+    return rel.drop(columns="base_mean")
+
+
+# --------------------------------------------------------------------------- #
+# Generic line panel: x = memory usage, one line per quantize method
+# --------------------------------------------------------------------------- #
+
+def _line_panel(
+    df: pd.DataFrame,
+    value_col: str,
+    ylabel: str,
+    filename: str,
+    cfg: Config,
+    use_tau: bool = False,
+    log_y: bool = False,
+    y_bounds: Optional[tuple] = None,
+    relative_to_baseline: bool = False,
+    extra=None,
+) -> pd.DataFrame:
+    agg = aggregate(df, value_col, cfg, use_tau=use_tau)
+    if relative_to_baseline:
+        agg = _relative_to_baseline(agg)
+
+    apply_style()
+    fig, ax = plt.subplots()
+
+    for stage in STAGES:
+        sub = agg[agg["quantize"] == stage].sort_values("Memory (MB)")
+        if sub.empty:
+            continue
+        ax.plot(
+            sub["Memory (MB)"], sub["mean"],
+            color=STAGE_COLORS[stage], marker=STAGE_MARKERS[stage], markersize=2.5,
+            linewidth=0.8, zorder=2,
+        )
+        if (sub["ci95"] > 0).any():
+            ax.errorbar(
+                sub["Memory (MB)"], sub["mean"], yerr=sub["ci95"],
+                fmt="none", ecolor=STAGE_COLORS[stage],
+                elinewidth=0.5, capsize=1.5, capthick=0.5, zorder=3,
+            )
+
+    ax.set_xscale("log", base=2)
+    ax.xaxis.set_major_locator(LogLocator(base=2.0))
+    ax.xaxis.set_major_formatter(LogFormatterMathtext(base=2.0))
+
+    if relative_to_baseline:
+        ax.axhline(0.0, color="black", linewidth=0.5, zorder=1)
+    if log_y:
+        ax.set_yscale("log")
+        ax.yaxis.set_major_locator(LogLocator(base=10.0))
+        ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10.0))
+        ax.yaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10)))
+        ax.yaxis.set_minor_formatter(NullFormatter())
+        ax.tick_params(axis="y", which="minor", length=1.2, width=0.4)
+    elif y_bounds is not None:
+        ax.set_ylim(*y_bounds)
+
+    ax.set_xlabel("Memory Usage (MB)")
+    ax.set_ylabel(ylabel)
+    _style_axes(ax)
+    if extra is not None:
+        extra(ax)
+
+    _save(fig, filename, cfg)
+    return agg
 
 
 # --------------------------------------------------------------------------- #
@@ -249,27 +317,10 @@ def _lookup(agg: pd.DataFrame, dataset: str, quantize: str) -> tuple:
 # --------------------------------------------------------------------------- #
 
 def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    agg = aggregate(df, "log10_J", cfg, use_tau=False)
-
-    rel = agg.copy()
-    rel["rel_mean"] = np.nan
-    rel["rel_ci95"] = np.nan
-    for dataset in DATASETS:
-        base_mean, _ = _lookup(agg, dataset, BASELINE_STAGE)
-        mask = rel["dataset"] == dataset
-        rel.loc[mask, "rel_mean"] = rel.loc[mask, "mean"] - base_mean
-        rel.loc[mask, "rel_ci95"] = rel.loc[mask, "ci95"]
-
-    _bar_panel(
-        rel,
-        value_col="rel_mean",
-        ci_col="rel_ci95",
-        ylabel=r"$\log_{10} J(\mathcal{C})/J_{\mathrm{ball}}$",
-        filename="ablation-geometric-objective.png",
-        cfg=cfg,
-        zero_line=True,
+    return _line_panel(
+        df, "log10_J", r"$\log_{10} J(\mathcal{C})/J_{\mathrm{ball}}$",
+        "ablation-geometric-objective.png", cfg, use_tau=False, relative_to_baseline=True,
     )
-    return rel
 
 
 # --------------------------------------------------------------------------- #
@@ -277,102 +328,17 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 
 def panel_threshold_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    agg = aggregate(df, "log10_J_tau", cfg, use_tau=True)
-
-    rel = agg.copy()
-    rel["rel_mean"] = np.nan
-    rel["rel_ci95"] = np.nan
-    for dataset in DATASETS:
-        base_mean, _ = _lookup(agg, dataset, BASELINE_STAGE)
-        mask = rel["dataset"] == dataset
-        rel.loc[mask, "rel_mean"] = rel.loc[mask, "mean"] - base_mean
-        rel.loc[mask, "rel_ci95"] = rel.loc[mask, "ci95"]
-
     def annotate(ax: plt.Axes) -> None:
         ax.text(
-            0.97,
-            0.95,
-            rf"$\tau = {cfg.tau:g}$",
-            transform=ax.transAxes,
-            ha="right",
-            va="top",
-            fontsize=5.5,
+            0.97, 0.95, rf"$\tau = {cfg.tau:g}$",
+            transform=ax.transAxes, ha="right", va="top", fontsize=5.5,
         )
 
-    _bar_panel(
-        rel,
-        value_col="rel_mean",
-        ci_col="rel_ci95",
-        ylabel=r"$\log_{10} J_\tau(\mathcal{C})/J_{\tau,\mathrm{ball}}$",
-        filename="ablation-threshold-expanded-objective.png",
-        cfg=cfg,
-        zero_line=True,
-        extra=annotate,
+    return _line_panel(
+        df, "log10_J_tau", r"$\log_{10} J_\tau(\mathcal{C})/J_{\tau,\mathrm{ball}}$",
+        "ablation-threshold-expanded-objective.png", cfg, use_tau=True,
+        relative_to_baseline=True, extra=annotate,
     )
-    return rel
-
-
-def _bar_panel(
-    agg: pd.DataFrame,
-    value_col: str,
-    ci_col: str,
-    ylabel: str,
-    filename: str,
-    cfg: Config,
-    zero_line: bool = False,
-    extra=None,
-    stages: list = STAGES,
-) -> None:
-    apply_style()
-    fig, ax = plt.subplots()
-    x = np.arange(len(stages))
-    offsets = _dataset_offsets()
-
-    for dataset in DATASETS:
-        means, cis = [], []
-        for stage in stages:
-            row = agg[(agg["dataset"] == dataset) & (agg["quantize"] == stage)].iloc[0]
-            means.append(row[value_col])
-            cis.append(row[ci_col])
-        means = np.array(means)
-        cis = np.array(cis)
-        has_ci = np.any(cis > 0)
-
-        ax.bar(
-            x + offsets[dataset],
-            means,
-            width=BAR_WIDTH,
-            color=DATASET_COLORS[dataset],
-            hatch=DATASET_HATCHES[dataset],
-            edgecolor="black",
-            linewidth=0.4,
-            zorder=2,
-        )
-        if has_ci:
-            ax.errorbar(
-                x + offsets[dataset],
-                means,
-                yerr=cis,
-                fmt="none",
-                ecolor="black",
-                elinewidth=0.5,
-                capsize=1.5,
-                capthick=0.5,
-                zorder=3,
-            )
-
-    if zero_line:
-        ax.axhline(0.0, color="black", linewidth=0.5, zorder=1)
-        ymin = agg[value_col].min()
-        ax.set_ylim(1.1 * min(ymin, 0.0), 0.0)
-
-    ax.set_ylabel(ylabel)
-    _set_quantize_xaxis(ax, stages)
-    _style_axes(ax)
-    if extra is not None:
-        extra(ax)
-
-    _save(fig, filename, cfg)
 
 
 # --------------------------------------------------------------------------- #
@@ -384,55 +350,34 @@ def panel_fpr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     positive = agg.loc[agg["mean"] > 0, "mean"]
     if len(positive) == 0:
-        raise ValueError("All FPR values are zero at the selected k/tau; cannot set a log floor.")
+        raise ValueError("All FPR values are zero at the selected tau; cannot set a log floor.")
     floor = 10 ** (np.floor(np.log10(positive.min())) - 1)
+    # Zero FPR can't be drawn on a log axis; clip to the floor so the line
+    # still traces through those points instead of vanishing off-chart.
+    agg = agg.copy()
+    agg["mean"] = agg["mean"].where(agg["mean"] > 0, floor)
 
     apply_style()
     fig, ax = plt.subplots()
-    x = np.arange(len(STAGES))
-    offsets = _dataset_offsets()
-
-    for dataset in DATASETS:
-        means, cis, is_zero = [], [], []
-        for stage in STAGES:
-            row = agg[(agg["dataset"] == dataset) & (agg["quantize"] == stage)].iloc[0]
-            m = row["mean"]
-            is_zero.append(m == 0)
-            means.append(floor if m == 0 else m)
-            cis.append(row["ci95"])
-        means = np.array(means)
-        cis = np.array(cis)
-        is_zero = np.array(is_zero)
-        has_ci = np.any(cis > 0)
-
-        for i, xi in enumerate(x + offsets[dataset]):
-            hatch = "xxxx" if is_zero[i] else DATASET_HATCHES[dataset]
-            facecolor = "none" if is_zero[i] else DATASET_COLORS[dataset]
-            ax.bar(
-                xi,
-                means[i],
-                width=BAR_WIDTH,
-                color=facecolor,
-                hatch=hatch,
-                edgecolor=DATASET_COLORS[dataset] if is_zero[i] else "black",
-                linewidth=0.4,
-                zorder=2,
-            )
-            if is_zero[i]:
-                ax.text(xi, means[i] * 1.3, "0", ha="center", va="bottom", fontsize=5.5)
-
-        if has_ci:
+    for stage in STAGES:
+        sub = agg[agg["quantize"] == stage].sort_values("Memory (MB)")
+        if sub.empty:
+            continue
+        ax.plot(
+            sub["Memory (MB)"], sub["mean"],
+            color=STAGE_COLORS[stage], marker=STAGE_MARKERS[stage], markersize=2.5,
+            linewidth=0.8, zorder=2,
+        )
+        if (sub["ci95"] > 0).any():
             ax.errorbar(
-                (x + offsets[dataset])[~is_zero],
-                means[~is_zero],
-                yerr=cis[~is_zero],
-                fmt="none",
-                ecolor="black",
-                elinewidth=0.5,
-                capsize=1.5,
-                capthick=0.5,
-                zorder=3,
+                sub["Memory (MB)"], sub["mean"], yerr=sub["ci95"],
+                fmt="none", ecolor=STAGE_COLORS[stage],
+                elinewidth=0.5, capsize=1.5, capthick=0.5, zorder=3,
             )
+
+    ax.set_xscale("log", base=2)
+    ax.xaxis.set_major_locator(LogLocator(base=2.0))
+    ax.xaxis.set_major_formatter(LogFormatterMathtext(base=2.0))
 
     ax.set_yscale("log")
     ax.set_ylim(floor / 3.0, None)
@@ -442,8 +387,8 @@ def panel_fpr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     ax.yaxis.set_minor_formatter(NullFormatter())
     ax.tick_params(axis="y", which="minor", length=1.2, width=0.4)
 
+    ax.set_xlabel("Memory Usage (MB)")
     ax.set_ylabel("FPR")
-    _set_quantize_xaxis(ax, STAGES)
     _style_axes(ax)
 
     _save(fig, "ablation-false-positive-rate.png", cfg)
@@ -455,75 +400,14 @@ def panel_fpr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 
 def panel_construction_time(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    agg_stage = aggregate(df, "stage_time_s", cfg, use_tau=False)
-    agg_cum = aggregate(df, "cum_time_s", cfg, use_tau=False)
-
-    apply_style()
-    fig, ax = plt.subplots()
-    x = np.arange(len(STAGES))
-    offsets = _dataset_offsets()
-
-    for dataset in DATASETS:
-        means, cis = [], []
-        for stage in STAGES:
-            row = agg_stage[(agg_stage["dataset"] == dataset) & (agg_stage["quantize"] == stage)].iloc[0]
-            means.append(row["mean"])
-            cis.append(row["ci95"])
-        means = np.array(means)
-        cis = np.array(cis)
-        has_ci = np.any(cis > 0)
-
-        ax.bar(
-            x + offsets[dataset],
-            means,
-            width=BAR_WIDTH,
-            color=DATASET_COLORS[dataset],
-            hatch=DATASET_HATCHES[dataset],
-            edgecolor="black",
-            linewidth=0.4,
-            zorder=2,
-        )
-        if has_ci:
-            ax.errorbar(
-                x + offsets[dataset],
-                means,
-                yerr=cis,
-                fmt="none",
-                ecolor="black",
-                elinewidth=0.5,
-                capsize=1.5,
-                capthick=0.5,
-                zorder=3,
-            )
-
-        cum_means = [
-            agg_cum[(agg_cum["dataset"] == dataset) & (agg_cum["quantize"] == stage)].iloc[0]["mean"]
-            for stage in STAGES
-        ]
-        ax.plot(
-            x,
-            cum_means,
-            color=DATASET_COLORS[dataset],
-            linestyle="--",
-            linewidth=0.7,
-            marker="o",
-            markersize=2.5,
-            zorder=4,
-        )
-
-    ax.set_yscale("log")
-    ax.yaxis.set_major_locator(LogLocator(base=10.0))
-    ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10.0))
-    ax.yaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10)))
-    ax.yaxis.set_minor_formatter(NullFormatter())
-    ax.tick_params(axis="y", which="minor", length=1.2, width=0.4)
-
-    ax.set_ylabel("Time (s)")
-    _set_quantize_xaxis(ax, STAGES)
-    _style_axes(ax)
-
-    _save(fig, "ablation-construction-time.png", cfg)
-    return agg_stage
+    # stage_time_s == cum_time_s in ablation_worker (each row is a single
+    # from-scratch construction, not a multi-stage pipeline), so there's no
+    # separate "cumulative" series to overlay here the way the old bar panel
+    # did -- one line per quantize method is the whole picture.
+    return _line_panel(
+        df, "cum_time_s", "Time (s)", "ablation-construction-time.png", cfg,
+        use_tau=False, log_y=True,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -531,63 +415,15 @@ def panel_construction_time(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 
 def panel_n_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """Realized ball count per quantize variant, at the one memory budget
-    shared by the whole sweep (derived from cfg.k against the unquantized
-    cover's byte-per-ball size). Unlike a per-level sweep -- where n_balls
-    would always equal k regardless of construction strategy -- this is
-    genuinely informative here: a quantizer with a smaller per-center code
-    packs more balls into the same budget, so bars are expected to rise as
-    the code gets more compact (PQ/SQ4 highest, None/FP16/BF16 lowest, at
-    k itself)."""
-    agg = aggregate(df, "n_balls", cfg, use_tau=False)
-
-    apply_style()
-    fig, ax = plt.subplots()
-    x = np.arange(len(STAGES))
-    offsets = _dataset_offsets()
-
-    for dataset in DATASETS:
-        means, cis = [], []
-        for stage in STAGES:
-            row = agg[(agg["dataset"] == dataset) & (agg["quantize"] == stage)].iloc[0]
-            means.append(row["mean"])
-            cis.append(row["ci95"])
-        means = np.array(means)
-        cis = np.array(cis)
-        has_ci = np.any(cis > 0)
-
-        ax.bar(
-            x + offsets[dataset],
-            means,
-            width=BAR_WIDTH,
-            color=DATASET_COLORS[dataset],
-            hatch=DATASET_HATCHES[dataset],
-            edgecolor="black",
-            linewidth=0.4,
-            zorder=2,
-        )
-        if has_ci:
-            ax.errorbar(
-                x + offsets[dataset],
-                means,
-                yerr=cis,
-                fmt="none",
-                ecolor="black",
-                elinewidth=0.5,
-                capsize=1.5,
-                capthick=0.5,
-                zorder=3,
-            )
-
-    ax.axhline(cfg.k, color="black", linewidth=0.6, linestyle=":", zorder=1)
-    ax.text(len(STAGES) - 0.5, cfg.k, f"k={cfg.k}", fontsize=5, ha="right", va="bottom")
-
-    ax.set_ylabel("Number of balls")
-    _set_quantize_xaxis(ax, STAGES)
-    _style_axes(ax)
-
-    _save(fig, "ablation-n-balls.png", cfg)
-    return agg
+    """Realized ball count per quantize variant across the memory-usage
+    sweep. Unlike a per-level sweep -- where n_balls would always equal k
+    regardless of construction strategy -- this is genuinely informative
+    here: a quantizer with a smaller per-center code packs more balls into
+    the same budget, so at a given x (memory usage) the lines are expected to
+    separate, with PQ/SQ4 highest and None/FP16/BF16 lowest."""
+    return _line_panel(
+        df, "n_balls", "Number of Balls", "ablation-n-balls.png", cfg, use_tau=False,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -595,7 +431,34 @@ def panel_n_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 
 def save_legend(cfg: Config) -> None:
-    save_dataset_legend(cfg.outdir, cfg.dpi, cfg.emit_pdf, filename="ablation-legend.png")
+    apply_style()
+    fig, ax = plt.subplots(figsize=(5.6, 0.32))
+    ax.axis("off")
+
+    handles = [
+        plt.Line2D(
+            [0], [0],
+            color=STAGE_COLORS[stage], marker=STAGE_MARKERS[stage],
+            markersize=3, linewidth=1.0,
+        )
+        for stage in STAGES
+    ]
+    labels = [STAGE_LABELS[stage] for stage in STAGES]
+
+    fig.legend(
+        handles, labels,
+        loc="center", ncol=min(5, len(STAGES)),
+        frameon=False, fontsize=7,
+    )
+    fig.patch.set_alpha(0.0)
+
+    path = os.path.join(cfg.outdir, "ablation-legend.png")
+    os.makedirs(cfg.outdir, exist_ok=True)
+    fig.savefig(path, dpi=cfg.dpi, bbox_inches="tight", pad_inches=0.01, transparent=True)
+    if cfg.emit_pdf:
+        fig.savefig(path.replace(".png", ".pdf"), bbox_inches="tight", pad_inches=0.01, transparent=True)
+    plt.close(fig)
+    print(f"Wrote {path}")
 
 
 # --------------------------------------------------------------------------- #
@@ -611,26 +474,25 @@ def _save(fig: plt.Figure, filename: str, cfg: Config) -> None:
 # --------------------------------------------------------------------------- #
 
 def print_summary(df: pd.DataFrame, cfg: Config) -> None:
-    print("\n--- Ablation summary (k={}, tau={:g}) ---".format(cfg.k, cfg.tau))
-    header = (f"{'dataset':<10} {'quantize':>9} {'d(log10 J) vs None':>20} "
+    print(f"\n--- Ablation summary (tau={cfg.tau:g}) ---")
+    header = (f"{'quantize':>9} {'memory (MB)':>12} {'d(log10 J) vs None':>20} "
               f"{'fpr':>12} {'time (s)':>10} {'n_balls':>8}")
     print(header)
     print("-" * len(header))
 
-    j_agg = aggregate(df, "log10_J", cfg, use_tau=False)
+    j_agg = _relative_to_baseline(aggregate(df, "log10_J", cfg, use_tau=False))
     fpr_agg = aggregate(df, "fpr", cfg, use_tau=True)
     time_agg = aggregate(df, "cum_time_s", cfg, use_tau=False)
     balls_agg = aggregate(df, "n_balls", cfg, use_tau=False)
 
-    for dataset in DATASETS:
-        base_j, _ = _lookup(j_agg, dataset, BASELINE_STAGE)
-        for stage in STAGES:
-            this_j, _ = _lookup(j_agg, dataset, stage)
-            this_fpr, _ = _lookup(fpr_agg, dataset, stage)
-            this_time, _ = _lookup(time_agg, dataset, stage)
-            this_balls, _ = _lookup(balls_agg, dataset, stage)
+    for stage in STAGES:
+        for _, row in j_agg[j_agg["quantize"] == stage].sort_values("k").iterrows():
+            k = row["k"]
+            this_fpr = fpr_agg[(fpr_agg["quantize"] == stage) & (fpr_agg["k"] == k)]["mean"].iloc[0]
+            this_time = time_agg[(time_agg["quantize"] == stage) & (time_agg["k"] == k)]["mean"].iloc[0]
+            this_balls = balls_agg[(balls_agg["quantize"] == stage) & (balls_agg["k"] == k)]["mean"].iloc[0]
             print(
-                f"{DATASET_LABELS[dataset]:<10} {STAGE_LABELS[stage]:>9} {this_j - base_j:>20.3f} "
+                f"{STAGE_LABELS[stage]:>9} {row['Memory (MB)']:>12.3f} {row['mean']:>20.3f} "
                 f"{this_fpr:>12.2e} {this_time:>10.3f} {this_balls:>8.1f}"
             )
     print()
@@ -643,7 +505,6 @@ def print_summary(df: pd.DataFrame, cfg: Config) -> None:
 def generate_ablation_figures(
     df: Optional[pd.DataFrame] = None,
     outdir: str = OUTDIR,
-    k: int = K,
     tau: Optional[float] = TAU,
     dpi: int = DPI,
     emit_pdf: bool = EMIT_PDF,
@@ -659,7 +520,7 @@ def generate_ablation_figures(
     else:
         _validate_schema(df)
 
-    cfg = resolve_config(df, k=k, tau=tau, dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
+    cfg = resolve_config(df, tau=tau, dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
 
     panel_geometric_objective(df, cfg)
     panel_threshold_objective(df, cfg)

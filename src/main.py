@@ -27,7 +27,7 @@ from util.dataset_paths import dataset_filenames
 from util.fetch_datasets import load_embeds
 from vector_source import VectorSource
 
-MAX_WORKERS = 6
+MAX_WORKERS = 4
 DATASET = 'ELI5'
 
 # Registry name -> canonical dataset key, shared by every long-format
@@ -274,10 +274,10 @@ def generate_equal_memory() -> list:
     and query throughput is measured on the held-out query set; all four are
     plotted one series per budget.
     """
-    num_vectors             = 10_000
+    num_vectors             = 100_000
     dim                     = 384
-    percentage_construct    = 40
-    percentage_calibration  = 20
+    percentage_construct    = 20
+    percentage_calibration  = 10
     duplicate_percentage    = 5.0
     count_memory_steps        = 10
 
@@ -561,34 +561,36 @@ def plot_system_tau(df: pd.DataFrame, k: int) -> None:
     generate_system_tau_figures(df, k_fixed=k)
 
 
-def generate_ablation() -> Tuple[pd.DataFrame, int]:
+def generate_ablation() -> pd.DataFrame:
     """
     Generate the per-quantize-variant construction data for BallCoverFilter
     (ABLATION_QUANTIZE_SWEEP: the raw/unquantized cover plus every scalar/
-    product quantizer) across the 3 datasets the ablation figure needs, and
-    write it to results/ablation.csv. Every candidate in the sweep shares one
-    memory budget (derived from k against the unquantized cover's byte-per-
-    ball size), so a more compact quantizer's realized ball count can exceed
-    k -- that's the point of the ablation-n-balls panel. Returns the
-    long-format df plus the largest k used.
+    product quantizer) on a single dataset (DATASET), and write it to
+    results/ablation.csv. Every candidate in the sweep shares one memory
+    budget per k (derived from k against the unquantized cover's byte-per-
+    ball size), so a more compact quantizer's realized ball count can pack
+    more balls into that same budget -- which is what lets plot_ablation.py
+    use each row's recorded memory usage as the x-axis with one line per
+    quantize method, instead of faceting bars by dataset. That tracking is
+    imperfect for the most compact quantizers (see ablation_worker's
+    docstring): a quantizer compact enough to want more balls than the
+    construct set actually has saturates at n_construct balls short of the
+    nominal budget, so its memory-usage line goes flat across the k sweep
+    instead of spanning it -- real information about that quantizer being
+    construct-set-bound rather than a plotting bug.
 
     k and tau are both derived from num_vectors/percentage_construct rather
     than hardcoded absolute values, so editing those two knobs rescales
     the whole sweep instead of silently clamping/dropping stale constants:
-      - k_values = k_fractions * the smallest construct set (same pattern as
-        generate_system's k_fraction), guaranteed < that set's size since
-        every fraction is < 1 -- k >= a construct set's size makes
+      - k_values = k_fractions * the construct set size, guaranteed below it
+        since every fraction is < 1 -- k >= the construct-set size makes
         BallCoverFilter fall back to one zero-radius ball per point
         (log10_J = -inf, unplottable).
-      - tau_values = duplicate_percentages-th percentile of each dataset's
-        own nearest-neighbour distance (calculate_nn_distance_threshold),
-        averaged across datasets into one shared float per percentage --
-        every dataset's ground truth/job below needs the exact same literal
-        tau (plot_ablation's shared-tau bar panels filter by equality), but
-        an absolute L2 distance means something different at every
-        construct-set scale, so the percentile (computed per-dataset, off
-        that dataset's own distribution) is what actually stays meaningful
-        as num_vectors/percentage_construct change -- not the raw float.
+      - tau_values = duplicate_percentages-th percentile of the dataset's own
+        nearest-neighbour distance (calculate_nn_distance_threshold) -- an
+        absolute L2 distance means something different at every
+        construct-set scale, so the percentile is what stays meaningful as
+        num_vectors/percentage_construct change, not a raw float.
     """
     num_vectors            = 100_000
     dim                    = 384
@@ -598,71 +600,49 @@ def generate_ablation() -> Tuple[pd.DataFrame, int]:
     seeds                  = [0]
     output_csv             = "results/ablation.csv"
 
-    datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
-    missing = [d for d in DATASET_KEYS if d not in datasets]
-    if missing:
-        print(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
-    if set(datasets) != set(DATASET_KEYS):
-        raise RuntimeError(
-            "generate_ablation needs all 3 datasets "
-            f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
-        )
+    dataset = DATASET
+    vectors = load_embeds(dataset, num_vectors)[0]
+    num_construct = len(vectors) * percentage_construct // 100
+    vectors_construct = vectors[:num_construct]
+    vectors_query = vectors[num_construct:]
 
-    # Load once per dataset and reuse below (construct sizing, tau
-    # calibration, and job submission all need the same vectors).
-    dataset_vectors = {d: load_embeds(d, num_vectors)[0] for d in datasets}
-    construct_sizes = {d: len(dataset_vectors[d]) * percentage_construct // 100 for d in datasets}
-    min_construct = min(construct_sizes.values())
+    construct_source = VectorSource(dataset, 0, num_construct)
+    query_source = VectorSource(dataset, num_construct, len(vectors))
 
-    k_values = sorted({max(1, round(min_construct * f)) for f in k_fractions})
-    k_values = [k for k in k_values if k < min_construct]
+    k_values = sorted({max(1, round(num_construct * f)) for f in k_fractions})
+    k_values = [k for k in k_values if k < num_construct]
     if not k_values:
         raise RuntimeError(
-            f"No k_fraction in {k_fractions} produced a k below the smallest construct set "
-            f"({min_construct} vectors, from {min(construct_sizes, key=construct_sizes.get)}). "
-            "Raise num_vectors/percentage_construct or lower k_fractions."
+            f"No k_fraction in {k_fractions} produced a k below the construct set "
+            f"({num_construct} vectors). Raise num_vectors/percentage_construct or lower k_fractions."
         )
-    print(f"Scaling k_values to {k_values} ({min_construct} vectors in the smallest construct set)")
+    print(f"Scaling k_values to {k_values} ({num_construct} vectors in the construct set)")
 
-    per_dataset_tau = {
-        d: [calculate_nn_distance_threshold(dataset_vectors[d][:construct_sizes[d]], p) for p in duplicate_percentages]
-        for d in datasets
-    }
-    tau_values = [float(np.mean([per_dataset_tau[d][i] for d in datasets])) for i in range(len(duplicate_percentages))]
-    print(f"Scaling tau_values to {tau_values} (mean {duplicate_percentages}-th percentile NN distance across datasets)")
+    tau_values = [calculate_nn_distance_threshold(vectors_construct, p) for p in duplicate_percentages]
+    print(f"Scaling tau_values to {tau_values} ({duplicate_percentages}-th percentile NN distance)")
 
     # Kept for interface parity with ablation_worker's signature; unused there
     # now that BallCoverFilter's Gonzalez construction has no distance-
     # threshold knob to feed (only quantize varies the cover, not tau).
     construct_tau = float(np.median(tau_values))
 
+    print(f"Computing ground truth for tau in {tau_values}...")
+    actual_results_by_tau = {
+        tau: compute_static_actual_results(vectors_construct, vectors_query, tau)
+        for tau in tau_values
+    }
+
     runner = Runner(num_workers=MAX_WORKERS)
-
-    for dataset in datasets:
-        vectors = dataset_vectors[dataset]
-        n = len(vectors)  # a dataset may hold fewer than num_vectors
-        num_construct = n * percentage_construct // 100
-        vectors_construct = vectors[:num_construct]
-        vectors_query = vectors[num_construct:]
-
-        construct_source = VectorSource(dataset, 0, num_construct)
-        query_source = VectorSource(dataset, num_construct, n)
-
-        print(f"{dataset}: computing ground truth for tau in {tau_values}...")
-        actual_results_by_tau = {
-            tau: compute_static_actual_results(vectors_construct, vectors_query, tau)
-            for tau in tau_values
-        }
-        for k in k_values:
-            for seed in seeds:
-                for quantize in ABLATION_QUANTIZE_SWEEP:
-                    runner.submit(
-                        'ablation',
-                        dim=dim, dataset=DATASET_KEYS[dataset],
-                        k=k, quantize=quantize, tau_values=tau_values, seed=seed, construct_tau=construct_tau,
-                        vectors_construct=construct_source, vectors_query=query_source,
-                        actual_results_by_tau=actual_results_by_tau,
-                    )
+    for k in k_values:
+        for seed in seeds:
+            for quantize in ABLATION_QUANTIZE_SWEEP:
+                runner.submit(
+                    'ablation',
+                    dim=dim, dataset=dataset,
+                    k=k, quantize=quantize, tau_values=tau_values, seed=seed, construct_tau=construct_tau,
+                    vectors_construct=construct_source, vectors_query=query_source,
+                    actual_results_by_tau=actual_results_by_tau,
+                )
 
     job_results = runner.run()
     print("Ablation evaluation completed.")
@@ -673,21 +653,21 @@ def generate_ablation() -> Tuple[pd.DataFrame, int]:
     df.to_csv(output_csv, index=False)
     print(f"Wrote {output_csv}")
 
-    return df, max(k_values)
+    return df
 
 
-def plot_ablation(df: pd.DataFrame, k: int) -> None:
-    generate_ablation_figures(df, k=k)
+def plot_ablation(df: pd.DataFrame) -> None:
+    generate_ablation_figures(df)
 
 
 def generate_query_performance() -> pd.DataFrame:
     """
     Measure single-query vs. batched-query latency/throughput of a
-    BallCoverFilter cover as a function of filter size k, across the same
-    3 datasets used by generate_ablation(). Mirrors generate_ablation()'s
-    structure: one job per (dataset, k, seed), flattened into a long-format
-    DataFrame, written to results/query_performance.csv. Render with
-    plot_query_performance().
+    BallCoverFilter cover as a function of filter size k, across the 3
+    datasets in DATASET_KEYS (unlike generate_ablation(), which now runs on
+    a single dataset). One job per (dataset, k, seed), flattened into a
+    long-format DataFrame, written to results/query_performance.csv. Render
+    with plot_query_performance().
     """
     num_vectors           = 100_000
     dim                   = 384
@@ -1184,7 +1164,7 @@ def generate_and_plot_all() -> None:
     # plot_system_tau(*generate_system_tau())
     return
     try:
-        plot_ablation(*generate_ablation())
+        plot_ablation(generate_ablation())
     except Exception as e:
         print(f"An error occurred: {e}")
     return
@@ -1230,7 +1210,7 @@ def plot_all() -> None:
 
     try:
         df = pd.read_csv("results/ablation.csv")
-        plot_ablation(df, k=int(df["k"].max()))
+        plot_ablation(df)
     except Exception as e:
         print(f"An error occurred: {e}")
 
