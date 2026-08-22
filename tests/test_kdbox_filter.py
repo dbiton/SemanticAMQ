@@ -378,15 +378,6 @@ class TestKDBoxMemoryAndState(unittest.TestCase):
 
 
 class TestKDBoxEdgeCasesAndInterface(unittest.TestCase):
-    def test_remove_raises_not_implemented(self):
-        f = KDBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
-        with self.assertRaises(NotImplementedError):
-            f.remove(_rand(5))
-
-    def test_exact_matching_fpr_is_zero(self):
-        f = KDBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
-        self.assertEqual(f.get_exact_matching_fpr(), 0.0)
-
     def test_extreme_coordinates_handling(self):
         f = KDBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         extreme_vecs = np.array([[1e10, -1e10] * (DIM // 2)], dtype=np.float32)

@@ -24,6 +24,7 @@ from filters.covering_lsh_fallback_filter import CoveringLSHFallbackFilter
 from filters.lsbf_filter import LSBFFilter
 from filters.dsh_filter import DSHFilter
 from filters.hnsw_filter import HNSWFilter
+from filters.ivf_filter import IVFFilter
 from util.dataset_paths import dataset_filenames
 from util.fetch_datasets import load_embeds
 from vector_source import VectorSource
@@ -36,7 +37,7 @@ DATASET = 'ELI5'
 # plot_common so the dataset trio has one source of truth.
 DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
 
-dynamic_filters = [BallCoverFilter, DSBFFilter, CoveringLSHFallbackFilter, LSBFFilter, DSHFilter, HNSWFilter]
+dynamic_filters = [BallCoverFilter, DSBFFilter, CoveringLSHFallbackFilter, LSBFFilter, DSHFilter, HNSWFilter, IVFFilter]
 static_filters  = []
 
 def calculate_max_memory_budget_bytes(num_vectors: int, dimension: int, bytes_per_element: float) -> int:

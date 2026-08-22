@@ -386,18 +386,6 @@ class TestGonzalezAdd(unittest.TestCase):
         self.assertTrue(all(f.query(vecs)))
 
 
-# ---------------------------------------------------------------------------
-# Removal
-# ---------------------------------------------------------------------------
-
-class TestGonzalezRemove(unittest.TestCase):
-
-    def test_remove_raises_not_implemented(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
-        f.construct(_rand(10))
-        with self.assertRaises(NotImplementedError):
-            f.remove(_rand(2))
-
 
 # ---------------------------------------------------------------------------
 # Memory
@@ -430,10 +418,6 @@ class TestGonzalezMemory(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestGonzalezInterface(unittest.TestCase):
-
-    def test_exact_matching_fpr_is_zero(self):
-        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
-        self.assertEqual(f.get_exact_matching_fpr(), 0.0)
 
     def test_get_volume_is_zero(self):
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)

@@ -55,6 +55,7 @@ import numpy as np
 from pybloom_live import BloomFilter as _BloomFilter
 
 from filters.filter import Filter
+from filters._hashing import signature_to_key
 
 
 class DSHFilter(Filter):
@@ -85,7 +86,7 @@ class DSHFilter(Filter):
         max_spheres: Optional[int] = None,
         seed: int = 42,
     ):
-        super().__init__(dim, lsh=None, max_memory=max_memory)
+        super().__init__(dim, max_memory=max_memory)
         self.distance_threshold = float(distance_threshold)
         self.num_projections_per_table = num_projections_per_table
         self._error_rate = error_rate
@@ -221,13 +222,10 @@ class DSHFilter(Filter):
         codes = self._codes(vectors)
         for row in codes:
             for t in range(self.num_tables):
-                key = self._signature_to_key((t, row[t].tobytes()))
+                key = signature_to_key((t, row[t].tobytes()))
                 self.filter.add(key)
 
     # ------------------------------------------------------------------ Filter interface
-
-    def get_exact_matching_fpr(self) -> float:
-        return float(self._error_rate)
 
     def construct(self, vectors: np.ndarray) -> None:
         capacity = (
@@ -251,7 +249,7 @@ class DSHFilter(Filter):
         results = []
         for row in codes:
             hit = any(
-                self._signature_to_key((t, row[t].tobytes())) in self.filter
+                signature_to_key((t, row[t].tobytes())) in self.filter
                 for t in range(self.num_tables)
             )
             results.append(hit)

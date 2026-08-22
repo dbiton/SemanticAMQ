@@ -19,10 +19,7 @@ exclusively with L2-normalized (unit-sphere) real embeddings at d=384, so
 this port substitutes the Euclidean/cosine analogue of Hamming-bit hashing
 that the rest of this codebase already uses: random-hyperplane SimHash
 (`src/lsh.py::SimHashLSH`), whose sign bit is the direct continuous-space
-counterpart of a Hamming coordinate, and whose closed-form collision
-probability `_get_base_probabilities` (the standard `1 - arccos(1-r^2/2)/pi`
-formula relating Euclidean distance on the unit sphere to hyperplane-sign
-agreement probability) is reused unchanged for `DSBFFilter.get_criteria`.
+counterpart of a Hamming coordinate.
 The paper's own `m`/`m'`/`L`/`t` notation is renamed here to `num_tables`
 (m), `bits_per_table` (m'), `hashes_per_table` (L), `vote_threshold` (t) to
 avoid clashing with this codebase's own L/K naming for LSH tables/sub-hashes.
@@ -67,7 +64,7 @@ class DSBFFilter(Filter):
         max_spheres: Optional[int] = None,
         seed: int = 42,
     ):
-        super().__init__(dim, lsh=None, max_memory=max_memory)
+        super().__init__(dim, max_memory=max_memory)
         self.distance_threshold = float(distance_threshold)
         self.hashes_per_table = hashes_per_table
         self._max_spheres = max_spheres  # unused; accepted for _instantiate_filter parity
@@ -134,43 +131,6 @@ class DSBFFilter(Filter):
         return bool((byte >> (bit_idx % 8)) & 1)
 
     # ------------------------------------------------------------------ Filter interface
-
-    def get_exact_matching_fpr(self) -> float:
-        """
-        Structural (LSH-collision-free) false positive estimate: probability
-        that >= vote_threshold of num_tables independent bit arrays have a
-        uniformly-random bit already set, given each array's observed fill
-        fraction. 0.0 before construction.
-        """
-        if self._byte_arrays is None or self._n_inserted == 0:
-            return 0.0
-        from scipy.stats import binom
-
-        fills = [
-            float(np.unpackbits(arr).sum()) / self.bits_per_table for arr in self._byte_arrays
-        ]
-        avg_fill = sum(fills) / len(fills)
-        return float(binom.sf(self.vote_threshold - 1, self.num_tables, avg_fill))
-
-    def get_criteria(self, n: int, r1: float, r2: float):
-        """
-        Approximate expected (FPR, FNR) from the SimHash collision model,
-        composed as: base per-hyperplane probability -> per-table AND of
-        `hashes_per_table` hyperplanes -> vote-threshold-of-`num_tables`
-        binomial composition. Documented as approximate/secondary -- the
-        comparison harness (runner.py) measures FPR/FNR empirically against
-        ground truth and does not call this method.
-        """
-        from scipy.stats import binom
-
-        p1_base, p2_base = self._lsh._get_base_probabilities(r1, r2)
-        p1_table = p1_base ** self.hashes_per_table
-        p2_table = p2_base ** self.hashes_per_table
-        p1_vote = binom.sf(self.vote_threshold - 1, self.num_tables, p1_table)
-        p2_vote = binom.sf(self.vote_threshold - 1, self.num_tables, p2_table)
-        fnr = 1.0 - p1_vote
-        fpr = 1.0 - (1.0 - p2_vote) ** max(n, 0)
-        return float(fpr), float(fnr)
 
     def construct(self, vectors: np.ndarray) -> None:
         self._reset_storage()

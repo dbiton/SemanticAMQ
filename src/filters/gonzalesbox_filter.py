@@ -63,7 +63,7 @@ class GonzalezBoxFilter(Filter):
     _BATCH_SIZE = 2048
 
     def __init__(self, dim: int, distance_threshold: float, max_memory: Optional[int] = None, max_spheres: Optional[int] = None):
-        super().__init__(dim, lsh=None, max_memory=max_memory)
+        super().__init__(dim, max_memory=max_memory)
         self.distance_threshold = distance_threshold
         self.max_boxes = (max_spheres if max_spheres is not None 
                     else self._calculate_max_boxes(self.max_memory))
@@ -290,14 +290,6 @@ class GonzalezBoxFilter(Filter):
 
     def insert(self, vectors: np.ndarray) -> None:
         self.add(vectors)
-
-
-    def remove(self, vectors: np.ndarray) -> List[bool]:
-        raise NotImplementedError("GonzalezBoxFilter does not support remove operation.")
-
-
-    def get_exact_matching_fpr(self) -> float:
-        return 0.0
 
 
     def get_bytesize(self) -> int:

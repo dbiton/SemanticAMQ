@@ -100,6 +100,7 @@ def _radius_stats(filter_instance: Any) -> Dict[str, float]:
 _DIRECT_TAU_FILTERS = {
     "FirstNFilter", "BallCoverFilter",
     "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", "DSHFilter", "HNSWFilter",
+    "IVFFilter",
 }
 
 
@@ -223,9 +224,18 @@ def _f1_score(predicted: np.ndarray, actual: np.ndarray) -> float:
     return _precision_recall_f1(predicted, actual)[2]
 
 
+_IVF_NPROBE_CANDIDATES = (1, 2, 4, 8, 16, 32, 64)
+
+
 # Filters with a cheap post-construction query-time dial: score every candidate on one built instance.
 _POST_CONSTRUCTION_CONFIG_DIALS = {
     "DSBFFilter": lambda f: [("vote_threshold", t) for t in range(1, f.num_tables + 1)],
+    # nprobe is a pure query-time knob (IVFFilter.nprobe proxies to the built
+    # index, see its property docstring) -- swept on a log-ish grid up to
+    # nlist rather than exhaustively, since nlist can be in the hundreds.
+    "IVFFilter": lambda f: [
+        ("nprobe", p) for p in sorted({c for c in _IVF_NPROBE_CANDIDATES if c <= f.nlist} | {f.nlist})
+    ],
 }
 
 # Filters whose configuration changes memory layout at construction time: one build per candidate.
