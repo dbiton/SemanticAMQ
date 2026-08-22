@@ -80,7 +80,7 @@ class IVFFilter(Filter):
         self.nlist: Optional[int] = None
         self.pq_m: Optional[int] = None
         self.pq_nbits: Optional[int] = None
-        self.index: Optional[faiss.IndexIVFPQ] = None
+        self.index: Optional[faiss.Index] = None  # IndexIVFPQ, or IndexIVFFlat for the n<2 fallback
         self._constructed = False
 
     @property
@@ -172,13 +172,24 @@ class IVFFilter(Filter):
             self.index = None
             return
 
-        self._choose_params(n)
         quantizer = faiss.IndexFlatL2(self.dim)
-        index = faiss.IndexIVFPQ(quantizer, self.dim, self.nlist, self.pq_m, self.pq_nbits)
-        index.cp.min_points_per_centroid = 1
-        index.cp.seed = self.seed
-        index.pq.cp.min_points_per_centroid = 1
-        index.pq.cp.seed = self.seed
+        if n < 2:
+            # PQ needs >= 2 training points for even a 1-bit codebook (faiss
+            # hard-errors below that -- "nx >= k" in Clustering::train_encoded).
+            # A singleton construct set can't train one, so fall back to an
+            # uncompressed IndexIVFFlat, whose only training step is the
+            # (trivial, single-point) coarse quantizer.
+            self.nlist, self.pq_m, self.pq_nbits = 1, None, None
+            index = faiss.IndexIVFFlat(quantizer, self.dim, 1)
+            index.cp.min_points_per_centroid = 1
+            index.cp.seed = self.seed
+        else:
+            self._choose_params(n)
+            index = faiss.IndexIVFPQ(quantizer, self.dim, self.nlist, self.pq_m, self.pq_nbits)
+            index.cp.min_points_per_centroid = 1
+            index.cp.seed = self.seed
+            index.pq.cp.min_points_per_centroid = 1
+            index.pq.cp.seed = self.seed
         index.train(vecs)
         index.add(vecs)
         index.nprobe = self._nprobe

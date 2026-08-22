@@ -6,9 +6,7 @@ import inspect
 import numpy as np
 import pandas as pd
 
-from lsh import LSH, DummyLSH
 from runner import Runner, ABLATION_QUANTIZE_SWEEP
-from plots.legacy import plot_equal_memory_results
 from plots.plot_ablation import generate_ablation_figures
 from plots.plot_query_performance import generate_query_performance_figures
 from plots.plot_equal_memory import generate_equal_memory_figures
@@ -39,6 +37,16 @@ DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
 
 dynamic_filters = [BallCoverFilter, DSBFFilter, CoveringLSHFallbackFilter, LSBFFilter, DSHFilter, HNSWFilter, IVFFilter]
 static_filters  = []
+
+# generate_equal_memory()'s own comparison set: BallCoverFilter (the paper's
+# own method) against only the two FAISS-based ANN baselines. The other four
+# dynamic_filters entries (DSBFFilter, CoveringLSHFallbackFilter, LSBFFilter,
+# DSHFilter) degenerate to predicting ~100% of queries as duplicates at every
+# memory budget on realistic construct-set sizes (their hash-code alphabets /
+# grid cell width saturate regardless of budget -- see project memory), which
+# makes them uninformative for a budget-sensitivity comparison specifically;
+# they stay in dynamic_filters for the other evaluations.
+equal_memory_filters = [BallCoverFilter, HNSWFilter, IVFFilter]
 
 def calculate_max_memory_budget_bytes(num_vectors: int, dimension: int, bytes_per_element: float) -> int:
     return num_vectors * dimension * bytes_per_element // 64
@@ -200,7 +208,6 @@ def generate_static() -> list:
     count_steps              = 9
     count_memory_steps       = 10
     percentage_construct     = 10
-    max_L                    = 256
 
     dataset = DATASET
     vectors = load_embeds(dataset, num_vectors)[0]
@@ -228,9 +235,9 @@ def generate_static() -> list:
             for filter_cls in static_filters + dynamic_filters:
                 runner.submit(
                     'static',
-                    filter_cls=filter_cls, lsh_cls=DummyLSH,
+                    filter_cls=filter_cls,
                     dim=dim, distance_threshold=distance_threshold,
-                    max_L=max_L, memory_budget=memory_budget,
+                    memory_budget=memory_budget,
                     vectors_construct=construct_source, vectors_query=query_source,
                     actual_results=actual_results, percentage=percentage,
                 )
@@ -242,33 +249,36 @@ def generate_static() -> list:
 
 def generate_equal_memory() -> list:
     """
-    Equal-memory comparison: every registered filter (BallCoverFilter -- the
-    paper's own method -- plus the five baselines in dynamic_filters:
-    DSBFFilter, CoveringLSHFallbackFilter, LSBFFilter, DSHFilter, HNSWFilter)
-    is given the exact same memory budget. count_memory_steps evenly spaced
-    budgets are swept from max_memory_budget/count_memory_steps up to
-    max_memory_budget, where max_memory_budget is scaled off the construct
-    set itself (num_construct * bytes for one float32 sphere per point) --
-    not calculate_max_memory_budget_bytes, which is tuned for
+    Equal-memory comparison: BallCoverFilter (the paper's own method) against
+    equal_memory_filters' two FAISS-based ANN baselines, HNSWFilter and
+    IVFFilter (see equal_memory_filters' own comment for why the other four
+    dynamic_filters baselines are excluded here specifically).
+    count_memory_steps evenly spaced budgets are swept from
+    max_memory_budget/count_memory_steps up to max_memory_budget, where
+    max_memory_budget is scaled off the construct set itself (num_construct *
+    bytes for one float32 sphere per point) -- not
+    calculate_max_memory_budget_bytes, which is tuned for
     generate_static()/generate_dynamic()'s much smaller num_vectors and
     would cap out at a couple MB here, far below the point past which more
     memory stops buying additional accuracy for a covering-based method.
 
     For each budget, every filter's best available "valid configuration" is
     chosen on a calibration workload disjoint from both the construct set and
-    the final query set (see runner.py::_build_calibrated_filter -- filters
-    with a discrete config dial, e.g. DSBFFilter's vote_threshold or
-    LSBFFilter's verify flag, pick whichever candidate scores best on
-    calibration; filters without one just use their single memory-budget-
-    derived default). FPR, FNR, query latency and query throughput are then
-    measured on the held-out query set and plotted one series per budget.
+    the final query set (see runner.py::_build_calibrated_filter --
+    IVFFilter's nprobe is one such dial, registered in
+    runner.py::_POST_CONSTRUCTION_CONFIG_DIALS, so it's picked per-budget on
+    the calibration set the same way; BallCoverFilter and HNSWFilter have no
+    registered dial and just use their single memory-budget-derived default).
+    FPR and FNR are then measured on the held-out query set, construction
+    latency is timed during calibration (see runner.py::_build_calibrated_filter),
+    and query throughput is measured on the held-out query set; all four are
+    plotted one series per budget.
     """
-    num_vectors             = 100_000
+    num_vectors             = 10_000
     dim                     = 384
     percentage_construct    = 40
     percentage_calibration  = 20
     duplicate_percentage    = 5.0
-    max_L                   = 256
     count_memory_steps        = 10
 
     dataset = DATASET
@@ -314,11 +324,11 @@ def generate_equal_memory() -> list:
     runner = Runner(num_workers=MAX_WORKERS)
     for memory_budget in memory_budgets:
         print(f"Submitting jobs for memory_budget={memory_budget} bytes...")
-        for filter_cls in static_filters + dynamic_filters:
+        for filter_cls in equal_memory_filters:
             runner.submit(
                 'equal_memory',
-                filter_cls=filter_cls, lsh_cls=DummyLSH,
-                dim=dim, distance_threshold=distance_threshold, max_L=max_L,
+                filter_cls=filter_cls,
+                dim=dim, distance_threshold=distance_threshold,
                 memory_budget=memory_budget,
                 vectors_construct=construct_source, vectors_calibration=calibration_source,
                 vectors_query=query_source,
@@ -338,7 +348,6 @@ def generate_equal_memory() -> list:
 
 
 def plot_equal_memory(results: list) -> None:
-    plot_equal_memory_results(results)
     generate_equal_memory_figures(df=pd.DataFrame(results))
 
 
@@ -1127,7 +1136,6 @@ def generate_dynamic() -> list:
     count_steps              = 10
     count_memory_steps       = 10
     percentage_construct     = 25
-    max_L                    = 256
 
     dataset       = DATASET
     vectors       = load_embeds(dataset, num_vectors)[0]
@@ -1147,9 +1155,9 @@ def generate_dynamic() -> list:
             for filter_cls in dynamic_filters:
                 runner.submit(
                     'dynamic',
-                    filter_cls=filter_cls, lsh_cls=DummyLSH,
+                    filter_cls=filter_cls,
                     dim=dim, distance_threshold=distance_threshold,
-                    max_L=max_L, memory_budget=memory_budget,
+                    memory_budget=memory_budget,
                     vectors_construct=construct_source, vectors_query=query_source,
                     actual_results=actual_results, percentage=percentage,
                 )
@@ -1170,8 +1178,8 @@ def generate_and_plot_all() -> None:
     """
     # plot_ablation(*generate_ablation())
     # plot_scaling(*generate_scaling())
-    plot_streaming(*generate_streaming())
-    #plot_equal_memory(generate_equal_memory()) // failed on 100K
+    # plot_streaming(*generate_streaming())
+    plot_equal_memory(generate_equal_memory()) # failed on 100K
     #plot_system(*generate_system())
     # plot_system_tau(*generate_system_tau())
     return
@@ -1250,4 +1258,4 @@ def plot_all() -> None:
 
 if __name__ == "__main__":
     generate_and_plot_all()
-    plot_all()
+    # plot_all()

@@ -52,6 +52,15 @@ class TestIVFSizing(unittest.TestCase):
         self.assertEqual(f.get_bytesize(), 0)
         self.assertEqual(f.query(_rand(3)), [False, False, False])
 
+    def test_singleton_construct_does_not_crash(self):
+        """PQ training hard-errors below 2 points (faiss's "nx >= k" check on
+        even a 1-bit codebook); a 1-vector construct set must fall back to an
+        uncompressed index instead of raising."""
+        f = IVFFilter(dim=DIM, distance_threshold=R, max_memory=200_000)
+        vec = _rand(1, seed=3)
+        f.construct(vec)
+        self.assertTrue(f.query(vec)[0])
+
 
 # ---------------------------------------------------------------------------
 # Near-neighbor behavior (approximate, unlike CoveringLSHFallbackFilter's

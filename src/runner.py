@@ -148,14 +148,14 @@ class _BallCoverFilterEvalAdapter:
         return self._filt.all_radiuses
 
 
-def _instantiate_filter(filter_cls: Any, dim: int, lsh: Any, memory_budget: int, distance_threshold: float = None,
+def _instantiate_filter(filter_cls: Any, dim: int, memory_budget: int, distance_threshold: float = None,
                         max_spheres: int = None, extra_kwargs: Optional[Dict[str, Any]] = None) -> Any:
     extra_kwargs = extra_kwargs or {}
     if filter_cls.__name__ not in _DIRECT_TAU_FILTERS:
         try:
-            return filter_cls(dim=dim, lsh=lsh, max_memory=memory_budget, **extra_kwargs)
+            return filter_cls(dim=dim, max_memory=memory_budget, **extra_kwargs)
         except TypeError:
-            return filter_cls(dim=dim, lsh=lsh, **extra_kwargs)
+            return filter_cls(dim=dim, **extra_kwargs)
     elif filter_cls is BallCoverFilter:
         return _BallCoverFilterEvalAdapter(dim=dim, max_memory=memory_budget,
                                             distance_threshold=distance_threshold,
@@ -167,19 +167,16 @@ def _instantiate_filter(filter_cls: Any, dim: int, lsh: Any, memory_budget: int,
 
 def static_worker(
     filter_cls: Any,
-    lsh_cls: Any,
     dim: int,
     distance_threshold: float,
-    max_L: int,
     memory_budget: int,
     vectors_construct: VectorInput,
     vectors_query: VectorInput,
     actual_results: List[bool],
     percentage: float,
 ) -> Dict[str, Any]:
-    config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
-    lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
-    filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold)
+    config = filter_cls.__name__
+    filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold)
     filter_instance.construct(_to_construct_array(vectors_construct))
 
     predicted: List[bool] = []
@@ -194,19 +191,16 @@ def static_worker(
 
 def dynamic_worker(
     filter_cls: Any,
-    lsh_cls: Any,
     dim: int,
     distance_threshold: float,
-    max_L: int,
     memory_budget: int,
     vectors_construct: VectorInput,
     vectors_query: VectorInput,
     actual_results: List[bool],
     percentage: float,
 ) -> Dict[str, Any]:
-    config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
-    lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
-    filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold)
+    config = filter_cls.__name__
+    filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold)
     filter_instance.construct(_to_construct_array(vectors_construct))
 
     predicted: List[bool] = []
@@ -247,39 +241,47 @@ _CONSTRUCTION_TIME_CONFIG_DIALS = {
 def _build_calibrated_filter(
     filter_cls: Any,
     dim: int,
-    lsh: Any,
     memory_budget: int,
     distance_threshold: float,
     construct_arr: np.ndarray,
     calib_arr: np.ndarray,
     calib_actual: np.ndarray,
-) -> Any:
+) -> Tuple[Any, float]:
     """Builds filter_cls at memory_budget, picking whichever registered config
-    dial candidate scores best (F1) on the calibration set."""
+    dial candidate scores best (F1) on the calibration set. Returns
+    (filter_instance, construction_seconds) -- construction_seconds sums only
+    the time spent inside .construct() calls (every candidate build, for a
+    construction-time dial), excluding the calibration-set .query() calls used
+    purely to score candidates, so it reflects the cost of reaching a
+    ready-to-query filter rather than this function's own search overhead."""
     name = filter_cls.__name__
+    construction_time = 0.0
 
     if name in _CONSTRUCTION_TIME_CONFIG_DIALS:
         best_f1, best_instance = -1.0, None
         for kwargs in _CONSTRUCTION_TIME_CONFIG_DIALS[name]:
             # Routed through _instantiate_filter's own dispatch (not a
             # hardcoded direct-tau constructor call) so a filter added to
-            # this dial registry that isn't in _DIRECT_TAU_FILTERS (i.e.
-            # takes lsh= instead of distance_threshold=/max_spheres=) still
+            # this dial registry that isn't in _DIRECT_TAU_FILTERS still
             # gets built correctly.
             candidate = _instantiate_filter(
-                filter_cls, dim, lsh, memory_budget, distance_threshold, extra_kwargs=kwargs
+                filter_cls, dim, memory_budget, distance_threshold, extra_kwargs=kwargs
             )
+            t0 = time.perf_counter()
             candidate.construct(construct_arr)
+            construction_time += time.perf_counter() - t0
             f1 = (
                 _f1_score(np.asarray(candidate.query(calib_arr), dtype=bool), calib_actual)
                 if len(calib_arr) > 0 else 0.0
             )
             if f1 > best_f1:
                 best_f1, best_instance = f1, candidate
-        return best_instance
+        return best_instance, construction_time
 
-    filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold)
+    filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold)
+    t0 = time.perf_counter()
     filter_instance.construct(construct_arr)
+    construction_time = time.perf_counter() - t0
 
     if name in _POST_CONSTRUCTION_CONFIG_DIALS and len(calib_arr) > 0:
         best_attr, best_value, best_f1 = None, None, -1.0
@@ -291,15 +293,13 @@ def _build_calibrated_filter(
         if best_attr is not None:
             setattr(filter_instance, best_attr, best_value)
 
-    return filter_instance
+    return filter_instance, construction_time
 
 
 def equal_memory_worker(
     filter_cls: Any,
-    lsh_cls: Any,
     dim: int,
     distance_threshold: float,
-    max_L: int,
     memory_budget: int,
     vectors_construct: VectorInput,
     vectors_calibration: VectorInput,
@@ -308,14 +308,13 @@ def equal_memory_worker(
     actual_query: List[bool],
     dataset: str = "",
 ) -> Dict[str, Any]:
-    config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
-    lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
+    config = filter_cls.__name__
     construct_arr = _to_construct_array(vectors_construct)
     calib_arr = _to_construct_array(vectors_calibration)
     calib_actual = np.asarray(actual_calibration, dtype=bool)
 
-    filter_instance = _build_calibrated_filter(
-        filter_cls, dim, lsh, memory_budget, distance_threshold,
+    filter_instance, construction_time = _build_calibrated_filter(
+        filter_cls, dim, memory_budget, distance_threshold,
         construct_arr, calib_arr, calib_actual,
     )
 
@@ -336,7 +335,11 @@ def equal_memory_worker(
         'Threshold': distance_threshold,
         'FPR': fp / (fp + tn) if (fp + tn) > 0 else 0.0,
         'FNR': fn / (fn + tp) if (fn + tp) > 0 else 0.0,
-        'Latency (ms)': elapsed / n_q * 1000,
+        # Construction latency, not query latency -- this comparison cares
+        # about the one-time cost of building each filter at a given memory
+        # budget (see _build_calibrated_filter's docstring for what's
+        # included/excluded), not per-query serving cost.
+        'Latency (ms)': construction_time * 1000,
         'Throughput (qps)': n_q / max(elapsed, 1e-9),
     }
 
@@ -358,10 +361,8 @@ def _fpvr_bounds(
 
 def system_worker(
     filter_cls: Any,
-    lsh_cls: Any,
     dim: int,
     distance_threshold: float,
-    max_L: int,
     memory_budget: int,
     vectors_construct: VectorInput,
     vectors_query: VectorInput,
@@ -375,15 +376,14 @@ def system_worker(
     stream timed with and without the filter. orig_vol_log_* is the caller's
     precomputed true-duplicate-volume bound, combined with the filter's own
     covering volume into ground-truth-free FPVR bounds."""
-    config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
-    lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
+    config = filter_cls.__name__
 
     construct = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
 
     index = faiss.IndexFlatL2(dim)
     index.add(construct)
 
-    filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold)
+    filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold)
     construct_result = filter_instance.construct(construct)
     if isinstance(construct_result, tuple) and len(construct_result) == 2:
         filt_vol_log_low, filt_vol_log_high = construct_result
@@ -927,8 +927,8 @@ _WORKER_FNS: Dict[str, Any] = {
 
 
 def _describe_job(kwargs: Dict[str, Any]) -> str:
-    if 'filter_cls' in kwargs and 'lsh_cls' in kwargs:
-        return f"{kwargs['filter_cls'].__name__} + {kwargs['lsh_cls'].__name__}"
+    if 'filter_cls' in kwargs:
+        return kwargs['filter_cls'].__name__
     if {'dataset', 'k', 'tau_values', 'seed'} <= kwargs.keys():
         return f"{kwargs['dataset']} k={kwargs['k']} tau_values={kwargs['tau_values']} seed={kwargs['seed']}"
     if {'dataset', 'method', 'k', 'seed'} <= kwargs.keys():

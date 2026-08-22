@@ -38,30 +38,21 @@ EMIT_PDF = False
 # Fixed filter styling -- must match every other figure in the paper.
 # --------------------------------------------------------------------------- #
 
-CONFIGS = ["BallCoverFilter", "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", "DSHFilter", "HNSWFilter"]
+CONFIGS = ["BallCoverFilter", "HNSWFilter", "IVFFilter"]
 CONFIG_LABELS = {
     "BallCoverFilter": "Ours",
-    "DSBFFilter": "DSBF",
-    "CoveringLSHFallbackFilter": "CoveringLSH-Fallback",
-    "LSBFFilter": "LSBF",
-    "DSHFilter": "DSH",
     "HNSWFilter": "HNSW",
+    "IVFFilter": "IVF",
 }
 CONFIG_COLORS = {
     "BallCoverFilter": "#0072B2",
-    "DSBFFilter": "#E69F00",
-    "CoveringLSHFallbackFilter": "#009E73",
-    "LSBFFilter": "#CC79A7",
-    "DSHFilter": "#D55E00",
     "HNSWFilter": "#56B4E9",
+    "IVFFilter": "#E69F00",
 }
 CONFIG_MARKERS = {
     "BallCoverFilter": "o",
-    "DSBFFilter": "s",
-    "CoveringLSHFallbackFilter": "^",
-    "LSBFFilter": "D",
-    "DSHFilter": "v",
     "HNSWFilter": "P",
+    "IVFFilter": "s",
 }
 
 
@@ -202,7 +193,10 @@ def panel_fnr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 
 def panel_latency(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    return _line_panel(df, "Latency (ms)", "Latency (ms)", "equal-memory-latency.png", cfg, log_y=True)
+    """"Latency (ms)" is construction latency here (the one-time cost of
+    building each filter at a given memory budget), not per-query serving
+    latency -- see runner.py::equal_memory_worker."""
+    return _line_panel(df, "Latency (ms)", "Construction Latency (ms)", "equal-memory-latency.png", cfg, log_y=True)
 
 
 def panel_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
@@ -265,7 +259,7 @@ def _save(fig: plt.Figure, filename: str, cfg: Config) -> None:
 
 def print_summary(df: pd.DataFrame) -> None:
     print("\n--- Equal-memory comparison summary ---")
-    header = f"{'filter':<24} {'budget (MB)':>12} {'FPR':>8} {'FNR':>8} {'lat (ms)':>10} {'QPS':>12}"
+    header = f"{'filter':<24} {'budget (MB)':>12} {'FPR':>8} {'FNR':>8} {'construct (ms)':>15} {'QPS':>12}"
     print(header)
     print("-" * len(header))
 
@@ -284,7 +278,7 @@ def print_summary(df: pd.DataFrame) -> None:
             print(
                 f"{CONFIG_LABELS[name]:<24} {budget:>12.3f} "
                 f"{_mean(fpr_agg):>8.3f} {_mean(fnr_agg):>8.3f} "
-                f"{_mean(lat_agg):>10.4f} {_mean(qps_agg):>12.1f}"
+                f"{_mean(lat_agg):>15.4f} {_mean(qps_agg):>12.1f}"
             )
     print()
 
@@ -345,7 +339,7 @@ def generate_equal_memory_figures(
   \end{subfigure}\hfill
   \begin{subfigure}{0.24\linewidth}
     \includegraphics[width=\linewidth]{figures/equal-memory-latency.png}
-    \caption{Query latency}
+    \caption{Construction latency}
     \label{fig:equal-memory-latency}
   \end{subfigure}\hfill
   \begin{subfigure}{0.24\linewidth}

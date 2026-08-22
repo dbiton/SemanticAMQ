@@ -650,10 +650,9 @@ def generate_ablation_figures(
 ) -> None:
     """
     Library entry point: render the five ablation panels (+ legend) from an
-    in-memory long-format DataFrame, the same way `plot_results` in plots.py
-    is called directly on a results list instead of round-tripping through a
-    file. If `df` is omitted, falls back to `load_data()` (CONFIG-driven,
-    reads INPUT_PATH) so the script still works standalone.
+    in-memory long-format DataFrame instead of round-tripping through a file.
+    If `df` is omitted, falls back to `load_data()` (CONFIG-driven, reads
+    INPUT_PATH) so the script still works standalone.
     """
     if df is None:
         df = load_data()
