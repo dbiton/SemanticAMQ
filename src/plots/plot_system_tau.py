@@ -1,10 +1,9 @@
-"""System-evaluation figures for the *fixed*-tau sweep (see
+"""System-evaluation figures for the fixed-tau sweep (see
 main.generate_system_tau): fixed ball budget k, tau itself is the swept
 independent variable -- a single, dataset-independent set of absolute L2
-distances applied identically to all 3 datasets, unlike plot_system.py's
-sweep where tau is reverse-engineered per dataset to hit a target
-redundancy rate. redundancy_rate is therefore a reported *outcome* of a
-given tau here, not the quantity tau is solved for.
+distances applied identically to all datasets. redundancy_rate is
+therefore a reported *outcome* of a given tau here, not a quantity tau is
+solved for.
 
 Five panels, one line per dataset:
   (a) Throughput Improvement (%) of the filtered pipeline over the
@@ -121,9 +120,8 @@ def resolve_config(df: pd.DataFrame, k_fixed: Optional[int] = K_FIXED, dpi: int 
 def _line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg: Config,
                 bounded_unit: bool = False) -> pd.DataFrame:
     """One line per dataset, plotted against tau itself -- tau is the fixed,
-    dataset-independent independent variable in this sweep (contrast
-    plot_system.py, where the shared x-axis is the measured redundancy rate
-    tau was solved for). Aggregated over the seed sweep by (dataset, tau)."""
+    dataset-independent independent variable in this sweep. Aggregated over
+    the seed sweep by (dataset, tau)."""
     agg = mean_ci95(df, ["dataset", "tau"], value_col)
 
     apply_style(cfg.dpi)
@@ -174,8 +172,8 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 def panel_redundancy_rate(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     """Redundancy rate as a function of tau -- the calibration curve this
-    fixed-tau sweep lets a reader look up directly, since (unlike
-    plot_system.py's sweep) tau here isn't chosen to hit a target rate."""
+    fixed-tau sweep lets a reader look up directly, since tau here isn't
+    chosen to hit a target rate."""
     return _line_panel(df, "redundancy_rate", "Redundancy Rate", "system-tau-redundancy-rate.png",
                        cfg, bounded_unit=True)
 

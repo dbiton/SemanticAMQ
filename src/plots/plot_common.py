@@ -16,10 +16,16 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-DATASETS = ["eli5", "mmlu", "wildchat"]
-DATASET_LABELS = {"eli5": "ELI5", "mmlu": "MMLU", "wildchat": "WildChat"}
-DATASET_COLORS = {"eli5": "#0072B2", "mmlu": "#E69F00", "wildchat": "#009E73"}
-DATASET_HATCHES = {"eli5": "", "mmlu": "//", "wildchat": ".."}
+DATASETS = ["eli5", "mmlu", "wildchat", "msmarco", "hotpotqa"]
+DATASET_LABELS = {
+    "eli5": "ELI5", "mmlu": "MMLU", "wildchat": "WildChat",
+    "msmarco": "MsMarco", "hotpotqa": "HotPotQA",
+}
+DATASET_COLORS = {
+    "eli5": "#0072B2", "mmlu": "#E69F00", "wildchat": "#009E73",
+    "msmarco": "#D55E00", "hotpotqa": "#CC79A7",
+}
+DATASET_HATCHES = {"eli5": "", "mmlu": "//", "wildchat": "..", "msmarco": "\\\\", "hotpotqa": "xx"}
 
 
 def apply_style(dpi: int = 300) -> None:
@@ -98,7 +104,7 @@ def mean_ci95(df: pd.DataFrame, group_cols: List[str], value_col: str) -> pd.Dat
 
 def save_dataset_legend(outdir: str, dpi: int, emit_pdf: bool = False, filename: str = "dataset-legend.png") -> None:
     apply_style(dpi)
-    fig, ax = plt.subplots(figsize=(4.2, 0.25))
+    fig, ax = plt.subplots(figsize=(6.4, 0.25))
     ax.axis("off")
     handles = [
         plt.Rectangle((0, 0), 1, 1, facecolor=DATASET_COLORS[d], hatch=DATASET_HATCHES[d],
@@ -106,6 +112,6 @@ def save_dataset_legend(outdir: str, dpi: int, emit_pdf: bool = False, filename:
         for d in DATASETS
     ]
     labels = [DATASET_LABELS[d] for d in DATASETS]
-    fig.legend(handles, labels, loc="center", ncol=3, frameon=False, fontsize=7)
+    fig.legend(handles, labels, loc="center", ncol=len(DATASETS), frameon=False, fontsize=7)
     fig.patch.set_alpha(0.0)
     save_figure(fig, filename, outdir, dpi, emit_pdf, transparent=True)

@@ -589,8 +589,14 @@ def system_tau_worker(
     """Builds one BallCoverFilter cover (fixed k) per (dataset, seed) plus a
     flat L2 index over the same construct set, then sweeps the query-time
     threshold tau over that single construction, measuring filtered vs.
-    unfiltered throughput/index-access/FPR/FNR at each tau. redundancy_rate
-    is the measured (not nominal) duplicate fraction of the query stream."""
+    unfiltered throughput/index-access/FPR/FNR at each tau. Queries are
+    issued one at a time (not batched), on both arms of the comparison, to
+    reflect a realistic online setting where each arrival is answered
+    individually: the filtered path calls filt.query() on that one vector
+    and only falls through to the backend index.search() when the filter
+    reports a possible match, skipping the index entirely otherwise.
+    redundancy_rate is the measured (not nominal) duplicate fraction of the
+    query stream."""
     construct_arr = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
     query_arr = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
     n_q = len(query_arr)
@@ -613,16 +619,21 @@ def system_tau_worker(
         redundancy_rate = float(np.mean(actual)) if len(actual) > 0 else 0.0
 
         start = time.perf_counter()
-        index.search(query_arr, 1)
+        for i in range(n_q):
+            index.search(query_arr[i:i + 1], 1)
         time_without = time.perf_counter() - start
 
+        predicted = np.empty(n_q, dtype=bool)
         start = time.perf_counter()
-        predicted = np.asarray(filt.query(query_arr, distance_threshold=t), dtype=bool)
-        n_index_accesses = int(predicted.sum())
-        if n_index_accesses > 0:
-            index.search(query_arr[predicted], 1)
+        for i in range(n_q):
+            v = query_arr[i:i + 1]
+            hit = filt.query(v, distance_threshold=t)[0]
+            predicted[i] = hit
+            if hit:
+                index.search(v, 1)
         time_with = time.perf_counter() - start
 
+        n_index_accesses = int(predicted.sum())
         rates = _confusion_rates(predicted.tolist(), actual)
         throughput_without = n_q / max(time_without, 1e-9)
         throughput_with = n_q / max(time_with, 1e-9)

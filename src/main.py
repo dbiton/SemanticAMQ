@@ -12,7 +12,6 @@ from plots.plot_query_performance import generate_query_performance_figures
 from plots.plot_equal_memory import generate_equal_memory_figures
 from plots.plot_scaling import generate_scaling_figures
 from plots.plot_streaming import generate_streaming_figures
-from plots.plot_system import generate_system_figures
 from plots.plot_system_tau import generate_system_tau_figures
 from plots.plot_common import DATASETS, DATASET_LABELS
 from typing import Tuple
@@ -27,7 +26,7 @@ from util.dataset_paths import dataset_filenames
 from util.fetch_datasets import load_embeds
 from vector_source import VectorSource
 
-MAX_WORKERS = 4
+MAX_WORKERS = 2
 DATASET = 'ELI5'
 
 # Registry name -> canonical dataset key, shared by every long-format
@@ -351,147 +350,27 @@ def plot_equal_memory(results: list) -> None:
     generate_equal_memory_figures(df=pd.DataFrame(results))
 
 
-def generate_system() -> Tuple[pd.DataFrame, int]:
-    """
-    Measure how much a semantic filter reduces accesses to a flat L2 index
-    that explicitly stores all construct vectors, as a function of the
-    threshold-driven redundancy rate of the query stream, at a fixed ball
-    budget k -- not the memory-budget sweep this used to run. One
-    BallCoverFilter cover is built per (dataset, seed) at that fixed k,
-    then queried at every tau in a sweep (see system_tau_worker); tau is a
-    pure query-time knob controlling how much of the fixed-length query
-    stream counts as a ground-truth duplicate, which is the "redundancy
-    rate" plot_system's figure actually plots against on its shared x-axis.
-
-    Writes results/system.csv. Returns the long-format df plus k, since
-    plot_system() needs it for the per-panel annotation and there's nothing
-    to derive it from -- k is fixed by construction, not swept.
-    """
-    num_vectors               = 10_000
-    dim                       = 384
-    percentage_construct      = 20
-    # k is scaled off the construct-set size rather than a fixed constant.
-    # tau_values below are deliberately fine-grained (1-20th percentile of
-    # single-nearest-neighbour distance), but a ball's own construction
-    # radius is set by how many construct points it has to cover -- and at
-    # 384 dimensions, that radius barely shrinks until points-per-ball drops
-    # to nearly 1 (covering-ball volume is exponential in dimension, so an
-    # 8x denser cover, e.g. k 100->800, only shaved the radius ~15%).
-    # Below ~k_fraction=0.9 the base radius already exceeds the whole tau
-    # sweep, so eff_r = radius + tau saturates to "covers everything" at
-    # every tau and the filter can never report a negative -- verified
-    # empirically on all 3 datasets, where 0.9 produces a smooth savings
-    # gradient across the full redundancy sweep instead of an instant cliff.
-    k_fraction                = 0.5
-    min_percentage_duplicates = 1
-    max_percentage_duplicates = 20
-    count_steps               = 10
-    seeds                     = [0]
-    output_csv                = "results/system.csv"
-
-    datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
-    missing = [d for d in DATASET_KEYS if d not in datasets]
-    if missing:
-        print(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
-    if set(datasets) != set(DATASET_KEYS):
-        raise RuntimeError(
-            "generate_system needs all 3 datasets "
-            f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
-        )
-
-    # A single, shared k (plot_system's figure assumes one global k across
-    # all datasets) scaled off the *smallest* construct set, same clamping
-    # pattern as generate_ablation's min_construct.
-    construct_sizes = {d: len(load_embeds(d, num_vectors)[0]) * percentage_construct // 100 for d in datasets}
-    min_construct = min(construct_sizes.values())
-    k = round(k_fraction * min_construct)
-    print(f"Scaling k to {k} ({k_fraction:.0%} of the smallest construct set, {min_construct} vectors)")
-
-    runner = Runner(num_workers=MAX_WORKERS)
-
-    for dataset in datasets:
-        vectors = load_embeds(dataset, num_vectors)[0]
-        n = len(vectors)  # a dataset may hold fewer than num_vectors
-        num_construct = n * percentage_construct // 100
-        vectors_construct = vectors[:num_construct]
-        vectors_query = vectors[num_construct:]
-
-        construct_source = VectorSource(dataset, 0, num_construct)
-        query_source = VectorSource(dataset, num_construct, n)
-
-        print(f"{dataset}: calculating tau sweep...")
-        # Pick tau directly off the percentiles of the query stream's own
-        # nearest-construct-neighbour distances, rather than a proxy percentile
-        # (pairwise or construct-only NN -- see calculate_nn_distance_threshold's
-        # docstring for why those drift from the nominal percentage). Percentile
-        # is the inverse-ECDF of this exact population, so the p-th percentile
-        # tau is guaranteed to land within a rounding hair of a p% redundancy
-        # rate once measured -- unless the distribution has a mass spike (e.g.
-        # exact-duplicate embeddings) wide enough to straddle multiple target
-        # percentages, in which case they collapse onto the same tau/rate and
-        # fewer than count_steps distinct points appear for that dataset.
-        construct_arr = np.ascontiguousarray(vectors_construct, dtype=np.float32)
-        query_arr = np.ascontiguousarray(vectors_query, dtype=np.float32)
-        index = faiss.IndexFlatL2(dim)
-        index.add(construct_arr)
-        nn_sq_dist, _ = index.search(query_arr, 1)
-        nn_dist = np.sqrt(np.clip(nn_sq_dist[:, 0], 0, None))
-
-        redundancy_percentages = np.linspace(min_percentage_duplicates, max_percentage_duplicates, count_steps)
-        tau_values = sorted({float(np.percentile(nn_dist, p)) for p in redundancy_percentages})
-        print(f"{dataset}: computing ground truth at {len(tau_values)} tau values...")
-        actual_results_by_tau = {t: (nn_dist <= t).tolist() for t in tau_values}
-        # Sweep-independent construction-tightness knob (same role as
-        # generate_ablation's construct_tau) -- tau only affects querying.
-        construct_tau = float(np.median(tau_values))
-
-        for seed in seeds:
-            runner.submit(
-                'system_tau',
-                dim=dim, dataset=DATASET_KEYS[dataset],
-                k=k, tau_values=tau_values, seed=seed, construct_tau=construct_tau,
-                vectors_construct=construct_source, vectors_query=query_source,
-                actual_results_by_tau=actual_results_by_tau,
-            )
-
-    job_results = runner.run()
-    print("System (tau-sweep) evaluation completed.")
-
-    df = pd.DataFrame([row for job_rows in job_results for row in job_rows])
-
-    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
-    df.to_csv(output_csv, index=False)
-    print(f"Wrote {output_csv}")
-
-    return df, k
-
-
-def plot_system(df: pd.DataFrame, k: int) -> None:
-    generate_system_figures(df, k_fixed=k)
-
-
 def generate_system_tau() -> Tuple[pd.DataFrame, int]:
     """
-    Same measurement as generate_system() -- fixed ball budget k, one
+    Measure how much a semantic filter reduces accesses to a flat L2 index
+    that explicitly stores all construct vectors: fixed ball budget k, one
     BallCoverFilter cover built per (dataset, seed), then queried at every
-    tau in a sweep (system_tau_worker) -- but tau itself is the swept
-    independent variable here, instead of being reverse-engineered per
-    dataset from percentiles of that dataset's own nearest-construct-
-    neighbour distances. tau_values is one fixed, dataset-independent set of
-    absolute L2 distances shared across all 3 datasets, so redundancy_rate
-    becomes a reported *outcome* of a given tau rather than the quantity tau
-    is solved for -- see plot_system_tau's redundancy-rate-vs-tau panel.
+    tau in a sweep (system_tau_worker). tau_values is one fixed,
+    dataset-independent set of absolute L2 distances shared across all
+    datasets, so redundancy_rate is a reported *outcome* of a given tau
+    rather than a quantity tau is solved for -- see plot_system_tau's
+    redundancy-rate-vs-tau panel.
 
-    Writes results/system_tau.csv. Returns the long-format df plus k, same
-    shape as generate_system().
+    Writes results/system_tau.csv. Returns the long-format df plus k, since
+    plot_system_tau() needs it for the per-panel annotation and there's
+    nothing to derive it from -- k is fixed by construction, not swept.
     """
     num_vectors           = 100_000
     dim                   = 384
     percentage_construct  = 10
-    # Same k-scaling rationale as generate_system (see its comment): k is a
-    # fraction of the smallest construct set, not a fixed constant.
-    k_fraction              = 0.1
-    tau_values              = [float(t) for t in np.linspace(0.01, 0.15, 10)]
+    # k is scaled off the construct-set size rather than a fixed constant.
+    k_fraction              = 0.2
+    tau_values              = [float(t) for t in np.linspace(0.01, 0.15, 6)]
     seeds                   = [0]
     output_csv              = "results/system_tau.csv"
 
@@ -501,7 +380,7 @@ def generate_system_tau() -> Tuple[pd.DataFrame, int]:
         print(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
     if set(datasets) != set(DATASET_KEYS):
         raise RuntimeError(
-            "generate_system_tau needs all 3 datasets "
+            f"generate_system_tau needs all {len(DATASET_KEYS)} datasets "
             f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
         )
 
@@ -684,7 +563,7 @@ def generate_query_performance() -> pd.DataFrame:
         print(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
     if set(datasets) != set(DATASET_KEYS):
         raise RuntimeError(
-            "generate_query_performance needs all 3 datasets "
+            f"generate_query_performance needs all {len(DATASET_KEYS)} datasets "
             f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
         )
 
@@ -1001,7 +880,7 @@ def generate_streaming() -> Tuple[pd.DataFrame, int]:
         print(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
     if set(datasets) != set(DATASET_KEYS):
         raise RuntimeError(
-            "generate_streaming needs all 3 datasets "
+            f"generate_streaming needs all {len(DATASET_KEYS)} datasets "
             f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
         )
     if _STREAMING_REPRESENTATIVE_DATASET not in datasets:
@@ -1150,18 +1029,17 @@ def generate_dynamic() -> list:
 def generate_and_plot_all() -> None:
     """
     Run every active evaluation end-to-end (generate, then plot), the same
-    5 evaluations __main__ used to run inline, plus system (tau-sweep).
+    5 evaluations __main__ used to run inline, plus system_tau.
     static/dynamic/equal_memory stay disabled -- they fail at the
     100K-vector scale this file is currently configured for (see comments
-    below). The early return currently isolates system for standalone
+    below). The early return currently isolates system_tau for standalone
     testing; remove it to also run the other 5.
     """
-    plot_ablation(generate_ablation())
+    # plot_ablation(generate_ablation())
     # plot_scaling(*generate_scaling())
     # plot_streaming(*generate_streaming())
     # plot_equal_memory(generate_equal_memory()) # failed on 100K
-    #plot_system(*generate_system())
-    # plot_system_tau(*generate_system_tau())
+    plot_system_tau(*generate_system_tau())
     return
     try:
         plot_ablation(generate_ablation())
@@ -1189,19 +1067,13 @@ def plot_all() -> None:
     Re-render every figure from data a prior generate_and_plot_all() run
     already persisted to disk, without repeating the (expensive) evaluation
     sweeps -- handy for iterating on plot styling alone. Reads back
-    results/{ablation,query_performance,scaling,streaming,system}.csv,
+    results/{ablation,query_performance,scaling,streaming,system_tau}.csv,
     re-deriving whatever generate-time metadata (k, k_fixed,
     T_representative) each plot_ needs directly from the loaded data instead
     of threading it through from the generate_ call. Requires at least one
     prior generate_and_plot_all() (or equivalent generate_X + plot_X) run to
     have produced those files.
     """
-    try:
-        df = pd.read_csv("results/system.csv")
-        plot_system(df, k=int(df["k"].iloc[0]))
-    except Exception as e:
-        print(f"An error occurred: {e}")
-
     try:
         df = pd.read_csv("results/system_tau.csv")
         plot_system_tau(df, k=int(df["k"].iloc[0]))
