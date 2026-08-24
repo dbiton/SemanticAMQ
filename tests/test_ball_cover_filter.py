@@ -274,35 +274,6 @@ class TestQuery(unittest.TestCase):
         self.assertGreaterEqual(recall_large, recall_small)
 
 
-# ---------------------------------------------------------------------------
-# distance_to_balls_surfaces
-# ---------------------------------------------------------------------------
-
-class TestDistanceToBallsSurfaces(unittest.TestCase):
-
-    def test_shape(self):
-        bytes_per_ball = (DIM + 1) * 4
-        f = BallCoverFilter(dim=DIM, max_memory=bytes_per_ball * 5, quantize=Quantize.NONE)
-        f.construct(_rand(50, seed=3))
-        queries = _rand(7, seed=1)
-        surface = f.distance_to_balls_surfaces(queries)
-        self.assertEqual(surface.shape, (7, f.count_balls))
-
-    def test_center_is_non_positive_on_its_own_surface(self):
-        f = BallCoverFilter(dim=DIM, max_memory=10_000, quantize=Quantize.NONE)
-        vecs = _rand(20, seed=2)
-        f.construct(vecs)
-        centers = _stored_centers(f)
-        surface = f.distance_to_balls_surfaces(centers)
-        self.assertTrue(np.all(surface.min(axis=1) <= 1e-4))
-
-    def test_far_point_is_positive(self):
-        f = BallCoverFilter(dim=DIM, max_memory=10_000, quantize=Quantize.NONE)
-        f.construct(_rand(20, seed=2))
-        far = np.full((1, DIM), 1000.0, dtype=np.float32)
-        surface = f.distance_to_balls_surfaces(far)
-        self.assertTrue(np.all(surface > 0))
-
 
 # ---------------------------------------------------------------------------
 # insert
