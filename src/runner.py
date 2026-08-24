@@ -13,7 +13,7 @@ import inspect
 from scipy.special import logsumexp
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 
-from filters.ball_cover_filter import BallCoverFilter, Quantize
+from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize
 from hyperspheres_volume import estimate_hypersphere_volume
 from vector_source import VectorSource
 
@@ -136,9 +136,6 @@ class _BallCoverFilterEvalAdapter:
 
     def insert(self, vectors: np.ndarray) -> None:
         self._filt.insert(vectors)
-
-    def add(self, vectors: np.ndarray) -> None:
-        self._filt.add(vectors)
 
     def get_bytesize(self) -> int:
         return self._filt.get_bytesize()
@@ -743,7 +740,7 @@ def scaling_insert_worker(
 ) -> Dict[str, Any]:
     """Measures batched-insertion throughput (vectors/sec) for a
     BallCoverFilter built at filter size k (same fixed-stream setup as
-    scaling_query_worker), inserting via add() in batches of `batch_size`
+    scaling_query_worker), inserting via insert() in batches of `batch_size`
     after the initial construct(). The insert pool is cycled up to
     n_insert_vectors so every batch_size inserts the same total count."""
     construct_arr = _to_construct_array(vectors_construct)
@@ -756,7 +753,7 @@ def scaling_insert_worker(
 
     start = time.perf_counter()
     for i in range(0, len(stream), batch_size):
-        filt.add(stream[i:i + batch_size])
+        filt.insert(stream[i:i + batch_size])
     elapsed = time.perf_counter() - start
 
     return {
@@ -823,7 +820,7 @@ def stream_rebuild_worker(
 ) -> List[Dict[str, Any]]:
     """Simulates one rebuild policy over vectors_stream, reporting FPR and
     amortized cost per checkpoint.
-      "streaming": BallCoverFilter.add() per arrival (using insertion_level),
+      "streaming": BallCoverFilter.insert() per arrival (using insertion_level),
         never rebuilt.
       "periodic": like "streaming", rebuilt from scratch every T arrivals.
       "oracle": rebuilt from scratch at every checkpoint (insertion_level
@@ -902,7 +899,7 @@ def stream_rebuild_worker(
         if rebuild_every is not None and pos % rebuild_every == 0:
             filt.construct(stream_arr[:pos])
         else:
-            filt.add(stream_arr[t][np.newaxis, :])
+            filt.insert(stream_arr[t][np.newaxis, :])
         cumulative_time_s += time.perf_counter() - t0
 
         if ci < len(checkpoint_set) and pos == checkpoint_set[ci]:

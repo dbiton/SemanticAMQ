@@ -153,14 +153,11 @@ class DSBFFilter(Filter):
             results.append(count >= self.vote_threshold)
         return results
 
-    def add(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray) -> None:
         if self._byte_arrays is None:
             self.construct(vectors)
             return
         self._insert_batch(vectors)
-
-    def insert(self, vectors: np.ndarray) -> None:
-        self.add(vectors)
 
     def get_bytesize(self) -> int:
         return self.num_tables * self._bytes_per_table

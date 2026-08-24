@@ -262,7 +262,7 @@ class GonzalezBoxFilter(Filter):
         return in_any_box.tolist()
 
 
-    def add(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray) -> None:
         if not self._constructed:
             self.construct(vectors)
             return
@@ -275,7 +275,7 @@ class GonzalezBoxFilter(Filter):
             vector_batch = np.ascontiguousarray(vector_batch, dtype=np.float32)
 
             if self._num_boxes > 0:
-                in_each_box = np.all((vector_batch[:, None, :] >= self.all_boxes_min[None, :, :] + self.distance_threshold) & 
+                in_each_box = np.all((vector_batch[:, None, :] >= self.all_boxes_min[None, :, :] + self.distance_threshold) &
                                      (vector_batch[:, None, :] <= self.all_boxes_max[None, :, :] - self.distance_threshold), axis=2)
                 is_already_covered = np.any(in_each_box, axis=1)
                 vector_batch = vector_batch[~is_already_covered]
@@ -286,10 +286,6 @@ class GonzalezBoxFilter(Filter):
                 self._add_box(box_min, box_max)
 
             self._merge_boxes()
-
-
-    def insert(self, vectors: np.ndarray) -> None:
-        self.add(vectors)
 
 
     def get_bytesize(self) -> int:

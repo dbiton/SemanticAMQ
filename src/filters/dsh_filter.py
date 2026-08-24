@@ -255,14 +255,11 @@ class DSHFilter(Filter):
             results.append(hit)
         return results
 
-    def add(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray) -> None:
         if self.filter is None:
             self.construct(vectors)
             return
         self._insert_batch(vectors)
-
-    def insert(self, vectors: np.ndarray) -> None:
-        self.add(vectors)
 
     def get_bytesize(self) -> int:
         proj_bytes = int(self._projections.nbytes)

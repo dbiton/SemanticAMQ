@@ -8,21 +8,18 @@ class Filter:
         self.max_memory = max_memory
 
     def insert(self, vectors: np.ndarray) -> None:
-        raise NotImplementedError("Subclasses must implement the insert method.")
+        """
+        Insert vectors into an already-constructed filter.
+
+        Not all filters support dynamic insertion. Filters that don't should raise NotImplementedError.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not support dynamic insertion.")
 
     def construct(self, vectors: np.ndarray) -> None:
         raise NotImplementedError("Subclasses must implement the construct method.")
 
     def query(self, vectors: np.ndarray) -> List[bool]:
         raise NotImplementedError("Subclasses must implement the query method.")
-
-    def add(self, vectors: np.ndarray) -> None:
-        """
-        Add vectors to an already-constructed filter.
-
-        Not all filters support dynamic insertion. Filters that don't should raise NotImplementedError.
-        """
-        raise NotImplementedError(f"{self.__class__.__name__} does not support dynamic insertion.")
 
     def get_bytesize(self) -> int:
         """

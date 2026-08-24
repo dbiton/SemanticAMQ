@@ -208,16 +208,13 @@ class IVFFilter(Filter):
         is_dup = found & (sq_dist[:, 0] <= float(tau) ** 2)
         return is_dup.tolist()
 
-    def add(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray) -> None:
         if self.index is None:
             self.construct(vectors)
             return
         vecs = np.ascontiguousarray(vectors, dtype=np.float32)
         if len(vecs) > 0:
             self.index.add(vecs)
-
-    def insert(self, vectors: np.ndarray) -> None:
-        self.add(vectors)
 
     def get_bytesize(self) -> int:
         if self.index is None:

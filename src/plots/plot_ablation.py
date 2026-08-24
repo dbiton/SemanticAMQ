@@ -31,7 +31,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 
-from filters.ball_cover_filter import Quantize
+from src.filters.ball_cover.ball_cover_filter import Quantize
 from plots.plot_common import apply_style as _apply_style, save_figure
 
 # --------------------------------------------------------------------------- #

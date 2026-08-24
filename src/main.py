@@ -16,7 +16,7 @@ from plots.plot_system import generate_system_figures
 from plots.plot_system_tau import generate_system_tau_figures
 from plots.plot_common import DATASETS, DATASET_LABELS
 from typing import Tuple
-from filters.ball_cover_filter import BallCoverFilter
+from filters.ball_cover.ball_cover_filter import BallCoverFilter
 from filters.dsbf_filter import DSBFFilter
 from filters.covering_lsh_fallback_filter import CoveringLSHFallbackFilter
 from filters.lsbf_filter import LSBFFilter
@@ -596,7 +596,7 @@ def generate_ablation() -> pd.DataFrame:
     dim                    = 384
     percentage_construct   = 20
     k_fractions            = [0.03, 0.06, 0.125, 0.25]
-    duplicate_percentages  = [5, 10, 20]
+    duplicate_percentages  = [10]
     seeds                  = [0]
     output_csv             = "results/ablation.csv"
 
@@ -913,7 +913,7 @@ def generate_streaming() -> Tuple[pd.DataFrame, int]:
     """
     Compare BallCoverFilter's 4 insertion methods (insertion_level:
     "nearest", "least_inflation", "merge", "doubling" -- see
-    BallCoverFilter.add()'s dispatch) via stream_rebuild_worker's
+    BallCoverFilter.insert()'s dispatch) via stream_rebuild_worker's
     policy="streaming", each sharing the identical bootstrap-then-diverge
     setup (see that worker's docstring). Produces the long-format data
     behind the streaming figure's four panels:
@@ -1156,10 +1156,10 @@ def generate_and_plot_all() -> None:
     below). The early return currently isolates system for standalone
     testing; remove it to also run the other 5.
     """
-    # plot_ablation(*generate_ablation())
+    plot_ablation(generate_ablation())
     # plot_scaling(*generate_scaling())
     # plot_streaming(*generate_streaming())
-    plot_equal_memory(generate_equal_memory()) # failed on 100K
+    # plot_equal_memory(generate_equal_memory()) # failed on 100K
     #plot_system(*generate_system())
     # plot_system_tau(*generate_system_tau())
     return

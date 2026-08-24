@@ -274,7 +274,7 @@ class GonzalezMEBFilter(Filter):
         return in_any_sphere.tolist()
 
 
-    def add(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray) -> None:
         if not self._constructed:
             self.construct(vectors)
             return
@@ -299,10 +299,6 @@ class GonzalezMEBFilter(Filter):
                 self._add_sphere(vec, self.distance_threshold)
 
             self._merge_spheres()
-
-
-    def insert(self, vectors: np.ndarray) -> None:
-        self.add(vectors)
 
 
     def get_volume(self) -> float:

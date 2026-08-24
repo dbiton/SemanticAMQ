@@ -183,14 +183,11 @@ class LSBFFilter(Filter):
             results.append(self._bit_set(self._verify_buckets[bucket], fp_bit))
         return results
 
-    def add(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray) -> None:
         if self._primary is None:
             self.construct(vectors)
             return
         self._insert_batch(vectors)
-
-    def insert(self, vectors: np.ndarray) -> None:
-        self.add(vectors)
 
     # Small fixed bookkeeping cost for the verify structure. Keeps
     # get_bytesize() strictly larger for verify=True than for verify=False

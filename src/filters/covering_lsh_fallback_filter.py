@@ -190,14 +190,11 @@ class CoveringLSHFallbackFilter(Filter):
         cells = self._cell_indices(vectors)
         return [signature_to_key(tuple(row.tolist())) in self.filter for row in cells]
 
-    def add(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray) -> None:
         if self.filter is None:
             self.construct(vectors)
             return
         self._insert_batch(vectors)
-
-    def insert(self, vectors: np.ndarray) -> None:
-        self.add(vectors)
 
     def get_bytesize(self) -> int:
         if self.filter is None:

@@ -1,6 +1,6 @@
 """Streaming-evaluation figures: BallCoverFilter's 4 insertion methods
 (insertion_level: nearest / least_inflation / merge / doubling -- see
-BallCoverFilter.add()'s dispatch), one line per method throughout.
+BallCoverFilter.insert()'s dispatch), one line per method throughout.
 
 Reads results/streaming.csv: one row per (method, checkpoint), tagged by
 `sweep` in {"position","k_sweep"} and `metric` in {"checkpoint",
