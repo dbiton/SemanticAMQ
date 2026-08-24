@@ -21,7 +21,7 @@ from plots.plot_common import DATASETS, DATASET_LABELS
 from typing import Tuple, List
 from filters.kdbox_filter import KDBoxFilter
 from filters.gonzalesbox_filter import GonzalezBoxFilter
-from filters.ball_cover_filter import BallCoverFilter
+from filters.ball_cover.ball_cover_filter import BallCoverFilter
 from filters.dsbf_filter import DSBFFilter
 from filters.covering_lsh_fallback_filter import CoveringLSHFallbackFilter
 from filters.lsbf_filter import LSBFFilter
