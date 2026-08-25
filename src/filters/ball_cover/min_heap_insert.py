@@ -1,5 +1,4 @@
-import sys
-import heapq
+import sys, heapq
 import numpy as np
 from typing import List, Tuple
 from filters.ball_cover.ball_interfaces import InsertInterface, Filter
@@ -14,12 +13,6 @@ class MinHeapInsert(InsertInterface):
         self._sphere_versions = np.zeros(0, dtype=np.int32)
         self._minimal_pairs: List[Tuple[float, int, int, int, int]] = []
 
-    # ------------------------------------------------------------------ sizing / buffers
-
-    def reset_buffers(self, capacity: int) -> None:
-        self.ensure_capacity(capacity)
-        self._minimal_pairs = []
-        self._sphere_versions.fill(0)
 
     def ensure_capacity(self, required_cap: int) -> None:
         current_cap = len(self._sphere_versions)
@@ -30,7 +23,19 @@ class MinHeapInsert(InsertInterface):
         new_versions[:current_cap] = self._sphere_versions[:current_cap]
         self._sphere_versions = new_versions
 
-    # ------------------------------------------------------------------ streaming / dynamic merge
+
+    def reset_buffers(self, capacity: int) -> None:
+        self.ensure_capacity(capacity)
+        self._minimal_pairs = []
+        self._sphere_versions.fill(0)
+
+
+    @staticmethod
+    def _compute_squared_distances(a: np.ndarray, a_sq: np.ndarray, b: np.ndarray, b_sq: np.ndarray) -> np.ndarray:
+        a_b_cross = a @ b.T
+        sq_distances = a_sq[:, None] - 2.0 * a_b_cross + b_sq[None, :]
+        return np.maximum(sq_distances, 0.0)
+
 
     def add_sphere(self, filter: Filter, center: np.ndarray, radius: float) -> None:
         current_spheres = filter.all_spheres
@@ -38,10 +43,11 @@ class MinHeapInsert(InsertInterface):
         if filter._num_spheres > 0:
             current_centers = filter._all_centers[current_spheres]
             current_radiuses = filter._all_radiuses[current_spheres]
-            center_sq = np.einsum('ij,ij->i', center[None, :], center[None, :], dtype=np.float64)
+            center_sq = np.einsum('ij,ij->i', center[None, :], center[None, :])
+            current_centers_sq = np.einsum('ij,ij->i', current_centers, current_centers)
 
-            sq_center_distances = filter._sq_dists_to_centers(
-                center[None, :], center_sq, current_centers)[0]
+            sq_center_distances = self._compute_squared_distances(
+                center[None, :], center_sq, current_centers, current_centers_sq)[0]
             center_distances = np.sqrt(np.maximum(sq_center_distances, 0.0))
 
             if np.any(center_distances + radius <= current_radiuses):
@@ -82,6 +88,7 @@ class MinHeapInsert(InsertInterface):
                 neighbor_version = self._sphere_versions[neighbor_idx]
                 heapq.heappush(self._minimal_pairs, (volume, sphere_idx, sphere_version, neighbor_idx, neighbor_version))
 
+
     def _merge_spheres(self, filter: Filter) -> None:
         while filter._num_spheres > filter.max_spheres and self._minimal_pairs:
             vol, i, i_version, j, j_version = heapq.heappop(self._minimal_pairs)
@@ -108,40 +115,32 @@ class MinHeapInsert(InsertInterface):
             self._sphere_versions[[i, j]] += 1
             filter._num_spheres -= 2
 
-            self.add_sphere(filter, new_center.astype(np.float32), new_radius)
+            self.add_sphere(filter, new_center, new_radius)
 
-    def add(self, filter: Filter, vectors: np.ndarray) -> None:
-        if not filter._constructed:
-            filter.construct(vectors)
-            return
 
-        if len(vectors) == 0 or filter.max_spheres == 0:
-            return
-
+    def insert(self, filter: Filter, vectors: np.ndarray) -> None:
         for i in range(0, len(vectors), self._BATCH_SIZE):
             vector_batch = vectors[i:i + self._BATCH_SIZE]
             vector_batch = np.ascontiguousarray(vector_batch, dtype=np.float32)
-            sq_vector_batch = np.einsum('ij,ij->i', vector_batch, vector_batch, dtype=np.float64)
+            sq_vector_batch = np.einsum('ij,ij->i', vector_batch, vector_batch)
 
             if filter._num_spheres > 0:
-                sq_batch_distances = filter._sq_dists_to_centers(vector_batch, sq_vector_batch, filter.all_centers)
+                sq_centers = np.einsum('ij,ij->i', filter.all_centers, filter.all_centers)
+                sq_batch_distances = self._compute_squared_distances(vector_batch, sq_vector_batch, filter.all_centers, sq_centers)
                 batch_distances = np.sqrt(np.maximum(sq_batch_distances, 0.0))
 
-                is_already_covered = np.any(batch_distances <= (filter.all_radiuses[None, :] - filter.distance_threshold), axis=1)
+                is_already_covered = np.any(batch_distances <= (filter.all_radiuses[None, :]), axis=1)
                 vector_batch = vector_batch[~is_already_covered]
 
             for vec in vector_batch:
-                self.add_sphere(filter, vec, filter.distance_threshold)
+                self.add_sphere(filter, vec, 0.0)
 
             self._merge_spheres(filter)
 
-    def insert(self, filter: Filter, vectors: np.ndarray) -> None:
-        self.add(filter, vectors)
 
     def remove(self, filter: Filter, vectors: np.ndarray) -> List[bool]:
         raise NotImplementedError("MinHeapInsert does not support remove operation.")
 
-    # ------------------------------------------------------------------ memory / misc
 
     def get_bytesize(self) -> int:
         return self._sphere_versions.nbytes + sys.getsizeof(self._minimal_pairs)

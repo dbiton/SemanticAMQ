@@ -33,13 +33,9 @@ class InsertInterface(ABC):
         pass
 
     @abstractmethod
-    def add(self, filter: 'Filter', vectors: np.ndarray) -> None:
+    def insert(self, filter: 'Filter', vectors: np.ndarray) -> None:
         """Filters out covered points and dynamically inserts uncovered vectors."""
         pass
-
-    def insert(self, filter: 'Filter', vectors: np.ndarray) -> None:
-        """Delegates directly to `add` for vector insertion."""
-        self.add(filter, vectors)
 
     @abstractmethod
     def remove(self, filter: 'Filter', vectors: np.ndarray) -> List[bool]:

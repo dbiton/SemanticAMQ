@@ -13,8 +13,7 @@ import inspect
 from scipy.special import logsumexp
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 
-from filters.ball_cover.ball_cover_filter import BallCoverFilter
-from filters import streaming_insertion
+from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize
 from hyperspheres_volume import estimate_hypersphere_volume
 from vector_source import VectorSource
 
@@ -94,31 +93,83 @@ def _radius_stats(filter_instance: Any) -> Dict[str, float]:
     }
 
 
-def _instantiate_filter(filter_cls: Any, dim: int, lsh: Any, memory_budget: int, distance_threshold: float = None, max_spheres: int = None) -> Any:
-    if 'max_spheres' in inspect.signature(filter_cls.__init__).parameters:
-        return filter_cls(dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold, max_spheres=max_spheres)
+_DIRECT_TAU_FILTERS = {
+    "FirstNFilter", "BallCoverFilter",
+    "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", "DSHFilter", "HNSWFilter",
+    "IVFFilter",
+}
+
+
+def _ball_cover_max_memory(dim: int, k: int, quantize: Quantize = Quantize.NONE) -> int:
+    """BallCoverFilter sizes its ball budget from a byte budget (max_memory),
+    not a raw ball count -- this converts a desired count k into the
+    max_memory that yields exactly k balls for the given quantize type."""
+    bytes_per_ball = BallCoverFilter(dim=dim, max_memory=1, quantize=quantize).bytes_per_ball()
+    return bytes_per_ball * k
+
+
+class _BallCoverFilterEvalAdapter:
+    """BallCoverFilter.query() takes an explicit per-call distance_threshold
+    rather than baking one in at construction time, unlike the other
+    _DIRECT_TAU_FILTERS below -- this adapter captures the threshold once at
+    construction so the generic single-arg `filter_instance.query(block)`
+    call sites elsewhere in this module (static/dynamic/system/equal_memory
+    workers) keep working unchanged."""
+
+    def __init__(self, dim: int, max_memory: int, distance_threshold: float,
+                 max_spheres: Optional[int] = None, **extra_kwargs: Any) -> None:
+        self.distance_threshold = distance_threshold
+        quantize = extra_kwargs.get("quantize", Quantize.NONE)
+        if max_spheres is not None:
+            max_memory = _ball_cover_max_memory(dim, max_spheres, quantize)
+        self._filt = BallCoverFilter(dim=dim, max_memory=max_memory, max_spheres=max_spheres, **extra_kwargs)
+
+    def construct(self, vectors: np.ndarray) -> None:
+        return self._filt.construct(vectors)
+
+    def query(self, vectors: np.ndarray) -> List[bool]:
+        return self._filt.query(vectors, distance_threshold=self.distance_threshold)
+
+    def insert(self, vectors: np.ndarray) -> None:
+        self._filt.insert(vectors)
+
+    def get_bytesize(self) -> int:
+        return self._filt.get_bytesize()
+
+    @property
+    def all_radiuses(self) -> np.ndarray:
+        return self._filt.all_radiuses
+
+
+def _instantiate_filter(filter_cls: Any, dim: int, memory_budget: int, distance_threshold: float = None,
+                        max_spheres: int = None, lsh: Any = None, extra_kwargs: Optional[Dict[str, Any]] = None) -> Any:
+    extra_kwargs = extra_kwargs or {}
+    if filter_cls.__name__ in _DIRECT_TAU_FILTERS or 'max_spheres' in inspect.signature(filter_cls.__init__).parameters:
+        if filter_cls is BallCoverFilter:
+            return _BallCoverFilterEvalAdapter(dim=dim, max_memory=memory_budget,distance_threshold=distance_threshold,
+                                                max_spheres=max_spheres, **extra_kwargs)
+        else:
+            return filter_cls(dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold,
+                            max_spheres=max_spheres, **extra_kwargs)
     else:
         try:
-            return filter_cls(dim=dim, lsh=lsh, max_memory=memory_budget)
+            return filter_cls(dim=dim, max_memory=memory_budget, lsh=lsh, **extra_kwargs)
         except TypeError:
-            return filter_cls(dim=dim, lsh=lsh)
+            return filter_cls(dim=dim, lsh=lsh, **extra_kwargs)
 
 
 def static_worker(
     filter_cls: Any,
-    lsh_cls: Any,
     dim: int,
     distance_threshold: float,
-    max_L: int,
     memory_budget: int,
     vectors_construct: VectorInput,
     vectors_query: VectorInput,
     actual_results: List[bool],
     percentage: float,
 ) -> Dict[str, Any]:
-    config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
-    lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
-    filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold)
+    config = filter_cls.__name__
+    filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold)
     filter_instance.construct(_to_construct_array(vectors_construct))
 
     predicted: List[bool] = []
@@ -133,19 +184,16 @@ def static_worker(
 
 def dynamic_worker(
     filter_cls: Any,
-    lsh_cls: Any,
     dim: int,
     distance_threshold: float,
-    max_L: int,
     memory_budget: int,
     vectors_construct: VectorInput,
     vectors_query: VectorInput,
     actual_results: List[bool],
     percentage: float,
 ) -> Dict[str, Any]:
-    config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
-    lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
-    filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold)
+    config = filter_cls.__name__
+    filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold)
     filter_instance.construct(_to_construct_array(vectors_construct))
 
     predicted: List[bool] = []
@@ -163,9 +211,18 @@ def _f1_score(predicted: np.ndarray, actual: np.ndarray) -> float:
     return _precision_recall_f1(predicted, actual)[2]
 
 
+_IVF_NPROBE_CANDIDATES = (1, 2, 4, 8, 16, 32, 64)
+
+
 # Filters with a cheap post-construction query-time dial: score every candidate on one built instance.
 _POST_CONSTRUCTION_CONFIG_DIALS = {
     "DSBFFilter": lambda f: [("vote_threshold", t) for t in range(1, f.num_tables + 1)],
+    # nprobe is a pure query-time knob (IVFFilter.nprobe proxies to the built
+    # index, see its property docstring) -- swept on a log-ish grid up to
+    # nlist rather than exhaustively, since nlist can be in the hundreds.
+    "IVFFilter": lambda f: [
+        ("nprobe", p) for p in sorted({c for c in _IVF_NPROBE_CANDIDATES if c <= f.nlist} | {f.nlist})
+    ],
 }
 
 # Filters whose configuration changes memory layout at construction time: one build per candidate.
@@ -177,34 +234,47 @@ _CONSTRUCTION_TIME_CONFIG_DIALS = {
 def _build_calibrated_filter(
     filter_cls: Any,
     dim: int,
-    lsh: Any,
     memory_budget: int,
     distance_threshold: float,
     construct_arr: np.ndarray,
     calib_arr: np.ndarray,
     calib_actual: np.ndarray,
-) -> Any:
+) -> Tuple[Any, float]:
     """Builds filter_cls at memory_budget, picking whichever registered config
-    dial candidate scores best (F1) on the calibration set."""
+    dial candidate scores best (F1) on the calibration set. Returns
+    (filter_instance, construction_seconds) -- construction_seconds sums only
+    the time spent inside .construct() calls (every candidate build, for a
+    construction-time dial), excluding the calibration-set .query() calls used
+    purely to score candidates, so it reflects the cost of reaching a
+    ready-to-query filter rather than this function's own search overhead."""
     name = filter_cls.__name__
+    construction_time = 0.0
 
     if name in _CONSTRUCTION_TIME_CONFIG_DIALS:
         best_f1, best_instance = -1.0, None
         for kwargs in _CONSTRUCTION_TIME_CONFIG_DIALS[name]:
-            candidate = filter_cls(
-                dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold, **kwargs
+            # Routed through _instantiate_filter's own dispatch (not a
+            # hardcoded direct-tau constructor call) so a filter added to
+            # this dial registry that isn't in _DIRECT_TAU_FILTERS still
+            # gets built correctly.
+            candidate = _instantiate_filter(
+                filter_cls, dim, memory_budget, distance_threshold, extra_kwargs=kwargs
             )
+            t0 = time.perf_counter()
             candidate.construct(construct_arr)
+            construction_time += time.perf_counter() - t0
             f1 = (
                 _f1_score(np.asarray(candidate.query(calib_arr), dtype=bool), calib_actual)
                 if len(calib_arr) > 0 else 0.0
             )
             if f1 > best_f1:
                 best_f1, best_instance = f1, candidate
-        return best_instance
+        return best_instance, construction_time
 
-    filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold)
+    filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold)
+    t0 = time.perf_counter()
     filter_instance.construct(construct_arr)
+    construction_time = time.perf_counter() - t0
 
     if name in _POST_CONSTRUCTION_CONFIG_DIALS and len(calib_arr) > 0:
         best_attr, best_value, best_f1 = None, None, -1.0
@@ -216,15 +286,13 @@ def _build_calibrated_filter(
         if best_attr is not None:
             setattr(filter_instance, best_attr, best_value)
 
-    return filter_instance
+    return filter_instance, construction_time
 
 
 def equal_memory_worker(
     filter_cls: Any,
-    lsh_cls: Any,
     dim: int,
     distance_threshold: float,
-    max_L: int,
     memory_budget: int,
     vectors_construct: VectorInput,
     vectors_calibration: VectorInput,
@@ -233,14 +301,13 @@ def equal_memory_worker(
     actual_query: List[bool],
     dataset: str = "",
 ) -> Dict[str, Any]:
-    config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
-    lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
+    config = filter_cls.__name__
     construct_arr = _to_construct_array(vectors_construct)
     calib_arr = _to_construct_array(vectors_calibration)
     calib_actual = np.asarray(actual_calibration, dtype=bool)
 
-    filter_instance = _build_calibrated_filter(
-        filter_cls, dim, lsh, memory_budget, distance_threshold,
+    filter_instance, construction_time = _build_calibrated_filter(
+        filter_cls, dim, memory_budget, distance_threshold,
         construct_arr, calib_arr, calib_actual,
     )
 
@@ -261,7 +328,11 @@ def equal_memory_worker(
         'Threshold': distance_threshold,
         'FPR': fp / (fp + tn) if (fp + tn) > 0 else 0.0,
         'FNR': fn / (fn + tp) if (fn + tp) > 0 else 0.0,
-        'Latency (ms)': elapsed / n_q * 1000,
+        # Construction latency, not query latency -- this comparison cares
+        # about the one-time cost of building each filter at a given memory
+        # budget (see _build_calibrated_filter's docstring for what's
+        # included/excluded), not per-query serving cost.
+        'Latency (ms)': construction_time * 1000,
         'Throughput (qps)': n_q / max(elapsed, 1e-9),
     }
 
@@ -283,10 +354,8 @@ def _fpvr_bounds(
 
 def system_worker(
     filter_cls: Any,
-    lsh_cls: Any,
     dim: int,
     distance_threshold: float,
-    max_L: int,
     memory_budget: int,
     vectors_construct: VectorInput,
     vectors_query: VectorInput,
@@ -300,15 +369,14 @@ def system_worker(
     stream timed with and without the filter. orig_vol_log_* is the caller's
     precomputed true-duplicate-volume bound, combined with the filter's own
     covering volume into ground-truth-free FPVR bounds."""
-    config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
-    lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
+    config = filter_cls.__name__
 
     construct = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
 
     index = faiss.IndexFlatL2(dim)
     index.add(construct)
 
-    filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold)
+    filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold)
     construct_result = filter_instance.construct(construct)
     if isinstance(construct_result, tuple) and len(construct_result) == 2:
         filt_vol_log_low, filt_vol_log_high = construct_result
@@ -428,12 +496,12 @@ def tradeoff_static_worker(
     construction time, memory usage, query throughput, and accuracy metrics.
     """
     try:
-        config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
+        config = filter_cls.__name__
         lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
         vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
 
         construct_start = time.perf_counter() # start construct timer
-        filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold, max_spheres)
+        filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold, max_spheres, lsh)
         filter_instance.construct(vectors_construct)
         construct_latency = time.perf_counter() - construct_start # final construct time
 
@@ -472,12 +540,12 @@ def tradeoff_dynamic_worker(
     memory usage, query throughput, and accuracy metrics.
     """
     try:
-        config = f"{filter_cls.__name__} + {lsh_cls.__name__}"
+        config = filter_cls.__name__
         lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
         vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
 
         construct_start = time.perf_counter() # start construct timer
-        filter_instance = _instantiate_filter(filter_cls, dim, lsh, memory_budget, distance_threshold, max_spheres)
+        filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold, max_spheres, lsh)
         filter_instance.construct(vectors_construct)
         construct_latency = time.perf_counter() - construct_start # final construct time
 
@@ -532,10 +600,23 @@ def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, flo
     }
 
 
+# The ablation sweep now varies BallCoverFilter's quantize choice rather than
+# the retired per-level construction strategies. NONE is included as the
+# raw/unquantized baseline point in this same sweep (tagged stage="ball")
+# rather than a separate per-candidate stage: Gonzalez construction no
+# longer varies by quantize choice, so there's exactly one "ball" cover to
+# compare every real quantizer against, not one per candidate.
+ABLATION_QUANTIZE_SWEEP = (
+    Quantize.NONE, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
+    Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.PQ,
+)
+
+
 def ablation_worker(
     dim: int,
     dataset: str,
     k: int,
+    quantize: Quantize,
     tau_values: List[float],
     seed: int,
     construct_tau: float,
@@ -543,11 +624,36 @@ def ablation_worker(
     vectors_query: VectorInput,
     actual_results_by_tau: Dict[float, List[bool]],
 ) -> List[Dict[str, Any]]:
-    """Builds one BallCoverFilter cover per (dataset, k, seed) via the full
-    construction ladder, then evaluates it at every tau. Returns one row per
-    (stage, tau) for stages ["ball", "quantizing"]; construct_tau is a
-    sweep-independent construction knob, kept separate from the evaluated
-    tau's so log10_J stays tau-independent for a given cover."""
+    """Builds one BallCoverFilter cover per (dataset, k, seed, quantize),
+    where `quantize` selects the scalar/product quantizer BallCoverFilter
+    applies during construction (Quantize.NONE for the raw, unquantized
+    Gonzalez cover), then evaluates it at every tau. Returns one row per tau,
+    tagged stage="ball" for quantize=Quantize.NONE and stage="quantizing"
+    otherwise, so a caller sweeping every ABLATION_QUANTIZE_SWEEP member gets
+    one row group per member, with NONE serving as the baseline point in that
+    same sweep rather than a value repeated across jobs.
+
+    max_memory is derived from k using Quantize.NONE's byte-per-ball size and
+    then held fixed across every quantize candidate in the sweep (not
+    re-derived per candidate) -- this is what makes n_balls meaningfully
+    different per quantize choice (a more compact code packs more balls into
+    the same byte budget) rather than trivially equal to k for every
+    candidate, and is also what the recorded memory_bytes (filt.get_bytesize())
+    tracks as plot_ablation.py's x-axis. That tracking isn't exact for every
+    quantize choice, though: BallCoverFilter caps ball count at
+    min(max_count_balls, n_construct), so a quantizer compact enough that
+    max_count_balls exceeds the construct-set size (e.g. PQ, whose ~8-12
+    byte code is roughly two orders of magnitude smaller than NONE's
+    (dim+1)*4 bytes) saturates at n_construct balls well before the nominal
+    byte budget is used -- its realized memory usage then stays flat across
+    the whole k sweep instead of tracking k, which is real information (that
+    quantizer is construct-set-bound, not budget-bound, at these k_fractions)
+    rather than a plotting artifact. construct_tau is accepted for interface
+    parity with the other tau-sweep workers but unused: BallCoverFilter's own
+    construction has no distance-threshold knob to feed it (Gonzalez
+    construction only takes the vectors and a ball budget).
+
+    FNR is asserted (raises on violation), never plotted."""
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
     n_q = len(query_arr)
@@ -558,51 +664,36 @@ def ablation_worker(
             )
 
     actual_by_tau = {t: np.asarray(a, dtype=bool) for t, a in actual_results_by_tau.items()}
+    stage = "ball" if quantize == Quantize.NONE else "quantizing"
 
     rows: List[Dict[str, Any]] = []
 
-    filt = BallCoverFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed)
-    filt.construct(construct_arr, retain_assignments=True)
-    levels = filt.get_stats(taus=tau_values)["levels"]
-    ball_level = levels[-1]
-    ball_cum_time = sum(s["wall_time"] for s in levels)
-    ball_log10_J = ball_level["log_J"] / _LN10
-
-    for t in tau_values:
-        predicted = filt.query(query_arr, tau=t)
-        rates = _confusion_rates(predicted, actual_by_tau[t])
-        rows.append({
-            "dataset": dataset, "k": k, "stage": "ball", "stage_index": 1, "tau": t,
-            "log10_J": ball_log10_J,
-            "log10_J_tau": ball_level["log_J_tau"][t] / _LN10,
-            "fpr": rates["fpr"], "fnr": rates["fnr"],
-            "stage_time_s": ball_cum_time, "cum_time_s": ball_cum_time,
-            "n_balls": ball_level["ball_count"], "seed": seed,
-        })
-
+    max_memory = _ball_cover_max_memory(dim, k, Quantize.NONE)
     t0 = time.perf_counter()
-    filt.quantize_centers()
-    quant_time = time.perf_counter() - t0
-    quant_cum_time = ball_cum_time + quant_time
-    quant_radii = filt.all_radiuses
-    quant_log10_J = _log10_J(quant_radii, dim)
+    filt = BallCoverFilter(dim=dim, max_memory=max_memory, quantize=quantize)
+    filt.construct(construct_arr)
+    stage_time = time.perf_counter() - t0
+    radii = filt.all_radiuses
+    log10_J = _log10_J(radii, dim)
 
+    memory_bytes = filt.get_bytesize()
+
+    predicted_by_tau = {t: filt.query(query_arr, distance_threshold=t) for t in tau_values}
     for t in tau_values:
-        predicted = filt.query(query_arr, tau=t)
-        rates = _confusion_rates(predicted, actual_by_tau[t])
+        rates = _confusion_rates(predicted_by_tau[t], actual_by_tau[t])
         rows.append({
-            "dataset": dataset, "k": k, "stage": "quantizing", "stage_index": 2, "tau": t,
-            "log10_J": quant_log10_J,
-            "log10_J_tau": _log10_J(quant_radii, dim, tau=t),
+            "dataset": dataset, "k": k, "quantize": quantize.value, "stage": stage, "tau": t,
+            "log10_J": log10_J,
+            "log10_J_tau": _log10_J(radii, dim, tau=t),
             "fpr": rates["fpr"], "fnr": rates["fnr"],
-            "stage_time_s": quant_time, "cum_time_s": quant_cum_time,
-            "n_balls": len(quant_radii), "seed": seed,
+            "stage_time_s": stage_time, "cum_time_s": stage_time,
+            "n_balls": filt.count_balls, "memory_bytes": memory_bytes, "seed": seed,
         })
 
     bad = [r for r in rows if r["fnr"] != 0]
     if bad:
         raise ValueError(
-            f"Zero-false-negative invariant violated (dataset={dataset}, k={k}, seed={seed}): "
+            f"Zero-false-negative invariant violated (dataset={dataset}, k={k}, quantize={quantize}, seed={seed}): "
             f"{bad[:3]}"
         )
 
@@ -623,8 +714,14 @@ def system_tau_worker(
     """Builds one BallCoverFilter cover (fixed k) per (dataset, seed) plus a
     flat L2 index over the same construct set, then sweeps the query-time
     threshold tau over that single construction, measuring filtered vs.
-    unfiltered throughput/index-access/FPR/FNR at each tau. redundancy_rate
-    is the measured (not nominal) duplicate fraction of the query stream."""
+    unfiltered throughput/index-access/FPR/FNR at each tau. Queries are
+    issued one at a time (not batched), on both arms of the comparison, to
+    reflect a realistic online setting where each arrival is answered
+    individually: the filtered path calls filt.query() on that one vector
+    and only falls through to the backend index.search() when the filter
+    reports a possible match, skipping the index entirely otherwise.
+    redundancy_rate is the measured (not nominal) duplicate fraction of the
+    query stream."""
     construct_arr = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
     query_arr = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
     n_q = len(query_arr)
@@ -637,7 +734,7 @@ def system_tau_worker(
     index = faiss.IndexFlatL2(dim)
     index.add(construct_arr)
 
-    filt = BallCoverFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed)
+    filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
     filt.construct(construct_arr)
     radii = filt.all_radiuses
 
@@ -647,16 +744,21 @@ def system_tau_worker(
         redundancy_rate = float(np.mean(actual)) if len(actual) > 0 else 0.0
 
         start = time.perf_counter()
-        index.search(query_arr, 1)
+        for i in range(n_q):
+            index.search(query_arr[i:i + 1], 1)
         time_without = time.perf_counter() - start
 
+        predicted = np.empty(n_q, dtype=bool)
         start = time.perf_counter()
-        predicted = np.asarray(filt.query(query_arr, tau=t), dtype=bool)
-        n_index_accesses = int(predicted.sum())
-        if n_index_accesses > 0:
-            index.search(query_arr[predicted], 1)
+        for i in range(n_q):
+            v = query_arr[i:i + 1]
+            hit = filt.query(v, distance_threshold=t)[0]
+            predicted[i] = hit
+            if hit:
+                index.search(v, 1)
         time_with = time.perf_counter() - start
 
+        n_index_accesses = int(predicted.sum())
         rates = _confusion_rates(predicted.tolist(), actual)
         throughput_without = n_q / max(time_without, 1e-9)
         throughput_with = n_q / max(time_with, 1e-9)
@@ -690,7 +792,7 @@ def query_performance_worker(
     query), batched mode is left uncapped. Returns one row per mode."""
     construct_arr = _to_construct_array(vectors_construct)
 
-    filt = BallCoverFilter(dim=dim, distance_threshold=construct_tau, max_spheres=k, seed=seed)
+    filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
     filt.construct(construct_arr)
 
     rows: List[Dict[str, Any]] = []
@@ -700,7 +802,7 @@ def query_performance_worker(
     for v in _iter_query_vectors(vectors_query):
         if n_single >= single_query_limit:
             break
-        filt.query(v[np.newaxis, :], tau=query_tau)
+        filt.query(v[np.newaxis, :], distance_threshold=query_tau)
         n_single += 1
     elapsed_single = time.perf_counter() - start
     rows.append({
@@ -713,7 +815,7 @@ def query_performance_worker(
     n_batched = 0
     start = time.perf_counter()
     for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
-        filt.query(block, tau=query_tau)
+        filt.query(block, distance_threshold=query_tau)
         n_batched += len(block)
     elapsed_batched = time.perf_counter() - start
     rows.append({
@@ -726,239 +828,115 @@ def query_performance_worker(
     return rows
 
 
-def scaling_worker(
+def scaling_query_worker(
     dim: int,
     dataset: str,
     k: int,
+    batch_size: int,
     seed: int,
     tau_mid: float,
     vectors_construct: VectorInput,
     vectors_query: VectorInput,
-    actual_results: List[bool],
-    single_query_limit: int = 2000,
+    n_query_vectors: int = 8192,
 ) -> Dict[str, Any]:
-    """Builds one BallCoverFilter at fixed k over n=len(vectors_construct)
-    vectors; reports construction time, single-query latency, memory, FPR."""
+    """Measures batched-query throughput (queries/sec) for a BallCoverFilter
+    built at filter size k (over a fixed stream held constant across the
+    whole batch_size sweep -- only k and batch_size vary here), querying in
+    batches of `batch_size`. The query pool is cycled up to n_query_vectors
+    so every batch_size times the same total query count."""
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
-    n = len(construct_arr)
 
-    construct_start = time.perf_counter()
-    filt = BallCoverFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed)
+    filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
     filt.construct(construct_arr)
-    construct_time_s = time.perf_counter() - construct_start
 
-    memory_bytes = filt.get_bytesize()
+    stream = query_arr[np.arange(n_query_vectors) % len(query_arr)]
 
-    n_single = min(single_query_limit, len(query_arr))
     start = time.perf_counter()
-    for v in query_arr[:n_single]:
-        filt.query(v[np.newaxis, :], tau=tau_mid)
-    elapsed_single = time.perf_counter() - start
-    query_latency_us = elapsed_single / max(n_single, 1) * 1e6
-
-    predicted: List[bool] = []
-    for block in _iter_query_batches(query_arr, _QUERY_BATCH):
-        predicted.extend(filt.query(block, tau=tau_mid))
-    rates = _confusion_rates(predicted, np.asarray(actual_results, dtype=bool))
+    for i in range(0, len(stream), batch_size):
+        filt.query(stream[i:i + batch_size], distance_threshold=tau_mid)
+    elapsed = time.perf_counter() - start
 
     return {
-        "dataset": dataset, "n": n, "k": k, "seed": seed,
-        "construct_time_s": construct_time_s,
-        "query_latency_us": query_latency_us,
-        "fpr": rates["fpr"],
-        "memory_bytes": memory_bytes,
+        "dataset": dataset, "k": k, "batch_size": batch_size, "seed": seed,
+        "n_queries": len(stream),
+        "throughput_qps": len(stream) / max(elapsed, 1e-9),
     }
 
 
-def streaming_method_worker(
+def scaling_insert_worker(
     dim: int,
     dataset: str,
     k: int,
+    batch_size: int,
     seed: int,
-    fold_offset: int,
-    tau_mid: float,
-    method: str,
-    method_kwargs: Dict[str, Any],
-    vectors_stream_pool: VectorInput,
-    stream_len: int,
-    vectors_negative: VectorInput,
-    checkpoints: List[int],
-    sweep: str,
-) -> List[Dict[str, Any]]:
-    """Streams one insertion method (M1-M5, see filters.streaming_insertion)
-    over a fold_offset-windowed slice of vectors_stream_pool; at each
-    checkpoint, reports FPR, log10_j_tau, ball count, and amortized cost per
-    insertion. Serves both the position sweep (sweep="position") and the k
-    sweep (sweep="k_sweep"); rows are tagged with sweep/method/fold_offset so
-    they're self-describing regardless of completion order. FNR is asserted
-    (raises on violation), never plotted."""
-    stream_arr = _to_construct_array(vectors_stream_pool)[:stream_len]
-    negative_arr = _to_construct_array(vectors_negative)
-    n = len(stream_arr)
-    checkpoint_set = sorted(set(c for c in checkpoints if 0 < c <= n))
-
-    m = streaming_insertion.make_method(method, dim=dim, k=k, seed=seed, **method_kwargs)
-
-    rows: List[Dict[str, Any]] = []
-    cumulative_time_s = 0.0
-    ci = 0
-    for t in range(n):
-        pos = t + 1
-        t0 = time.perf_counter()
-        m.insert(stream_arr[t])
-        cumulative_time_s += time.perf_counter() - t0
-
-        if ci < len(checkpoint_set) and pos == checkpoint_set[ci]:
-            predicted_neg = m.query(negative_arr, tau=tau_mid)
-            actual_neg = np.zeros(len(negative_arr), dtype=bool)
-            rates = _confusion_rates(predicted_neg.tolist(), actual_neg)
-
-            predicted_seen = np.asarray(m.query(stream_arr[:pos], tau=tau_mid), dtype=bool)
-            fnr = float(np.mean(~predicted_seen)) if pos else 0.0
-            if fnr != 0.0:
-                raise ValueError(
-                    f"Zero-false-negative invariant violated (method={method}, dataset={dataset}, "
-                    f"k={k}, seed={seed}, fold_offset={fold_offset}, position={pos}): fnr={fnr}"
-                )
-
-            radii = m.all_radiuses
-            rows.append({
-                "dataset": dataset, "method": method, "k": k, "seed": seed, "fold_offset": fold_offset,
-                "b": method_kwargs.get("b"), "position": pos,
-                "fpr": rates["fpr"],
-                "log10_j_tau": _log10_J(radii, dim, tau=tau_mid),
-                "n_balls": len(radii),
-                "cumulative_time_s": cumulative_time_s,
-                "amortized_cost_s": cumulative_time_s / pos,
-                "metric": "checkpoint", "sweep": sweep,
-            })
-            ci += 1
-
-    return rows
-
-
-def stream_m4_exactness_worker(
-    dim: int,
-    dataset: str,
-    k: int,
-    seed: int,
-    tau_mid: float,
-    vectors_stream_pool: VectorInput,
-    stream_len: int,
+    vectors_construct: VectorInput,
+    vectors_insert: VectorInput,
+    n_insert_vectors: int = 8192,
 ) -> Dict[str, Any]:
-    """Runs CachedHeapMerge (M4) and the exhaustive Algorithm 2 reference in
-    lockstep, comparing resulting ball sets (sorted radii) after every
-    post-bootstrap insertion. Feeds the paper's "M4 exactness" text sentence."""
-    stream_arr = _to_construct_array(vectors_stream_pool)[:stream_len]
-    n = len(stream_arr)
+    """Measures batched-insertion throughput (vectors/sec) for a
+    BallCoverFilter built at filter size k (same fixed-stream setup as
+    scaling_query_worker), inserting via insert() in batches of `batch_size`
+    after the initial construct(). The insert pool is cycled up to
+    n_insert_vectors so every batch_size inserts the same total count."""
+    construct_arr = _to_construct_array(vectors_construct)
+    insert_arr = _to_construct_array(vectors_insert)
 
-    m4 = streaming_insertion.make_method("M4", dim=dim, k=k, seed=seed)
-    ref = BallCoverFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
-                            merge_criterion="log_space")
-    ref.construct(np.empty((0, dim), dtype=np.float32))
+    filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
+    filt.construct(construct_arr)
 
-    n_checked = 0
-    n_mismatches = 0
-    first_mismatch_position: Optional[int] = None
-    for t in range(n):
-        x = stream_arr[t]
-        m4.insert(x)
-        streaming_insertion.exhaustive_algo2_step(ref, x)
+    stream = insert_arr[np.arange(n_insert_vectors) % len(insert_arr)]
 
-        pos = t + 1
-        if pos > k:
-            n_checked += 1
-            r_m4 = np.sort(np.round(m4.all_radiuses.astype(np.float64), 6))
-            r_ref = np.sort(np.round(ref.all_radiuses.astype(np.float64), 6))
-            same = len(r_m4) == len(r_ref) and np.allclose(r_m4, r_ref, atol=1e-4, rtol=1e-4)
-            if not same:
-                n_mismatches += 1
-                if first_mismatch_position is None:
-                    first_mismatch_position = pos
+    start = time.perf_counter()
+    for i in range(0, len(stream), batch_size):
+        filt.insert(stream[i:i + batch_size])
+    elapsed = time.perf_counter() - start
 
     return {
-        "dataset": dataset, "k": k, "seed": seed,
-        "n_checked": n_checked, "n_mismatches": n_mismatches,
-        "first_mismatch_position": first_mismatch_position,
+        "dataset": dataset, "k": k, "batch_size": batch_size, "seed": seed,
+        "n_inserted": len(stream),
+        "throughput_ips": len(stream) / max(elapsed, 1e-9),
     }
 
 
-def stream_m3_gap_worker(
+def scaling_construction_worker(
     dim: int,
     dataset: str,
     k: int,
+    n: int,
     seed: int,
-    tau_mid: float,
-    vectors_stream_pool: VectorInput,
-    stream_len: int,
+    vectors_construct: VectorInput,
 ) -> Dict[str, Any]:
-    """Runs RestrictedMerge (M3, track_gap=True); returns the fraction of
-    post-bootstrap insertions where the unrestricted argmin would have
-    excluded the arriving singleton. Feeds the paper's "M3 gap" sentence."""
-    stream_arr = _to_construct_array(vectors_stream_pool)[:stream_len]
-    m3 = streaming_insertion.make_method("M3", dim=dim, k=k, seed=seed, track_gap=True)
-    for x in stream_arr:
-        m3.insert(x)
+    """Measures construction throughput (vectors/sec) for a BallCoverFilter
+    at filter size k built over n indexed vectors -- the (k, n) grid this is
+    swept over is the ablation-style basis for the construction-throughput-
+    vs-filter-size plot's per-stream-size lines."""
+    construct_arr = _to_construct_array(vectors_construct)[:n]
+
+    start = time.perf_counter()
+    filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
+    filt.construct(construct_arr)
+    elapsed = time.perf_counter() - start
+
     return {
-        "dataset": dataset, "k": k, "seed": seed,
-        "n_checked": m3.n_total,
-        "fraction_excluded": (m3.n_gap / m3.n_total) if m3.n_total else 0.0,
+        "dataset": dataset, "k": k, "n": n, "seed": seed,
+        "construct_time_s": elapsed,
+        "throughput_vps": n / max(elapsed, 1e-9),
     }
 
 
-def stream_delta_distribution_worker(
-    dim: int,
-    dataset: str,
-    k: int,
-    seed: int,
-    tau_mid: float,
-    method: str,
-    vectors_stream_pool: VectorInput,
-    stream_len: int,
-) -> Dict[str, Any]:
-    """Streams `method` in {"M3","M4","ref_exhaustive"} and summarizes the
-    distribution of realized merge Deltas (mean/median/percentiles/beneficial
-    fraction). Feeds the paper's Delta-distribution text statistics."""
-    stream_arr = _to_construct_array(vectors_stream_pool)[:stream_len]
-
-    if method == "ref_exhaustive":
-        filt = BallCoverFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
-                                 merge_criterion="log_space")
-        filt.construct(np.empty((0, dim), dtype=np.float32))
-        deltas: List[float] = []
-        for x in stream_arr:
-            delta = streaming_insertion.exhaustive_algo2_step(filt, x)
-            if delta is not None:
-                deltas.append(delta)
-    elif method in ("M3", "M4"):
-        m = streaming_insertion.make_method(method, dim=dim, k=k, seed=seed)
-        for x in stream_arr:
-            m.insert(x)
-        deltas = list(m.accepted_deltas)
-    else:
-        raise ValueError(f"Unknown method {method!r} for delta-distribution; expected 'M3', 'M4', or 'ref_exhaustive'")
-
-    arr = np.asarray(deltas, dtype=np.float64)
-    finite = arr[np.isfinite(arr)]
-    if len(finite) == 0:
-        finite = np.array([0.0])
-    return {
-        "dataset": dataset, "k": k, "seed": seed, "method": method,
-        "n": len(arr),
-        "mean": float(np.mean(finite)), "median": float(np.median(finite)),
-        "p10": float(np.percentile(finite, 10)), "p90": float(np.percentile(finite, 90)),
-        "min": float(np.min(finite)), "max": float(np.max(finite)),
-        "frac_beneficial": float(np.mean(arr < 0)) if len(arr) else 0.0,
-    }
-
-
-# policy -> (metric, method) tag used by the streaming figure.
-_REBUILD_POLICY_TAGS = {
-    "oracle": ("static_reference", "static_reference"),
-    "streaming": ("exhaustive_reference", "ref_exhaustive"),
-    "periodic": ("exhaustive_reference", "ref_exhaustive"),
-}
+def _rebuild_policy_tags(policy: str, insertion_level: Optional[str]) -> tuple:
+    """(metric, method) tag used by the streaming figure. "oracle" is always
+    a from-scratch rebuild regardless of insertion_level, so it gets one
+    fixed reference tag; "streaming"/"periodic" report whichever
+    insertion_level they actually ran (nearest/least_inflation/merge/
+    doubling) as the method tag, so all four are plotted as regular,
+    directly comparable lines rather than one of them (the old "merge",
+    formerly the only add() behavior) needing a special "exhaustive
+    reference" tag of its own."""
+    if policy == "oracle":
+        return "static_reference", "static_rebuild"
+    return "checkpoint", insertion_level or "nearest"
 
 
 def stream_rebuild_worker(
@@ -972,42 +950,58 @@ def stream_rebuild_worker(
     vectors_negative: VectorInput,
     checkpoints: List[int],
     T: Optional[int] = None,
-    merge_criterion: str = "log_space",
+    insertion_level: Optional[str] = None,
     sweep: Optional[str] = None,
     fold_offset: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Simulates one rebuild policy over vectors_stream, reporting FPR and
     amortized cost per checkpoint.
-      "streaming": BallCoverFilter.add() per arrival, never rebuilt.
+      "streaming": BallCoverFilter.insert() per arrival (using insertion_level),
+        never rebuilt.
       "periodic": like "streaming", rebuilt from scratch every T arrivals.
-      "oracle": rebuilt from scratch at every checkpoint.
+      "oracle": rebuilt from scratch at every checkpoint (insertion_level
+        doesn't apply -- there's nothing to insert into).
     sweep/fold_offset are pass-through tag columns only."""
     stream_arr = _to_construct_array(vectors_stream)
     negative_arr = _to_construct_array(vectors_negative)
     n = len(stream_arr)
     checkpoint_set = sorted(set(c for c in checkpoints if 0 < c <= n))
-    metric, method = _REBUILD_POLICY_TAGS.get(policy, (None, None))
+    metric, method = _rebuild_policy_tags(policy, insertion_level)
 
     rows: List[Dict[str, Any]] = []
     cumulative_time_s = 0.0
 
     def _fpr(filt: BallCoverFilter) -> float:
-        predicted = filt.query(negative_arr, tau=tau_mid)
+        predicted = filt.query(negative_arr, distance_threshold=tau_mid)
         return float(np.mean(predicted)) if len(predicted) else 0.0
+
+    def _assert_fnr_zero(filt: BallCoverFilter, seen: np.ndarray, pos: int) -> None:
+        """The covering invariant is a correctness requirement, not a
+        plotted quantity: every stream vector seen so far must still be
+        recalled. Raises rather than recording a violation, matching every
+        other FNR check in this module."""
+        recalled = filt.query(seen, distance_threshold=tau_mid)
+        fnr = float(np.mean(~np.asarray(recalled, dtype=bool))) if len(recalled) else 0.0
+        if fnr != 0.0:
+            raise ValueError(
+                f"Zero-false-negative invariant violated (dataset={dataset}, policy={policy}, "
+                f"insertion_level={insertion_level}, k={k}, seed={seed}, position={pos}): fnr={fnr}"
+            )
 
     if policy == "oracle":
         for c in checkpoint_set:
-            filt = BallCoverFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
-                                     merge_criterion=merge_criterion)
+            filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
             t0 = time.perf_counter()
             filt.construct(stream_arr[:c])
             cumulative_time_s += time.perf_counter() - t0
+            _assert_fnr_zero(filt, stream_arr[:c], c)
             radii = filt.all_radiuses
             rows.append({
                 "dataset": dataset, "policy": policy, "T": T, "k": k, "seed": seed,
                 "position": c, "fpr": _fpr(filt),
                 "log10_j_tau": _log10_J(radii, dim, tau=tau_mid),
                 "n_balls": len(radii),
+                "memory_bytes": filt.get_bytesize(),
                 "cumulative_time_s": cumulative_time_s,
                 "amortized_cost_s": cumulative_time_s / c,
                 "metric": metric, "method": method, "sweep": sweep, "fold_offset": fold_offset,
@@ -1018,29 +1012,41 @@ def stream_rebuild_worker(
         raise ValueError(f"Unknown policy {policy!r}; expected 'streaming', 'periodic', or 'oracle'")
 
     rebuild_every = T if (policy == "periodic" and T is not None) else None
-    filt = BallCoverFilter(dim=dim, distance_threshold=tau_mid, max_spheres=k, seed=seed,
-                             merge_criterion=merge_criterion)
+    filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k),
+                             insertion_level=insertion_level)
+    # Bootstrap-then-diverge: the first k arrivals always become raw
+    # zero-radius singletons via one batch construct() (identical across
+    # every insertion_level), so checkpoint k+1 onward is a genuine
+    # comparison of each method's own decision rule -- not an artifact of
+    # add_nearest/add_least_inflation never creating new balls on their own
+    # (only add_merge/add_doubling do), which would otherwise collapse this
+    # streamed-from-empty setup to a single ball for those two methods.
+    # generate_streaming()'s checkpoints all sit above k, so this never
+    # skips a requested checkpoint.
+    bootstrap_n = min(k, n)
     t0 = time.perf_counter()
-    filt.construct(np.empty((0, dim), dtype=np.float32))
+    filt.construct(stream_arr[:bootstrap_n])
     cumulative_time_s += time.perf_counter() - t0
 
     ci = 0
-    for t in range(n):
+    for t in range(bootstrap_n, n):
         pos = t + 1
         t0 = time.perf_counter()
         if rebuild_every is not None and pos % rebuild_every == 0:
             filt.construct(stream_arr[:pos])
         else:
-            filt.add(stream_arr[t][np.newaxis, :])
+            filt.insert(stream_arr[t][np.newaxis, :])
         cumulative_time_s += time.perf_counter() - t0
 
         if ci < len(checkpoint_set) and pos == checkpoint_set[ci]:
+            _assert_fnr_zero(filt, stream_arr[:pos], pos)
             radii = filt.all_radiuses
             rows.append({
                 "dataset": dataset, "policy": policy, "T": T, "k": k, "seed": seed,
                 "position": pos, "fpr": _fpr(filt),
                 "log10_j_tau": _log10_J(radii, dim, tau=tau_mid),
                 "n_balls": len(radii),
+                "memory_bytes": filt.get_bytesize(),
                 "cumulative_time_s": cumulative_time_s,
                 "amortized_cost_s": cumulative_time_s / pos,
                 "metric": metric, "method": method, "sweep": sweep, "fold_offset": fold_offset,
@@ -1060,18 +1066,16 @@ _WORKER_FNS: Dict[str, Any] = {
     'ablation': ablation_worker,
     'query_performance': query_performance_worker,
     'equal_memory': equal_memory_worker,
-    'scaling': scaling_worker,
+    'scaling_query': scaling_query_worker,
+    'scaling_insert': scaling_insert_worker,
+    'scaling_construction': scaling_construction_worker,
     'stream_rebuild': stream_rebuild_worker,
-    'streaming_method': streaming_method_worker,
-    'stream_m4_exactness': stream_m4_exactness_worker,
-    'stream_m3_gap': stream_m3_gap_worker,
-    'stream_delta_distribution': stream_delta_distribution_worker,
 }
 
 
 def _describe_job(kwargs: Dict[str, Any]) -> str:
-    if 'filter_cls' in kwargs and 'lsh_cls' in kwargs:
-        return f"{kwargs['filter_cls'].__name__} + {kwargs['lsh_cls'].__name__}"
+    if 'filter_cls' in kwargs:
+        return kwargs['filter_cls'].__name__
     if {'dataset', 'k', 'tau_values', 'seed'} <= kwargs.keys():
         return f"{kwargs['dataset']} k={kwargs['k']} tau_values={kwargs['tau_values']} seed={kwargs['seed']}"
     if {'dataset', 'method', 'k', 'seed'} <= kwargs.keys():

@@ -9,7 +9,8 @@ import pandas as pd
 
 from lsh import FaissSimHashLSH, LSH, DummyLSH
 from runner import Runner
-from plots.legacy import plot_results, plot_throughput_results, load_tradeoff_results, plot_tradeoff_results, plot_equal_memory_results
+from plots.legacy import plot_results, plot_throughput_results, plot_equal_memory_results
+from plots.plot_tradeoff import load_tradeoff_results, plot_tradeoff_results
 from plots.plot_ablation import generate_ablation_figures
 from plots.plot_query_performance import generate_query_performance_figures
 from plots.plot_equal_memory import generate_equal_memory_figures
@@ -1461,3 +1462,4 @@ def plot_all() -> None:
 if __name__ == "__main__":
     generate_and_plot_all()
     # plot_all()
+    # generate_tradeoff_dynamic()
