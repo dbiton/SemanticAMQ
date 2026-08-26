@@ -117,12 +117,13 @@ class _BallCoverFilterEvalAdapter:
     workers) keep working unchanged."""
 
     def __init__(self, dim: int, max_memory: int, distance_threshold: float,
-                 max_spheres: Optional[int] = None, **extra_kwargs: Any) -> None:
+                 max_spheres: Optional[int] = None, insert_mem_percent: Optional[float] = 0.0, **extra_kwargs: Any) -> None:
         self.distance_threshold = distance_threshold
         quantize = extra_kwargs.get("quantize", Quantize.NONE)
         if max_spheres is not None:
             max_memory = _ball_cover_max_memory(dim, max_spheres, quantize)
-        self._filt = BallCoverFilter(dim=dim, max_memory=max_memory, max_spheres=max_spheres, **extra_kwargs)
+        self._filt = BallCoverFilter(dim=dim, max_memory=max_memory, max_spheres=max_spheres, 
+                                     insert_memory_percent=insert_mem_percent, **extra_kwargs)
 
     def construct(self, vectors: np.ndarray) -> None:
         return self._filt.construct(vectors)
@@ -141,13 +142,13 @@ class _BallCoverFilterEvalAdapter:
         return self._filt.all_radiuses
 
 
-def _instantiate_filter(filter_cls: Any, dim: int, memory_budget: int, distance_threshold: float = None,
-                        max_spheres: int = None, lsh: Any = None, extra_kwargs: Optional[Dict[str, Any]] = None) -> Any:
+def _instantiate_filter(filter_cls: Any, dim: int, memory_budget: int, distance_threshold: float = None, max_spheres: int = None,
+                         insert_mem_percent: Optional[float] = 0.0, lsh: Any = None, extra_kwargs: Optional[Dict[str, Any]] = None) -> Any:
     extra_kwargs = extra_kwargs or {}
     if filter_cls.__name__ in _DIRECT_TAU_FILTERS or 'max_spheres' in inspect.signature(filter_cls.__init__).parameters:
         if filter_cls is BallCoverFilter:
             return _BallCoverFilterEvalAdapter(dim=dim, max_memory=memory_budget,distance_threshold=distance_threshold,
-                                                max_spheres=max_spheres, **extra_kwargs)
+                                                max_spheres=max_spheres, insert_mem_percent=insert_mem_percent, **extra_kwargs)
         else:
             return filter_cls(dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold,
                             max_spheres=max_spheres, **extra_kwargs)
@@ -488,7 +489,8 @@ def tradeoff_static_worker(
     vectors_query: np.ndarray,
     actual_results: List[bool],
     max_spheres: int = None,
-    memory_budget: int = None
+    memory_budget: int = None,
+    insert_memory_percent: float = 0.0
 ) -> Dict[str, Any]:
     """
     Function for executing a single benchmarking trial of a static filter,
@@ -501,7 +503,7 @@ def tradeoff_static_worker(
         vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
 
         construct_start = time.perf_counter() # start construct timer
-        filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold, max_spheres, lsh)
+        filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold, max_spheres, insert_memory_percent, lsh)
         filter_instance.construct(vectors_construct)
         construct_latency = time.perf_counter() - construct_start # final construct time
 
@@ -532,7 +534,8 @@ def tradeoff_dynamic_worker(
     vectors_query: np.ndarray,
     actual_results: List[bool],
     max_spheres: int = None,
-    memory_budget: int = None
+    memory_budget: int = None,
+    insert_memory_percent: float = 0.0
 ) -> Dict[str, Any]:
     """
     Function for executing a single benchmarking trial of a dynamic filter,
@@ -545,7 +548,7 @@ def tradeoff_dynamic_worker(
         vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
 
         construct_start = time.perf_counter() # start construct timer
-        filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold, max_spheres, lsh)
+        filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold, max_spheres, insert_memory_percent, lsh)
         filter_instance.construct(vectors_construct)
         construct_latency = time.perf_counter() - construct_start # final construct time
 

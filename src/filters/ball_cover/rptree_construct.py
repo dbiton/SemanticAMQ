@@ -17,7 +17,7 @@ class RPTreeConstruct(ConstructInterface):
             raise ValueError(f"expected a 2-D array, got shape {X.shape}")
         n, dim = X.shape
 
-        k = min(filter.max_spheres, n)
+        k = min(filter.max_construct_spheres, n)
         if k <= 0:
             return np.empty((0, dim), dtype=np.float32), np.empty(0, dtype=np.float32)
         if n <= k:

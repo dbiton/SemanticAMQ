@@ -49,15 +49,18 @@ class BallCoverFilter(Filter):
         insert_method: Optional[InsertInterface] = MinHeapInsert(),
         quantize: Quantize = Quantize.NONE,
         max_memory: Optional[int] = None,
-        max_spheres: Optional[int] = None
+        max_spheres: Optional[int] = None,
+        insert_memory_percent: Optional[float] = 0.0
     ) -> None:
         super().__init__(dim, lsh=None, max_memory=max_memory)
         self.quantize = quantize
         self.construct_method = construct_method
         self.insert_method = insert_method
+        self.insert_memory_percent = insert_memory_percent
         self.index = self._make_index(self.quantize)
         self.max_spheres = (max_spheres if max_spheres is not None 
                     else self._calculate_max_spheres(self.max_memory))
+        self.max_construct_spheres = self._calculate_max_construct_spheres(self.insert_memory_percent)
         self._constructed = False
 
         # main filter sphere buffers
@@ -121,6 +124,17 @@ class BallCoverFilter(Filter):
     def _calculate_max_spheres(self, max_memory: int) -> int:
         usable = max(0, max_memory - self._codebook_bytes())
         return max(1, usable // self.bytes_per_ball())
+
+
+    def _calculate_max_construct_spheres(self, insertion_memory_percent: float) -> int:
+        if insertion_memory_percent <= 0.0:
+            return self.max_spheres
+
+        if self.max_memory is not None:
+            construct_memory = max(0, int(self.max_memory * (1.0 - insertion_memory_percent / 100.0)))
+            return self._calculate_max_spheres(construct_memory)
+
+        return max(1, int(self.max_spheres * (1.0 - insertion_memory_percent / 100.0)))
 
     # ------------------------------------------------------------------ quantization & helpers
 

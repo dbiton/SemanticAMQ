@@ -13,7 +13,7 @@ class GonzalesConstruct(ConstructInterface):
         X = np.ascontiguousarray(vectors, dtype=np.float32)
         n = X.shape[0]
         dim = X.shape[1]
-        k = min(filter.max_spheres, n)
+        k = min(filter.max_construct_spheres, n)
         if k <= 0:
             return np.empty((0, dim), dtype=np.float32), np.empty(0, dtype=np.float32)
         if n <= k:

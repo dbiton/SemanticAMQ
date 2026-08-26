@@ -1462,4 +1462,5 @@ def plot_all() -> None:
 if __name__ == "__main__":
     generate_and_plot_all()
     # plot_all()
+    # generate_tradeoff_static()
     # generate_tradeoff_dynamic()
