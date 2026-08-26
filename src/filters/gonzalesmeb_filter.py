@@ -190,7 +190,7 @@ class GonzalezMEBFilter(Filter):
             merged_radius = np.maximum((neighbors_radiuses + neighbors_center_dists + radius) / 2.0, 1e-6)
 
             # log(R_merged^D - (R_1^D + R_2^D)) = D*log(R_merged) + log(1 - ((R_1/R_merged)^D + (R_2/R_merged)^D))
-            merged_volumes = self.dim * np.log(merged_radius) + np.log(1.0 - ((radius / merged_radius) ** self.dim + (neighbors_radiuses / merged_radius) ** self.dim))
+            merged_volumes = self.dim * np.log(merged_radius) + np.log(np.maximum(1.0 - ((radius / merged_radius) ** self.dim + (neighbors_radiuses / merged_radius) ** self.dim), 1e-6))
 
             for volume, neighbor_idx in zip(merged_volumes, closest_neighbors):
                 neighbor_count = self._indices_count[neighbor_idx]
