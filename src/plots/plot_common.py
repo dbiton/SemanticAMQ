@@ -1,4 +1,4 @@
-"""Shared infrastructure for the per-evaluation figure scripts (plot_ablation.py,
+"""Shared infrastructure for the per-evaluation figure scripts (plot_quantization.py,
 plot_query_performance.py, plot_scaling.py, plot_streaming.py): the dataset
 trio + styling every figure in the paper shares, the matplotlib rcParams
 preset, and small save/aggregate helpers."""
@@ -25,7 +25,10 @@ DATASET_COLORS = {
     "eli5": "#0072B2", "mmlu": "#E69F00", "wildchat": "#009E73",
     "msmarco": "#D55E00", "hotpotqa": "#CC79A7",
 }
-DATASET_HATCHES = {"eli5": "", "mmlu": "//", "wildchat": "..", "msmarco": "\\\\", "hotpotqa": "xx"}
+# Distinct matplotlib marker per dataset, so lines (and the shared legend)
+# stay distinguishable by shape alone (grayscale printouts, colorblind
+# readers) and not just color.
+DATASET_MARKERS = {"eli5": "o", "mmlu": "s", "wildchat": "^", "msmarco": "D", "hotpotqa": "v"}
 
 
 def apply_style(dpi: int = 300) -> None:
@@ -102,13 +105,25 @@ def mean_ci95(df: pd.DataFrame, group_cols: List[str], value_col: str) -> pd.Dat
     return agg.drop(columns=["_mean", "_sem", "_count"])
 
 
+def mean_std(df: pd.DataFrame, group_cols: List[str], value_col: str) -> pd.DataFrame:
+    """Mean +/- standard deviation of value_col over seed, grouped by
+    group_cols -- unlike mean_ci95's standard error, this doesn't shrink as
+    more seeds/folds are added, so it stays a direct read of how much
+    individual runs (e.g. K-fold splits) actually vary. Stat columns are
+    prefixed "_" so they never collide with a group_cols name (e.g. "n")."""
+    agg = df.groupby(group_cols)[value_col].agg(_mean="mean", _std="std", _count="count").reset_index()
+    agg["mean"] = agg["_mean"]
+    agg["std"] = np.where(agg["_count"] > 1, agg["_std"].fillna(0.0), 0.0)
+    return agg.drop(columns=["_mean", "_std", "_count"])
+
+
 def save_dataset_legend(outdir: str, dpi: int, emit_pdf: bool = False, filename: str = "dataset-legend.png") -> None:
     apply_style(dpi)
     fig, ax = plt.subplots(figsize=(6.4, 0.25))
     ax.axis("off")
     handles = [
-        plt.Rectangle((0, 0), 1, 1, facecolor=DATASET_COLORS[d], hatch=DATASET_HATCHES[d],
-                     edgecolor="black", linewidth=0.4)
+        plt.Line2D([0], [0], color=DATASET_COLORS[d], marker=DATASET_MARKERS[d],
+                  markersize=4, linewidth=0.8)
         for d in DATASETS
     ]
     labels = [DATASET_LABELS[d] for d in DATASETS]

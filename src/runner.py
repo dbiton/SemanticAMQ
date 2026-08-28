@@ -475,19 +475,19 @@ def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, flo
     }
 
 
-# The ablation sweep now varies BallCoverFilter's quantize choice rather than
+# The quantization sweep varies BallCoverFilter's quantize choice rather than
 # the retired per-level construction strategies. NONE is included as the
 # raw/unquantized baseline point in this same sweep (tagged stage="ball")
 # rather than a separate per-candidate stage: Gonzalez construction no
 # longer varies by quantize choice, so there's exactly one "ball" cover to
 # compare every real quantizer against, not one per candidate.
-ABLATION_QUANTIZE_SWEEP = (
+QUANTIZATION_SWEEP = (
     Quantize.NONE, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
     Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.PQ,
 )
 
 
-def ablation_worker(
+def quantization_worker(
     dim: int,
     dataset: str,
     k: int,
@@ -504,7 +504,7 @@ def ablation_worker(
     applies during construction (Quantize.NONE for the raw, unquantized
     Gonzalez cover), then evaluates it at every tau. Returns one row per tau,
     tagged stage="ball" for quantize=Quantize.NONE and stage="quantizing"
-    otherwise, so a caller sweeping every ABLATION_QUANTIZE_SWEEP member gets
+    otherwise, so a caller sweeping every QUANTIZATION_SWEEP member gets
     one row group per member, with NONE serving as the baseline point in that
     same sweep rather than a value repeated across jobs.
 
@@ -514,7 +514,7 @@ def ablation_worker(
     different per quantize choice (a more compact code packs more balls into
     the same byte budget) rather than trivially equal to k for every
     candidate, and is also what the recorded memory_bytes (filt.get_bytesize())
-    tracks as plot_ablation.py's x-axis. That tracking isn't exact for every
+    tracks as plot_quantization.py's x-axis. That tracking isn't exact for every
     quantize choice, though: BallCoverFilter caps ball count at
     min(max_count_balls, n_construct), so a quantizer compact enough that
     max_count_balls exceeds the construct-set size (e.g. PQ, whose ~8-12
@@ -936,7 +936,7 @@ _WORKER_FNS: Dict[str, Any] = {
     'dynamic': dynamic_worker,
     'system':  system_worker,
     'system_tau': system_tau_worker,
-    'ablation': ablation_worker,
+    'quantization': quantization_worker,
     'query_performance': query_performance_worker,
     'equal_memory': equal_memory_worker,
     'scaling_query': scaling_query_worker,

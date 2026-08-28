@@ -6,8 +6,8 @@ import inspect
 import numpy as np
 import pandas as pd
 
-from runner import Runner, ABLATION_QUANTIZE_SWEEP
-from plots.plot_ablation import generate_ablation_figures
+from runner import Runner, QUANTIZATION_SWEEP
+from plots.plot_quantization import generate_quantization_figures
 from plots.plot_query_performance import generate_query_performance_figures
 from plots.plot_equal_memory import generate_equal_memory_figures
 from plots.plot_scaling import generate_scaling_figures
@@ -24,13 +24,13 @@ from filters.hnsw_filter import HNSWFilter
 from filters.ivf_filter import IVFFilter
 from util.dataset_paths import dataset_filenames
 from util.fetch_datasets import load_embeds
-from vector_source import VectorSource
+from vector_source import VectorSource, ArrayVectorSource
 
-MAX_WORKERS = 2
+MAX_WORKERS = 4
 DATASET = 'ELI5'
 
 # Registry name -> canonical dataset key, shared by every long-format
-# evaluation (ablation, query_performance, scaling, streaming). Derived from
+# evaluation (quantization, query_performance, scaling, streaming). Derived from
 # plot_common so the dataset trio has one source of truth.
 DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
 
@@ -354,24 +354,46 @@ def generate_system_tau() -> Tuple[pd.DataFrame, int]:
     """
     Measure how much a semantic filter reduces accesses to a flat L2 index
     that explicitly stores all construct vectors: fixed ball budget k, one
-    BallCoverFilter cover built per (dataset, seed), then queried at every
+    BallCoverFilter cover built per (dataset, fold), then queried at every
     tau in a sweep (system_tau_worker). tau_values is one fixed,
     dataset-independent set of absolute L2 distances shared across all
     datasets, so redundancy_rate is a reported *outcome* of a given tau
     rather than a quantity tau is solved for -- see plot_system_tau's
     redundancy-rate-vs-tau panel.
 
+    use_kfold selects between two construct/query splitting protocols:
+      - True (default): k-fold cross-validation. Each dataset is cut into
+        k_folds contiguous, equal-sized intervals, and every fold in turn
+        plays the role a fixed prefix used to play -- that fold's interval
+        becomes the construct set (the filter/index reference set), and
+        every other point in the dataset becomes the query set. Each fold
+        is submitted with seed=fold, so the existing per-seed aggregation
+        in plot_system_tau.py (mean_std) turns into a per-fold mean +/- std
+        across k_folds independent construct/query splits instead of a
+        single point estimate.
+      - False: a single run per dataset, with construct_size set directly
+        instead of derived from k_folds. The first construct_size vectors
+        become the construct set and every remaining vector becomes the
+        query set (seed=0). There's only one split, so plot_system_tau's
+        per-fold std collapses to 0 (its error bars are already skipped
+        when std == 0 -- see _line_panel).
+    Either way, the query set generally isn't contiguous on disk once its
+    held-out interval sits in the middle of the dataset, so it's shipped to
+    the worker as an ArrayVectorSource (materialized in memory) rather than
+    a VectorSource (lazy, contiguous-range-only); the construct set stays a
+    plain VectorSource since it's always a single contiguous interval.
+
     Writes results/system_tau.csv. Returns the long-format df plus k, since
     plot_system_tau() needs it for the per-panel annotation and there's
     nothing to derive it from -- k is fixed by construction, not swept.
     """
-    num_vectors           = 100_000
+    num_vectors           = 100000
     dim                   = 384
-    percentage_construct  = 10
-    # k is scaled off the construct-set size rather than a fixed constant.
-    k_fraction              = 0.2
-    tau_values              = [float(t) for t in np.linspace(0.01, 0.15, 6)]
-    seeds                   = [0]
+    use_kfold             = False
+    k_folds               = 5
+    construct_percentage  = 0.95
+    k_fraction              = 0.1
+    tau_values              = [float(t) for t in np.linspace(0.01, 0.1, 10)]
     output_csv              = "results/system_tau.csv"
 
     datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
@@ -384,11 +406,13 @@ def generate_system_tau() -> Tuple[pd.DataFrame, int]:
             f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
         )
 
-    construct_sizes = {d: len(load_embeds(d, num_vectors)[0]) * percentage_construct // 100 for d in datasets}
+    construct_size = int(num_vectors * construct_percentage)
+    construct_sizes = {d: (num_vectors // k_folds if use_kfold else construct_size) for d in datasets}
     min_construct = min(construct_sizes.values())
     k = round(k_fraction * min_construct)
     print(f"Scaling k to {k} ({k_fraction:.0%} of the smallest construct set, {min_construct} vectors)")
     print(f"Fixed tau sweep (shared across datasets): {tau_values}")
+    print(f"K-fold cross-validation: {k_folds} folds" if use_kfold else f"Single run: construct_size={construct_size}")
 
     # tau is fixed up front (not solved for), so the construction-tightness
     # knob is a single global median instead of a per-dataset one.
@@ -399,23 +423,31 @@ def generate_system_tau() -> Tuple[pd.DataFrame, int]:
     for dataset in datasets:
         vectors = load_embeds(dataset, num_vectors)[0]
         n = len(vectors)  # a dataset may hold fewer than num_vectors
-        num_construct = n * percentage_construct // 100
-        vectors_construct = vectors[:num_construct]
-        vectors_query = vectors[num_construct:]
 
-        construct_source = VectorSource(dataset, 0, num_construct)
-        query_source = VectorSource(dataset, num_construct, n)
+        if use_kfold:
+            fold_edges = [int(e) for e in np.linspace(0, n, k_folds + 1)]
+            splits = [(fold_edges[fold], fold_edges[fold + 1], fold) for fold in range(k_folds)]
+        else:
+            splits = [(0, min(construct_size, n), 0)]
 
-        print(f"{dataset}: computing ground truth at {len(tau_values)} fixed tau values...")
-        construct_arr = np.ascontiguousarray(vectors_construct, dtype=np.float32)
-        query_arr = np.ascontiguousarray(vectors_query, dtype=np.float32)
-        index = faiss.IndexFlatL2(dim)
-        index.add(construct_arr)
-        nn_sq_dist, _ = index.search(query_arr, 1)
-        nn_dist = np.sqrt(np.clip(nn_sq_dist[:, 0], 0, None))
-        actual_results_by_tau = {t: (nn_dist <= t).tolist() for t in tau_values}
+        for start, stop, seed in splits:
+            vectors_construct = vectors[start:stop]
+            vectors_query = np.concatenate([vectors[:start], vectors[stop:]])
 
-        for seed in seeds:
+            construct_source = VectorSource(dataset, start, stop)
+            query_source = ArrayVectorSource(dataset_name=dataset, start=0, stop=len(vectors_query),
+                                             array=vectors_query)
+
+            split_label = f"fold {seed}/{k_folds}" if use_kfold else "single run"
+            print(f"{dataset} {split_label}: computing ground truth at {len(tau_values)} fixed tau values...")
+            construct_arr = np.ascontiguousarray(vectors_construct, dtype=np.float32)
+            query_arr = np.ascontiguousarray(vectors_query, dtype=np.float32)
+            index = faiss.IndexFlatL2(dim)
+            index.add(construct_arr)
+            nn_sq_dist, _ = index.search(query_arr, 1)
+            nn_dist = np.sqrt(np.clip(nn_sq_dist[:, 0], 0, None))
+            actual_results_by_tau = {t: (nn_dist <= t).tolist() for t in tau_values}
+
             runner.submit(
                 'system_tau',
                 dim=dim, dataset=DATASET_KEYS[dataset],
@@ -425,7 +457,7 @@ def generate_system_tau() -> Tuple[pd.DataFrame, int]:
             )
 
     job_results = runner.run()
-    print("System (fixed tau-sweep) evaluation completed.")
+    print(f"System (fixed tau-sweep, {'K-fold' if use_kfold else 'single run'}) evaluation completed.")
 
     df = pd.DataFrame([row for job_rows in job_results for row in job_rows])
 
@@ -440,18 +472,18 @@ def plot_system_tau(df: pd.DataFrame, k: int) -> None:
     generate_system_tau_figures(df, k_fixed=k)
 
 
-def generate_ablation() -> pd.DataFrame:
+def generate_quantization() -> pd.DataFrame:
     """
     Generate the per-quantize-variant construction data for BallCoverFilter
-    (ABLATION_QUANTIZE_SWEEP: the raw/unquantized cover plus every scalar/
+    (QUANTIZATION_SWEEP: the raw/unquantized cover plus every scalar/
     product quantizer) on a single dataset (DATASET), and write it to
-    results/ablation.csv. Every candidate in the sweep shares one memory
+    results/quantization.csv. Every candidate in the sweep shares one memory
     budget per k (derived from k against the unquantized cover's byte-per-
     ball size), so a more compact quantizer's realized ball count can pack
-    more balls into that same budget -- which is what lets plot_ablation.py
+    more balls into that same budget -- which is what lets plot_quantization.py
     use each row's recorded memory usage as the x-axis with one line per
     quantize method, instead of faceting bars by dataset. That tracking is
-    imperfect for the most compact quantizers (see ablation_worker's
+    imperfect for the most compact quantizers (see quantization_worker's
     docstring): a quantizer compact enough to want more balls than the
     construct set actually has saturates at n_construct balls short of the
     nominal budget, so its memory-usage line goes flat across the k sweep
@@ -477,7 +509,7 @@ def generate_ablation() -> pd.DataFrame:
     k_fractions            = [0.03, 0.06, 0.125, 0.25]
     duplicate_percentages  = [10]
     seeds                  = [0]
-    output_csv             = "results/ablation.csv"
+    output_csv             = "results/quantization.csv"
 
     dataset = DATASET
     vectors = load_embeds(dataset, num_vectors)[0]
@@ -500,7 +532,7 @@ def generate_ablation() -> pd.DataFrame:
     tau_values = [calculate_nn_distance_threshold(vectors_construct, p) for p in duplicate_percentages]
     print(f"Scaling tau_values to {tau_values} ({duplicate_percentages}-th percentile NN distance)")
 
-    # Kept for interface parity with ablation_worker's signature; unused there
+    # Kept for interface parity with quantization_worker's signature; unused there
     # now that BallCoverFilter's Gonzalez construction has no distance-
     # threshold knob to feed (only quantize varies the cover, not tau).
     construct_tau = float(np.median(tau_values))
@@ -514,9 +546,9 @@ def generate_ablation() -> pd.DataFrame:
     runner = Runner(num_workers=MAX_WORKERS)
     for k in k_values:
         for seed in seeds:
-            for quantize in ABLATION_QUANTIZE_SWEEP:
+            for quantize in QUANTIZATION_SWEEP:
                 runner.submit(
-                    'ablation',
+                    'quantization',
                     dim=dim, dataset=dataset,
                     k=k, quantize=quantize, tau_values=tau_values, seed=seed, construct_tau=construct_tau,
                     vectors_construct=construct_source, vectors_query=query_source,
@@ -524,7 +556,7 @@ def generate_ablation() -> pd.DataFrame:
                 )
 
     job_results = runner.run()
-    print("Ablation evaluation completed.")
+    print("Quantization evaluation completed.")
 
     df = pd.DataFrame([row for job_rows in job_results for row in job_rows])
 
@@ -535,15 +567,15 @@ def generate_ablation() -> pd.DataFrame:
     return df
 
 
-def plot_ablation(df: pd.DataFrame) -> None:
-    generate_ablation_figures(df)
+def plot_quantization(df: pd.DataFrame) -> None:
+    generate_quantization_figures(df)
 
 
 def generate_query_performance() -> pd.DataFrame:
     """
     Measure single-query vs. batched-query latency/throughput of a
     BallCoverFilter cover as a function of filter size k, across the 3
-    datasets in DATASET_KEYS (unlike generate_ablation(), which now runs on
+    datasets in DATASET_KEYS (unlike generate_quantization(), which now runs on
     a single dataset). One job per (dataset, k, seed), flattened into a
     long-format DataFrame, written to results/query_performance.csv. Render
     with plot_query_performance().
@@ -569,7 +601,7 @@ def generate_query_performance() -> pd.DataFrame:
 
     # k >= a dataset's construct-set size makes BallCoverFilter fall back to
     # one zero-radius ball per point, so clamp the sweep the same way
-    # generate_ablation() does (kept defensive even though the 100K-row
+    # generate_quantization() does (kept defensive even though the 100K-row
     # datasets comfortably support k=1024 at 20% construct).
     construct_sizes = {d: len(load_embeds(d, num_vectors)[0]) * percentage_construct // 100 for d in datasets}
     min_construct = min(construct_sizes.values())
@@ -1035,14 +1067,14 @@ def generate_and_plot_all() -> None:
     below). The early return currently isolates system_tau for standalone
     testing; remove it to also run the other 5.
     """
-    # plot_ablation(generate_ablation())
+    plot_quantization(generate_quantization())
     # plot_scaling(*generate_scaling())
     # plot_streaming(*generate_streaming())
     # plot_equal_memory(generate_equal_memory()) # failed on 100K
-    plot_system_tau(*generate_system_tau())
+    # plot_system_tau(*generate_system_tau())
     return
     try:
-        plot_ablation(generate_ablation())
+        plot_quantization(generate_quantization())
     except Exception as e:
         print(f"An error occurred: {e}")
     return
@@ -1067,7 +1099,7 @@ def plot_all() -> None:
     Re-render every figure from data a prior generate_and_plot_all() run
     already persisted to disk, without repeating the (expensive) evaluation
     sweeps -- handy for iterating on plot styling alone. Reads back
-    results/{ablation,query_performance,scaling,streaming,system_tau}.csv,
+    results/{quantization,query_performance,scaling,streaming,system_tau}.csv,
     re-deriving whatever generate-time metadata (k, k_fixed,
     T_representative) each plot_ needs directly from the loaded data instead
     of threading it through from the generate_ call. Requires at least one
@@ -1081,8 +1113,8 @@ def plot_all() -> None:
         print(f"An error occurred: {e}")
 
     try:
-        df = pd.read_csv("results/ablation.csv")
-        plot_ablation(df)
+        df = pd.read_csv("results/quantization.csv")
+        plot_quantization(df)
     except Exception as e:
         print(f"An error occurred: {e}")
 

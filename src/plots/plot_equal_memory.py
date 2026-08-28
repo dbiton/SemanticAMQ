@@ -3,7 +3,7 @@
 Self-contained: reads a long-format results file (one row per filter config /
 memory budget), and writes PNG (optionally PDF) panels sized for
 `\\includegraphics[width=\\linewidth]` inside `subfigure{0.24\\linewidth}` cells
-of a two-column `figure*`, matching plot_ablation.py / plot_query_performance.py's
+of a two-column `figure*`, matching plot_quantization.py / plot_query_performance.py's
 panel styling.
 
 Edit the CONFIG block below to change parameters -- no CLI flags.
@@ -23,7 +23,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 
-from plots.plot_ablation import apply_style
+from plots.plot_quantization import apply_style
 
 # --------------------------------------------------------------------------- #
 # CONFIG
@@ -296,7 +296,7 @@ def generate_equal_memory_figures(
     """
     Library entry point: render the four equal-memory-comparison panels
     (+ legend) from an in-memory long-format DataFrame, the same way
-    plot_ablation.generate_ablation_figures is called directly on an
+    plot_quantization.generate_quantization_figures is called directly on an
     in-memory df instead of round-tripping through a file. If `df` is
     omitted, falls back to load_data() (CONFIG-driven, reads INPUT_PATH) so
     the script still works standalone.

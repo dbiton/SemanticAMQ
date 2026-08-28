@@ -1,13 +1,13 @@
-"""Generate the five ablation-figure panels (+ shared legend) for the PVLDB paper.
+"""Generate the five quantization-figure panels (+ shared legend) for the PVLDB paper.
 
 Self-contained: reads a long-format results file (one row per (quantize, k,
-seed) on a single dataset -- see main.py::generate_ablation), aggregates over
+seed) on a single dataset -- see main.py::generate_quantization), aggregates over
 seeds, and writes PNG (optionally PDF) panels sized for
 `\\includegraphics[width=\\linewidth]` inside `subfigure{0.24\\linewidth}` cells
 of a two-column `figure*`.
 
 Each panel is a line plot: x-axis = memory usage (MB, log scale, driven by
-the k sweep -- see ablation_worker's docstring for how closely memory usage
+the k sweep -- see quantization_worker's docstring for how closely memory usage
 tracks k for a given quantize choice, which isn't exact for the most compact
 quantizers), one line per quantize method (color + marker), for the single
 dataset the input was generated on. This replaced an earlier per-dataset
@@ -38,16 +38,16 @@ from plots.plot_common import apply_style as _apply_style, save_figure
 # CONFIG
 # --------------------------------------------------------------------------- #
 
-INPUT_PATH = "results/ablation.csv"
-OUTDIR = "plots/ablation/"
+INPUT_PATH = "results/quantization.csv"
+OUTDIR = "plots/quantization/"
 TAU: Optional[float] = None  # None => median tau present in the data
 DPI = 400
 EMIT_PDF = False
 
-# runner.ABLATION_QUANTIZE_SWEEP, mirrored here (rather than imported) so
+# runner.QUANTIZATION_SWEEP, mirrored here (rather than imported) so
 # this module has no dependency on runner.py's multiprocessing/harness
 # machinery -- just the Quantize enum both sides already agree on. NONE is
-# the raw/unquantized cover (tagged stage="ball" by ablation_worker); every
+# the raw/unquantized cover (tagged stage="ball" by quantization_worker); every
 # other entry is a real quantizer sharing that same cover's memory budget
 # (tagged stage="quantizing"), which is what makes the n-balls panel
 # meaningful: a more compact code packs more balls into the same budget.
@@ -69,7 +69,7 @@ STAGE_LABELS = {
 }
 # Reference stage for the two relative-objective panels: the raw/unquantized
 # cover, matching the "reduction relative to the ball cover" reading the
-# panels had before per-quantize ablation existed.
+# panels had before per-quantize breakdown existed.
 BASELINE_STAGE = Quantize.NONE.value
 
 # tab10 has 10 qualitative colors; 9 quantize variants fit with one to spare.
@@ -144,7 +144,7 @@ def _validate_schema(df: pd.DataFrame) -> None:
     n_datasets = df["dataset"].nunique()
     if n_datasets != 1:
         raise ValueError(
-            f"Expected a single-dataset input (see generate_ablation()), found "
+            f"Expected a single-dataset input (see generate_quantization()), found "
             f"{n_datasets}: {sorted(df['dataset'].unique())}"
         )
 
@@ -160,7 +160,7 @@ def _validate_schema(df: pd.DataFrame) -> None:
 def load_data() -> pd.DataFrame:
     if not os.path.exists(INPUT_PATH):
         raise FileNotFoundError(
-            f"Input file not found: {INPUT_PATH!r}. Run generate_ablation() (main.py) "
+            f"Input file not found: {INPUT_PATH!r}. Run generate_quantization() (main.py) "
             "first, or point INPUT_PATH at a real results file."
         )
     if INPUT_PATH.endswith(".parquet"):
@@ -319,7 +319,7 @@ def _line_panel(
 def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _line_panel(
         df, "log10_J", r"$\log_{10} J(\mathcal{C})/J_{\mathrm{ball}}$",
-        "ablation-geometric-objective.png", cfg, use_tau=False, relative_to_baseline=True,
+        "quantization-geometric-objective.png", cfg, use_tau=False, relative_to_baseline=True,
     )
 
 
@@ -336,7 +336,7 @@ def panel_threshold_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     return _line_panel(
         df, "log10_J_tau", r"$\log_{10} J_\tau(\mathcal{C})/J_{\tau,\mathrm{ball}}$",
-        "ablation-threshold-expanded-objective.png", cfg, use_tau=True,
+        "quantization-threshold-expanded-objective.png", cfg, use_tau=True,
         relative_to_baseline=True, extra=annotate,
     )
 
@@ -391,7 +391,7 @@ def panel_fpr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     ax.set_ylabel("FPR")
     _style_axes(ax)
 
-    _save(fig, "ablation-false-positive-rate.png", cfg)
+    _save(fig, "quantization-false-positive-rate.png", cfg)
     return agg
 
 
@@ -400,12 +400,12 @@ def panel_fpr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 
 def panel_construction_time(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    # stage_time_s == cum_time_s in ablation_worker (each row is a single
+    # stage_time_s == cum_time_s in quantization_worker (each row is a single
     # from-scratch construction, not a multi-stage pipeline), so there's no
     # separate "cumulative" series to overlay here the way the old bar panel
     # did -- one line per quantize method is the whole picture.
     return _line_panel(
-        df, "cum_time_s", "Time (s)", "ablation-construction-time.png", cfg,
+        df, "cum_time_s", "Time (s)", "quantization-construction-time.png", cfg,
         use_tau=False, log_y=True,
     )
 
@@ -422,7 +422,7 @@ def panel_n_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     the same budget, so at a given x (memory usage) the lines are expected to
     separate, with PQ/SQ4 highest and None/FP16/BF16 lowest."""
     return _line_panel(
-        df, "n_balls", "Number of Balls", "ablation-n-balls.png", cfg, use_tau=False,
+        df, "n_balls", "Number of Balls", "quantization-n-balls.png", cfg, use_tau=False,
     )
 
 
@@ -452,7 +452,7 @@ def save_legend(cfg: Config) -> None:
     )
     fig.patch.set_alpha(0.0)
 
-    path = os.path.join(cfg.outdir, "ablation-legend.png")
+    path = os.path.join(cfg.outdir, "quantization-legend.png")
     os.makedirs(cfg.outdir, exist_ok=True)
     fig.savefig(path, dpi=cfg.dpi, bbox_inches="tight", pad_inches=0.01, transparent=True)
     if cfg.emit_pdf:
@@ -474,7 +474,7 @@ def _save(fig: plt.Figure, filename: str, cfg: Config) -> None:
 # --------------------------------------------------------------------------- #
 
 def print_summary(df: pd.DataFrame, cfg: Config) -> None:
-    print(f"\n--- Ablation summary (tau={cfg.tau:g}) ---")
+    print(f"\n--- Quantization summary (tau={cfg.tau:g}) ---")
     header = (f"{'quantize':>9} {'memory (MB)':>12} {'d(log10 J) vs None':>20} "
               f"{'fpr':>12} {'time (s)':>10} {'n_balls':>8}")
     print(header)
@@ -502,7 +502,7 @@ def print_summary(df: pd.DataFrame, cfg: Config) -> None:
 # Main
 # --------------------------------------------------------------------------- #
 
-def generate_ablation_figures(
+def generate_quantization_figures(
     df: Optional[pd.DataFrame] = None,
     outdir: str = OUTDIR,
     tau: Optional[float] = TAU,
@@ -510,7 +510,7 @@ def generate_ablation_figures(
     emit_pdf: bool = EMIT_PDF,
 ) -> None:
     """
-    Library entry point: render the five ablation panels (+ legend) from an
+    Library entry point: render the five quantization panels (+ legend) from an
     in-memory long-format DataFrame instead of round-tripping through a file.
     If `df` is omitted, falls back to `load_data()` (CONFIG-driven, reads
     INPUT_PATH) so the script still works standalone.
@@ -534,31 +534,31 @@ def generate_ablation_figures(
     snippet = r"""
 \begin{subfigure}[b]{\linewidth}
     \centering
-    \includegraphics[width=0.6\linewidth]{figures/ablation-legend.png}
+    \includegraphics[width=0.6\linewidth]{figures/quantization-legend.png}
 \end{subfigure}\\[-0.3em]
 \begin{subfigure}[b]{0.24\linewidth}
     \centering
-    \includegraphics[width=\linewidth]{figures/ablation-geometric-objective.png}
+    \includegraphics[width=\linewidth]{figures/quantization-geometric-objective.png}
     \caption{Geometric objective}
 \end{subfigure}
 \begin{subfigure}[b]{0.24\linewidth}
     \centering
-    \includegraphics[width=\linewidth]{figures/ablation-threshold-expanded-objective.png}
+    \includegraphics[width=\linewidth]{figures/quantization-threshold-expanded-objective.png}
     \caption{$\tau$-expanded objective}
 \end{subfigure}
 \begin{subfigure}[b]{0.24\linewidth}
     \centering
-    \includegraphics[width=\linewidth]{figures/ablation-false-positive-rate.png}
+    \includegraphics[width=\linewidth]{figures/quantization-false-positive-rate.png}
     \caption{False positive rate}
 \end{subfigure}
 \begin{subfigure}[b]{0.24\linewidth}
     \centering
-    \includegraphics[width=\linewidth]{figures/ablation-construction-time.png}
+    \includegraphics[width=\linewidth]{figures/quantization-construction-time.png}
     \caption{Construction time}
 \end{subfigure}
 \begin{subfigure}[b]{0.24\linewidth}
     \centering
-    \includegraphics[width=\linewidth]{figures/ablation-n-balls.png}
+    \includegraphics[width=\linewidth]{figures/quantization-n-balls.png}
     \caption{Ball count}
 \end{subfigure}
 """.strip("\n")
@@ -567,7 +567,7 @@ def generate_ablation_figures(
 
 
 def main() -> None:
-    generate_ablation_figures()
+    generate_quantization_figures()
 
 
 if __name__ == "__main__":

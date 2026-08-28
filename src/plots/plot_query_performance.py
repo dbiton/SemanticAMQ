@@ -4,7 +4,7 @@ Self-contained: reads a long-format results file (one row per
 dataset/k/seed/mode), aggregates over seeds, and writes PNG (optionally PDF)
 panels sized for `\\includegraphics[width=\\linewidth]` inside
 `subfigure{0.24\\linewidth}` cells of a two-column `figure*`, matching
-plot_ablation.py's panel styling.
+plot_quantization.py's panel styling.
 
 Edit the CONFIG block below to change parameters -- no CLI flags.
 """
@@ -23,7 +23,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 
-from plots.plot_common import DATASETS, DATASET_LABELS, DATASET_COLORS, DATASET_HATCHES, apply_style as _apply_style, save_figure, save_dataset_legend, mean_ci95
+from plots.plot_common import DATASETS, DATASET_LABELS, DATASET_COLORS, apply_style as _apply_style, save_figure, save_dataset_legend, mean_ci95
 
 # --------------------------------------------------------------------------- #
 # CONFIG
@@ -272,7 +272,7 @@ def generate_query_performance_figures(
     """
     Library entry point: render the four query-performance panels (+ legend)
     from an in-memory long-format DataFrame, the same way
-    plot_ablation.generate_ablation_figures is called directly on an
+    plot_quantization.generate_quantization_figures is called directly on an
     in-memory df instead of round-tripping through a file. If `df` is
     omitted, falls back to load_data() (CONFIG-driven, honors DEMO/INPUT_PATH)
     so the script still works standalone.
