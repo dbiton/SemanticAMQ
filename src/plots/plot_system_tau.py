@@ -1,10 +1,9 @@
-"""System-evaluation figures for the *fixed*-tau sweep (see
+"""System-evaluation figures for the fixed-tau sweep (see
 main.generate_system_tau): fixed ball budget k, tau itself is the swept
 independent variable -- a single, dataset-independent set of absolute L2
-distances applied identically to all 3 datasets, unlike plot_system.py's
-sweep where tau is reverse-engineered per dataset to hit a target
-redundancy rate. redundancy_rate is therefore a reported *outcome* of a
-given tau here, not the quantity tau is solved for.
+distances applied identically to all datasets. redundancy_rate is
+therefore a reported *outcome* of a given tau here, not a quantity tau is
+solved for.
 
 Five panels, one line per dataset:
   (a) Throughput Improvement (%) of the filtered pipeline over the
@@ -28,7 +27,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from plots.plot_common import DATASETS, DATASET_COLORS, apply_style, style_axes, save_figure, save_dataset_legend, mean_ci95, wrap_label
+from plots.plot_common import DATASETS, DATASET_COLORS, DATASET_MARKERS, apply_style, style_axes, save_figure, save_dataset_legend, mean_ci95, mean_std, wrap_label
 
 INPUT_PATH = "results/system_tau.csv"
 OUTDIR = "plots/system_tau/"
@@ -58,10 +57,11 @@ def _synthesize_demo_data() -> pd.DataFrame:
     seeds = [0, 1, 2]
     k_fixed = 256
 
-    base_redundancy = {"eli5": 1.6, "mmlu": 1.3, "wildchat": 1.9}  # tau -> redundancy_rate curvature
-    base_speedup = {"eli5": 180.0, "mmlu": 150.0, "wildchat": 210.0}
-    base_fpr = {"eli5": 0.02, "mmlu": 0.03, "wildchat": 0.015}
-    base_log10_j = {"eli5": 140.0, "mmlu": 128.0, "wildchat": 115.0}
+    # tau -> redundancy_rate curvature
+    base_redundancy = {"eli5": 1.6, "mmlu": 1.3, "wildchat": 1.9, "msmarco": 1.4, "hotpotqa": 1.7}
+    base_speedup = {"eli5": 180.0, "mmlu": 150.0, "wildchat": 210.0, "msmarco": 165.0, "hotpotqa": 195.0}
+    base_fpr = {"eli5": 0.02, "mmlu": 0.03, "wildchat": 0.015, "msmarco": 0.025, "hotpotqa": 0.018}
+    base_log10_j = {"eli5": 140.0, "mmlu": 128.0, "wildchat": 115.0, "msmarco": 132.0, "hotpotqa": 121.0}
     n_queries = 9000
 
     rows = []
@@ -121,10 +121,14 @@ def resolve_config(df: pd.DataFrame, k_fixed: Optional[int] = K_FIXED, dpi: int 
 def _line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg: Config,
                 bounded_unit: bool = False) -> pd.DataFrame:
     """One line per dataset, plotted against tau itself -- tau is the fixed,
-    dataset-independent independent variable in this sweep (contrast
-    plot_system.py, where the shared x-axis is the measured redundancy rate
-    tau was solved for). Aggregated over the seed sweep by (dataset, tau)."""
-    agg = mean_ci95(df, ["dataset", "tau"], value_col)
+    dataset-independent independent variable in this sweep. Aggregated over
+    the seed sweep (one seed per K-fold split) by (dataset, tau); error bars
+    show +/- 1 standard deviation across folds, not standard error, so they
+    read as "how much do folds actually disagree" rather than shrinking
+    just because more folds were run. Each dataset also gets its own marker
+    shape (DATASET_MARKERS), not just its own color, so lines stay
+    distinguishable without relying on color alone."""
+    agg = mean_std(df, ["dataset", "tau"], value_col)
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots()
@@ -132,10 +136,10 @@ def _line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cf
         sub = agg[agg["dataset"] == dataset].sort_values("tau")
         if sub.empty:
             continue
-        ax.plot(sub["tau"], sub["mean"], color=DATASET_COLORS[dataset], marker="o",
+        ax.plot(sub["tau"], sub["mean"], color=DATASET_COLORS[dataset], marker=DATASET_MARKERS[dataset],
                markersize=2.5, linewidth=0.8, zorder=2)
-        if (sub["ci95"] > 0).any():
-            ax.errorbar(sub["tau"], sub["mean"], yerr=sub["ci95"], fmt="none",
+        if (sub["std"] > 0).any():
+            ax.errorbar(sub["tau"], sub["mean"], yerr=sub["std"], fmt="none",
                        ecolor=DATASET_COLORS[dataset], elinewidth=0.5, capsize=1.5, capthick=0.5, zorder=3)
 
     if bounded_unit:
@@ -174,8 +178,8 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 def panel_redundancy_rate(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     """Redundancy rate as a function of tau -- the calibration curve this
-    fixed-tau sweep lets a reader look up directly, since (unlike
-    plot_system.py's sweep) tau here isn't chosen to hit a target rate."""
+    fixed-tau sweep lets a reader look up directly, since tau here isn't
+    chosen to hit a target rate."""
     return _line_panel(df, "redundancy_rate", "Redundancy Rate", "system-tau-redundancy-rate.png",
                        cfg, bounded_unit=True)
 

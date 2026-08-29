@@ -40,7 +40,7 @@ class GonzalezMEBFilter(Filter):
     _BATCH_SIZE = 2048
 
     def __init__(self, dim: int, distance_threshold: float, max_memory: Optional[int] = None, max_spheres: Optional[int] = None):
-        super().__init__(dim, lsh=None, max_memory=max_memory)
+        super().__init__(dim, max_memory=max_memory)
         self.distance_threshold = distance_threshold
         self.max_spheres = (max_spheres if max_spheres is not None 
                     else self._calculate_max_spheres(self.max_memory))
@@ -274,7 +274,7 @@ class GonzalezMEBFilter(Filter):
         return in_any_sphere.tolist()
 
 
-    def add(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray) -> None:
         if not self._constructed:
             self.construct(vectors)
             return
@@ -299,18 +299,6 @@ class GonzalezMEBFilter(Filter):
                 self._add_sphere(vec, self.distance_threshold)
 
             self._merge_spheres()
-
-
-    def insert(self, vectors: np.ndarray) -> None:
-        self.add(vectors)
-
-
-    def remove(self, vectors: np.ndarray) -> List[bool]:
-        raise NotImplementedError("GonzalezMEBFilter does not support remove operation.")
-
-
-    def get_exact_matching_fpr(self) -> float:
-        return 0.0
 
 
     def get_volume(self) -> float:

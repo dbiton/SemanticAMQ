@@ -63,7 +63,7 @@ class KDBoxFilter(Filter):
     _BATCH_SIZE = 2048
 
     def __init__(self, dim: int, distance_threshold: float, max_memory: Optional[int] = None, max_spheres: Optional[int] = None):
-        super().__init__(dim, lsh=None, max_memory=max_memory)
+        super().__init__(dim, max_memory=max_memory)
         self.distance_threshold = distance_threshold
         self.max_boxes = (max_spheres if max_spheres is not None 
                     else self._calculate_max_boxes(self.max_memory))
@@ -274,7 +274,7 @@ class KDBoxFilter(Filter):
         return in_any_box.tolist()
 
 
-    def add(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray) -> None:
         if not self._constructed:
             self.construct(vectors)
             return
@@ -287,7 +287,7 @@ class KDBoxFilter(Filter):
             vector_batch = np.ascontiguousarray(vector_batch, dtype=np.float32)
 
             if self._num_boxes > 0:
-                in_each_box = np.all((vector_batch[:, None, :] >= self.all_boxes_min[None, :, :] + self.distance_threshold) & 
+                in_each_box = np.all((vector_batch[:, None, :] >= self.all_boxes_min[None, :, :] + self.distance_threshold) &
                                      (vector_batch[:, None, :] <= self.all_boxes_max[None, :, :] - self.distance_threshold), axis=2)
                 is_already_covered = np.any(in_each_box, axis=1)
                 vector_batch = vector_batch[~is_already_covered]
@@ -298,18 +298,6 @@ class KDBoxFilter(Filter):
                 self._add_box(box_min, box_max)
 
             self._merge_boxes()
-
-
-    def insert(self, vectors: np.ndarray) -> None:
-        self.add(vectors)
-
-
-    def remove(self, vectors: np.ndarray) -> List[bool]:
-        raise NotImplementedError("KDBoxFilter does not support remove operation.")
-
-
-    def get_exact_matching_fpr(self) -> float:
-        return 0.0
 
 
     def get_bytesize(self) -> int:

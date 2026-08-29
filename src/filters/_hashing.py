@@ -33,3 +33,14 @@ def stable_hash_to_int(key) -> int:
 def stable_bit_index(key, num_bits: int) -> int:
     """Map `key` to a bit position in [0, num_bits)."""
     return stable_hash_to_int(key) % num_bits
+
+
+def signature_to_key(signature):
+    """Convert an LSH signature tuple into a single filter key (a scalar
+    inputs to stable_hash_to_int can hash directly, or a colon-joined string
+    for multi-element tuples)."""
+    if isinstance(signature, tuple):
+        if len(signature) == 1:
+            return signature[0]
+        return ":".join(map(str, signature))
+    return signature

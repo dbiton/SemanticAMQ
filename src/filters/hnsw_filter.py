@@ -8,8 +8,8 @@ graph and answers "is anything within tau?" via a real (approximate)
 nearest-neighbor search on real vectors. That gives it a property no other
 filter here has: it cannot produce a structural false positive (a returned
 neighbor's distance is measured exactly against the real stored vector, not
-inferred from a hash collision), so get_exact_matching_fpr() is 0.0. What it
-trades away is BallCoverFilter's zero-false-negative guarantee -- HNSW
+inferred from a hash collision). What it trades away is BallCoverFilter's
+zero-false-negative guarantee -- HNSW
 search is approximate, so it can miss the true nearest neighbor and silently
 under-report duplicates; how often that happens is governed by
 ef_search/ef_construction/M, not bounded by construction the way a covering
@@ -49,7 +49,7 @@ class HNSWFilter(Filter):
         ef_search: int = 64,
         max_spheres: Optional[int] = None,
     ):
-        super().__init__(dim, lsh=None, max_memory=max_memory)
+        super().__init__(dim, max_memory=max_memory)
         self.distance_threshold = float(distance_threshold)
         self.M = M
         self.ef_construction = ef_construction
@@ -62,9 +62,6 @@ class HNSWFilter(Filter):
         index.hnsw.efConstruction = self.ef_construction
         index.hnsw.efSearch = self.ef_search
         return index
-
-    def get_exact_matching_fpr(self) -> float:
-        return 0.0
 
     def construct(self, vectors: np.ndarray) -> None:
         self.index = self._new_index()
@@ -83,16 +80,13 @@ class HNSWFilter(Filter):
         sq_dist, _ = self.index.search(vecs, 1)
         return (sq_dist[:, 0] <= float(tau) ** 2).tolist()
 
-    def add(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray) -> None:
         if self.index is None:
             self.construct(vectors)
             return
         vecs = np.ascontiguousarray(vectors, dtype=np.float32)
         if len(vecs) > 0:
             self.index.add(vecs)
-
-    def insert(self, vectors: np.ndarray) -> None:
-        self.add(vectors)
 
     def get_bytesize(self) -> int:
         if self.index is None:

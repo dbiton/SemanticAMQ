@@ -71,6 +71,7 @@ import numpy as np
 from pybloom_live import BloomFilter as _BloomFilter
 
 from filters.filter import Filter
+from filters._hashing import signature_to_key
 
 _MAX_RECOMMENDED_DIRECTIONS = 10
 
@@ -103,7 +104,7 @@ class CoveringLSHFallbackFilter(Filter):
         max_spheres: Optional[int] = None,
         seed: int = 42,
     ):
-        super().__init__(dim, lsh=None, max_memory=max_memory)
+        super().__init__(dim, max_memory=max_memory)
 
         if num_directions > _MAX_RECOMMENDED_DIRECTIONS:
             raise ValueError(
@@ -160,13 +161,10 @@ class CoveringLSHFallbackFilter(Filter):
         for i in range(base_cells.shape[0]):
             shifted = base_cells[i][None, :] + self._offsets  # (3**L, L)
             for row in shifted:
-                key = self._signature_to_key(tuple(row.tolist()))
+                key = signature_to_key(tuple(row.tolist()))
                 self.filter.add(key)
 
     # ------------------------------------------------------------------ Filter interface
-
-    def get_exact_matching_fpr(self) -> float:
-        return float(self._error_rate)
 
     def construct(self, vectors: np.ndarray) -> None:
         capacity = (
@@ -190,16 +188,13 @@ class CoveringLSHFallbackFilter(Filter):
         if len(vectors) == 0:
             return []
         cells = self._cell_indices(vectors)
-        return [self._signature_to_key(tuple(row.tolist())) in self.filter for row in cells]
+        return [signature_to_key(tuple(row.tolist())) in self.filter for row in cells]
 
-    def add(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray) -> None:
         if self.filter is None:
             self.construct(vectors)
             return
         self._insert_batch(vectors)
-
-    def insert(self, vectors: np.ndarray) -> None:
-        self.add(vectors)
 
     def get_bytesize(self) -> int:
         if self.filter is None:
