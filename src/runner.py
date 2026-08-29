@@ -13,7 +13,7 @@ import inspect
 from scipy.special import logsumexp
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 
-from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize
+from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize, InsufficientMemoryError
 from hyperspheres_volume import estimate_hypersphere_volume
 from vector_source import VectorSource
 
@@ -143,7 +143,7 @@ class _BallCoverFilterEvalAdapter:
 
 
 def _instantiate_filter(filter_cls: Any, dim: int, memory_budget: int, distance_threshold: float = None, max_spheres: int = None,
-                         insert_mem_percent: Optional[float] = 0.0, lsh: Any = None, extra_kwargs: Optional[Dict[str, Any]] = None) -> Any:
+                         insert_mem_percent: Optional[float] = 0.0, extra_kwargs: Optional[Dict[str, Any]] = None) -> Any:
     extra_kwargs = extra_kwargs or {}
     if filter_cls.__name__ in _DIRECT_TAU_FILTERS or 'max_spheres' in inspect.signature(filter_cls.__init__).parameters:
         if filter_cls is BallCoverFilter:
@@ -154,9 +154,9 @@ def _instantiate_filter(filter_cls: Any, dim: int, memory_budget: int, distance_
                             max_spheres=max_spheres, **extra_kwargs)
     else:
         try:
-            return filter_cls(dim=dim, max_memory=memory_budget, lsh=lsh, **extra_kwargs)
+            return filter_cls(dim=dim, max_memory=memory_budget, **extra_kwargs)
         except TypeError:
-            return filter_cls(dim=dim, lsh=lsh, **extra_kwargs)
+            return filter_cls(dim=dim, **extra_kwargs)
 
 
 def static_worker(
@@ -481,10 +481,8 @@ def _compute_tradeoff_metrics(
 
 def tradeoff_static_worker(
     filter_cls: Any,
-    lsh_cls: Any,
     dim: int,
     distance_threshold: float,
-    max_L: int,
     vectors_construct: np.ndarray,
     vectors_query: np.ndarray,
     actual_results: List[bool],
@@ -499,11 +497,10 @@ def tradeoff_static_worker(
     """
     try:
         config = filter_cls.__name__
-        lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
         vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
 
         construct_start = time.perf_counter() # start construct timer
-        filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold, max_spheres, insert_memory_percent, lsh)
+        filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold, max_spheres, insert_memory_percent)
         filter_instance.construct(vectors_construct)
         construct_latency = time.perf_counter() - construct_start # final construct time
 
@@ -526,10 +523,8 @@ def tradeoff_static_worker(
 
 def tradeoff_dynamic_worker(
     filter_cls: Any,
-    lsh_cls: Any,
     dim: int,
     distance_threshold: float,
-    max_L: int,
     vectors_construct: np.ndarray,
     vectors_query: np.ndarray,
     actual_results: List[bool],
@@ -544,11 +539,10 @@ def tradeoff_dynamic_worker(
     """
     try:
         config = filter_cls.__name__
-        lsh = lsh_cls.build_optimized(dim, distance_threshold, None, max_L)
         vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
 
         construct_start = time.perf_counter() # start construct timer
-        filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold, max_spheres, insert_memory_percent, lsh)
+        filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold, max_spheres, insert_memory_percent)
         filter_instance.construct(vectors_construct)
         construct_latency = time.perf_counter() - construct_start # final construct time
 
@@ -603,19 +597,19 @@ def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, flo
     }
 
 
-# The ablation sweep now varies BallCoverFilter's quantize choice rather than
+# The quantization sweep varies BallCoverFilter's quantize choice rather than
 # the retired per-level construction strategies. NONE is included as the
 # raw/unquantized baseline point in this same sweep (tagged stage="ball")
 # rather than a separate per-candidate stage: Gonzalez construction no
 # longer varies by quantize choice, so there's exactly one "ball" cover to
 # compare every real quantizer against, not one per candidate.
-ABLATION_QUANTIZE_SWEEP = (
+QUANTIZATION_SWEEP = (
     Quantize.NONE, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
-    Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.PQ,
+    Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.SQ2T, Quantize.PQ,
 )
 
 
-def ablation_worker(
+def quantization_worker(
     dim: int,
     dataset: str,
     k: int,
@@ -632,7 +626,7 @@ def ablation_worker(
     applies during construction (Quantize.NONE for the raw, unquantized
     Gonzalez cover), then evaluates it at every tau. Returns one row per tau,
     tagged stage="ball" for quantize=Quantize.NONE and stage="quantizing"
-    otherwise, so a caller sweeping every ABLATION_QUANTIZE_SWEEP member gets
+    otherwise, so a caller sweeping every QUANTIZATION_SWEEP member gets
     one row group per member, with NONE serving as the baseline point in that
     same sweep rather than a value repeated across jobs.
 
@@ -642,7 +636,7 @@ def ablation_worker(
     different per quantize choice (a more compact code packs more balls into
     the same byte budget) rather than trivially equal to k for every
     candidate, and is also what the recorded memory_bytes (filt.get_bytesize())
-    tracks as plot_ablation.py's x-axis. That tracking isn't exact for every
+    tracks as plot_quantization.py's x-axis. That tracking isn't exact for every
     quantize choice, though: BallCoverFilter caps ball count at
     min(max_count_balls, n_construct), so a quantizer compact enough that
     max_count_balls exceeds the construct-set size (e.g. PQ, whose ~8-12
@@ -656,7 +650,19 @@ def ablation_worker(
     construction has no distance-threshold knob to feed it (Gonzalez
     construction only takes the vectors and a ball budget).
 
-    FNR is asserted (raises on violation), never plotted."""
+    FNR is asserted (raises on violation), never plotted. Each tau also times
+    its own filt.query(query_arr, ...) call (batched over the whole query
+    set, not per-query) to report query_throughput_qps -- query cost doesn't
+    conceptually depend on tau (every ball is still checked), so this is
+    mainly a per-quantize-candidate throughput estimate with tau_values-many
+    independent samples rather than a real tau sweep of the metric.
+
+    If constructing the filter itself raises (e.g. InsufficientMemoryError:
+    too tight a memory budget for PQ's minimum 2-center codebook -- see
+    BallCoverFilter._build_quantizer), that's treated as "this quantize
+    candidate isn't viable at this (dataset, k) point" rather than a fatal
+    error: the exception is caught, a message is printed, and this job
+    contributes zero rows (returns []) instead of aborting the whole sweep."""
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
     n_q = len(query_arr)
@@ -673,15 +679,29 @@ def ablation_worker(
 
     max_memory = _ball_cover_max_memory(dim, k, Quantize.NONE)
     t0 = time.perf_counter()
-    filt = BallCoverFilter(dim=dim, max_memory=max_memory, quantize=quantize)
-    filt.construct(construct_arr)
+    try:
+        filt = BallCoverFilter(dim=dim, max_memory=max_memory, quantize=quantize)
+        filt.construct(construct_arr)
+    except Exception as e:
+        print(
+            f"Skipping quantization job (dataset={dataset}, k={k}, quantize={quantize.value}, "
+            f"seed={seed}): construction raised {type(e).__name__}: {e}"
+        )
+        return []
     stage_time = time.perf_counter() - t0
     radii = filt.all_radiuses
     log10_J = _log10_J(radii, dim)
 
     memory_bytes = filt.get_bytesize()
 
-    predicted_by_tau = {t: filt.query(query_arr, distance_threshold=t) for t in tau_values}
+    predicted_by_tau: Dict[float, List[bool]] = {}
+    query_throughput_by_tau: Dict[float, float] = {}
+    for t in tau_values:
+        q0 = time.perf_counter()
+        predicted_by_tau[t] = filt.query(query_arr, distance_threshold=t)
+        query_time = time.perf_counter() - q0
+        query_throughput_by_tau[t] = n_q / max(query_time, 1e-9)
+
     for t in tau_values:
         rates = _confusion_rates(predicted_by_tau[t], actual_by_tau[t])
         rows.append({
@@ -690,6 +710,7 @@ def ablation_worker(
             "log10_J_tau": _log10_J(radii, dim, tau=t),
             "fpr": rates["fpr"], "fnr": rates["fnr"],
             "stage_time_s": stage_time, "cum_time_s": stage_time,
+            "query_throughput_qps": query_throughput_by_tau[t],
             "n_balls": filt.count_balls, "memory_bytes": memory_bytes, "seed": seed,
         })
 
@@ -1066,7 +1087,7 @@ _WORKER_FNS: Dict[str, Any] = {
     'tradeoff_dynamic': tradeoff_dynamic_worker,
     'system':  system_worker,
     'system_tau': system_tau_worker,
-    'ablation': ablation_worker,
+    'quantization': quantization_worker,
     'query_performance': query_performance_worker,
     'equal_memory': equal_memory_worker,
     'scaling_query': scaling_query_worker,

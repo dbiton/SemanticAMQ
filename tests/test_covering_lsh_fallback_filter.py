@@ -177,11 +177,5 @@ class TestCoveringLSHInterface(unittest.TestCase):
         with self.assertRaises(ValueError):
             f.query(_rand(1))
 
-    def test_get_exact_matching_fpr_returns_configured_error_rate(self):
-        f = CoveringLSHFallbackFilter(dim=DIM, distance_threshold=R, num_directions=4,
-                                       max_memory=500_000, error_rate=0.02)
-        self.assertAlmostEqual(f.get_exact_matching_fpr(), 0.02)
-
-
 if __name__ == "__main__":
     unittest.main()

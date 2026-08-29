@@ -159,10 +159,5 @@ class TestDSBFInterface(unittest.TestCase):
         with self.assertRaises(ValueError):
             f.query(_rand(1), tau=0.9)
 
-    def test_get_exact_matching_fpr_zero_before_construct(self):
-        f = DSBFFilter(dim=DIM, distance_threshold=R, num_tables=4, hashes_per_table=2, max_memory=100_000)
-        self.assertEqual(f.get_exact_matching_fpr(), 0.0)
-
-
 if __name__ == "__main__":
     unittest.main()

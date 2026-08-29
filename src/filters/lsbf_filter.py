@@ -72,7 +72,7 @@ class LSBFFilter(Filter):
         max_spheres: Optional[int] = None,
         seed: int = 42,
     ):
-        super().__init__(dim, lsh=None, max_memory=max_memory)
+        super().__init__(dim, max_memory=max_memory)
         self.distance_threshold = float(distance_threshold)
         self.num_hashes = num_hashes
         self.sub_bits_per_hash = sub_bits_per_hash
@@ -150,38 +150,6 @@ class LSBFFilter(Filter):
 
     # ------------------------------------------------------------------ Filter interface
 
-    def get_exact_matching_fpr(self) -> float:
-        """
-        Structural estimate: probability all num_hashes primary bits are
-        already set (AND composition, from the observed fill fraction of
-        the shared array), reduced by an approximate 1/2**verify_fingerprint_bits
-        factor when verify=True. Both are documented as approximate --
-        the comparison harness measures FPR/FNR empirically and does not
-        call this method.
-        """
-        if self._primary is None or self._n_inserted == 0:
-            return 0.0
-        fill = float(np.unpackbits(self._primary).sum()) / self.primary_bits
-        base = fill ** self.num_hashes
-        if self.verify:
-            base *= 2.0 ** (-self.verify_fingerprint_bits)
-        return float(base)
-
-    def get_criteria(self, n: int, r1: float, r2: float):
-        """Approximate (FPR, FNR) from the SimHash collision model, AND-composed
-        across num_hashes -- documented as approximate/secondary (see
-        get_exact_matching_fpr); does not model the verify stage's effect on
-        near-neighbor (non-exact) recall, which is only bounded qualitatively
-        in the module docstring."""
-        p1_base, p2_base = self._lsh._get_base_probabilities(r1, r2)
-        p1_hash = p1_base ** self.sub_bits_per_hash
-        p2_hash = p2_base ** self.sub_bits_per_hash
-        p1_and = p1_hash ** self.num_hashes
-        p2_and = p2_hash ** self.num_hashes
-        fnr = 1.0 - p1_and
-        fpr = 1.0 - (1.0 - p2_and) ** max(n, 0)
-        return float(fpr), float(fnr)
-
     def construct(self, vectors: np.ndarray) -> None:
         self._reset_storage()
         self._insert_batch(vectors)
@@ -215,14 +183,11 @@ class LSBFFilter(Filter):
             results.append(self._bit_set(self._verify_buckets[bucket], fp_bit))
         return results
 
-    def add(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray) -> None:
         if self._primary is None:
             self.construct(vectors)
             return
         self._insert_batch(vectors)
-
-    def insert(self, vectors: np.ndarray) -> None:
-        self.add(vectors)
 
     # Small fixed bookkeeping cost for the verify structure. Keeps
     # get_bytesize() strictly larger for verify=True than for verify=False

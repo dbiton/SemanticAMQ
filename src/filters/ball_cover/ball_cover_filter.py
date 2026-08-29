@@ -63,7 +63,7 @@ class BallCoverFilter(Filter):
         max_spheres: Optional[int] = None,
         insert_memory_percent: Optional[float] = 0.0
     ) -> None:
-        super().__init__(dim, lsh=None, max_memory=max_memory)
+        super().__init__(dim, max_memory=max_memory)
         self.quantize = quantize
         self.construct_method = construct_method
         self.insert_method = insert_method
