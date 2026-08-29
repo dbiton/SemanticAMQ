@@ -260,83 +260,83 @@ class TestGonzalezBoxQuery(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestGonzalezBoxDynamicUpdates(unittest.TestCase):
-    def test_insert_new_vectors_updates_boxes(self):
+    def test_add_new_vectors_updates_boxes(self):
         f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f.construct(_rand(10))
-        f.insert(_rand(20, seed=42) + 100.0)
+        f.add(_rand(20, seed=42) + 100.0)
         self.assertTrue(len(f.all_boxes) <= 5)
 
-    def test_insert_before_construct_calls_construct(self):
+    def test_add_before_construct_calls_construct(self):
         f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         vecs = _rand(10)
-        f.insert(vecs)
+        f.add(vecs)
         self.assertTrue(f._constructed)
         self.assertNotIn(False, f.query(vecs))
 
-    def test_insert_empty_vectors_safe(self):
+    def test_add_empty_vectors_safe(self):
         f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f.construct(_rand(10))
-        f.insert(np.empty((0, DIM), dtype=np.float32))
+        f.add(np.empty((0, DIM), dtype=np.float32))
         self.assertTrue(f._constructed)
 
-    def test_insert_is_deterministic(self):
+    def test_insert_is_alias_to_add(self):
         f1 = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f2 = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         vecs = _rand(20)
-        f1.insert(vecs)
+        f1.add(vecs)
         f2.insert(vecs)
         self.assertTrue(np.array_equal(f1.all_boxes_min, f2.all_boxes_min))
 
-    def test_insert_covered_vector_does_not_increase_box_count(self):
+    def test_add_covered_vector_does_not_increase_box_count(self):
         f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f.construct(_rand(10, seed=42))
         box_count = len(f.all_boxes)
 
         # Midpoint of the first box is strictly inside its bounds
         covered_vec = ((f.all_boxes_min[0] + f.all_boxes_max[0]) / 2.0).reshape(1, DIM)
-        f.insert(covered_vec)
+        f.add(covered_vec)
         self.assertEqual(len(f.all_boxes), box_count)
 
-    def test_insert_duplicate_does_not_create_new_box(self):
+    def test_add_duplicate_does_not_create_new_box(self):
         vecs = _rand(5)
         f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=30)
         f.construct(vecs)
         before = len(f.all_boxes)
-        f.insert(vecs[:1])
+        f.add(vecs[:1])
         self.assertEqual(len(f.all_boxes), before)
 
-    def test_insert_growth_and_merge_at_max_boxes(self):
+    def test_add_growth_and_merge_at_max_boxes(self):
         f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=3)
         f.construct(np.array([[0.0] * DIM], dtype=np.float32))
         self.assertEqual(len(f.all_boxes), 1)
 
-        f.insert(np.array([[100.0] * DIM], dtype=np.float32))
+        f.add(np.array([[100.0] * DIM], dtype=np.float32))
         self.assertEqual(len(f.all_boxes), 2)
 
-        f.insert(np.array([[200.0] * DIM], dtype=np.float32))
+        f.add(np.array([[200.0] * DIM], dtype=np.float32))
         self.assertEqual(len(f.all_boxes), 3)
 
-        f.insert(np.array([[300.0] * DIM], dtype=np.float32))
+        f.add(np.array([[300.0] * DIM], dtype=np.float32))
         self.assertLessEqual(len(f.all_boxes), 3)
 
-    def test_insert_in_batches(self):
+    def test_add_in_batches(self):
         f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=10)
         f.construct(_rand(5))
         vecs = _rand(4000)
-        f.insert(vecs)
+        f.add(vecs)
         self.assertLessEqual(len(f.all_boxes), 10)
 
-    def test_insert_preserves_no_false_negatives_over_many_batches(self):
+    def test_add_preserves_no_false_negatives_over_many_batches(self):
         f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=8)
         all_vecs = []
         f.construct(_rand(20, seed=0))
         all_vecs.append(_rand(20, seed=0))
         for seed in range(1, 6):
             batch = _rand(15, seed=seed) * (1.0 + seed)
-            f.insert(batch)
+            f.add(batch)
             all_vecs.append(batch)
         stored = np.vstack(all_vecs)
-        self.assertTrue(all(f.query(stored)), "no-false-negative invariant broken by insert()")
+        self.assertTrue(all(f.query(stored)), "no-false-negative invariant broken by add()")
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +375,15 @@ class TestGonzalezBoxMemoryAndState(unittest.TestCase):
 
 
 class TestGonzalezBoxEdgeCasesAndInterface(unittest.TestCase):
+    def test_remove_raises_not_implemented(self):
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        with self.assertRaises(NotImplementedError):
+            f.remove(_rand(5))
+
+    def test_exact_matching_fpr_is_zero(self):
+        f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        self.assertEqual(f.get_exact_matching_fpr(), 0.0)
+
     def test_extreme_coordinates_handling(self):
         f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         extreme_vecs = np.array([[1e10, -1e10] * (DIM // 2)], dtype=np.float32)

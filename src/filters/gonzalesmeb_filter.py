@@ -190,7 +190,7 @@ class GonzalezMEBFilter(Filter):
             merged_radius = np.maximum((neighbors_radiuses + neighbors_center_dists + radius) / 2.0, 1e-6)
 
             # log(R_merged^D - (R_1^D + R_2^D)) = D*log(R_merged) + log(1 - ((R_1/R_merged)^D + (R_2/R_merged)^D))
-            merged_volumes = self.dim * np.log(merged_radius) + np.log(1.0 - ((radius / merged_radius) ** self.dim + (neighbors_radiuses / merged_radius) ** self.dim))
+            merged_volumes = self.dim * np.log(merged_radius) + np.log(np.maximum(1.0 - ((radius / merged_radius) ** self.dim + (neighbors_radiuses / merged_radius) ** self.dim), 1e-6))
 
             for volume, neighbor_idx in zip(merged_volumes, closest_neighbors):
                 neighbor_count = self._indices_count[neighbor_idx]
@@ -274,7 +274,7 @@ class GonzalezMEBFilter(Filter):
         return in_any_sphere.tolist()
 
 
-    def insert(self, vectors: np.ndarray) -> None:
+    def add(self, vectors: np.ndarray) -> None:
         if not self._constructed:
             self.construct(vectors)
             return
@@ -299,6 +299,18 @@ class GonzalezMEBFilter(Filter):
                 self._add_sphere(vec, self.distance_threshold)
 
             self._merge_spheres()
+
+
+    def insert(self, vectors: np.ndarray) -> None:
+        self.add(vectors)
+
+
+    def remove(self, vectors: np.ndarray) -> List[bool]:
+        raise NotImplementedError("GonzalezMEBFilter does not support remove operation.")
+
+
+    def get_exact_matching_fpr(self) -> float:
+        return 0.0
 
 
     def get_volume(self) -> float:

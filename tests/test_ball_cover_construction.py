@@ -6,19 +6,24 @@ import unittest
 import faiss
 import numpy as np
 
-from src.filters.ball_cover.ball_cover_construction import (
-    gonzales_construct_enclosing_balls,
-    rptree_construct_enclosing_balls,
-    ivf_construct_enclosing_balls,
-)
+from src.filters.ball_cover.ball_cover_filter import BallCoverFilter
+from src.filters.ball_cover.ball_interfaces import ConstructInterface
+from src.filters.ball_cover.gonzales_construct import GonzalesConstruct
+from src.filters.ball_cover.rptree_construct import RPTreeConstruct
+from src.filters.ball_cover.ivf_construct import IVFConstruct
 
 DIM = 8
 
-_CONSTRUCTORS = (
-    gonzales_construct_enclosing_balls,
-    rptree_construct_enclosing_balls,
-    ivf_construct_enclosing_balls,
-)
+def get_constructors():
+    """Generates the three core construct strategies."""
+    return [GonzalesConstruct(), RPTreeConstruct(), IVFConstruct()]
+
+
+def run_construct(construct_method: ConstructInterface, budget: int, vecs: np.ndarray):
+    """Helper to bridge the old functional tests to the new BallCoverFilter OOP design."""
+    safe_budget = max(0, budget)
+    f = BallCoverFilter(dim=DIM, construct_method=construct_method, max_spheres=safe_budget, insert_memory_percent=0.0)
+    return construct_method.construct_filter(f, vecs)
 
 
 def _rand(n: int, dim: int = DIM, seed: int = 0) -> np.ndarray:
@@ -38,13 +43,10 @@ def _covering_ok(vecs: np.ndarray, centers: np.ndarray, radii: np.ndarray, tol: 
     the zero-false-negative invariant every construction strategy must hold.
     Checked the way BallCoverFilter.distance_to_balls_surfaces actually
     queries: signed distance to *every* ball, take the minimum, not just
-    the geometrically nearest-by-raw-distance ball (a ball can be farther
-    away but still cover the point if its own radius is large enough)."""
+    the geometrically nearest-by-raw-distance ball."""
     if len(centers) == 0:
         return len(vecs) == 0
-    # A faiss exhaustive search rather than a raw (n, k, d) broadcast: the
-    # latter materializes a full dense tensor (e.g. 20000 x 5000 x 384
-    # floats is ~150GB) at the scale some of the tests below use.
+    
     index = faiss.IndexFlatL2(centers.shape[1])
     index.add(np.ascontiguousarray(centers, dtype=np.float32))
     d2, labels = index.search(np.ascontiguousarray(vecs, dtype=np.float32), len(centers))
@@ -54,94 +56,97 @@ def _covering_ok(vecs: np.ndarray, centers: np.ndarray, radii: np.ndarray, tol: 
 
 # ---------------------------------------------------------------------------
 # Shared contract across all three constructors. Ball count is checked as
-# "at most k", not "exactly k": unlike Gonzalez (always returns exactly k),
-# rptree rounds down to a power of 2 and IVF can drop empty inverted lists,
-# so neither guarantees hitting the requested budget exactly -- see their
-# own test classes below for the specifics of by how much and when.
+# "at most k", not "exactly k"
 # ---------------------------------------------------------------------------
 
 class TestSharedContract(unittest.TestCase):
 
     def test_empty_input_returns_empty(self):
-        for construct in _CONSTRUCTORS:
-            centers, radii = construct(10, np.empty((0, DIM), dtype=np.float32))
-            self.assertEqual(len(centers), 0, construct.__name__)
-            self.assertEqual(len(radii), 0, construct.__name__)
-            self.assertEqual(centers.shape[1], DIM, construct.__name__)
+        for construct in get_constructors():
+            centers, radii = run_construct(construct, 10, np.empty((0, DIM), dtype=np.float32))
+            name = construct.__class__.__name__
+            self.assertEqual(len(centers), 0, name)
+            self.assertEqual(len(radii), 0, name)
+            self.assertEqual(centers.shape[1], DIM, name)
 
     def test_non_positive_budget_returns_empty(self):
         vecs = _rand(20)
-        for construct in _CONSTRUCTORS:
+        for construct in get_constructors():
+            name = construct.__class__.__name__
             for budget in (0, -5):
-                centers, radii = construct(budget, vecs)
-                self.assertEqual(len(centers), 0, f"{construct.__name__} budget={budget}")
-                self.assertEqual(len(radii), 0, f"{construct.__name__} budget={budget}")
+                centers, radii = run_construct(construct, budget, vecs)
+                self.assertEqual(len(centers), 0, f"{name} budget={budget}")
+                self.assertEqual(len(radii), 0, f"{name} budget={budget}")
 
     def test_fewer_vectors_than_budget_returns_one_ball_per_vector(self):
         vecs = _rand(15)
-        for construct in _CONSTRUCTORS:
-            centers, radii = construct(50, vecs)
-            self.assertEqual(len(centers), 15, construct.__name__)
+        for construct in get_constructors():
+            name = construct.__class__.__name__
+            centers, radii = run_construct(construct, 50, vecs)
+            self.assertEqual(len(centers), 15, name)
             np.testing.assert_array_equal(radii, np.zeros(15, dtype=np.float32))
-            self.assertTrue(_covering_ok(vecs, centers, radii, tol=1e-6), construct.__name__)
+            self.assertTrue(_covering_ok(vecs, centers, radii, tol=1e-6), name)
 
     def test_n_equals_budget_returns_all_as_zero_radius_balls(self):
         vecs = _rand(12)
-        for construct in _CONSTRUCTORS:
-            centers, radii = construct(12, vecs)
-            self.assertEqual(len(centers), 12, construct.__name__)
+        for construct in get_constructors():
+            name = construct.__class__.__name__
+            centers, radii = run_construct(construct, 12, vecs)
+            self.assertEqual(len(centers), 12, name)
             np.testing.assert_array_equal(radii, np.zeros(12, dtype=np.float32))
 
     def test_never_exceeds_requested_budget(self):
         vecs = _rand(200, seed=3)
-        for construct in _CONSTRUCTORS:
-            centers, radii = construct(20, vecs)
-            self.assertLessEqual(len(centers), 20, construct.__name__)
-            self.assertEqual(len(centers), len(radii), construct.__name__)
-            self.assertEqual(centers.shape[1], DIM, construct.__name__)
+        for construct in get_constructors():
+            name = construct.__class__.__name__
+            centers, radii = run_construct(construct, 20, vecs)
+            self.assertLessEqual(len(centers), 20, name)
+            self.assertEqual(len(centers), len(radii), name)
+            self.assertEqual(centers.shape[1], DIM, name)
 
     def test_covering_invariant_nontrivial_case(self):
         """The property BallCoverFilter's zero-false-negative guarantee is
         built on: no matter how centers are chosen, every input vector must
         end up within its assigned ball."""
         vecs = _rand(300, seed=4)
-        for construct in _CONSTRUCTORS:
-            centers, radii = construct(25, vecs)
-            self.assertTrue(_covering_ok(vecs, centers, radii), construct.__name__)
+        for construct in get_constructors():
+            centers, radii = run_construct(construct, 25, vecs)
+            self.assertTrue(_covering_ok(vecs, centers, radii), construct.__class__.__name__)
 
     def test_covering_invariant_on_clustered_data(self):
         vecs = _clustered(n_clusters=5, per_cluster=40, seed=7)
-        for construct in _CONSTRUCTORS:
-            centers, radii = construct(15, vecs)
-            self.assertTrue(_covering_ok(vecs, centers, radii), construct.__name__)
+        for construct in get_constructors():
+            centers, radii = run_construct(construct, 15, vecs)
+            self.assertTrue(_covering_ok(vecs, centers, radii), construct.__class__.__name__)
 
     def test_radii_are_non_negative(self):
         vecs = _rand(150, seed=9)
-        for construct in _CONSTRUCTORS:
-            _, radii = construct(10, vecs)
-            self.assertTrue(np.all(radii >= 0.0), construct.__name__)
+        for construct in get_constructors():
+            _, radii = run_construct(construct, 10, vecs)
+            self.assertTrue(np.all(radii >= 0.0), construct.__class__.__name__)
 
     def test_duplicate_points_do_not_crash(self):
         vecs = np.repeat(_rand(1, seed=11), 50, axis=0)
-        for construct in _CONSTRUCTORS:
-            centers, radii = construct(5, vecs)
-            self.assertTrue(_covering_ok(vecs, centers, radii), construct.__name__)
+        for construct in get_constructors():
+            centers, radii = run_construct(construct, 5, vecs)
+            self.assertTrue(_covering_ok(vecs, centers, radii), construct.__class__.__name__)
 
     def test_output_dtype_is_float32(self):
         vecs = _rand(100, seed=13)
-        for construct in _CONSTRUCTORS:
-            centers, radii = construct(10, vecs)
-            self.assertEqual(centers.dtype, np.float32, construct.__name__)
-            self.assertEqual(radii.dtype, np.float32, construct.__name__)
+        for construct in get_constructors():
+            centers, radii = run_construct(construct, 10, vecs)
+            name = construct.__class__.__name__
+            self.assertEqual(centers.dtype, np.float32, name)
+            self.assertEqual(radii.dtype, np.float32, name)
 
     def test_accepts_non_contiguous_and_float64_input(self):
         """Callers (BallCoverFilter) don't guarantee contiguous float32
         arrays; every constructor must coerce rather than assume."""
         vecs = _rand(80, seed=19).astype(np.float64)[::2]  # non-contiguous, wrong dtype
         self.assertFalse(vecs.flags["C_CONTIGUOUS"])
-        for construct in _CONSTRUCTORS:
-            centers, radii = construct(8, vecs)
-            self.assertTrue(_covering_ok(vecs.astype(np.float32), centers, radii), construct.__name__)
+        for construct in get_constructors():
+            centers, radii = run_construct(construct, 8, vecs)
+            self.assertTrue(_covering_ok(vecs.astype(np.float32), centers, radii), construct.__class__.__name__)
 
     def test_deterministic_given_same_input(self):
         """Gonzalez and rptree are both pure, seeded numpy pipelines with no
@@ -150,15 +155,16 @@ class TestSharedContract(unittest.TestCase):
         can_vary_run_to_run_at_scale, which documents that it genuinely
         isn't reproducible at larger k."""
         vecs = _rand(120, seed=17)
-        for construct in (gonzales_construct_enclosing_balls, rptree_construct_enclosing_balls):
-            c1, r1 = construct(12, vecs)
-            c2, r2 = construct(12, vecs)
-            np.testing.assert_array_equal(c1, c2, err_msg=construct.__name__)
-            np.testing.assert_array_equal(r1, r2, err_msg=construct.__name__)
+        for construct in (GonzalesConstruct(), RPTreeConstruct(seed=0)):
+            name = construct.__class__.__name__
+            c1, r1 = run_construct(construct, 12, vecs)
+            c2, r2 = run_construct(construct, 12, vecs)
+            np.testing.assert_array_equal(c1, c2, err_msg=name)
+            np.testing.assert_array_equal(r1, r2, err_msg=name)
 
 
 # ---------------------------------------------------------------------------
-# gonzales_construct_enclosing_balls -- farthest-first specific properties
+# GonzalesConstruct -- farthest-first specific properties
 # ---------------------------------------------------------------------------
 
 class TestGonzalesConstruct(unittest.TestCase):
@@ -167,7 +173,7 @@ class TestGonzalesConstruct(unittest.TestCase):
         """Unlike rptree/IVF, Gonzalez always fills the requested budget
         exactly in the non-trivial case."""
         vecs = _rand(200, seed=3)
-        centers, radii = gonzales_construct_enclosing_balls(20, vecs)
+        centers, radii = run_construct(GonzalesConstruct(), 20, vecs)
         self.assertEqual(len(centers), 20)
         self.assertEqual(len(radii), 20)
 
@@ -176,7 +182,7 @@ class TestGonzalesConstruct(unittest.TestCase):
         center is literally one of the input vectors, unlike a
         centroid-based method (rptree, IVF)."""
         vecs = _rand(100, seed=2)
-        centers, _ = gonzales_construct_enclosing_balls(10, vecs)
+        centers, _ = run_construct(GonzalesConstruct(), 10, vecs)
         for c in centers:
             self.assertTrue(np.any(np.all(vecs == c, axis=1)), "center not found among input vectors")
 
@@ -185,7 +191,7 @@ class TestGonzalesConstruct(unittest.TestCase):
         objective -- chosen centers should be markedly more spread out than
         a same-size random sample."""
         vecs = _clustered(n_clusters=4, per_cluster=50, sep=20.0, seed=5)
-        centers, _ = gonzales_construct_enclosing_balls(8, vecs)
+        centers, _ = run_construct(GonzalesConstruct(), 8, vecs)
 
         def min_pairwise_dist(pts: np.ndarray) -> float:
             d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
@@ -213,13 +219,12 @@ class TestGonzalesConstruct(unittest.TestCase):
             return chosen
 
         expected_idx = reference(k, vecs)
-        centers, _ = gonzales_construct_enclosing_balls(k, vecs)
+        centers, _ = run_construct(GonzalesConstruct(), k, vecs)
         np.testing.assert_allclose(centers, vecs[expected_idx], atol=1e-3)
 
 
 # ---------------------------------------------------------------------------
-# rptree_construct_enclosing_balls -- random-projection-tree specific
-# properties
+# RPTreeConstruct -- random-projection-tree specific properties
 # ---------------------------------------------------------------------------
 
 class TestRPTreeConstruct(unittest.TestCase):
@@ -231,7 +236,7 @@ class TestRPTreeConstruct(unittest.TestCase):
         undershoot (e.g. k=99 -> 64 balls, not 99)."""
         vecs = _rand(300, seed=1)
         for k in (1, 2, 5, 20, 99, 200):
-            centers, radii = rptree_construct_enclosing_balls(k, vecs, seed=0)
+            centers, radii = run_construct(RPTreeConstruct(seed=0), k, vecs)
             expected = 2 ** int(np.floor(np.log2(k)))
             self.assertEqual(len(centers), expected, f"k={k}")
             self.assertEqual(len(radii), expected, f"k={k}")
@@ -240,7 +245,7 @@ class TestRPTreeConstruct(unittest.TestCase):
         """Unlike Gonzalez, centers are means of each leaf's members, so
         they generally aren't literal input vectors."""
         vecs = _rand(100, seed=2)
-        centers, _ = rptree_construct_enclosing_balls(10, vecs, seed=0)
+        centers, _ = run_construct(RPTreeConstruct(seed=0), 10, vecs)
         for c in centers:
             self.assertFalse(np.any(np.all(vecs == c, axis=1)))
 
@@ -250,7 +255,7 @@ class TestRPTreeConstruct(unittest.TestCase):
         two -- radii should stay well under half the cluster separation."""
         sep, spread = 25.0, 0.5
         vecs = _clustered(n_clusters=4, per_cluster=60, spread=spread, sep=sep, seed=6)
-        _, radii = rptree_construct_enclosing_balls(4, vecs, seed=0)
+        _, radii = run_construct(RPTreeConstruct(seed=0), 4, vecs)
         self.assertTrue(np.all(radii < sep / 2), f"radii {radii} span across clusters")
 
     def test_non_power_of_two_k_can_merge_distinct_clusters(self):
@@ -264,29 +269,30 @@ class TestRPTreeConstruct(unittest.TestCase):
         test is meant to catch."""
         spread, sep = 0.5, 25.0
         vecs = _clustered(n_clusters=6, per_cluster=40, spread=spread, sep=sep, seed=8)
-        _, radii = rptree_construct_enclosing_balls(6, vecs, seed=0)
+        _, radii = run_construct(RPTreeConstruct(seed=0), 6, vecs)
         self.assertEqual(len(radii), 4)  # 2**floor(log2(6))
         self.assertTrue(np.any(radii > sep / 2), "expected at least one leaf to span two clusters")
 
     def test_deterministic_given_seed_varies_with_seed(self):
         vecs = _rand(200, seed=14)
-        c1, r1 = rptree_construct_enclosing_balls(16, vecs, seed=0)
-        c2, r2 = rptree_construct_enclosing_balls(16, vecs, seed=0)
+        c1, r1 = run_construct(RPTreeConstruct(seed=0), 16, vecs)
+        c2, r2 = run_construct(RPTreeConstruct(seed=0), 16, vecs)
         np.testing.assert_array_equal(c1, c2)
         np.testing.assert_array_equal(r1, r2)
-        c3, _ = rptree_construct_enclosing_balls(16, vecs, seed=1)
+        
+        c3, _ = run_construct(RPTreeConstruct(seed=1), 16, vecs)
         self.assertFalse(np.array_equal(c1, c3), "different seeds should (almost always) pick different splits")
 
 
 # ---------------------------------------------------------------------------
-# ivf_construct_enclosing_balls -- IVF-based specific properties
+# IVFConstruct -- IVF-based specific properties
 # ---------------------------------------------------------------------------
 
 class TestIVFConstruct(unittest.TestCase):
 
     def test_k_equals_one_special_case(self):
         vecs = _rand(50, seed=15)
-        centers, radii = ivf_construct_enclosing_balls(1, vecs)
+        centers, radii = run_construct(IVFConstruct(), 1, vecs)
         self.assertEqual(len(centers), 1)
         self.assertEqual(len(radii), 1)
         np.testing.assert_allclose(centers[0], vecs.mean(axis=0), atol=1e-4)
@@ -299,7 +305,7 @@ class TestIVFConstruct(unittest.TestCase):
         and reproducibly here, unlike the large-k/HNSW-quantizer regime
         exercised in test_ball_count_can_undershoot_at_scale below."""
         vecs = _rand(300, seed=16)
-        centers, radii = ivf_construct_enclosing_balls(50, vecs)
+        centers, radii = run_construct(IVFConstruct(), 50, vecs)
         self.assertEqual(len(centers), 50)
         self.assertEqual(len(radii), 50)
         self.assertTrue(_covering_ok(vecs, centers, radii))
@@ -310,7 +316,7 @@ class TestIVFConstruct(unittest.TestCase):
         valid, fully-covering set of balls, not just avoid crashing."""
         vecs = _rand(3000, seed=18)
         for k in (2047, 2048, 2100):
-            centers, radii = ivf_construct_enclosing_balls(k, vecs)
+            centers, radii = run_construct(IVFConstruct(), k, vecs)
             self.assertLessEqual(len(centers), k, f"k={k}")
             self.assertGreater(len(centers), 0, f"k={k}")
             self.assertTrue(_covering_ok(vecs, centers, radii), f"k={k}")
@@ -332,7 +338,7 @@ class TestIVFConstruct(unittest.TestCase):
         X = rng.standard_normal((20_000, dim)).astype(np.float32)
         X /= np.linalg.norm(X, axis=1, keepdims=True)
 
-        centers, radii = ivf_construct_enclosing_balls(5000, X)
+        centers, radii = run_construct(IVFConstruct(), 5000, X)
         self.assertLess(len(centers), 5000, "expected a real undershoot at this scale")
         self.assertGreater(len(centers), 0)
         self.assertTrue(_covering_ok(X, centers, radii))

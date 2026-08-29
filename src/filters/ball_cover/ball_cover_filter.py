@@ -1,11 +1,17 @@
-from enum import Enum
-from typing import Optional
-
-import faiss
 import numpy as np
-
-from filters.ball_cover.ball_cover_construction import gonzales_construct_enclosing_balls
-from filters.ball_cover.ball_cover_insertion import INSERTION_STRATEGIES
+import faiss
+from enum import Enum
+from typing import List, Tuple, Optional
+from hyperspheres_volume import estimate_hypersphere_volume
+from filters.filter import Filter
+from filters.ball_cover.ball_interfaces import ConstructInterface, InsertInterface
+from filters.ball_cover.gonzales_construct import GonzalesConstruct
+from filters.ball_cover.ivf_construct import IVFConstruct
+from filters.ball_cover.rptree_construct import RPTreeConstruct
+from filters.ball_cover.min_heap_insert import MinHeapInsert
+from filters.ball_cover.nearest_insert import NearestInsert
+from filters.ball_cover.least_inflation_insert import LeastInflationInsert
+from filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
 
 
 class Quantize(Enum):
@@ -21,7 +27,6 @@ class Quantize(Enum):
     PQ = "PQ"
 
 PQ_MAX_NBITS = 8
-
 
 class InsufficientMemoryError(ValueError):
     """Raised when max_memory is too small to construct the requested
@@ -44,28 +49,117 @@ _QTYPES = {
 }
 
 
+class BallCoverFilter(Filter):
+    _BYTES_PER_FLOAT32 = 4
+    _BYTES_PER_FLOAT64 = 8
 
-class BallCoverFilter:
     def __init__(
         self,
         dim: int,
-        max_memory: int | None  = None,
+        construct_method: Optional[ConstructInterface] = GonzalesConstruct(),
+        insert_method: Optional[InsertInterface] = MinHeapInsert(),
         quantize: Quantize = Quantize.NONE,
-        construction_level: int = 3,
-        insertion_level: str | None = None,
+        max_memory: Optional[int] = None,
+        max_spheres: Optional[int] = None,
+        insert_memory_percent: Optional[float] = 0.0
     ) -> None:
-        self.dim = dim
+        super().__init__(dim, max_memory=max_memory)
         self.quantize = quantize
-        self.construction_level = construction_level
-        self.insertion_level = insertion_level
-        self.index = self._make_index(quantize)
-        self.max_count_balls = self.calculate_max_balls(max_memory)
-        self.count_balls = 0
-        self.radii = np.zeros(self.max_count_balls, dtype=np.float32)
+        self.construct_method = construct_method
+        self.insert_method = insert_method
+        self.insert_memory_percent = insert_memory_percent
+        self._all_centers_index = self._make_faiss_index(self.quantize)
+        self.max_spheres = (max_spheres if max_spheres is not None 
+                    else self._calculate_max_spheres(self.max_memory))
+        self.max_construct_spheres = self._calculate_max_construct_spheres(self.insert_memory_percent)
+        self._constructed = False
+
+        # main filter sphere buffers
+        self._num_spheres = 0
+        self._all_spheres = np.arange(self.max_spheres, dtype=np.int32)
+        self._all_centers = None # temp array used only during insertions
+        self._all_radiuses = np.empty((self.max_spheres,), dtype=np.float32)
+
+        # initialize insertion method buffers
+        self.insert_method.ensure_capacity(self.max_spheres)
+
+    # ------------------------------------------------------------------ properties
+
+    @property
+    def all_spheres(self) -> np.ndarray:
+        return self._all_spheres[:self._num_spheres]
+
+    @property
+    def all_centers(self) -> np.ndarray:
+        if self._all_centers is None:
+            self._all_centers = np.empty((len(self._all_radiuses), self.dim), dtype=np.float32)
+            self._all_centers[self.all_spheres] = self.all_centers_index.reconstruct_n(0, self._num_spheres)
+        return self._all_centers[self.all_spheres]
+
+    @property
+    def all_centers_index(self) -> faiss.Index:
+        if isinstance(self._all_centers_index, faiss.IndexIDMap2):
+            return faiss.downcast_index(self._all_centers_index.index)
+        return self._all_centers_index
 
     @property
     def all_radiuses(self) -> np.ndarray:
-        return self.radii[: self.count_balls]
+        return self._all_radiuses[self.all_spheres]
+
+    # ------------------------------------------------------------------ buffer operations
+
+    def _ensure_capacity(self, required_cap: int) -> None:
+        current_cap = len(self._all_radiuses)
+        if required_cap <= current_cap:
+            return
+
+        new_cap = max(current_cap * 2, required_cap)
+        new_spheres = np.empty((new_cap,), dtype=np.int32)
+        new_spheres[:current_cap] = self._all_spheres
+        new_spheres[current_cap:] = np.arange(current_cap, new_cap, dtype=np.int32)
+        self._all_spheres = new_spheres
+
+        if self._all_centers is not None:
+            new_centers = np.empty((new_cap, self.dim), dtype=np.float32)
+            new_centers[:current_cap] = self._all_centers
+            self._all_centers = new_centers
+
+        new_radiuses = np.empty((new_cap,), dtype=np.float32)
+        new_radiuses[:current_cap] = self._all_radiuses
+        self._all_radiuses = new_radiuses
+        self.insert_method.ensure_capacity(new_cap)
+
+
+    def _get_new_index(self) -> int:
+        if self._num_spheres == len(self._all_radiuses):
+            self._ensure_capacity(len(self._all_radiuses) * 2)
+        return self._all_spheres[self._num_spheres]
+
+
+    def _reset_buffers(self, capacity: int) -> None:
+        self._ensure_capacity(capacity)
+        self._num_spheres = 0
+        self._all_centers = None
+        self._all_centers_index = self._make_faiss_index(self.quantize)
+        self.insert_method.reset_buffers(capacity)
+
+
+    def _calculate_max_spheres(self, max_memory: int) -> int:
+        usable = max(0, max_memory - self._codebook_bytes())
+        return max(1, usable // self.bytes_per_ball())
+
+
+    def _calculate_max_construct_spheres(self, insertion_memory_percent: float) -> int:
+        if insertion_memory_percent <= 0.0:
+            return self.max_spheres
+
+        if self.max_memory is not None:
+            construct_memory = max(0, int(self.max_memory * (1.0 - insertion_memory_percent / 100.0)))
+            return self._calculate_max_spheres(construct_memory)
+
+        return max(1, int(self.max_spheres * (1.0 - insertion_memory_percent / 100.0)))
+
+    # ------------------------------------------------------------------ quantization & helpers
 
     @staticmethod
     def _choose_pq_m(dim: int) -> int:
@@ -74,6 +168,7 @@ class BallCoverFilter:
                 return m
         return 1
 
+
     @staticmethod
     def _pq_nbits_for(n: int) -> Optional[int]:
         nbits = 0
@@ -81,48 +176,43 @@ class BallCoverFilter:
             nbits += 1
         return nbits if nbits >= 1 else None
 
-    def _make_index(self, quantize: Quantize, pq_nbits: int = PQ_MAX_NBITS) -> faiss.Index:
+
+    def _make_faiss_index(self, quantize: Quantize, pq_nbits: int = PQ_MAX_NBITS) -> faiss.IndexIDMap2:
         if quantize == Quantize.NONE:
-            return faiss.IndexFlatL2(self.dim)
-        if quantize == Quantize.PQ:
+            index = faiss.IndexFlatL2(self.dim)
+        elif quantize == Quantize.PQ:
             pq_m = self._choose_pq_m(self.dim)
-            return faiss.IndexPQ(self.dim, pq_m, pq_nbits, faiss.METRIC_L2)
-        return faiss.IndexScalarQuantizer(self.dim, _QTYPES[quantize], faiss.METRIC_L2)
+            index = faiss.IndexPQ(self.dim, pq_m, pq_nbits, faiss.METRIC_L2)
+        else:
+            index = faiss.IndexScalarQuantizer(self.dim, _QTYPES[quantize], faiss.METRIC_L2)
+        return faiss.IndexIDMap2(index)
+
 
     def bytes_per_ball(self) -> int:
-        if isinstance(self.index, faiss.IndexPQ):
-            return self.index.pq.code_size + 4
-        if isinstance(self.index, faiss.IndexScalarQuantizer):
-            return self.index.sq.code_size + 4
-        return (self.index.d + 1) * 4
+        index = self.all_centers_index
+        if isinstance(index, faiss.IndexPQ):
+            return index.pq.code_size + self._BYTES_PER_FLOAT32
+        if isinstance(index, faiss.IndexScalarQuantizer):
+            return index.sq.code_size + self._BYTES_PER_FLOAT32
+        return (self.dim + 1) * self._BYTES_PER_FLOAT32
+
 
     def _codebook_bytes(self) -> int:
-        if isinstance(self.index, faiss.IndexPQ):
-            return int(faiss.vector_to_array(self.index.pq.centroids).nbytes)
-        if isinstance(self.index, faiss.IndexScalarQuantizer):
-            trained = faiss.vector_to_array(self.index.sq.trained)
+        index = self.all_centers_index
+        if isinstance(index, faiss.IndexPQ):
+            return int(faiss.vector_to_array(index.pq.centroids).nbytes)
+        if isinstance(index, faiss.IndexScalarQuantizer):
+            trained = faiss.vector_to_array(index.sq.trained)
             if len(trained) == 0:
-                probe = faiss.IndexScalarQuantizer(self.dim, self.index.sq.qtype, faiss.METRIC_L2)
+                probe = faiss.IndexScalarQuantizer(self.dim, index.sq.qtype, faiss.METRIC_L2)
                 probe.train(np.zeros((2, self.dim), dtype=np.float32))
                 trained = faiss.vector_to_array(probe.sq.trained)
             return int(trained.nbytes)
         return 0
 
-    def calculate_max_balls(self, max_memory: int) -> int:
-        usable = max(0, max_memory - self._codebook_bytes())
-        return max(1, usable // self.bytes_per_ball())
+    # ------------------------------------------------------------------ center quantization & rebuilding
 
-    def get_bytesize(self) -> int:
-        return self.count_balls * self.bytes_per_ball() + self._codebook_bytes()
-
-    def construct_enclosing_balls(
-        self, vectors: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        return gonzales_construct_enclosing_balls(self.max_count_balls, vectors)
-
-    def _build_quantizer(
-        self, quantize: Quantize, centers: np.ndarray
-    ) -> tuple[faiss.Index, np.ndarray]:
+    def _build_quantizer(self, quantize: Quantize, centers: np.ndarray) -> Tuple[faiss.IndexIDMap2, np.ndarray]:
         """Train an index of the given quantizer type over centers (not yet
         populated -- caller adds centers to the returned index) and return the
         per-center reconstruction error ||center - decode(encode(center))||.
@@ -138,75 +228,123 @@ class BallCoverFilter:
                     "center(s) is too few for even a 1-bit codebook (need >= 2 centers, "
                     "which requires a larger max_memory or a smaller ball budget)."
                 )
-            index = self._make_index(quantize, pq_nbits=nbits)
-            index.pq.cp.min_points_per_centroid = 1  # our "training set" is just the ball centers
+            index = self._make_faiss_index(quantize, pq_nbits=nbits)
+            base_idx = faiss.downcast_index(index.index)
+            base_idx.pq.cp.min_points_per_centroid = 1
             index.train(centers)
-            decoded = index.pq.decode(index.pq.compute_codes(centers))
+            decoded = base_idx.pq.decode(base_idx.pq.compute_codes(centers))
         else:
-            index = self._make_index(quantize)
+            index = self._make_faiss_index(quantize)
+            base_idx = faiss.downcast_index(index.index)
             index.train(centers)
-            decoded = index.sq.decode(index.sq.compute_codes(centers))
+            decoded = base_idx.sq.decode(base_idx.sq.compute_codes(centers))
         error = np.linalg.norm(centers - decoded, axis=1).astype(np.float32)
         return index, error
 
-    def construct(self, vectors: np.ndarray) -> None:
-        centers, radii = self.construct_enclosing_balls(vectors)
-        centers = np.ascontiguousarray(centers, dtype=np.float32)
-        self._rebuild_from_centers(centers, radii)
 
-    def _rebuild_from_centers(self, centers: np.ndarray, radii: np.ndarray) -> None:
-        """Re-derive self.index/self.radii/self.count_balls from an explicit
+    def _rebuild_from_centers(self, sphere_indices: np.ndarray, centers: np.ndarray, radii: np.ndarray) -> None:
+        """Re-derive our ball data structures from an explicit
         (centers, radii) pair, applying the configured quantizer exactly like
         construct() does. Used both by construct() itself and by insert() when
         an insertion strategy relocates/adds balls (e.g. "merge") rather
         than just growing an existing ball's radius in place."""
+        sphere_indices = np.ascontiguousarray(sphere_indices, dtype=np.int64)
         centers = np.ascontiguousarray(centers, dtype=np.float32)
         radii = np.asarray(radii, dtype=np.float32)
         n = len(centers)
 
         if n == 0:
-            index = self._make_index(Quantize.NONE)
+            index = self._make_faiss_index(Quantize.NONE)
         elif self.quantize == Quantize.NONE:
-            index = self._make_index(Quantize.NONE)
-            index.add(centers)
+            index = self._make_faiss_index(Quantize.NONE)
+            index.add_with_ids(centers, sphere_indices)
         else:
             index, error = self._build_quantizer(self.quantize, centers)
             radii = radii + error
-            index.add(centers)
+            index.add_with_ids(centers, sphere_indices)
 
-        self.index = index
+        self._ensure_capacity(n)
+        self._num_spheres = n
+        self._all_spheres[:n] = sphere_indices.astype(np.int32)
+        self._all_centers = None
+        self._all_centers_index = index
+        self._all_radiuses[sphere_indices] = radii
 
-        self.radii[:] = 0.0
-        self.radii[:n] = radii
-        self.count_balls = n
+    # ------------------------------------------------------------------ construct & insert
 
-    def query(self, query_vectors: np.ndarray, distance_threshold: float) -> list[bool]:
-        Q = np.ascontiguousarray(query_vectors, dtype=np.float32)
-        d2, labels = self.index.search(Q, self.count_balls)
-        surface = np.sqrt(np.maximum(d2, 0.0)) - self.radii[labels]
+    def construct(self, vectors: np.ndarray) -> Tuple[float, float]:
+        centers, radii = self.construct_method.construct_filter(self, vectors)
+        _ = self.all_centers
+
+        for center, radius in zip(centers, radii):
+            self.insert_method.add_sphere(self, center, radius)
+
+        self._rebuild_from_centers(self.all_spheres, self.all_centers, self.all_radiuses)
+        self._constructed = True
+
+        return self._log_volume_bounds()
+
+    # ------------------------------------------------------------------ query
+
+    def query(self, vectors: np.ndarray, distance_threshold: float) -> list[bool]:
+        if not self._constructed:
+            raise ValueError("BallCoverFilter has not been constructed.")
+
+        if self._num_spheres == 0 or len(vectors) == 0:
+            return [False] * len(vectors)
+
+        Q = np.ascontiguousarray(vectors, dtype=np.float32)
+        d2, labels = self.all_centers_index.search(Q, self._num_spheres)
+        surface = np.sqrt(np.maximum(d2, 0.0)) - self._all_radiuses[labels]
         return (surface.min(axis=1) < distance_threshold).tolist()
 
+    # ------------------------------------------------------------------ streaming / dynamic insertion
+
     def insert(self, vectors: np.ndarray) -> None:
-        if self.count_balls == 0:
+        if not self._constructed:
             self.construct(vectors)
             return
 
-        level = self.insertion_level or "nearest"
-        if level not in INSERTION_STRATEGIES:
-            raise ValueError(
-                f"Unknown insertion_level {level!r}; expected one of {tuple(INSERTION_STRATEGIES)}"
-            )
+        if len(vectors) == 0:
+            return
 
-        X = np.ascontiguousarray(vectors, dtype=np.float32)
-        centers = self.index.reconstruct_n(0, self.count_balls)
-        radii = self.radii[: self.count_balls]
+        old_centers = self.all_centers
+        self.insert_method.insert(self, vectors)
+        new_centers = self.all_centers
 
-        new_centers, new_radii = INSERTION_STRATEGIES[level](centers, radii, X, self.max_count_balls)
-
-        if new_centers is centers:
-            # "nearest"/"least_inflation" never relocate or add a ball (see
-            # ball_cover_insertion.py) -- only radii grew, so there's nothing
-            # to re-quantize or re-index.
-            self.radii[: self.count_balls] = new_radii
+        if len(old_centers) != len(new_centers) or not np.array_equal(old_centers, new_centers):
+            self._rebuild_from_centers(self.all_spheres, self.all_centers, self.all_radiuses)
         else:
-            self._rebuild_from_centers(new_centers, new_radii)
+            self._all_centers = None
+
+
+    def add(self, vectors: np.ndarray) -> None:
+        self.insert(vectors)
+
+
+    def remove(self, vectors: np.ndarray) -> List[bool]:
+        return self.insert_method.remove(self, vectors)
+
+    # ------------------------------------------------------------------ volume & memory accounting
+
+    def _log_volume_bounds(self) -> Tuple[float, float]:
+        if self._num_spheres == 0:
+            return -np.inf, -np.inf
+        current_centers = self.all_centers
+        self._all_centers = None
+        return estimate_hypersphere_volume(current_centers, self.all_radiuses, return_log=True)
+
+
+    def get_bytesize(self) -> int:
+        if not self._constructed:
+            return 0
+        filter_bytes = self._num_spheres * self.bytes_per_ball() + self._codebook_bytes()
+        if self.insert_method:
+            filter_bytes += self.insert_method.get_bytesize()
+        return filter_bytes
+
+
+    def get_construction_bytesize(self) -> int:
+        if not self.construct_method:
+            return 0
+        return self.construct_method.get_bytesize()

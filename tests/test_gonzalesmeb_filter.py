@@ -310,73 +310,93 @@ class TestGonzalezQuery(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Dynamic insertion
+# Dynamic insertion (add / insert)
 # ---------------------------------------------------------------------------
 
-class TestGonzalezInsert(unittest.TestCase):
+class TestGonzalezAdd(unittest.TestCase):
 
-    def test_insert_before_construct_constructs(self):
+    def test_add_before_construct_constructs(self):
         vecs = _rand(30)
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
-        f.insert(vecs)
+        f.add(vecs)
         self.assertTrue(f._constructed)
         self.assertTrue(all(f.query(vecs)))
 
-    def test_inserted_vectors_are_recalled(self):
+    def test_added_vectors_are_recalled(self):
         base = _rand(20, seed=0)
         extra = _rand(20, seed=5) + 50.0
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=10)
         f.construct(base)
-        f.insert(extra)
-        self.assertTrue(all(f.query(base)), "base vectors lost after insert")
-        self.assertTrue(all(f.query(extra)), "inserted vectors not recalled")
+        f.add(extra)
+        self.assertTrue(all(f.query(base)), "base vectors lost after add")
+        self.assertTrue(all(f.query(extra)), "added vectors not recalled")
 
-    def test_insert_far_vector_creates_new_sphere(self):
+    def test_add_far_vector_creates_new_sphere(self):
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=30)
         f.construct(_rand(5))
         before = len(f.all_spheres)
-        f.insert(np.full((1, DIM), 500.0, dtype=np.float32))
+        f.add(np.full((1, DIM), 500.0, dtype=np.float32))
         self.assertEqual(len(f.all_spheres), before + 1)
 
-    def test_insert_duplicate_does_not_create_new_sphere(self):
+    def test_add_duplicate_does_not_create_new_sphere(self):
         vecs = _rand(5)
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=30)
         f.construct(vecs)
         before = len(f.all_spheres)
-        f.insert(vecs[:1])
+        f.add(vecs[:1])
         self.assertEqual(len(f.all_spheres), before)
 
-    def test_insert_never_exceeds_max_spheres(self):
+    def test_add_never_exceeds_max_spheres(self):
         """Once at capacity, far vectors are merged instead of creating spheres."""
         k = 5
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=k)
         f.construct(_rand(k))
         self.assertEqual(len(f.all_spheres), k)
         extra = _rand(50, seed=3) * 20.0
-        f.insert(extra)
+        f.add(extra)
         self.assertLessEqual(len(f.all_spheres), k)
         self.assertTrue(all(f.query(extra)),
                         "merged vectors must still be recalled")
 
-    def test_insert_preserves_no_false_negatives_over_many_batches(self):
+    def test_add_preserves_no_false_negatives_over_many_batches(self):
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=8)
         all_vecs = []
         f.construct(_rand(20, seed=0))
         all_vecs.append(_rand(20, seed=0))
         for seed in range(1, 6):
             batch = _rand(15, seed=seed) * (1.0 + seed)
-            f.insert(batch)
+            f.add(batch)
             all_vecs.append(batch)
         stored = np.vstack(all_vecs)
         self.assertTrue(all(f.query(stored)),
-                        "no-false-negative invariant broken by insert()")
+                        "no-false-negative invariant broken by add()")
 
-    def test_insert_empty_is_noop(self):
+    def test_add_empty_is_noop(self):
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f.construct(_rand(10))
         spheres = f.all_spheres.copy()
-        f.insert(np.empty((0, DIM), dtype=np.float32))
+        f.add(np.empty((0, DIM), dtype=np.float32))
         np.testing.assert_array_equal(f.all_spheres, spheres)
+
+    def test_insert_delegates_to_add(self):
+        vecs = _rand(10)
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=20)
+        f.insert(vecs)
+        self.assertTrue(f._constructed)
+        self.assertTrue(all(f.query(vecs)))
+
+
+# ---------------------------------------------------------------------------
+# Removal
+# ---------------------------------------------------------------------------
+
+class TestGonzalezRemove(unittest.TestCase):
+
+    def test_remove_raises_not_implemented(self):
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        f.construct(_rand(10))
+        with self.assertRaises(NotImplementedError):
+            f.remove(_rand(2))
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +430,10 @@ class TestGonzalezMemory(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestGonzalezInterface(unittest.TestCase):
+
+    def test_exact_matching_fpr_is_zero(self):
+        f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
+        self.assertEqual(f.get_exact_matching_fpr(), 0.0)
 
     def test_get_volume_is_zero(self):
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)

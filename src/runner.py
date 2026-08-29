@@ -17,10 +17,6 @@ from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize, Insu
 from hyperspheres_volume import estimate_hypersphere_volume
 from vector_source import VectorSource
 
-# filters.streaming_insertion pulls in filters.ball_geometry, which no longer
-# exists -- imported lazily inside the few workers that use it (the M1-M5
-# insertion-method comparisons) so the rest of this module stays usable.
-
 VectorInput = Union[np.ndarray, VectorSource]
 _QUERY_BATCH = 4096
 
@@ -121,12 +117,13 @@ class _BallCoverFilterEvalAdapter:
     workers) keep working unchanged."""
 
     def __init__(self, dim: int, max_memory: int, distance_threshold: float,
-                 max_spheres: Optional[int] = None, **extra_kwargs: Any) -> None:
+                 max_spheres: Optional[int] = None, insert_mem_percent: Optional[float] = 0.0, **extra_kwargs: Any) -> None:
         self.distance_threshold = distance_threshold
         quantize = extra_kwargs.get("quantize", Quantize.NONE)
         if max_spheres is not None:
             max_memory = _ball_cover_max_memory(dim, max_spheres, quantize)
-        self._filt = BallCoverFilter(dim=dim, max_memory=max_memory, **extra_kwargs)
+        self._filt = BallCoverFilter(dim=dim, max_memory=max_memory, max_spheres=max_spheres, 
+                                     insert_memory_percent=insert_mem_percent, **extra_kwargs)
 
     def construct(self, vectors: np.ndarray) -> None:
         return self._filt.construct(vectors)
@@ -145,21 +142,21 @@ class _BallCoverFilterEvalAdapter:
         return self._filt.all_radiuses
 
 
-def _instantiate_filter(filter_cls: Any, dim: int, memory_budget: int, distance_threshold: float = None,
-                        max_spheres: int = None, extra_kwargs: Optional[Dict[str, Any]] = None) -> Any:
+def _instantiate_filter(filter_cls: Any, dim: int, memory_budget: int, distance_threshold: float = None, max_spheres: int = None,
+                         insert_mem_percent: Optional[float] = 0.0, extra_kwargs: Optional[Dict[str, Any]] = None) -> Any:
     extra_kwargs = extra_kwargs or {}
-    if filter_cls.__name__ not in _DIRECT_TAU_FILTERS:
+    if filter_cls.__name__ in _DIRECT_TAU_FILTERS or 'max_spheres' in inspect.signature(filter_cls.__init__).parameters:
+        if filter_cls is BallCoverFilter:
+            return _BallCoverFilterEvalAdapter(dim=dim, max_memory=memory_budget,distance_threshold=distance_threshold,
+                                                max_spheres=max_spheres, insert_mem_percent=insert_mem_percent, **extra_kwargs)
+        else:
+            return filter_cls(dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold,
+                            max_spheres=max_spheres, **extra_kwargs)
+    else:
         try:
             return filter_cls(dim=dim, max_memory=memory_budget, **extra_kwargs)
         except TypeError:
             return filter_cls(dim=dim, **extra_kwargs)
-    elif filter_cls is BallCoverFilter:
-        return _BallCoverFilterEvalAdapter(dim=dim, max_memory=memory_budget,
-                                            distance_threshold=distance_threshold,
-                                            max_spheres=max_spheres, **extra_kwargs)
-    else:
-        return filter_cls(dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold,
-                          max_spheres=max_spheres, **extra_kwargs)
 
 
 def static_worker(
@@ -443,6 +440,131 @@ def system_worker(
         'FPVR Upper':                   fpvr_upper,
         **_radius_stats(filter_instance),
     }
+
+
+def _compute_tradeoff_metrics(
+    predicted: List[bool],
+    actual: List[bool],
+    config: str,
+    max_spheres: int,
+    memory_budget: int,
+    memory_usage: int,
+    construct_time: float,
+    qps: float
+) -> Dict[str, Any]:
+    """
+    function for computing memory and sphere tradeoff metrics
+    """
+    tp = sum(1 for p, a in zip(predicted, actual) if p and a)
+    fp = sum(1 for p, a in zip(predicted, actual) if p and not a)
+    fn = sum(1 for p, a in zip(predicted, actual) if not p and a)
+    tn = sum(1 for p, a in zip(predicted, actual) if not p and not a)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    return {
+        "Config": config,
+        "NumSpheres": max_spheres if max_spheres is not None else 0,
+        "MemoryBudget": memory_budget,
+        "MemoryUsage": memory_usage,
+        "FPR": fp / (fp + tn) if (fp + tn) > 0 else 0.0,
+        "FNR": fn / (fn + tp) if (fn + tp) > 0 else 0.0,
+        "Precision": precision,
+        "Recall": recall,
+        "F1-Score": f1,
+        "ConstructTime": construct_time,
+        "QPS": qps
+    }
+
+
+def tradeoff_static_worker(
+    filter_cls: Any,
+    dim: int,
+    distance_threshold: float,
+    vectors_construct: np.ndarray,
+    vectors_query: np.ndarray,
+    actual_results: List[bool],
+    max_spheres: int = None,
+    memory_budget: int = None,
+    insert_memory_percent: float = 0.0
+) -> Dict[str, Any]:
+    """
+    Function for executing a single benchmarking trial of a static filter,
+    constructing the filter once from the full dataset and measuring
+    construction time, memory usage, query throughput, and accuracy metrics.
+    """
+    try:
+        config = filter_cls.__name__
+        vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
+
+        construct_start = time.perf_counter() # start construct timer
+        filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold, max_spheres, insert_memory_percent)
+        filter_instance.construct(vectors_construct)
+        construct_latency = time.perf_counter() - construct_start # final construct time
+
+        query_start = time.perf_counter() # start qps timer
+        # stream the query set in bounded blocks for efficiency
+        predicted: List[bool] = []
+        for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
+            predicted.extend(filter_instance.query(block))
+        query_latency = time.perf_counter() - query_start # final qps timer
+
+        qps = len(vectors_query) / max(query_latency, 1e-9)
+        memory_usage = filter_instance.get_bytesize()
+
+    except Exception as e:
+        print(f"  [Skipped] {config} failed: {e}")
+        return None
+
+    return _compute_tradeoff_metrics(predicted, actual_results, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
+
+
+def tradeoff_dynamic_worker(
+    filter_cls: Any,
+    dim: int,
+    distance_threshold: float,
+    vectors_construct: np.ndarray,
+    vectors_query: np.ndarray,
+    actual_results: List[bool],
+    max_spheres: int = None,
+    memory_budget: int = None,
+    insert_memory_percent: float = 0.0
+) -> Dict[str, Any]:
+    """
+    Function for executing a single benchmarking trial of a dynamic filter,
+    where vectors are inserted incrementally while measuring insertion time,
+    memory usage, query throughput, and accuracy metrics.
+    """
+    try:
+        config = filter_cls.__name__
+        vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
+
+        construct_start = time.perf_counter() # start construct timer
+        filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold, max_spheres, insert_memory_percent)
+        filter_instance.construct(vectors_construct)
+        construct_latency = time.perf_counter() - construct_start # final construct time
+
+        query_start = time.perf_counter() # start throughput timer
+        predicted: List[bool] = []
+        for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
+            block_preds = filter_instance.query(block)
+            predicted.extend(block_preds)
+
+            misses = [block[i] for i, is_dup in enumerate(block_preds) if not is_dup]
+            if misses:
+                filter_instance.insert(np.array(misses, dtype=np.float32))
+        query_latency = time.perf_counter() - query_start # final throughput timer
+
+        qps = len(vectors_query) / max(query_latency, 1e-9)
+        memory_usage = filter_instance.get_bytesize()
+
+    except Exception as e:
+        print(f"  [Skipped] {config} failed: {e}")
+        return None
+
+    return _compute_tradeoff_metrics(predicted, actual_results, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
 
 
 _LN10 = float(np.log(10.0))
@@ -961,6 +1083,8 @@ def stream_rebuild_worker(
 _WORKER_FNS: Dict[str, Any] = {
     'static':  static_worker,
     'dynamic': dynamic_worker,
+    'tradeoff_static': tradeoff_static_worker,
+    'tradeoff_dynamic': tradeoff_dynamic_worker,
     'system':  system_worker,
     'system_tau': system_tau_worker,
     'quantization': quantization_worker,
