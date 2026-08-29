@@ -23,8 +23,16 @@ class Quantize(Enum):
     SQ4 = "SQ4"
     SQ4T = "SQ4_trained"
     SQ8T = "SQ8_trained"
+    SQ2T = "SQ2_trained"
     PQ = "PQ"
 
+PQ_MAX_NBITS = 8
+
+class InsufficientMemoryError(ValueError):
+    """Raised when max_memory is too small to construct the requested
+    quantizer -- currently only reachable for Quantize.PQ, whose k-means
+    codebook training needs at least 2 ball centers for even a 1-bit
+    codebook (see BallCoverFilter._pq_nbits_for)."""
 
 _QTYPES = {
     Quantize.BF16: faiss.ScalarQuantizer.QT_bf16,
@@ -34,8 +42,11 @@ _QTYPES = {
     Quantize.SQ4: faiss.ScalarQuantizer.QT_4bit,
     Quantize.SQ4T: faiss.ScalarQuantizer.QT_4bit_tqmse,
     Quantize.SQ8T: faiss.ScalarQuantizer.QT_8bit_tqmse,
+    # No plain (min-max) QT_2bit exists in faiss -- 2 bits/component is only
+    # available as the MSE-trained TurboQuant variant, so SQ2T has no
+    # untrained SQ2 counterpart the way SQ4T/SQ8T do.
+    Quantize.SQ2T: faiss.ScalarQuantizer.QT_2bit_tqmse,
 }
-PQ_MAX_NBITS = 8
 
 
 class BallCoverFilter(Filter):
@@ -201,11 +212,22 @@ class BallCoverFilter(Filter):
 
     # ------------------------------------------------------------------ center quantization & rebuilding
 
-    def _build_quantizer(self, quantize: Quantize, centers: np.ndarray) -> Optional[Tuple[faiss.IndexIDMap2, np.ndarray]]:
+    def _build_quantizer(self, quantize: Quantize, centers: np.ndarray) -> Tuple[faiss.IndexIDMap2, np.ndarray]:
+        """Train an index of the given quantizer type over centers (not yet
+        populated -- caller adds centers to the returned index) and return the
+        per-center reconstruction error ||center - decode(encode(center))||.
+        Raises InsufficientMemoryError if this quantizer type can't be built
+        for this many centers (only possible for PQ: too few centers for even
+        a 1-bit codebook -- IndexPQ.search segfaults if built with nbits=0, so
+        this check must happen before ever constructing that index, not after)."""
         if quantize == Quantize.PQ:
             nbits = self._pq_nbits_for(len(centers))
             if nbits is None:
-                return None
+                raise InsufficientMemoryError(
+                    f"Not enough memory to construct a PQ index: {len(centers)} ball "
+                    "center(s) is too few for even a 1-bit codebook (need >= 2 centers, "
+                    "which requires a larger max_memory or a smaller ball budget)."
+                )
             index = self._make_faiss_index(quantize, pq_nbits=nbits)
             base_idx = faiss.downcast_index(index.index)
             base_idx.pq.cp.min_points_per_centroid = 1
@@ -221,6 +243,11 @@ class BallCoverFilter(Filter):
 
 
     def _rebuild_from_centers(self, sphere_indices: np.ndarray, centers: np.ndarray, radii: np.ndarray) -> None:
+        """Re-derive our ball data structures from an explicit
+        (centers, radii) pair, applying the configured quantizer exactly like
+        construct() does. Used both by construct() itself and by insert() when
+        an insertion strategy relocates/adds balls (e.g. "merge") rather
+        than just growing an existing ball's radius in place."""
         sphere_indices = np.ascontiguousarray(sphere_indices, dtype=np.int64)
         centers = np.ascontiguousarray(centers, dtype=np.float32)
         radii = np.asarray(radii, dtype=np.float32)
@@ -232,14 +259,9 @@ class BallCoverFilter(Filter):
             index = self._make_faiss_index(Quantize.NONE)
             index.add_with_ids(centers, sphere_indices)
         else:
-            built = self._build_quantizer(self.quantize, centers)
-            if built is None:
-                index = self._make_faiss_index(Quantize.NONE)
-                index.add_with_ids(centers, sphere_indices)
-            else:
-                index, error = built
-                radii = radii + error
-                index.add_with_ids(centers, sphere_indices)
+            index, error = self._build_quantizer(self.quantize, centers)
+            radii = radii + error
+            index.add_with_ids(centers, sphere_indices)
 
         self._ensure_capacity(n)
         self._num_spheres = n
@@ -286,9 +308,14 @@ class BallCoverFilter(Filter):
         if len(vectors) == 0:
             return
 
-        _ = self.all_centers
+        old_centers = self.all_centers
         self.insert_method.insert(self, vectors)
-        self._rebuild_from_centers(self.all_spheres, self.all_centers, self.all_radiuses)
+        new_centers = self.all_centers
+
+        if len(old_centers) != len(new_centers) or not np.array_equal(old_centers, new_centers):
+            self._rebuild_from_centers(self.all_spheres, self.all_centers, self.all_radiuses)
+        else:
+            self._all_centers = None
 
 
     def add(self, vectors: np.ndarray) -> None:
