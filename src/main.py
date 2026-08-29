@@ -503,11 +503,11 @@ def generate_quantization() -> pd.DataFrame:
         construct-set scale, so the percentile is what stays meaningful as
         num_vectors/percentage_construct change, not a raw float.
     """
-    num_vectors            = 100_000
+    num_vectors            = 50_000
     dim                    = 384
     percentage_construct   = 20
     k_fractions            = [0.03, 0.06, 0.125, 0.25]
-    duplicate_percentages  = [10]
+    duplicate_percentages  = [20]
     seeds                  = [0]
     output_csv             = "results/quantization.csv"
 

@@ -17,9 +17,17 @@ class Quantize(Enum):
     SQ4 = "SQ4"
     SQ4T = "SQ4_trained"
     SQ8T = "SQ8_trained"
+    SQ2T = "SQ2_trained"
     PQ = "PQ"
 
 PQ_MAX_NBITS = 8
+
+
+class InsufficientMemoryError(ValueError):
+    """Raised when max_memory is too small to construct the requested
+    quantizer -- currently only reachable for Quantize.PQ, whose k-means
+    codebook training needs at least 2 ball centers for even a 1-bit
+    codebook (see BallCoverFilter._pq_nbits_for)."""
 
 _QTYPES = {
     Quantize.BF16: faiss.ScalarQuantizer.QT_bf16,
@@ -29,6 +37,10 @@ _QTYPES = {
     Quantize.SQ4: faiss.ScalarQuantizer.QT_4bit,
     Quantize.SQ4T: faiss.ScalarQuantizer.QT_4bit_tqmse,
     Quantize.SQ8T: faiss.ScalarQuantizer.QT_8bit_tqmse,
+    # No plain (min-max) QT_2bit exists in faiss -- 2 bits/component is only
+    # available as the MSE-trained TurboQuant variant, so SQ2T has no
+    # untrained SQ2 counterpart the way SQ4T/SQ8T do.
+    Quantize.SQ2T: faiss.ScalarQuantizer.QT_2bit_tqmse,
 }
 
 
@@ -110,17 +122,22 @@ class BallCoverFilter:
 
     def _build_quantizer(
         self, quantize: Quantize, centers: np.ndarray
-    ) -> Optional[tuple[faiss.Index, np.ndarray]]:
+    ) -> tuple[faiss.Index, np.ndarray]:
         """Train an index of the given quantizer type over centers (not yet
         populated -- caller adds centers to the returned index) and return the
         per-center reconstruction error ||center - decode(encode(center))||.
-        Returns None if this quantizer type can't be built for this many
-        centers (only possible for PQ: too few centers for even a 1-bit
-        codebook)."""
+        Raises InsufficientMemoryError if this quantizer type can't be built
+        for this many centers (only possible for PQ: too few centers for even
+        a 1-bit codebook -- IndexPQ.search segfaults if built with nbits=0, so
+        this check must happen before ever constructing that index, not after)."""
         if quantize == Quantize.PQ:
             nbits = self._pq_nbits_for(len(centers))
             if nbits is None:
-                return None
+                raise InsufficientMemoryError(
+                    f"Not enough memory to construct a PQ index: {len(centers)} ball "
+                    "center(s) is too few for even a 1-bit codebook (need >= 2 centers, "
+                    "which requires a larger max_memory or a smaller ball budget)."
+                )
             index = self._make_index(quantize, pq_nbits=nbits)
             index.pq.cp.min_points_per_centroid = 1  # our "training set" is just the ball centers
             index.train(centers)
@@ -153,14 +170,9 @@ class BallCoverFilter:
             index = self._make_index(Quantize.NONE)
             index.add(centers)
         else:
-            built = self._build_quantizer(self.quantize, centers)
-            if built is None:
-                index = self._make_index(Quantize.NONE)
-                index.add(centers)
-            else:
-                index, error = built
-                radii = radii + error
-                index.add(centers)
+            index, error = self._build_quantizer(self.quantize, centers)
+            radii = radii + error
+            index.add(centers)
 
         self.index = index
 

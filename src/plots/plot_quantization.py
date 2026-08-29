@@ -1,4 +1,5 @@
-"""Generate the five quantization-figure panels (+ shared legend) for the PVLDB paper.
+"""Generate the six quantization-figure panels (+ shared legend) for the PVLDB paper,
+plus one diagnostic FNR sanity-check panel that isn't part of the paper figure set.
 
 Self-contained: reads a long-format results file (one row per (quantize, k,
 seed) on a single dataset -- see main.py::generate_quantization), aggregates over
@@ -53,7 +54,7 @@ EMIT_PDF = False
 # meaningful: a more compact code packs more balls into the same budget.
 QUANTIZE_SWEEP = (
     Quantize.NONE, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
-    Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.PQ,
+    Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.SQ2T, Quantize.PQ,
 )
 STAGES = [q.value for q in QUANTIZE_SWEEP]
 STAGE_LABELS = {
@@ -65,6 +66,7 @@ STAGE_LABELS = {
     Quantize.BF16.value: "BF16",
     Quantize.SQ4T.value: "SQ4-T",
     Quantize.SQ8T.value: "SQ8-T",
+    Quantize.SQ2T.value: "SQ2-T",
     Quantize.PQ.value: "PQ",
 }
 # Reference stage for the two relative-objective panels: the raw/unquantized
@@ -72,10 +74,10 @@ STAGE_LABELS = {
 # panels had before per-quantize breakdown existed.
 BASELINE_STAGE = Quantize.NONE.value
 
-# tab10 has 10 qualitative colors; 9 quantize variants fit with one to spare.
+# tab10 has 10 qualitative colors; 10 quantize variants use exactly all of them.
 _STAGE_PALETTE = plt.get_cmap("tab10").colors
 STAGE_COLORS = dict(zip(STAGES, _STAGE_PALETTE))
-_STAGE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h"]
+_STAGE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "p"]
 STAGE_MARKERS = dict(zip(STAGES, _STAGE_MARKERS))
 
 D_DIM = 384  # embedding dimensionality; objectives are stored pre-logged
@@ -120,6 +122,7 @@ _REQUIRED_COLUMNS = [
     "fnr",
     "stage_time_s",
     "cum_time_s",
+    "query_throughput_qps",
     "n_balls",
     "memory_bytes",
     "seed",
@@ -151,10 +154,16 @@ def _validate_schema(df: pd.DataFrame) -> None:
     present = set(df["quantize"].unique())
     missing_combos = [s for s in STAGES if s not in present]
     if missing_combos:
-        raise ValueError(
-            f"Missing quantize value(s) {missing_combos} in data. "
-            f"Available: {sorted(present)}"
-        )
+        # Not fatal: quantization_worker skips (contributes zero rows for) a
+        # candidate whose construction raises -- e.g. PQ needs >= 2 ball
+        # centers for even a 1-bit codebook (InsufficientMemoryError), which
+        # a tight enough memory budget can make true at every k in the
+        # sweep. Every panel/aggregate() call already tolerates an absent
+        # stage by just not drawing/counting it, so this is a heads-up, not
+        # a schema violation.
+        print(f"Note: quantize value(s) {missing_combos} have no rows (skipped during "
+              f"generation, e.g. InsufficientMemoryError) and won't be plotted. "
+              f"Available: {sorted(present)}")
 
 
 def load_data() -> pd.DataFrame:
@@ -227,11 +236,10 @@ def aggregate(df: pd.DataFrame, value_col: str, cfg: Config, use_tau: bool = Fal
     agg = agg.merge(mem, on=["quantize", "k"])
     agg["Memory (MB)"] = agg["memory_bytes"] / (1024 * 1024)
 
-    for stage in stages:
-        if not (agg["quantize"] == stage).any():
-            raise ValueError(
-                f"No rows for quantize={stage!r}" + (f" at tau={cfg.tau}" if use_tau else "") + "."
-            )
+    # A stage with zero rows here means every k in the sweep failed to
+    # construct that quantizer (see _validate_schema's note) -- not an
+    # error, just nothing to plot/summarize for it; every caller already
+    # skips an empty per-stage slice rather than assuming one exists.
     return agg
 
 
@@ -346,53 +354,16 @@ def panel_threshold_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 
 def panel_fpr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    agg = aggregate(df, "fpr", cfg, use_tau=True)
-
-    positive = agg.loc[agg["mean"] > 0, "mean"]
-    if len(positive) == 0:
-        raise ValueError("All FPR values are zero at the selected tau; cannot set a log floor.")
-    floor = 10 ** (np.floor(np.log10(positive.min())) - 1)
-    # Zero FPR can't be drawn on a log axis; clip to the floor so the line
-    # still traces through those points instead of vanishing off-chart.
-    agg = agg.copy()
-    agg["mean"] = agg["mean"].where(agg["mean"] > 0, floor)
-
-    apply_style()
-    fig, ax = plt.subplots()
-    for stage in STAGES:
-        sub = agg[agg["quantize"] == stage].sort_values("Memory (MB)")
-        if sub.empty:
-            continue
-        ax.plot(
-            sub["Memory (MB)"], sub["mean"],
-            color=STAGE_COLORS[stage], marker=STAGE_MARKERS[stage], markersize=2.5,
-            linewidth=0.8, zorder=2,
-        )
-        if (sub["ci95"] > 0).any():
-            ax.errorbar(
-                sub["Memory (MB)"], sub["mean"], yerr=sub["ci95"],
-                fmt="none", ecolor=STAGE_COLORS[stage],
-                elinewidth=0.5, capsize=1.5, capthick=0.5, zorder=3,
-            )
-
-    ax.set_xscale("log", base=2)
-    ax.xaxis.set_major_locator(LogLocator(base=2.0))
-    ax.xaxis.set_major_formatter(LogFormatterMathtext(base=2.0))
-
-    ax.set_yscale("log")
-    ax.set_ylim(floor / 3.0, None)
-    ax.yaxis.set_major_locator(LogLocator(base=10.0))
-    ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10.0))
-    ax.yaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10)))
-    ax.yaxis.set_minor_formatter(NullFormatter())
-    ax.tick_params(axis="y", which="minor", length=1.2, width=0.4)
-
-    ax.set_xlabel("Memory Usage (MB)")
-    ax.set_ylabel("FPR")
-    _style_axes(ax)
-
-    _save(fig, "quantization-false-positive-rate.png", cfg)
-    return agg
+    # Linear, not log: FPR is legitimately 0 for many quantize/memory points
+    # (that's the desired outcome, unlike FNR's "should always be exactly 0"
+    # invariant), and a log axis can't represent 0 at all -- it used to need
+    # a floor-clipping hack to fake it. y-min pinned to 0 (FPR can't be
+    # negative) so the axis isn't misleadingly truncated; top auto-scales to
+    # the data.
+    return _line_panel(
+        df, "fpr", "FPR", "quantization-false-positive-rate.png", cfg,
+        use_tau=True, y_bounds=(0, None),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -411,7 +382,26 @@ def panel_construction_time(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
-# Panel (e): ball count per quantize variant
+# Panel (e): query throughput
+# --------------------------------------------------------------------------- #
+
+def panel_query_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Batched-query throughput (queries/s) of filt.query() over the whole
+    query set, per quantize variant. Query cost doesn't conceptually depend
+    on tau (every ball is still checked regardless of threshold), so this
+    is averaged over the tau sweep (use_tau=False) the same way
+    panel_construction_time averages a per-construction, tau-independent
+    quantity -- log-scaled since a quantizer's decode overhead (e.g. PQ) can
+    separate lines by more than an order of magnitude from the raw/NONE
+    cover."""
+    return _line_panel(
+        df, "query_throughput_qps", "Query Throughput (queries/s)",
+        "quantization-query-throughput.png", cfg, use_tau=False, log_y=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Panel (f): ball count per quantize variant
 # --------------------------------------------------------------------------- #
 
 def panel_n_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
@@ -427,10 +417,39 @@ def panel_n_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
+# Diagnostic panel (not part of the paper figure set): false negative rate
+# --------------------------------------------------------------------------- #
+
+def panel_fnr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Sanity-check panel, not for the paper: FNR should be exactly 0 for
+    every row here -- it's BallCoverFilter's core no-false-negative
+    guarantee, already hard-asserted in quantization_worker (raises during
+    generation) and re-checked by _validate_schema before this module ever
+    plots anything. So under normal operation this renders as a flat line
+    pinned to 0; its only job is to make that visually obvious at a glance
+    (e.g. when skimming a run's figures) rather than only trusting an
+    assertion that ran silently offline. Fixed [0, 1] y-range -- the full
+    valid range for a rate -- so if the invariant were ever violated (a
+    corrupted/hand-edited CSV bypassing the hard checks above) it would be
+    dramatically visible instead of auto-scaling into a misleadingly
+    large-looking wobble around a tiny nonzero value."""
+    return _line_panel(
+        df, "fnr", "FNR", "quantization-false-negative-rate.png", cfg,
+        use_tau=True, y_bounds=(-0.02, 1.02),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Shared legend
 # --------------------------------------------------------------------------- #
 
-def save_legend(cfg: Config) -> None:
+def save_legend(df: pd.DataFrame, cfg: Config) -> None:
+    # Only legend a stage that actually has data -- a stage every k in the
+    # sweep failed to construct (see _validate_schema's note) has no line in
+    # any panel, so listing it here would be a legend key for nothing.
+    present = set(df["quantize"].unique())
+    stages = [s for s in STAGES if s in present]
+
     apply_style()
     fig, ax = plt.subplots(figsize=(5.6, 0.32))
     ax.axis("off")
@@ -441,13 +460,13 @@ def save_legend(cfg: Config) -> None:
             color=STAGE_COLORS[stage], marker=STAGE_MARKERS[stage],
             markersize=3, linewidth=1.0,
         )
-        for stage in STAGES
+        for stage in stages
     ]
-    labels = [STAGE_LABELS[stage] for stage in STAGES]
+    labels = [STAGE_LABELS[stage] for stage in stages]
 
     fig.legend(
         handles, labels,
-        loc="center", ncol=min(5, len(STAGES)),
+        loc="center", ncol=min(5, len(stages)),
         frameon=False, fontsize=7,
     )
     fig.patch.set_alpha(0.0)
@@ -476,13 +495,14 @@ def _save(fig: plt.Figure, filename: str, cfg: Config) -> None:
 def print_summary(df: pd.DataFrame, cfg: Config) -> None:
     print(f"\n--- Quantization summary (tau={cfg.tau:g}) ---")
     header = (f"{'quantize':>9} {'memory (MB)':>12} {'d(log10 J) vs None':>20} "
-              f"{'fpr':>12} {'time (s)':>10} {'n_balls':>8}")
+              f"{'fpr':>12} {'time (s)':>10} {'qps':>10} {'n_balls':>8}")
     print(header)
     print("-" * len(header))
 
     j_agg = _relative_to_baseline(aggregate(df, "log10_J", cfg, use_tau=False))
     fpr_agg = aggregate(df, "fpr", cfg, use_tau=True)
     time_agg = aggregate(df, "cum_time_s", cfg, use_tau=False)
+    qps_agg = aggregate(df, "query_throughput_qps", cfg, use_tau=False)
     balls_agg = aggregate(df, "n_balls", cfg, use_tau=False)
 
     for stage in STAGES:
@@ -490,10 +510,11 @@ def print_summary(df: pd.DataFrame, cfg: Config) -> None:
             k = row["k"]
             this_fpr = fpr_agg[(fpr_agg["quantize"] == stage) & (fpr_agg["k"] == k)]["mean"].iloc[0]
             this_time = time_agg[(time_agg["quantize"] == stage) & (time_agg["k"] == k)]["mean"].iloc[0]
+            this_qps = qps_agg[(qps_agg["quantize"] == stage) & (qps_agg["k"] == k)]["mean"].iloc[0]
             this_balls = balls_agg[(balls_agg["quantize"] == stage) & (balls_agg["k"] == k)]["mean"].iloc[0]
             print(
                 f"{STAGE_LABELS[stage]:>9} {row['Memory (MB)']:>12.3f} {row['mean']:>20.3f} "
-                f"{this_fpr:>12.2e} {this_time:>10.3f} {this_balls:>8.1f}"
+                f"{this_fpr:>12.2e} {this_time:>10.3f} {this_qps:>10.1f} {this_balls:>8.1f}"
             )
     print()
 
@@ -510,10 +531,13 @@ def generate_quantization_figures(
     emit_pdf: bool = EMIT_PDF,
 ) -> None:
     """
-    Library entry point: render the five quantization panels (+ legend) from an
-    in-memory long-format DataFrame instead of round-tripping through a file.
-    If `df` is omitted, falls back to `load_data()` (CONFIG-driven, reads
-    INPUT_PATH) so the script still works standalone.
+    Library entry point: render the six paper panels + one diagnostic FNR
+    panel (+ legend) from an in-memory long-format DataFrame instead of
+    round-tripping through a file. The FNR panel (panel_fnr) is a sanity
+    check, not part of the paper figure set -- see its own docstring -- so
+    it's excluded from the LaTeX subfigure snippet printed below. If `df` is
+    omitted, falls back to `load_data()` (CONFIG-driven, reads INPUT_PATH)
+    so the script still works standalone.
     """
     if df is None:
         df = load_data()
@@ -526,8 +550,10 @@ def generate_quantization_figures(
     panel_threshold_objective(df, cfg)
     panel_fpr(df, cfg)
     panel_construction_time(df, cfg)
+    panel_query_throughput(df, cfg)
     panel_n_balls(df, cfg)
-    save_legend(cfg)
+    panel_fnr(df, cfg)
+    save_legend(df, cfg)
 
     print_summary(df, cfg)
 
@@ -555,6 +581,11 @@ def generate_quantization_figures(
     \centering
     \includegraphics[width=\linewidth]{figures/quantization-construction-time.png}
     \caption{Construction time}
+\end{subfigure}
+\begin{subfigure}[b]{0.24\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/quantization-query-throughput.png}
+    \caption{Query throughput}
 \end{subfigure}
 \begin{subfigure}[b]{0.24\linewidth}
     \centering

@@ -13,7 +13,7 @@ import inspect
 from scipy.special import logsumexp
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 
-from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize
+from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize, InsufficientMemoryError
 from hyperspheres_volume import estimate_hypersphere_volume
 from vector_source import VectorSource
 
@@ -483,7 +483,7 @@ def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, flo
 # compare every real quantizer against, not one per candidate.
 QUANTIZATION_SWEEP = (
     Quantize.NONE, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
-    Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.PQ,
+    Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.SQ2T, Quantize.PQ,
 )
 
 
@@ -528,7 +528,19 @@ def quantization_worker(
     construction has no distance-threshold knob to feed it (Gonzalez
     construction only takes the vectors and a ball budget).
 
-    FNR is asserted (raises on violation), never plotted."""
+    FNR is asserted (raises on violation), never plotted. Each tau also times
+    its own filt.query(query_arr, ...) call (batched over the whole query
+    set, not per-query) to report query_throughput_qps -- query cost doesn't
+    conceptually depend on tau (every ball is still checked), so this is
+    mainly a per-quantize-candidate throughput estimate with tau_values-many
+    independent samples rather than a real tau sweep of the metric.
+
+    If constructing the filter itself raises (e.g. InsufficientMemoryError:
+    too tight a memory budget for PQ's minimum 2-center codebook -- see
+    BallCoverFilter._build_quantizer), that's treated as "this quantize
+    candidate isn't viable at this (dataset, k) point" rather than a fatal
+    error: the exception is caught, a message is printed, and this job
+    contributes zero rows (returns []) instead of aborting the whole sweep."""
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
     n_q = len(query_arr)
@@ -545,15 +557,29 @@ def quantization_worker(
 
     max_memory = _ball_cover_max_memory(dim, k, Quantize.NONE)
     t0 = time.perf_counter()
-    filt = BallCoverFilter(dim=dim, max_memory=max_memory, quantize=quantize)
-    filt.construct(construct_arr)
+    try:
+        filt = BallCoverFilter(dim=dim, max_memory=max_memory, quantize=quantize)
+        filt.construct(construct_arr)
+    except Exception as e:
+        print(
+            f"Skipping quantization job (dataset={dataset}, k={k}, quantize={quantize.value}, "
+            f"seed={seed}): construction raised {type(e).__name__}: {e}"
+        )
+        return []
     stage_time = time.perf_counter() - t0
     radii = filt.all_radiuses
     log10_J = _log10_J(radii, dim)
 
     memory_bytes = filt.get_bytesize()
 
-    predicted_by_tau = {t: filt.query(query_arr, distance_threshold=t) for t in tau_values}
+    predicted_by_tau: Dict[float, List[bool]] = {}
+    query_throughput_by_tau: Dict[float, float] = {}
+    for t in tau_values:
+        q0 = time.perf_counter()
+        predicted_by_tau[t] = filt.query(query_arr, distance_threshold=t)
+        query_time = time.perf_counter() - q0
+        query_throughput_by_tau[t] = n_q / max(query_time, 1e-9)
+
     for t in tau_values:
         rates = _confusion_rates(predicted_by_tau[t], actual_by_tau[t])
         rows.append({
@@ -562,6 +588,7 @@ def quantization_worker(
             "log10_J_tau": _log10_J(radii, dim, tau=t),
             "fpr": rates["fpr"], "fnr": rates["fnr"],
             "stage_time_s": stage_time, "cum_time_s": stage_time,
+            "query_throughput_qps": query_throughput_by_tau[t],
             "n_balls": filt.count_balls, "memory_bytes": memory_bytes, "seed": seed,
         })
 

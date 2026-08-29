@@ -4,7 +4,7 @@ sys.path.append(os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file
 import unittest
 import faiss
 import numpy as np
-from src.filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize
+from src.filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize, InsufficientMemoryError
 
 DIM = 8
 R = 0.3  # distance threshold used across most tests
@@ -363,7 +363,7 @@ class TestBytesize(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 _EXPLICIT_QUANTIZERS = (Quantize.SQ8, Quantize.SQ6, Quantize.SQ4, Quantize.FP16, Quantize.BF16,
-                        Quantize.SQ4T, Quantize.SQ8T, Quantize.PQ)
+                        Quantize.SQ4T, Quantize.SQ8T, Quantize.SQ2T, Quantize.PQ)
 
 
 _PQ_QUANTIZERS = (Quantize.PQ,)
@@ -491,14 +491,13 @@ class TestQuantizePQ(unittest.TestCase):
             pq_m = BallCoverFilter._choose_pq_m(dim)
             self.assertEqual(dim % pq_m, 0, f"dim={dim}, pq_m={pq_m}")
 
-    def test_single_center_falls_back_to_none_instead_of_crashing(self):
+    def test_single_center_raises_insufficient_memory_instead_of_crashing(self):
         """Regression test: IndexPQ.search segfaults when built with nbits=0
-        (which happens if n < 2 centers). A single stored vector must fall
-        back to Quantize.NONE, not attempt a 0-bit PQ codebook."""
+        (which happens if n < 2 centers). A single stored vector must raise
+        InsufficientMemoryError, not attempt a 0-bit PQ codebook."""
         f = BallCoverFilter(dim=DIM, max_memory=10_000, quantize=Quantize.PQ)
-        f.construct(_rand(1, seed=5))
-        self.assertIsInstance(f.index, faiss.IndexFlatL2)
-        self.assertTrue(f.query(_rand(1, seed=5), distance_threshold=1e-3)[0])
+        with self.assertRaises(InsufficientMemoryError):
+            f.construct(_rand(1, seed=5))
 
     def test_two_centers_is_the_minimum_pq_can_use(self):
         f = BallCoverFilter(dim=DIM, max_memory=10_000, quantize=Quantize.PQ)
@@ -508,8 +507,15 @@ class TestQuantizePQ(unittest.TestCase):
         self.assertTrue(all(f.query(vecs, distance_threshold=1e-2)))
 
     def test_pq_bytesize_stays_within_budget(self):
-        bytes_per_ball_fp16 = 2 * DIM + 4
-        budget = bytes_per_ball_fp16 * 10
+        # PQ's codebook is pre-allocated at nbits=8 regardless of training
+        # (see BallCoverFilter._make_index's default pq_nbits), so its fixed
+        # overhead dwarfs a couple ball-slots' worth of bytes -- budget must
+        # account for it explicitly, unlike the scalar quantizers' much
+        # smaller trained-parameter codebooks.
+        pq_probe = BallCoverFilter(dim=DIM, max_memory=1, quantize=Quantize.PQ)
+        bpb_pq = pq_probe.bytes_per_ball()
+        codebook_pq = pq_probe._codebook_bytes()
+        budget = codebook_pq + bpb_pq * 10
         f = BallCoverFilter(dim=DIM, max_memory=budget, quantize=Quantize.PQ)
         f.construct(_rand(200, seed=8))
         self.assertLessEqual(f.get_bytesize(), budget)
