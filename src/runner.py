@@ -711,7 +711,7 @@ def quantization_worker(
             "fpr": rates["fpr"], "fnr": rates["fnr"],
             "stage_time_s": stage_time, "cum_time_s": stage_time,
             "query_throughput_qps": query_throughput_by_tau[t],
-            "n_balls": filt.count_balls, "memory_bytes": memory_bytes, "seed": seed,
+            "n_balls": filt._num_spheres, "memory_bytes": memory_bytes, "seed": seed,
         })
 
     bad = [r for r in rows if r["fnr"] != 0]

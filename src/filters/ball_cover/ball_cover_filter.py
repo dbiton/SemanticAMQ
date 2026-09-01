@@ -68,7 +68,7 @@ class BallCoverFilter(Filter):
         self.construct_method = construct_method
         self.insert_method = insert_method
         self.insert_memory_percent = insert_memory_percent
-        self._all_centers_index = self._make_faiss_index(self.quantize)
+        self.all_centers_index = self._make_faiss_index(self.quantize)
         self.max_spheres = (max_spheres if max_spheres is not None 
                     else self._calculate_max_spheres(self.max_memory))
         self.max_construct_spheres = self._calculate_max_construct_spheres(self.insert_memory_percent)
@@ -93,14 +93,10 @@ class BallCoverFilter(Filter):
     def all_centers(self) -> np.ndarray:
         if self._all_centers is None:
             self._all_centers = np.empty((len(self._all_radiuses), self.dim), dtype=np.float32)
-            self._all_centers[self.all_spheres] = self.all_centers_index.reconstruct_n(0, self._num_spheres)
+            if self._num_spheres > 0:
+                sphere_indices = np.ascontiguousarray(self.all_spheres, dtype=np.int64)
+                self._all_centers[self.all_spheres] = self.all_centers_index.reconstruct_batch(sphere_indices)
         return self._all_centers[self.all_spheres]
-
-    @property
-    def all_centers_index(self) -> faiss.Index:
-        if isinstance(self._all_centers_index, faiss.IndexIDMap2):
-            return faiss.downcast_index(self._all_centers_index.index)
-        return self._all_centers_index
 
     @property
     def all_radiuses(self) -> np.ndarray:
@@ -140,7 +136,7 @@ class BallCoverFilter(Filter):
         self._ensure_capacity(capacity)
         self._num_spheres = 0
         self._all_centers = None
-        self._all_centers_index = self._make_faiss_index(self.quantize)
+        self.all_centers_index = self._make_faiss_index(self.quantize)
         self.insert_method.reset_buffers(capacity)
 
 
@@ -190,6 +186,8 @@ class BallCoverFilter(Filter):
 
     def bytes_per_ball(self) -> int:
         index = self.all_centers_index
+        if isinstance(index, faiss.IndexIDMap2):
+            index = faiss.downcast_index(self.all_centers_index.index)
         if isinstance(index, faiss.IndexPQ):
             return index.pq.code_size + self._BYTES_PER_FLOAT32
         if isinstance(index, faiss.IndexScalarQuantizer):
@@ -199,6 +197,8 @@ class BallCoverFilter(Filter):
 
     def _codebook_bytes(self) -> int:
         index = self.all_centers_index
+        if isinstance(index, faiss.IndexIDMap2):
+            index = faiss.downcast_index(self.all_centers_index.index)
         if isinstance(index, faiss.IndexPQ):
             return int(faiss.vector_to_array(index.pq.centroids).nbytes)
         if isinstance(index, faiss.IndexScalarQuantizer):
@@ -267,7 +267,7 @@ class BallCoverFilter(Filter):
         self._num_spheres = n
         self._all_spheres[:n] = sphere_indices.astype(np.int32)
         self._all_centers = None
-        self._all_centers_index = index
+        self.all_centers_index = index
         self._all_radiuses[sphere_indices] = radii
 
     # ------------------------------------------------------------------ construct & insert
@@ -296,7 +296,7 @@ class BallCoverFilter(Filter):
         Q = np.ascontiguousarray(vectors, dtype=np.float32)
         d2, labels = self.all_centers_index.search(Q, self._num_spheres)
         surface = np.sqrt(np.maximum(d2, 0.0)) - self._all_radiuses[labels]
-        return (surface.min(axis=1) < distance_threshold).tolist()
+        return (surface.min(axis=1) <= distance_threshold).tolist()
 
     # ------------------------------------------------------------------ streaming / dynamic insertion
 
@@ -308,7 +308,7 @@ class BallCoverFilter(Filter):
         if len(vectors) == 0:
             return
 
-        old_centers = self.all_centers
+        old_centers = self.all_centers.copy()
         self.insert_method.insert(self, vectors)
         new_centers = self.all_centers
 
