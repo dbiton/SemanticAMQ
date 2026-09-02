@@ -134,6 +134,13 @@ class KDBoxFilter(Filter):
         return best_margin, best_axis, best_split_val
 
 
+    def _remove_invalid_pairs(self) -> None:
+        counts = self._indices_count
+        self._minimal_pairs = [p for p in self._minimal_pairs 
+                if counts[p[1]] == p[2] and counts[p[3]] == p[4]]
+        heapq.heapify(self._minimal_pairs)
+
+
     def _add_box(self, box_min: np.ndarray, box_max: np.ndarray) -> None:
         current_boxes = self.all_boxes
 
@@ -195,9 +202,7 @@ class KDBoxFilter(Filter):
 
             i_min, i_max = self._all_boxes_min[i], self._all_boxes_max[i]
             j_min, j_max = self._all_boxes_min[j], self._all_boxes_max[j]
-
-            new_min = np.minimum(i_min, j_min)
-            new_max = np.maximum(i_max, j_max)
+            new_min, new_max = np.minimum(i_min, j_min), np.maximum(i_max, j_max)
 
             current_boxes = self.all_boxes[(self.all_boxes != i) & (self.all_boxes != j)]
             self._all_boxes[:self._num_boxes] = np.concatenate([current_boxes, [i, j]])
@@ -205,6 +210,9 @@ class KDBoxFilter(Filter):
             self._num_boxes -= 2
 
             self._add_box(new_min, new_max)
+
+        if len(self._minimal_pairs) > 2 * self.max_boxes * self._MAX_NEIGHBORS:
+            self._remove_invalid_pairs()
 
 
     def construct(self, vectors: np.ndarray) -> None:

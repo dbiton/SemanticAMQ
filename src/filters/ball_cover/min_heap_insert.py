@@ -37,6 +37,13 @@ class MinHeapInsert(InsertInterface):
         return np.maximum(sq_distances, 0.0)
 
 
+    def _remove_invalid_pairs(self) -> None:
+        versions = self._sphere_versions
+        self._minimal_pairs = [p for p in self._minimal_pairs 
+                if versions[p[1]] == p[2] and versions[p[3]] == p[4]]
+        heapq.heapify(self._minimal_pairs)
+
+
     def add_sphere(self, filter: Filter, center: np.ndarray, radius: float) -> None:
         current_spheres = filter.all_spheres
 
@@ -98,17 +105,17 @@ class MinHeapInsert(InsertInterface):
 
             center_i, radius_i = filter._all_centers[i], filter._all_radiuses[i]
             center_j, radius_j = filter._all_centers[j], filter._all_radiuses[j]
-
             centers_diff = center_i - center_j
             distance_ij = float(np.sqrt(np.dot(centers_diff, centers_diff)))
-            new_radius = (distance_ij + radius_i + radius_j) / 2.0
 
             if distance_ij > 0.0:
                 weight_j = ((radius_j - radius_i) / (2.0 * distance_ij)) + 0.5
                 weight_i = ((radius_i - radius_j) / (2.0 * distance_ij)) + 0.5
                 new_center = weight_j * center_j + weight_i * center_i
+                new_radius = max((distance_ij + radius_i + radius_j) / 2.0, 1e-6)
             else:
                 new_center = center_i
+                new_radius = max(radius_i, radius_j)
 
             current_spheres = filter.all_spheres[(filter.all_spheres != i) & (filter.all_spheres != j)]
             filter._all_spheres[:filter._num_spheres] = np.concatenate([current_spheres, [i, j]])
@@ -116,6 +123,9 @@ class MinHeapInsert(InsertInterface):
             filter._num_spheres -= 2
 
             self.add_sphere(filter, new_center, new_radius)
+
+        if len(self._minimal_pairs) > 2 * filter.max_spheres * self._MAX_NEIGHBORS:
+            self._remove_invalid_pairs()
 
 
     def insert(self, filter: Filter, vectors: np.ndarray) -> None:
