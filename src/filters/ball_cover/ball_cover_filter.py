@@ -294,7 +294,16 @@ class BallCoverFilter(Filter):
             return [False] * len(vectors)
 
         Q = np.ascontiguousarray(vectors, dtype=np.float32)
-        d2, labels = self.all_centers_index.search(Q, self._num_spheres)
+        # self._all_centers_index (the raw ID-mapped index), not the
+        # all_centers_index *property* -- that property unwraps to the
+        # plain inner index for bytes_per_ball()/_codebook_bytes()'s
+        # isinstance checks, and searching the unwrapped index returns
+        # labels keyed by raw insertion *position*, not sphere ID. Sphere
+        # IDs stop matching their insertion position after any merge
+        # retires/reassigns some of them, so self._all_radiuses[labels]
+        # below would silently index by the wrong sphere's radius,
+        # producing false negatives on exactly those merged points.
+        d2, labels = self._all_centers_index.search(Q, self._num_spheres)
         surface = np.sqrt(np.maximum(d2, 0.0)) - self._all_radiuses[labels]
         return (surface.min(axis=1) <= distance_threshold).tolist()
 

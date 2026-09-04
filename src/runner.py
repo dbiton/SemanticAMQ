@@ -14,8 +14,32 @@ from scipy.special import logsumexp
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 
 from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize, InsufficientMemoryError
+from filters.ball_cover.nearest_insert import NearestInsert
+from filters.ball_cover.least_inflation_insert import LeastInflationInsert
+from filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
+from filters.ball_cover.min_heap_insert import MinHeapInsert
+from filters.ball_cover.doubling_insert import DoublingInsert
 from hyperspheres_volume import estimate_hypersphere_volume
 from vector_source import VectorSource
+
+# String name -> InsertInterface class, used by stream_rebuild_worker to
+# turn generate_streaming()'s insertion_level strings into the strategy
+# *objects* BallCoverFilter.__init__'s insert_method now actually takes
+# (the older string-keyed insertion_level kwarg it accepted doesn't exist
+# on the current, modular BallCoverFilter). Classes, not instances -- each
+# job needs its own fresh strategy object, since e.g. MinHeapInsert carries
+# per-filter state (_sphere_versions, _minimal_pairs) that must not be
+# shared across filters/jobs. "doubling" is registered here (so it's usable
+# through this same dispatch) but not added to generate_streaming()'s own
+# `methods` sweep list -- that's a separate, deliberate opt-in since it adds
+# real compute to a real evaluation run.
+_INSERT_STRATEGIES = {
+    "nearest": NearestInsert,
+    "least_inflation": LeastInflationInsert,
+    "merge": ExhaustiveMergeInsert,
+    "min_heap": MinHeapInsert,
+    "doubling": DoublingInsert,
+}
 
 VectorInput = Union[np.ndarray, VectorSource]
 _QUERY_BATCH = 4096
@@ -954,10 +978,9 @@ def _rebuild_policy_tags(policy: str, insertion_level: Optional[str]) -> tuple:
     a from-scratch rebuild regardless of insertion_level, so it gets one
     fixed reference tag; "streaming"/"periodic" report whichever
     insertion_level they actually ran (nearest/least_inflation/merge/
-    doubling) as the method tag, so all four are plotted as regular,
-    directly comparable lines rather than one of them (the old "merge",
-    formerly the only add() behavior) needing a special "exhaustive
-    reference" tag of its own."""
+    min_heap -- see _INSERT_STRATEGIES) as the method tag, so all four are
+    plotted as regular, directly comparable lines rather than one of them
+    needing a special "exhaustive reference" tag of its own."""
     if policy == "oracle":
         return "static_reference", "static_rebuild"
     return "checkpoint", insertion_level or "nearest"
@@ -980,8 +1003,9 @@ def stream_rebuild_worker(
 ) -> List[Dict[str, Any]]:
     """Simulates one rebuild policy over vectors_stream, reporting FPR and
     amortized cost per checkpoint.
-      "streaming": BallCoverFilter.insert() per arrival (using insertion_level),
-        never rebuilt.
+      "streaming": BallCoverFilter.insert() per arrival (using the
+        InsertInterface instance _INSERT_STRATEGIES[insertion_level]()
+        selects), never rebuilt.
       "periodic": like "streaming", rebuilt from scratch every T arrivals.
       "oracle": rebuilt from scratch at every checkpoint (insertion_level
         doesn't apply -- there's nothing to insert into).
@@ -1035,17 +1059,23 @@ def stream_rebuild_worker(
     if policy not in ("streaming", "periodic"):
         raise ValueError(f"Unknown policy {policy!r}; expected 'streaming', 'periodic', or 'oracle'")
 
+    if insertion_level not in _INSERT_STRATEGIES:
+        raise ValueError(
+            f"Unknown insertion_level {insertion_level!r}; expected one of "
+            f"{sorted(_INSERT_STRATEGIES)}"
+        )
     rebuild_every = T if (policy == "periodic" and T is not None) else None
     filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k),
-                             insertion_level=insertion_level)
+                             insert_method=_INSERT_STRATEGIES[insertion_level]())
     # Bootstrap-then-diverge: the first k arrivals always become raw
     # zero-radius singletons via one batch construct() (identical across
     # every insertion_level), so checkpoint k+1 onward is a genuine
     # comparison of each method's own decision rule -- not an artifact of
-    # add_nearest/add_least_inflation never creating new balls on their own
-    # (only add_merge/add_doubling do), which would otherwise collapse this
-    # streamed-from-empty setup to a single ball for those two methods.
-    # generate_streaming()'s checkpoints all sit above k, so this never
+    # NearestInsert/LeastInflationInsert never creating new balls on their
+    # own (only ExhaustiveMergeInsert/MinHeapInsert do), which would
+    # otherwise collapse this streamed-from-empty setup to a single ball
+    # for those two methods. generate_streaming()'s checkpoints all sit
+    # above k, so this never
     # skips a requested checkpoint.
     bootstrap_n = min(k, n)
     t0 = time.perf_counter()

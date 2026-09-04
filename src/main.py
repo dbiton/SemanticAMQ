@@ -16,8 +16,6 @@ from plots.plot_system_tau import generate_system_tau_figures
 from plots.plot_common import DATASETS, DATASET_LABELS
 from typing import Tuple
 from filters.ball_cover.ball_cover_filter import BallCoverFilter
-from filters.dsbf_filter import DSBFFilter
-from filters.covering_lsh_fallback_filter import CoveringLSHFallbackFilter
 from filters.lsbf_filter import LSBFFilter
 from filters.dsh_filter import DSHFilter
 from filters.hnsw_filter import HNSWFilter
@@ -34,7 +32,7 @@ DATASET = 'ELI5'
 # plot_common so the dataset trio has one source of truth.
 DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
 
-dynamic_filters = [BallCoverFilter, DSBFFilter, CoveringLSHFallbackFilter, LSBFFilter, DSHFilter, HNSWFilter, IVFFilter]
+dynamic_filters = [BallCoverFilter, LSBFFilter, DSHFilter, HNSWFilter, IVFFilter]
 static_filters  = []
 
 # generate_equal_memory()'s own comparison set: BallCoverFilter (the paper's
@@ -822,10 +820,12 @@ def _build_streaming_negative_set(
 
 def generate_streaming() -> Tuple[pd.DataFrame, int]:
     """
-    Compare BallCoverFilter's 4 insertion methods (insertion_level:
-    "nearest", "least_inflation", "merge", "doubling" -- see
-    BallCoverFilter.insert()'s dispatch) via stream_rebuild_worker's
-    policy="streaming", each sharing the identical bootstrap-then-diverge
+    Compare BallCoverFilter's 4 insertion strategies (insertion_level:
+    "nearest", "least_inflation", "merge", "min_heap" -- see
+    runner._INSERT_STRATEGIES, which maps each name to the InsertInterface
+    object BallCoverFilter.insert() actually dispatches to) via
+    stream_rebuild_worker's policy="streaming", each sharing the identical
+    bootstrap-then-diverge
     setup (see that worker's docstring). Produces the long-format data
     behind the streaming figure's four panels:
       (a) FPR vs. stream position (fixed k_fixed), + a dashed static-rebuild
@@ -876,12 +876,12 @@ def generate_streaming() -> Tuple[pd.DataFrame, int]:
     plus k_fixed, which plot_streaming() needs and can't derive from the
     df alone.
     """
-    stream_size = 30_000
+    stream_size = 1_000
     dim = 384
     k_values = [16, 32, 64, 128, 256, 512, 1024]
-    methods = ["nearest", "least_inflation", "merge", "doubling"]
+    methods = ["nearest", "least_inflation", "merge", "min_heap"]
     n_negative, negative_candidate_multiplier = 500, 10
-    duplicate_percentage = 2.0  # calibrates tau_mid; see calculate_nn_distance_threshold
+    duplicate_percentage = 10.0  # calibrates tau_mid; see calculate_nn_distance_threshold
     seed = 0  # fixed; fold_offset supplies the stream-order variance instead
     output_csv = "results/streaming.csv"
 
@@ -1067,9 +1067,9 @@ def generate_and_plot_all() -> None:
     below). The early return currently isolates system_tau for standalone
     testing; remove it to also run the other 5.
     """
-    plot_quantization(generate_quantization())
+    # plot_quantization(generate_quantization())
     # plot_scaling(*generate_scaling())
-    # plot_streaming(*generate_streaming())
+    plot_streaming(*generate_streaming())
     # plot_equal_memory(generate_equal_memory()) # failed on 100K
     # plot_system_tau(*generate_system_tau())
     return
