@@ -303,7 +303,7 @@ class BallCoverFilter(Filter):
         # retires/reassigns some of them, so self._all_radiuses[labels]
         # below would silently index by the wrong sphere's radius,
         # producing false negatives on exactly those merged points.
-        d2, labels = self._all_centers_index.search(Q, self._num_spheres)
+        d2, labels = self.all_centers_index.search(Q, self._num_spheres)
         surface = np.sqrt(np.maximum(d2, 0.0)) - self._all_radiuses[labels]
         return (surface.min(axis=1) <= distance_threshold).tolist()
 

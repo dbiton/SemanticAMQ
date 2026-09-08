@@ -14,6 +14,9 @@ from scipy.special import logsumexp
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 
 from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize, InsufficientMemoryError
+from filters.quantized_vector_filter import (
+    QuantizedVectorFilter, InsufficientMemoryError as QVFInsufficientMemoryError,
+)
 from filters.ball_cover.nearest_insert import NearestInsert
 from filters.ball_cover.least_inflation_insert import LeastInflationInsert
 from filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
@@ -42,7 +45,7 @@ _INSERT_STRATEGIES = {
 }
 
 VectorInput = Union[np.ndarray, VectorSource]
-_QUERY_BATCH = 4096
+_QUERY_BATCH = 32
 
 
 def _to_construct_array(vectors: VectorInput) -> np.ndarray:
@@ -120,7 +123,7 @@ def _radius_stats(filter_instance: Any) -> Dict[str, float]:
 _DIRECT_TAU_FILTERS = {
     "FirstNFilter", "BallCoverFilter",
     "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", "DSHFilter", "HNSWFilter",
-    "IVFFilter",
+    "IVFFilter", "QuantizedVectorFilter",
 }
 
 
@@ -331,10 +334,29 @@ def equal_memory_worker(
     calib_arr = _to_construct_array(vectors_calibration)
     calib_actual = np.asarray(actual_calibration, dtype=bool)
 
-    filter_instance, construction_time = _build_calibrated_filter(
-        filter_cls, dim, memory_budget, distance_threshold,
-        construct_arr, calib_arr, calib_actual,
-    )
+    try:
+        filter_instance, construction_time = _build_calibrated_filter(
+            filter_cls, dim, memory_budget, distance_threshold,
+            construct_arr, calib_arr, calib_actual,
+        )
+    except QVFInsufficientMemoryError as e:
+        # Expected, meaningful outcome at small budgets for a per-point
+        # quantization baseline (see QuantizedVectorFilter's module
+        # docstring): not enough memory to store every vector at even the
+        # coarsest quantization level -- exactly the regime this comparison
+        # is meant to expose. Recorded as an explicit infeasible row (NaN
+        # metrics), unlike quantization_worker/tradeoff_*_worker's
+        # catch-and-skip convention (which drop the row silently) -- the
+        # equal-memory comparison wants this regime visible, not dropped or
+        # crashing the whole sweep.
+        print(f"  [Infeasible] {config} at memory_budget={memory_budget}: {e}")
+        return {
+            'Config': config, 'Dataset': dataset, 'Memory Budget': memory_budget,
+            'Memory Usage': float('nan'), 'Threshold': distance_threshold,
+            'FPR': float('nan'), 'FNR': float('nan'),
+            'Latency (ms)': float('nan'), 'Throughput (qps)': float('nan'),
+            'Infeasible': True,
+        }
 
     predicted: List[bool] = []
     start = time.perf_counter()
@@ -359,6 +381,7 @@ def equal_memory_worker(
         # included/excluded), not per-query serving cost.
         'Latency (ms)': construction_time * 1000,
         'Throughput (qps)': n_q / max(elapsed, 1e-9),
+        'Infeasible': False,
     }
 
 

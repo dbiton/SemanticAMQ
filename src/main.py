@@ -20,12 +20,26 @@ from filters.lsbf_filter import LSBFFilter
 from filters.dsh_filter import DSHFilter
 from filters.hnsw_filter import HNSWFilter
 from filters.ivf_filter import IVFFilter
+from filters.quantized_vector_filter import QuantizedVectorFilter
 from util.dataset_paths import dataset_filenames
 from util.fetch_datasets import load_embeds
 from vector_source import VectorSource, ArrayVectorSource
 
 MAX_WORKERS = 4
 DATASET = 'ELI5'
+
+# Single knob controlling how many vectors every generate_* evaluation below
+# pulls as its input stream (each function's local num_vectors/stream_size
+# variable now just aliases this, instead of each picking its own literal).
+# Every other size-related knob in a given function (k values, memory
+# budgets, construct/query splits, ...) still derives from that local
+# variable exactly as before, so raising/lowering this one global rescales
+# every evaluation at once. 1_000 is deliberately conservative: some
+# evaluations (generate_equal_memory, generate_dynamic, generate_streaming)
+# are documented to blow up, crash, or become impractically slow at the much
+# larger values each used to hardcode individually (up to 100_000) -- if you
+# raise this, check each function's own docstring for known ceilings first.
+STREAM_SIZE = 1_000
 
 # Registry name -> canonical dataset key, shared by every long-format
 # evaluation (quantization, query_performance, scaling, streaming). Derived from
@@ -42,8 +56,14 @@ static_filters  = []
 # memory budget on realistic construct-set sizes (their hash-code alphabets /
 # grid cell width saturate regardless of budget -- see project memory), which
 # makes them uninformative for a budget-sensitivity comparison specifically;
-# they stay in dynamic_filters for the other evaluations.
-equal_memory_filters = [BallCoverFilter, HNSWFilter, IVFFilter]
+# they stay in dynamic_filters for the other evaluations. QuantizedVectorFilter
+# is the "compress the vectors" counterpart to BallCoverFilter's "compress the
+# geometry" -- it belongs here specifically to find the dataset size at which
+# BallCoverFilter's geometric summary wins over storing (compressed) points
+# directly; it can also raise InsufficientMemoryError at small budgets, which
+# runner.py::equal_memory_worker records as an explicit outcome rather than a
+# crash.
+equal_memory_filters = [BallCoverFilter, HNSWFilter, IVFFilter, DSHFilter, QuantizedVectorFilter]
 
 def calculate_max_memory_budget_bytes(num_vectors: int, dimension: int, bytes_per_element: float) -> int:
     return num_vectors * dimension * bytes_per_element // 64
@@ -198,7 +218,7 @@ def compute_static_actual_results(
 
 
 def generate_static() -> list:
-    num_vectors              = 100_000
+    num_vectors              = STREAM_SIZE
     dim                      = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
@@ -271,11 +291,11 @@ def generate_equal_memory() -> list:
     and query throughput is measured on the held-out query set; all four are
     plotted one series per budget.
     """
-    num_vectors             = 100_000
-    dim                     = 384
-    percentage_construct    = 20
-    percentage_calibration  = 10
-    duplicate_percentage    = 5.0
+    num_vectors               = STREAM_SIZE
+    dim                       = 384
+    percentage_construct      = 80
+    percentage_calibration    = 10
+    duplicate_percentage      = 5.0
     count_memory_steps        = 10
 
     dataset = DATASET
@@ -385,7 +405,7 @@ def generate_system_tau() -> Tuple[pd.DataFrame, int]:
     plot_system_tau() needs it for the per-panel annotation and there's
     nothing to derive it from -- k is fixed by construction, not swept.
     """
-    num_vectors           = 100000
+    num_vectors           = STREAM_SIZE
     dim                   = 384
     use_kfold             = False
     k_folds               = 5
@@ -501,7 +521,7 @@ def generate_quantization() -> pd.DataFrame:
         construct-set scale, so the percentile is what stays meaningful as
         num_vectors/percentage_construct change, not a raw float.
     """
-    num_vectors            = 50_000
+    num_vectors            = STREAM_SIZE
     dim                    = 384
     percentage_construct   = 20
     k_fractions            = [0.03, 0.06, 0.125, 0.25]
@@ -578,7 +598,7 @@ def generate_query_performance() -> pd.DataFrame:
     long-format DataFrame, written to results/query_performance.csv. Render
     with plot_query_performance().
     """
-    num_vectors           = 100_000
+    num_vectors           = STREAM_SIZE
     dim                   = 384
     percentage_construct  = 20
     k_values              = [16, 32, 64, 128, 256, 512, 1024]
@@ -681,7 +701,7 @@ def generate_scaling() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     are the two other swept axes and stay independent knobs (they're not
     size-of-data parameters); dim/tau_mid/seeds are independent too.
     """
-    stream_size      = 90_000
+    stream_size      = STREAM_SIZE
     dim              = 384
     n_steps          = 6
     k_values         = [16, 32, 64, 128, 256, 512]
@@ -876,7 +896,7 @@ def generate_streaming() -> Tuple[pd.DataFrame, int]:
     plus k_fixed, which plot_streaming() needs and can't derive from the
     df alone.
     """
-    stream_size = 1_000
+    stream_size = STREAM_SIZE
     dim = 384
     k_values = [16, 32, 64, 128, 256, 512, 1024]
     methods = ["nearest", "least_inflation", "merge", "min_heap"]
@@ -1020,7 +1040,7 @@ def plot_streaming(df: pd.DataFrame, k_fixed: int) -> None:
 
 
 def generate_dynamic() -> list:
-    num_vectors              = 1_000
+    num_vectors              = STREAM_SIZE
     dim                      = 384
     min_percentage_duplicates = 1
     max_percentage_duplicates = 9
@@ -1069,8 +1089,8 @@ def generate_and_plot_all() -> None:
     """
     # plot_quantization(generate_quantization())
     # plot_scaling(*generate_scaling())
-    plot_streaming(*generate_streaming())
-    # plot_equal_memory(generate_equal_memory()) # failed on 100K
+    # plot_streaming(*generate_streaming())
+    plot_equal_memory(generate_equal_memory()) # failed on 100K
     # plot_system_tau(*generate_system_tau())
     return
     try:

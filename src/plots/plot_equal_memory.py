@@ -34,26 +34,56 @@ OUTDIR = "plots/equal_memory/"
 DPI = 400
 EMIT_PDF = False
 
-# --------------------------------------------------------------------------- #
-# Fixed filter styling -- must match every other figure in the paper.
-# --------------------------------------------------------------------------- #
-
-CONFIGS = ["BallCoverFilter", "HNSWFilter", "IVFFilter"]
-CONFIG_LABELS = {
-    "BallCoverFilter": "Ours",
+# Display overrides for recognized filter names; anything else falls back to
+# the palettes below (see _derive_style_maps).
+_KNOWN_LABELS = {
+    "BallCoverFilter": "BallFilter",
     "HNSWFilter": "HNSW",
     "IVFFilter": "IVF",
+    "DSHFilter": "DSH",
+    "LSBFFilter": "LSBF",
+    "DSBFFilter": "DSBF",
+    "CoveringLSHFallbackFilter": "Covering LSH",
 }
-CONFIG_COLORS = {
+_KNOWN_COLORS = {
     "BallCoverFilter": "#0072B2",
     "HNSWFilter": "#56B4E9",
     "IVFFilter": "#E69F00",
 }
-CONFIG_MARKERS = {
+_KNOWN_MARKERS = {
     "BallCoverFilter": "o",
     "HNSWFilter": "P",
     "IVFFilter": "s",
 }
+# Okabe-Ito-derived, colorblind-safe.
+_PALETTE_COLORS = ["#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7", "#56B4E9", "#F0E442", "#999999"]
+_PALETTE_MARKERS = ["o", "s", "^", "D", "v", "P", "*", "X", "h", "p"]
+
+
+def _label_for(name: str) -> str:
+    if name in _KNOWN_LABELS:
+        return _KNOWN_LABELS[name]
+    return name[:-len("Filter")] if name.endswith("Filter") else name
+
+
+def _derive_style_maps(configs: list) -> tuple:
+    labels, colors, markers = {}, {}, {}
+    used_colors, used_markers = set(_KNOWN_COLORS.values()), set(_KNOWN_MARKERS.values())
+    palette_colors = iter(c for c in _PALETTE_COLORS if c not in used_colors)
+    palette_markers = iter(m for m in _PALETTE_MARKERS if m not in used_markers)
+
+    for name in configs:
+        labels[name] = _label_for(name)
+        colors[name] = _KNOWN_COLORS.get(name) or next(palette_colors, _PALETTE_COLORS[0])
+        markers[name] = _KNOWN_MARKERS.get(name) or next(palette_markers, _PALETTE_MARKERS[0])
+
+    return labels, colors, markers
+
+
+def _derive_configs(df: pd.DataFrame) -> list:
+    """Ordered, de-duplicated filter base names present in df["Config"]."""
+    base_names = df["Config"].str.split(" + ", regex=False).str[0]
+    return list(dict.fromkeys(base_names))
 
 
 @dataclasses.dataclass
@@ -61,6 +91,10 @@ class Config:
     dpi: int
     emit_pdf: bool
     outdir: str
+    configs: list
+    labels: dict
+    colors: dict
+    markers: dict
 
 
 # --------------------------------------------------------------------------- #
@@ -78,13 +112,8 @@ def _validate_schema(df: pd.DataFrame) -> None:
             f"Present columns: {sorted(df.columns)}"
         )
 
-    filters_present = set(df["Config"].str.split(" + ", regex=False).str[0].unique())
-    missing = set(CONFIGS) - filters_present
-    if missing:
-        raise ValueError(
-            f"Missing filter config(s) {sorted(missing)} in data. "
-            f"Available: {sorted(filters_present)}"
-        )
+    if df["Config"].isna().all() or (df["Config"].str.len() == 0).all():
+        raise ValueError("Input has a 'Config' column but no filter configs in it.")
 
 
 def load_data() -> pd.DataFrame:
@@ -139,22 +168,22 @@ def _line_panel(
     apply_style()
     fig, ax = plt.subplots()
 
-    for name in CONFIGS:
+    for name in cfg.configs:
         sub = agg[agg["filter"] == name].sort_values("Memory Budget (MB)")
         if sub.empty:
             continue
         has_ci = (sub["ci95"] > 0).any()
         ax.plot(
             sub["Memory Budget (MB)"], sub["mean"],
-            color=CONFIG_COLORS[name],
-            marker=CONFIG_MARKERS[name], markersize=2.5,
+            color=cfg.colors[name],
+            marker=cfg.markers[name], markersize=2.5,
             linewidth=0.8,
             zorder=2,
         )
         if has_ci:
             ax.errorbar(
                 sub["Memory Budget (MB)"], sub["mean"], yerr=sub["ci95"],
-                fmt="none", ecolor=CONFIG_COLORS[name],
+                fmt="none", ecolor=cfg.colors[name],
                 elinewidth=0.5, capsize=1.5, capthick=0.5,
                 zorder=3,
             )
@@ -217,16 +246,16 @@ def save_legend(cfg: Config) -> None:
     handles = [
         plt.Line2D(
             [0], [0],
-            color=CONFIG_COLORS[name], marker=CONFIG_MARKERS[name],
+            color=cfg.colors[name], marker=cfg.markers[name],
             markersize=3, linewidth=1.0,
         )
-        for name in CONFIGS
+        for name in cfg.configs
     ]
-    labels = [CONFIG_LABELS[name] for name in CONFIGS]
+    labels = [cfg.labels[name] for name in cfg.configs]
 
     fig.legend(
         handles, labels,
-        loc="center", ncol=len(CONFIGS),
+        loc="center", ncol=len(cfg.configs),
         frameon=False, fontsize=7,
     )
     fig.patch.set_alpha(0.0)
@@ -257,7 +286,7 @@ def _save(fig: plt.Figure, filename: str, cfg: Config) -> None:
 # Summary table
 # --------------------------------------------------------------------------- #
 
-def print_summary(df: pd.DataFrame) -> None:
+def print_summary(df: pd.DataFrame, cfg: Config) -> None:
     print("\n--- Equal-memory comparison summary ---")
     header = f"{'filter':<24} {'budget (MB)':>12} {'FPR':>8} {'FNR':>8} {'construct (ms)':>15} {'QPS':>12}"
     print(header)
@@ -268,7 +297,7 @@ def print_summary(df: pd.DataFrame) -> None:
     lat_agg = aggregate(df, "Latency (ms)")
     qps_agg = aggregate(df, "Throughput (qps)")
 
-    for name in CONFIGS:
+    for name in cfg.configs:
         budgets = sorted(fpr_agg[fpr_agg["filter"] == name]["Memory Budget (MB)"].unique())
         for budget in budgets:
             def _mean(agg: pd.DataFrame) -> float:
@@ -276,7 +305,7 @@ def print_summary(df: pd.DataFrame) -> None:
                 return float(row["mean"].iloc[0]) if len(row) else float("nan")
 
             print(
-                f"{CONFIG_LABELS[name]:<24} {budget:>12.3f} "
+                f"{cfg.labels[name]:<24} {budget:>12.3f} "
                 f"{_mean(fpr_agg):>8.3f} {_mean(fnr_agg):>8.3f} "
                 f"{_mean(lat_agg):>15.4f} {_mean(qps_agg):>12.1f}"
             )
@@ -306,7 +335,9 @@ def generate_equal_memory_figures(
     else:
         _validate_schema(df)
 
-    cfg = Config(dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
+    configs = _derive_configs(df)
+    labels, colors, markers = _derive_style_maps(configs)
+    cfg = Config(dpi=dpi, emit_pdf=emit_pdf, outdir=outdir, configs=configs, labels=labels, colors=colors, markers=markers)
 
     panel_fpr(df, cfg)
     panel_fnr(df, cfg)
@@ -314,7 +345,7 @@ def generate_equal_memory_figures(
     panel_throughput(df, cfg)
     save_legend(cfg)
 
-    print_summary(df)
+    print_summary(df, cfg)
 
     snippet = r"""
 \begin{figure*}[]
