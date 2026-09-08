@@ -38,10 +38,11 @@ class MinHeapInsert(InsertInterface):
 
 
     def _remove_invalid_pairs(self) -> None:
-        versions = self._sphere_versions
-        self._minimal_pairs = [p for p in self._minimal_pairs 
-                if versions[p[1]] == p[2] and versions[p[3]] == p[4]]
-        heapq.heapify(self._minimal_pairs)
+        if len(self._minimal_pairs) > 2 * filter.max_spheres * self._MAX_NEIGHBORS:
+            versions = self._sphere_versions
+            self._minimal_pairs = [p for p in self._minimal_pairs 
+                    if versions[p[1]] == p[2] and versions[p[3]] == p[4]]
+            heapq.heapify(self._minimal_pairs)
 
 
     def add_sphere(self, filter: Filter, center: np.ndarray, radius: float) -> None:
@@ -124,9 +125,6 @@ class MinHeapInsert(InsertInterface):
 
             self.add_sphere(filter, new_center, new_radius)
 
-        if len(self._minimal_pairs) > 2 * filter.max_spheres * self._MAX_NEIGHBORS:
-            self._remove_invalid_pairs()
-
 
     def insert(self, filter: Filter, vectors: np.ndarray) -> None:
         for i in range(0, len(vectors), self._BATCH_SIZE):
@@ -146,6 +144,7 @@ class MinHeapInsert(InsertInterface):
                 self.add_sphere(filter, vec, 0.0)
 
             self._merge_spheres(filter)
+            self._remove_invalid_pairs()
 
 
     def remove(self, filter: Filter, vectors: np.ndarray) -> List[bool]:

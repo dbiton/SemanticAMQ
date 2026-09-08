@@ -126,11 +126,10 @@ class GonzalezBoxFilter(Filter):
         c = vectors[first]
         nearest_sq = np.maximum(sq_norms - 2.0 * (vectors @ c) + c @ c, 0.0)
         assignment = np.zeros(n, dtype=np.int32)
-        stop_sq = float(self.distance_threshold) ** 2
 
         for center_id in range(1, k):
             far_idx = int(nearest_sq.argmax())
-            if nearest_sq[far_idx] <= stop_sq:
+            if nearest_sq[far_idx] <= 1e-12:
                 break
             c = vectors[far_idx]
             new_sq = np.maximum(sq_norms - 2.0 * (vectors @ c) + c @ c, 0.0)
@@ -142,10 +141,11 @@ class GonzalezBoxFilter(Filter):
 
 
     def _remove_invalid_pairs(self) -> None:
-        counts = self._indices_count
-        self._minimal_pairs = [p for p in self._minimal_pairs 
-                if counts[p[1]] == p[2] and counts[p[3]] == p[4]]
-        heapq.heapify(self._minimal_pairs)
+        if len(self._minimal_pairs) > 2 * self.max_boxes * self._MAX_NEIGHBORS:
+            counts = self._indices_count
+            self._minimal_pairs = [p for p in self._minimal_pairs 
+                    if counts[p[1]] == p[2] and counts[p[3]] == p[4]]
+            heapq.heapify(self._minimal_pairs)
 
 
     def _add_box(self, box_min: np.ndarray, box_max: np.ndarray) -> None:
@@ -218,9 +218,6 @@ class GonzalezBoxFilter(Filter):
 
             self._add_box(new_min, new_max)
 
-        if len(self._minimal_pairs) > 2 * self.max_boxes * self._MAX_NEIGHBORS:
-            self._remove_invalid_pairs()
-
 
     def construct(self, vectors: np.ndarray) -> Tuple[float, float]:
         if len(vectors) == 0 or self.max_boxes == 0:
@@ -231,9 +228,7 @@ class GonzalezBoxFilter(Filter):
 
         if self.max_boxes >= len(vectors):
             for vec in vectors:
-                box_min = vec - self.distance_threshold
-                box_max = vec + self.distance_threshold
-                self._add_box(box_min, box_max)
+                self._add_box(vec, vec)
             self._constructed = True
             return
 
@@ -250,27 +245,30 @@ class GonzalezBoxFilter(Filter):
                 continue
 
             cluster_vectors = vectors[cluster_indices]
-            box_min = cluster_vectors.min(axis=0) - self.distance_threshold
-            box_max = cluster_vectors.max(axis=0) + self.distance_threshold
+            box_min = cluster_vectors.min(axis=0)
+            box_max = cluster_vectors.max(axis=0)
             self._add_box(box_min, box_max)
 
         self._constructed = True
 
 
-    def query(self, vectors: np.ndarray) -> List[bool]:
+    def query(self, vectors: np.ndarray, distance_threshold: Optional[float] = None) -> List[bool]:
         if not self._constructed:
             raise ValueError("GonzalezBoxFilter has not been constructed.")
 
         if len(self.all_boxes_min) == 0 or len(vectors) == 0:
             return [False] * len(vectors)
 
+        if distance_threshold is None:
+            distance_threshold = self.distance_threshold
+
         q = np.ascontiguousarray(vectors, dtype=np.float32)
-        in_any_box = box_query(q, self.all_boxes_min, self.all_boxes_max)
+        in_any_box = box_query(q, self.all_boxes_min - distance_threshold, self.all_boxes_max + distance_threshold)
 
         return in_any_box.tolist()
 
 
-    def add(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray) -> None:
         if not self._constructed:
             self.construct(vectors)
             return
@@ -283,21 +281,20 @@ class GonzalezBoxFilter(Filter):
             vector_batch = np.ascontiguousarray(vector_batch, dtype=np.float32)
 
             if self._num_boxes > 0:
-                in_each_box = np.all((vector_batch[:, None, :] >= self.all_boxes_min[None, :, :] + self.distance_threshold) & 
-                                     (vector_batch[:, None, :] <= self.all_boxes_max[None, :, :] - self.distance_threshold), axis=2)
+                in_each_box = np.all((vector_batch[:, None, :] >= self.all_boxes_min[None, :, :]) & 
+                                     (vector_batch[:, None, :] <= self.all_boxes_max[None, :, :]), axis=2)
                 is_already_covered = np.any(in_each_box, axis=1)
                 vector_batch = vector_batch[~is_already_covered]
 
             for vec in vector_batch:
-                box_min = vec - self.distance_threshold
-                box_max = vec + self.distance_threshold
-                self._add_box(box_min, box_max)
+                self._add_box(vec, vec)
 
             self._merge_boxes()
+            self._remove_invalid_pairs()
 
 
-    def insert(self, vectors: np.ndarray) -> None:
-        self.add(vectors)
+    def add(self, vectors: np.ndarray) -> None:
+        self.insert(vectors)
 
 
     def remove(self, vectors: np.ndarray) -> List[bool]:

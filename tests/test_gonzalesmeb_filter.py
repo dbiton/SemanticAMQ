@@ -100,14 +100,14 @@ class TestGonzalezConstruct(unittest.TestCase):
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=20)
         f.construct(vecs)
         self.assertEqual(len(f.all_spheres), 3)
-        np.testing.assert_allclose(f.all_radiuses, R, atol=1e-5)
+        np.testing.assert_allclose(f.all_radiuses + f.distance_threshold, R, atol=1e-5)
 
     def test_trivial_case_n_equals_max_spheres(self):
         vecs = _rand(5)
         f = GonzalezMEBFilter(dim=DIM, distance_threshold=R, max_spheres=5)
         f.construct(vecs)
         self.assertEqual(len(f.all_spheres), 5)
-        np.testing.assert_allclose(f.all_radiuses, R, atol=1e-5)
+        np.testing.assert_allclose(f.all_radiuses + f.distance_threshold, R, atol=1e-5)
 
     def test_all_spheres_contain_original_vectors_in_trivial_case(self):
         """When max_spheres >= n, each sphere center must literally be one

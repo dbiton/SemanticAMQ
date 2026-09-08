@@ -135,10 +135,11 @@ class KDBoxFilter(Filter):
 
 
     def _remove_invalid_pairs(self) -> None:
-        counts = self._indices_count
-        self._minimal_pairs = [p for p in self._minimal_pairs 
-                if counts[p[1]] == p[2] and counts[p[3]] == p[4]]
-        heapq.heapify(self._minimal_pairs)
+        if len(self._minimal_pairs) > 2 * self.max_boxes * self._MAX_NEIGHBORS:
+            counts = self._indices_count
+            self._minimal_pairs = [p for p in self._minimal_pairs 
+                    if counts[p[1]] == p[2] and counts[p[3]] == p[4]]
+            heapq.heapify(self._minimal_pairs)
 
 
     def _add_box(self, box_min: np.ndarray, box_max: np.ndarray) -> None:
@@ -211,9 +212,6 @@ class KDBoxFilter(Filter):
 
             self._add_box(new_min, new_max)
 
-        if len(self._minimal_pairs) > 2 * self.max_boxes * self._MAX_NEIGHBORS:
-            self._remove_invalid_pairs()
-
 
     def construct(self, vectors: np.ndarray) -> None:
         if len(vectors) == 0 or self.max_boxes == 0:
@@ -222,9 +220,7 @@ class KDBoxFilter(Filter):
 
         elif self.max_boxes >= len(vectors):
             for vec in vectors:
-                box_min = vec - self.distance_threshold
-                box_max = vec + self.distance_threshold
-                self._add_box(box_min, box_max)
+                self._add_box(vec, vec)
             self._constructed = True
             return
 
@@ -236,10 +232,6 @@ class KDBoxFilter(Filter):
         while len(rectangles) < self.max_boxes and len(rectangles) < len(vectors):
             p_margin, p_axis, p_split_val, parent_indices = heapq.heappop(rectangles)
             p_margin = -p_margin
-
-            if p_margin <= self.distance_threshold:
-                heapq.heappush(rectangles, (-p_margin, p_axis, p_split_val, parent_indices))
-                break
 
             current_vectors = vectors[parent_indices]
             left_mask = current_vectors[:, p_axis] < p_split_val
@@ -262,27 +254,30 @@ class KDBoxFilter(Filter):
                 continue
 
             box_vectors = vectors[rectangle_indices]
-            box_min = box_vectors.min(axis=0) - self.distance_threshold
-            box_max = box_vectors.max(axis=0) + self.distance_threshold
+            box_min = box_vectors.min(axis=0)
+            box_max = box_vectors.max(axis=0)
             self._add_box(box_min, box_max)
 
         self._constructed = True
 
 
-    def query(self, vectors: np.ndarray) -> List[bool]:
+    def query(self, vectors: np.ndarray, distance_threshold: Optional[float] = None) -> List[bool]:
         if not self._constructed:
             raise ValueError("KDBoxFilter has not been constructed.")
 
         if len(self.all_boxes_min) == 0 or len(vectors) == 0:
             return [False] * len(vectors)
 
+        if distance_threshold is None:
+            distance_threshold = self.distance_threshold
+
         q = np.ascontiguousarray(vectors, dtype=np.float32)
-        in_any_box = box_query(q, self.all_boxes_min, self.all_boxes_max)
+        in_any_box = box_query(q, self.all_boxes_min - distance_threshold, self.all_boxes_max + distance_threshold)
 
         return in_any_box.tolist()
 
 
-    def add(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray) -> None:
         if not self._constructed:
             self.construct(vectors)
             return
@@ -295,21 +290,20 @@ class KDBoxFilter(Filter):
             vector_batch = np.ascontiguousarray(vector_batch, dtype=np.float32)
 
             if self._num_boxes > 0:
-                in_each_box = np.all((vector_batch[:, None, :] >= self.all_boxes_min[None, :, :] + self.distance_threshold) & 
-                                     (vector_batch[:, None, :] <= self.all_boxes_max[None, :, :] - self.distance_threshold), axis=2)
+                in_each_box = np.all((vector_batch[:, None, :] >= self.all_boxes_min[None, :, :]) & 
+                                     (vector_batch[:, None, :] <= self.all_boxes_max[None, :, :]), axis=2)
                 is_already_covered = np.any(in_each_box, axis=1)
                 vector_batch = vector_batch[~is_already_covered]
 
             for vec in vector_batch:
-                box_min = vec - self.distance_threshold
-                box_max = vec + self.distance_threshold
-                self._add_box(box_min, box_max)
+                self._add_box(vec, vec)
 
             self._merge_boxes()
+            self._remove_invalid_pairs()
 
 
-    def insert(self, vectors: np.ndarray) -> None:
-        self.add(vectors)
+    def add(self, vectors: np.ndarray) -> None:
+        self.insert(vectors)
 
 
     def remove(self, vectors: np.ndarray) -> List[bool]:

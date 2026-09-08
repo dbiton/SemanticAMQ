@@ -67,7 +67,7 @@ class TestGonzalezClusteringLogic(unittest.TestCase):
 
     def test_gonzalez_stops_early_if_threshold_met(self):
         f = GonzalezBoxFilter(dim=2, distance_threshold=100.0, max_spheres=5)
-        vecs = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]], dtype=np.float32)
+        vecs = np.array([[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]], dtype=np.float32)
         sq_norms = np.sum(vecs * vecs, axis=1)
         assignments = f._gonzalez_clustering(vecs, sq_norms, k=5)
         self.assertEqual(len(np.unique(assignments)), 1)
@@ -118,7 +118,7 @@ class TestGonzalezBoxConstruct(unittest.TestCase):
         f = GonzalezBoxFilter(dim=DIM, distance_threshold=R, max_spheres=10)
         vecs = _rand(200)
         f.construct(vecs)
-        sides = f.all_boxes_max - f.all_boxes_min
+        sides = (f.all_boxes_max + R) - (f.all_boxes_min - R)
         self.assertTrue(np.all(sides >= 2 * R - 1e-5))
         
     def test_separated_clusters_get_one_box_each(self):

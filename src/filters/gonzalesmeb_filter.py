@@ -115,11 +115,10 @@ class GonzalezMEBFilter(Filter):
         c = vectors[first]
         nearest_sq = np.maximum(sq_norms - 2.0 * (vectors @ c) + c @ c, 0.0)
         assignment = np.zeros(n, dtype=np.int32)
-        stop_sq = float(self.distance_threshold) ** 2
 
         for center_id in range(1, k):
             far_idx = int(nearest_sq.argmax())
-            if nearest_sq[far_idx] <= stop_sq:
+            if nearest_sq[far_idx] <= 1e-12:
                 break
             c = vectors[far_idx]
             new_sq = np.maximum(sq_norms - 2.0 * (vectors @ c) + c @ c, 0.0)
@@ -146,10 +145,11 @@ class GonzalezMEBFilter(Filter):
 
 
     def _remove_invalid_pairs(self) -> None:
-        counts = self._indices_count
-        self._minimal_pairs = [p for p in self._minimal_pairs 
-                if counts[p[1]] == p[2] and counts[p[3]] == p[4]]
-        heapq.heapify(self._minimal_pairs)
+        if len(self._minimal_pairs) > 2 * self.max_spheres * self._MAX_NEIGHBORS:
+            counts = self._indices_count
+            self._minimal_pairs = [p for p in self._minimal_pairs 
+                    if counts[p[1]] == p[2] and counts[p[3]] == p[4]]
+            heapq.heapify(self._minimal_pairs)
 
 
     def _add_sphere(self, center: np.ndarray, radius: float) -> None:
@@ -232,9 +232,6 @@ class GonzalezMEBFilter(Filter):
 
             self._add_sphere(new_center, new_radius)
 
-        if len(self._minimal_pairs) > 2 * self.max_spheres * self._MAX_NEIGHBORS:
-            self._remove_invalid_pairs()
-
 
     def construct(self, vectors: np.ndarray) -> Tuple[float, float]:
         if len(vectors) == 0 or self.max_spheres == 0:
@@ -245,7 +242,7 @@ class GonzalezMEBFilter(Filter):
 
         if self.max_spheres >= len(vectors):
             for vec in vectors:
-                self._add_sphere(vec, self.distance_threshold)
+                self._add_sphere(vec, 0.0)
             self._constructed = True
             return self._log_volume_bounds()
 
@@ -259,18 +256,21 @@ class GonzalezMEBFilter(Filter):
 
         for cluster_id in clusters:
             center, radius = self._minimum_enclosing_ball(vectors[cluster_id], sq_norms[cluster_id])
-            self._add_sphere(center, radius + self.distance_threshold)
+            self._add_sphere(center, radius)
         self._constructed = True
 
         return self._log_volume_bounds()
-    
 
-    def query(self, vectors: np.ndarray) -> List[bool]:
+
+    def query(self, vectors: np.ndarray, distance_threshold: Optional[float] = None) -> List[bool]:
         if not self._constructed:
             raise ValueError("GonzalezMEBFilter has not been constructed.")
 
         if len(self.all_centers) == 0 or len(vectors) == 0:
             return [False] * len(vectors)
+
+        if distance_threshold is None:
+            distance_threshold = self.distance_threshold
 
         q = np.ascontiguousarray(vectors, dtype=np.float32)
         q_sq = np.sum(q**2, axis=1)
@@ -279,12 +279,13 @@ class GonzalezMEBFilter(Filter):
         c_sq = np.sum(self.all_centers**2, axis=1)
 
         sq_distances = self._compute_squared_distances(q, q_sq, c, c_sq)
-        in_any_sphere = np.any(sq_distances <= self.all_radiuses[None, :]**2, axis=1)
+        all_radiuses = self.all_radiuses + distance_threshold
+        in_any_sphere = np.any(sq_distances <= (all_radiuses[None, :] ** 2), axis=1)
 
         return in_any_sphere.tolist()
 
 
-    def add(self, vectors: np.ndarray) -> None:
+    def insert(self, vectors: np.ndarray) -> None:
         if not self._constructed:
             self.construct(vectors)
             return
@@ -302,17 +303,18 @@ class GonzalezMEBFilter(Filter):
                 sq_batch_distances = self._compute_squared_distances(vector_batch, sq_vector_batch, self.all_centers, sq_centers)
                 batch_distances = np.sqrt(sq_batch_distances)
 
-                is_already_covered = np.any(batch_distances <= (self.all_radiuses[None, :] - self.distance_threshold), axis=1)
+                is_already_covered = np.any(batch_distances <= self.all_radiuses[None, :], axis=1)
                 vector_batch = vector_batch[~is_already_covered]
 
             for vec in vector_batch:
-                self._add_sphere(vec, self.distance_threshold)
+                self._add_sphere(vec, 0.0)
 
             self._merge_spheres()
+            self._remove_invalid_pairs()
 
 
-    def insert(self, vectors: np.ndarray) -> None:
-        self.add(vectors)
+    def add(self, vectors: np.ndarray) -> None:
+        self.insert(vectors)
 
 
     def remove(self, vectors: np.ndarray) -> List[bool]:
