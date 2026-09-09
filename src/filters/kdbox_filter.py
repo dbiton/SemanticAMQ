@@ -30,32 +30,11 @@ def box_query(queries: np.ndarray, boxes_min: np.ndarray, boxes_max: np.ndarray)
 
 
 class KDBoxFilter(Filter):
-    """
-    A high-performance spatial filter that partitions high-dimensional vector data using recursive space-splitting.
-
-    The KDBoxFilter leverages recursive KD tree spatial partitioning to subdivide high-dimensional vector 
-    data into hierarchical leaf regions, enclosing each region with tight axis-aligned bounding boxes.
-
-    The partitioning strategy leverages:
-    - KD tree spatial decomposition, recursively splitting vectors along dimensions of high variance to create 
-      balanced and spatially localized subsets.
-    - Axis-aligned spatial bounding, calculating tight per-dimension minimum and maximum coordinates 
-      for the vectors within each KD tree leaf partition.
-
-    The filter is designed with a strict one-sided error guarantee: it allows false positives 
-    for fast pruning, but guarantees zero false negatives (no FN), ensuring that any matching 
-    vector is never incorrectly excluded.
-
-    Attributes:
-        dim (int): The dimensionality of the vector space.
-        distance_threshold (float): Additional padding (margin of error) added to the minimum and maximum 
-                                    bounds of each box to ensure boundary vectors are fully enclosed.
-        max_memory (Optional[int]): The maximum memory limit in bytes allocated for storing boxes.
-        max_boxes (int): The maximum number of space partitions (boxes) allowed, automatically
-                         calculated based on the memory limit to prevent overflow.
-        all_boxes (np.ndarray): A 1D array of shape (K,) containing the active indices of the boxes.
-        all_boxes_min (np.ndarray): A 2D array of shape (K, D) storing the minimum coordinate bounds of all boxes.
-        all_boxes_max (np.ndarray): A 2D array of shape (K, D) storing the maximum coordinate bounds of all boxes.
+    """Partitions vectors via a recursive KD-tree (splitting along
+    high-variance dimensions into balanced, spatially localized subsets),
+    enclosing each leaf with a tight axis-aligned bounding box. Zero false
+    negatives (distance_threshold pads each box's bounds); false positives
+    are the tradeoff for fast pruning.
     """
     _BYTES_PER_FLOAT32 = 4
     _BYTES_PER_FLOAT64 = 8

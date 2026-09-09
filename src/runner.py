@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
@@ -13,6 +14,7 @@ import inspect
 from scipy.special import logsumexp
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 
+from logging_config import configure_logging
 from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize, InsufficientMemoryError
 from filters.quantized_vector_filter import (
     QuantizedVectorFilter, InsufficientMemoryError as QVFInsufficientMemoryError,
@@ -25,17 +27,15 @@ from filters.ball_cover.doubling_insert import DoublingInsert
 from hyperspheres_volume import estimate_hypersphere_volume
 from vector_source import VectorSource
 
-# String name -> InsertInterface class, used by stream_rebuild_worker to
-# turn generate_streaming()'s insertion_level strings into the strategy
-# *objects* BallCoverFilter.__init__'s insert_method now actually takes
-# (the older string-keyed insertion_level kwarg it accepted doesn't exist
-# on the current, modular BallCoverFilter). Classes, not instances -- each
-# job needs its own fresh strategy object, since e.g. MinHeapInsert carries
-# per-filter state (_sphere_versions, _minimal_pairs) that must not be
-# shared across filters/jobs. "doubling" is registered here (so it's usable
-# through this same dispatch) but not added to generate_streaming()'s own
-# `methods` sweep list -- that's a separate, deliberate opt-in since it adds
-# real compute to a real evaluation run.
+# Configured at import time so worker functions still log with a timestamp
+# when re-imported inside a ProcessPoolExecutor child process.
+configure_logging()
+logger = logging.getLogger(__name__)
+
+# String name -> InsertInterface class (classes, not instances -- each job
+# needs its own fresh strategy object with its own state). "doubling" is
+# registered but not in generate_streaming()'s own sweep list, a deliberate
+# opt-in since it adds real compute.
 _INSERT_STRATEGIES = {
     "nearest": NearestInsert,
     "least_inflation": LeastInflationInsert,
@@ -340,16 +340,10 @@ def equal_memory_worker(
             construct_arr, calib_arr, calib_actual,
         )
     except QVFInsufficientMemoryError as e:
-        # Expected, meaningful outcome at small budgets for a per-point
-        # quantization baseline (see QuantizedVectorFilter's module
-        # docstring): not enough memory to store every vector at even the
-        # coarsest quantization level -- exactly the regime this comparison
-        # is meant to expose. Recorded as an explicit infeasible row (NaN
-        # metrics), unlike quantization_worker/tradeoff_*_worker's
-        # catch-and-skip convention (which drop the row silently) -- the
-        # equal-memory comparison wants this regime visible, not dropped or
-        # crashing the whole sweep.
-        print(f"  [Infeasible] {config} at memory_budget={memory_budget}: {e}")
+        # Expected outcome at small budgets (see QuantizedVectorFilter's
+        # docstring) -- recorded as an explicit infeasible row (NaN metrics)
+        # rather than dropped silently or crashing the sweep.
+        logger.warning(f"[Infeasible] {config} at memory_budget={memory_budget}: {e}")
         return {
             'Config': config, 'Dataset': dataset, 'Memory Budget': memory_budget,
             'Memory Usage': float('nan'), 'Threshold': distance_threshold,
@@ -562,7 +556,7 @@ def tradeoff_static_worker(
         memory_usage = filter_instance.get_bytesize()
 
     except Exception as e:
-        print(f"  [Skipped] {config} failed: {e}")
+        logger.warning(f"[Skipped] {config} failed: {e}")
         return None
 
     return _compute_tradeoff_metrics(predicted, actual_results, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
@@ -608,7 +602,7 @@ def tradeoff_dynamic_worker(
         memory_usage = filter_instance.get_bytesize()
 
     except Exception as e:
-        print(f"  [Skipped] {config} failed: {e}")
+        logger.warning(f"[Skipped] {config} failed: {e}")
         return None
 
     return _compute_tradeoff_metrics(predicted, actual_results, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
@@ -668,48 +662,26 @@ def quantization_worker(
     vectors_query: VectorInput,
     actual_results_by_tau: Dict[float, List[bool]],
 ) -> List[Dict[str, Any]]:
-    """Builds one BallCoverFilter cover per (dataset, k, seed, quantize),
-    where `quantize` selects the scalar/product quantizer BallCoverFilter
-    applies during construction (Quantize.NONE for the raw, unquantized
-    Gonzalez cover), then evaluates it at every tau. Returns one row per tau,
-    tagged stage="ball" for quantize=Quantize.NONE and stage="quantizing"
-    otherwise, so a caller sweeping every QUANTIZATION_SWEEP member gets
-    one row group per member, with NONE serving as the baseline point in that
-    same sweep rather than a value repeated across jobs.
+    """Builds one BallCoverFilter cover per (dataset, k, seed, quantize) and
+    evaluates it at every tau. Returns one row per tau, tagged
+    stage="ball"/"quantizing".
 
     max_memory is derived from k using Quantize.NONE's byte-per-ball size and
-    then held fixed across every quantize candidate in the sweep (not
-    re-derived per candidate) -- this is what makes n_balls meaningfully
-    different per quantize choice (a more compact code packs more balls into
-    the same byte budget) rather than trivially equal to k for every
-    candidate, and is also what the recorded memory_bytes (filt.get_bytesize())
-    tracks as plot_quantization.py's x-axis. That tracking isn't exact for every
-    quantize choice, though: BallCoverFilter caps ball count at
-    min(max_count_balls, n_construct), so a quantizer compact enough that
-    max_count_balls exceeds the construct-set size (e.g. PQ, whose ~8-12
-    byte code is roughly two orders of magnitude smaller than NONE's
-    (dim+1)*4 bytes) saturates at n_construct balls well before the nominal
-    byte budget is used -- its realized memory usage then stays flat across
-    the whole k sweep instead of tracking k, which is real information (that
-    quantizer is construct-set-bound, not budget-bound, at these k_fractions)
-    rather than a plotting artifact. construct_tau is accepted for interface
-    parity with the other tau-sweep workers but unused: BallCoverFilter's own
-    construction has no distance-threshold knob to feed it (Gonzalez
-    construction only takes the vectors and a ball budget).
+    held fixed across every quantize candidate, so a more compact code packs
+    more balls into the same budget -- n_balls and memory_bytes then vary
+    meaningfully per quantize choice instead of trivially matching k. A
+    quantizer compact enough to saturate at n_construct balls before using
+    the full budget (e.g. PQ) will show flat memory usage across the k
+    sweep -- real information (construct-set-bound, not budget-bound), not a
+    plotting artifact. construct_tau is unused: BallCoverFilter's
+    construction has no distance-threshold knob.
 
-    FNR is asserted (raises on violation), never plotted. Each tau also times
-    its own filt.query(query_arr, ...) call (batched over the whole query
-    set, not per-query) to report query_throughput_qps -- query cost doesn't
-    conceptually depend on tau (every ball is still checked), so this is
-    mainly a per-quantize-candidate throughput estimate with tau_values-many
-    independent samples rather than a real tau sweep of the metric.
+    FNR is asserted (raises on violation), never plotted.
 
-    If constructing the filter itself raises (e.g. InsufficientMemoryError:
-    too tight a memory budget for PQ's minimum 2-center codebook -- see
-    BallCoverFilter._build_quantizer), that's treated as "this quantize
-    candidate isn't viable at this (dataset, k) point" rather than a fatal
-    error: the exception is caught, a message is printed, and this job
-    contributes zero rows (returns []) instead of aborting the whole sweep."""
+    If construction itself raises (e.g. InsufficientMemoryError -- too
+    tight a budget for PQ's minimum codebook), that candidate is treated as
+    non-viable at this (dataset, k) point: caught, logged, and this job
+    contributes zero rows rather than aborting the whole sweep."""
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
     n_q = len(query_arr)
@@ -730,7 +702,7 @@ def quantization_worker(
         filt = BallCoverFilter(dim=dim, max_memory=max_memory, quantize=quantize)
         filt.construct(construct_arr)
     except Exception as e:
-        print(
+        logger.warning(
             f"Skipping quantization job (dataset={dataset}, k={k}, quantize={quantize.value}, "
             f"seed={seed}): construction raised {type(e).__name__}: {e}"
         )
@@ -1090,16 +1062,11 @@ def stream_rebuild_worker(
     rebuild_every = T if (policy == "periodic" and T is not None) else None
     filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k),
                              insert_method=_INSERT_STRATEGIES[insertion_level]())
-    # Bootstrap-then-diverge: the first k arrivals always become raw
-    # zero-radius singletons via one batch construct() (identical across
-    # every insertion_level), so checkpoint k+1 onward is a genuine
-    # comparison of each method's own decision rule -- not an artifact of
-    # NearestInsert/LeastInflationInsert never creating new balls on their
-    # own (only ExhaustiveMergeInsert/MinHeapInsert do), which would
-    # otherwise collapse this streamed-from-empty setup to a single ball
-    # for those two methods. generate_streaming()'s checkpoints all sit
-    # above k, so this never
-    # skips a requested checkpoint.
+    # Bootstrap-then-diverge: the first k arrivals become raw zero-radius
+    # singletons via one batch construct() (identical across every
+    # insertion_level), so checkpoint k+1 onward is a genuine comparison of
+    # each method's own decision rule, not an artifact of some methods never
+    # creating new balls on their own.
     bootstrap_n = min(k, n)
     t0 = time.perf_counter()
     filt.construct(stream_arr[:bootstrap_n])
@@ -1226,7 +1193,7 @@ class Runner:
             fn = _WORKER_FNS[job['mode']]
             kwargs = {k: v for k, v in job.items() if k != 'mode'}
             result = fn(**kwargs)
-            print(f"Completed: {_describe_result(result)}")
+            logger.info(f"Completed: {_describe_result(result)}")
             results.append(result)
             self._rewrite_csv(results)
         return results
@@ -1242,7 +1209,7 @@ class Runner:
             results = []
             for f in as_completed(futures):
                 result = f.result()
-                print(f"Completed: {futures[f]}")
+                logger.info(f"Completed: {futures[f]}")
                 results.append(result)
                 self._rewrite_csv(results)
         return results

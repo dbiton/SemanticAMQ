@@ -1,3 +1,4 @@
+import logging
 import os
 
 import faiss
@@ -6,6 +7,7 @@ import inspect
 import numpy as np
 import pandas as pd
 
+from logging_config import configure_logging
 from runner import Runner, QUANTIZATION_SWEEP
 from plots.plot_quantization import generate_quantization_figures
 from plots.plot_query_performance import generate_query_performance_figures
@@ -25,20 +27,16 @@ from util.dataset_paths import dataset_filenames
 from util.fetch_datasets import load_embeds
 from vector_source import VectorSource, ArrayVectorSource
 
+configure_logging()
+logger = logging.getLogger(__name__)
+
 MAX_WORKERS = 4
 DATASET = 'ELI5'
 
-# Single knob controlling how many vectors every generate_* evaluation below
-# pulls as its input stream (each function's local num_vectors/stream_size
-# variable now just aliases this, instead of each picking its own literal).
-# Every other size-related knob in a given function (k values, memory
-# budgets, construct/query splits, ...) still derives from that local
-# variable exactly as before, so raising/lowering this one global rescales
-# every evaluation at once. 1_000 is deliberately conservative: some
-# evaluations (generate_equal_memory, generate_dynamic, generate_streaming)
-# are documented to blow up, crash, or become impractically slow at the much
-# larger values each used to hardcode individually (up to 100_000) -- if you
-# raise this, check each function's own docstring for known ceilings first.
+# Single knob for how many vectors every generate_* evaluation pulls as its
+# input stream. 1_000 is conservative -- some evaluations are documented to
+# blow up or crash well below the 100_000 they used to hardcode; check a
+# function's own docstring before raising this.
 STREAM_SIZE = 1_000
 
 # Registry name -> canonical dataset key, shared by every long-format
@@ -49,20 +47,11 @@ DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
 dynamic_filters = [BallCoverFilter, LSBFFilter, DSHFilter, HNSWFilter, IVFFilter]
 static_filters  = []
 
-# generate_equal_memory()'s own comparison set: BallCoverFilter (the paper's
-# own method) against only the two FAISS-based ANN baselines. The other four
-# dynamic_filters entries (DSBFFilter, CoveringLSHFallbackFilter, LSBFFilter,
-# DSHFilter) degenerate to predicting ~100% of queries as duplicates at every
-# memory budget on realistic construct-set sizes (their hash-code alphabets /
-# grid cell width saturate regardless of budget -- see project memory), which
-# makes them uninformative for a budget-sensitivity comparison specifically;
-# they stay in dynamic_filters for the other evaluations. QuantizedVectorFilter
-# is the "compress the vectors" counterpart to BallCoverFilter's "compress the
-# geometry" -- it belongs here specifically to find the dataset size at which
-# BallCoverFilter's geometric summary wins over storing (compressed) points
-# directly; it can also raise InsufficientMemoryError at small budgets, which
-# runner.py::equal_memory_worker records as an explicit outcome rather than a
-# crash.
+# generate_equal_memory()'s own comparison set. The other dynamic_filters
+# entries (DSBFFilter, CoveringLSHFallbackFilter, LSBFFilter) degenerate to
+# ~100% duplicate predictions at realistic construct-set sizes, making them
+# uninformative for a budget-sensitivity comparison; they stay in
+# dynamic_filters for the other evaluations.
 equal_memory_filters = [BallCoverFilter, HNSWFilter, IVFFilter, DSHFilter, QuantizedVectorFilter]
 
 def calculate_max_memory_budget_bytes(num_vectors: int, dimension: int, bytes_per_element: float) -> int:
@@ -83,14 +72,10 @@ def calculate_distance_threshold(
     Return the distance threshold at which `percentage`% of all pairwise L2
     distances are considered duplicates (i.e., the `percentage`-th percentile).
 
-    Computing every pairwise distance is O(n^2) in time and memory -- an n x n
-    matrix plus an n(n-1)/2 distance array (~40 GB at n=100k), which is why the
-    exact version blows up. Instead we sample up to `max_pairs // n` query rows
-    and use faiss to compute their *exact* L2 distances against the full set
-    (BLAS-accelerated, multithreaded). Each sampled query contributes a complete
-    distance row, so the pooled distances are an unbiased sample of the pairwise
-    distribution; the percentile estimate is within ~0.2% of exact even in the
-    1-9% tail, at bounded (~`max_pairs`-sized) memory.
+    Full pairwise distance is O(n^2) memory (~40 GB at n=100k), so this
+    samples up to `max_pairs // n` query rows and computes exact L2 against
+    the full set via faiss instead -- an unbiased sample of the pairwise
+    distribution, within ~0.2% of the exact percentile at bounded memory.
     """
     n = len(vectors)
     if n < 2:
@@ -129,19 +114,14 @@ def calculate_nn_distance_threshold(
     construct_vectors have their nearest *other* construct vector within that
     distance.
 
-    Unlike calculate_distance_threshold (which percentiles *random pairwise*
-    distances), this ties the threshold directly to the nearest-neighbour
-    test compute_static_actual_results actually performs. That distinction
-    matters once the construct set is large: with tens of thousands of
-    candidate neighbours, a point's *nearest* neighbour is typically far
-    closer than a *random* pair, so calculate_distance_threshold's percentile
-    silently becomes far more permissive than its nominal `percentage`
-    suggests -- at construct-set sizes in the tens of thousands this pushed
-    the "duplicate" rate to ~100%, collapsing both FPR and FNR to degenerate
-    0/0 default values (no actual negatives -> FPR defaults to 0; predicted
-    matching the near-universal actual positives -> FNR ~0 too) regardless of
-    memory budget. Used by generate_equal_memory(), whose construct set is
-    large enough for this gap to matter.
+    Unlike calculate_distance_threshold (random pairwise distances), this
+    ties the threshold to the actual nearest-neighbour test
+    compute_static_actual_results performs -- at large construct-set sizes a
+    point's nearest neighbour is much closer than a random pair, so the
+    pairwise-percentile version silently pushes the duplicate rate toward
+    100%, collapsing FPR/FNR to degenerate values. Used by
+    generate_equal_memory(), whose construct set is large enough for this to
+    matter.
     """
     n = len(construct_vectors)
     if n < 2:
@@ -242,10 +222,10 @@ def generate_static() -> list:
     runner = Runner(num_workers=MAX_WORKERS)
 
     for percentage in np.linspace(min_percentage_duplicates, max_percentage_duplicates, count_steps):
-        print(f"Processing {percentage:.1f}% duplicates...")
-        print("Calculating distance threshold...")
+        logger.info(f"Processing {percentage:.1f}% duplicates...")
+        logger.info("Calculating distance threshold...")
         distance_threshold = calculate_distance_threshold(vectors, percentage)
-        print("Calculating actual results...")
+        logger.info("Calculating actual results...")
         actual_results     = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
 
         for memory_budget in memory_budgets:
@@ -260,36 +240,22 @@ def generate_static() -> list:
                 )
 
     results = runner.run()
-    print("Static evaluation completed.")
+    logger.info("Static evaluation completed.")
     return results
 
 
 def generate_equal_memory() -> list:
     """
-    Equal-memory comparison: BallCoverFilter (the paper's own method) against
-    equal_memory_filters' two FAISS-based ANN baselines, HNSWFilter and
-    IVFFilter (see equal_memory_filters' own comment for why the other four
-    dynamic_filters baselines are excluded here specifically).
-    count_memory_steps evenly spaced budgets are swept from
-    max_memory_budget/count_memory_steps up to max_memory_budget, where
-    max_memory_budget is scaled off the construct set itself (num_construct *
-    bytes for one float32 sphere per point) -- not
-    calculate_max_memory_budget_bytes, which is tuned for
-    generate_static()/generate_dynamic()'s much smaller num_vectors and
-    would cap out at a couple MB here, far below the point past which more
-    memory stops buying additional accuracy for a covering-based method.
+    Equal-memory comparison across equal_memory_filters (see its own comment
+    for why some dynamic_filters baselines are excluded here). Sweeps
+    count_memory_steps budgets up to max_memory_budget, scaled off the
+    construct set itself (not calculate_max_memory_budget_bytes, which is
+    tuned for generate_static()/generate_dynamic()'s smaller num_vectors).
 
-    For each budget, every filter's best available "valid configuration" is
-    chosen on a calibration workload disjoint from both the construct set and
-    the final query set (see runner.py::_build_calibrated_filter --
-    IVFFilter's nprobe is one such dial, registered in
-    runner.py::_POST_CONSTRUCTION_CONFIG_DIALS, so it's picked per-budget on
-    the calibration set the same way; BallCoverFilter and HNSWFilter have no
-    registered dial and just use their single memory-budget-derived default).
-    FPR and FNR are then measured on the held-out query set, construction
-    latency is timed during calibration (see runner.py::_build_calibrated_filter),
-    and query throughput is measured on the held-out query set; all four are
-    plotted one series per budget.
+    For each budget, every filter's best config is chosen on a held-out
+    calibration set (see runner.py::_build_calibrated_filter); FPR/FNR,
+    construction latency, and query throughput are then measured on a
+    separate held-out query set.
     """
     num_vectors               = STREAM_SIZE
     dim                       = 384
@@ -312,7 +278,7 @@ def generate_equal_memory() -> list:
     calibration_source = VectorSource(dataset, num_construct, num_construct + num_calibration)
     query_source        = VectorSource(dataset, num_construct + num_calibration, num_vectors)
 
-    print("Calculating distance threshold...")
+    logger.info("Calculating distance threshold...")
     # Nearest-neighbour-based, not calculate_distance_threshold's random-pairwise
     # percentile: with a 40%-of-100k = 40k-vector construct set, a pairwise
     # percentile is far more permissive than its nominal percentage once
@@ -320,27 +286,19 @@ def generate_equal_memory() -> list:
     # docstring) -- that mismatch was pushing the actual duplicate rate to ~100%,
     # collapsing both FPR and FNR to degenerate 0/0 values regardless of budget.
     distance_threshold = calculate_nn_distance_threshold(vectors_construct, duplicate_percentage)
-    print("Calculating calibration/query ground truth...")
+    logger.info("Calculating calibration/query ground truth...")
     actual_calibration = compute_static_actual_results(vectors_construct, vectors_calibration, distance_threshold)
     actual_query       = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
 
-    # Scaled off the construct set itself, not calculate_max_memory_budget_bytes:
-    # that helper is tuned for generate_static()/generate_dynamic()'s much
-    # smaller num_vectors and produces a ceiling of a couple MB here -- far
-    # below the budget at which a covering-ball method can give every
-    # construct point its own sphere (num_construct * bytes_per_sphere,
-    # mirroring BallCoverFilter._calculate_max_spheres's own formula), which
-    # is the point past which more memory stops buying additional accuracy for
-    # any covering-based method. Below that point every filter is forced into
-    # heavy compression and FPR stays pinned regardless of budget; sweeping up
-    # to it is what makes "equal memory" actually vary with the budget.
+    # Scaled off the construct set itself (one sphere per point), not
+    # calculate_max_memory_budget_bytes -- see docstring.
     bytes_per_sphere_at_1to1 = (dim + 1) * 4 * 4.0
     max_memory_budget = int(num_construct * bytes_per_sphere_at_1to1)
     memory_budgets = np.linspace(0, max_memory_budget, count_memory_steps + 1, dtype=int)[1:]
 
     runner = Runner(num_workers=MAX_WORKERS)
     for memory_budget in memory_budgets:
-        print(f"Submitting jobs for memory_budget={memory_budget} bytes...")
+        logger.info(f"Submitting jobs for memory_budget={memory_budget} bytes...")
         for filter_cls in equal_memory_filters:
             runner.submit(
                 'equal_memory',
@@ -354,12 +312,12 @@ def generate_equal_memory() -> list:
             )
 
     results = runner.run()
-    print("Equal-memory evaluation completed.")
+    logger.info("Equal-memory evaluation completed.")
 
     results_df = pd.DataFrame(results)
     os.makedirs("results", exist_ok=True)
     results_df.to_csv("results/equal_memory.csv", index=False)
-    print("Saved results/equal_memory.csv")
+    logger.info("Saved results/equal_memory.csv")
 
     return results
 
@@ -373,37 +331,17 @@ def generate_system_tau() -> Tuple[pd.DataFrame, int]:
     Measure how much a semantic filter reduces accesses to a flat L2 index
     that explicitly stores all construct vectors: fixed ball budget k, one
     BallCoverFilter cover built per (dataset, fold), then queried at every
-    tau in a sweep (system_tau_worker). tau_values is one fixed,
-    dataset-independent set of absolute L2 distances shared across all
-    datasets, so redundancy_rate is a reported *outcome* of a given tau
-    rather than a quantity tau is solved for -- see plot_system_tau's
-    redundancy-rate-vs-tau panel.
+    tau in a fixed, dataset-independent sweep (system_tau_worker).
 
-    use_kfold selects between two construct/query splitting protocols:
-      - True (default): k-fold cross-validation. Each dataset is cut into
-        k_folds contiguous, equal-sized intervals, and every fold in turn
-        plays the role a fixed prefix used to play -- that fold's interval
-        becomes the construct set (the filter/index reference set), and
-        every other point in the dataset becomes the query set. Each fold
-        is submitted with seed=fold, so the existing per-seed aggregation
-        in plot_system_tau.py (mean_std) turns into a per-fold mean +/- std
-        across k_folds independent construct/query splits instead of a
-        single point estimate.
-      - False: a single run per dataset, with construct_size set directly
-        instead of derived from k_folds. The first construct_size vectors
-        become the construct set and every remaining vector becomes the
-        query set (seed=0). There's only one split, so plot_system_tau's
-        per-fold std collapses to 0 (its error bars are already skipped
-        when std == 0 -- see _line_panel).
-    Either way, the query set generally isn't contiguous on disk once its
-    held-out interval sits in the middle of the dataset, so it's shipped to
-    the worker as an ArrayVectorSource (materialized in memory) rather than
-    a VectorSource (lazy, contiguous-range-only); the construct set stays a
-    plain VectorSource since it's always a single contiguous interval.
+    use_kfold=True cross-validates across k_folds contiguous splits (each
+    fold's interval becomes the construct set, everything else the query
+    set), giving plot_system_tau's per-fold mean +/- std; use_kfold=False
+    runs a single construct_size-vs-remainder split instead (std collapses
+    to 0). The query set ships as an ArrayVectorSource rather than a
+    VectorSource since it generally isn't a contiguous on-disk range.
 
-    Writes results/system_tau.csv. Returns the long-format df plus k, since
-    plot_system_tau() needs it for the per-panel annotation and there's
-    nothing to derive it from -- k is fixed by construction, not swept.
+    Writes results/system_tau.csv. Returns the long-format df plus k (fixed
+    by construction, not swept, and not derivable from the df alone).
     """
     num_vectors           = STREAM_SIZE
     dim                   = 384
@@ -417,7 +355,7 @@ def generate_system_tau() -> Tuple[pd.DataFrame, int]:
     datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
     missing = [d for d in DATASET_KEYS if d not in datasets]
     if missing:
-        print(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
+        logger.warning(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
     if set(datasets) != set(DATASET_KEYS):
         raise RuntimeError(
             f"generate_system_tau needs all {len(DATASET_KEYS)} datasets "
@@ -428,9 +366,9 @@ def generate_system_tau() -> Tuple[pd.DataFrame, int]:
     construct_sizes = {d: (num_vectors // k_folds if use_kfold else construct_size) for d in datasets}
     min_construct = min(construct_sizes.values())
     k = round(k_fraction * min_construct)
-    print(f"Scaling k to {k} ({k_fraction:.0%} of the smallest construct set, {min_construct} vectors)")
-    print(f"Fixed tau sweep (shared across datasets): {tau_values}")
-    print(f"K-fold cross-validation: {k_folds} folds" if use_kfold else f"Single run: construct_size={construct_size}")
+    logger.info(f"Scaling k to {k} ({k_fraction:.0%} of the smallest construct set, {min_construct} vectors)")
+    logger.info(f"Fixed tau sweep (shared across datasets): {tau_values}")
+    logger.info(f"K-fold cross-validation: {k_folds} folds" if use_kfold else f"Single run: construct_size={construct_size}")
 
     # tau is fixed up front (not solved for), so the construction-tightness
     # knob is a single global median instead of a per-dataset one.
@@ -457,7 +395,7 @@ def generate_system_tau() -> Tuple[pd.DataFrame, int]:
                                              array=vectors_query)
 
             split_label = f"fold {seed}/{k_folds}" if use_kfold else "single run"
-            print(f"{dataset} {split_label}: computing ground truth at {len(tau_values)} fixed tau values...")
+            logger.info(f"{dataset} {split_label}: computing ground truth at {len(tau_values)} fixed tau values...")
             construct_arr = np.ascontiguousarray(vectors_construct, dtype=np.float32)
             query_arr = np.ascontiguousarray(vectors_query, dtype=np.float32)
             index = faiss.IndexFlatL2(dim)
@@ -475,13 +413,13 @@ def generate_system_tau() -> Tuple[pd.DataFrame, int]:
             )
 
     job_results = runner.run()
-    print(f"System (fixed tau-sweep, {'K-fold' if use_kfold else 'single run'}) evaluation completed.")
+    logger.info(f"System (fixed tau-sweep, {'K-fold' if use_kfold else 'single run'}) evaluation completed.")
 
     df = pd.DataFrame([row for job_rows in job_results for row in job_rows])
 
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
     df.to_csv(output_csv, index=False)
-    print(f"Wrote {output_csv}")
+    logger.info(f"Wrote {output_csv}")
 
     return df, k
 
@@ -492,34 +430,22 @@ def plot_system_tau(df: pd.DataFrame, k: int) -> None:
 
 def generate_quantization() -> pd.DataFrame:
     """
-    Generate the per-quantize-variant construction data for BallCoverFilter
-    (QUANTIZATION_SWEEP: the raw/unquantized cover plus every scalar/
-    product quantizer) on a single dataset (DATASET), and write it to
-    results/quantization.csv. Every candidate in the sweep shares one memory
-    budget per k (derived from k against the unquantized cover's byte-per-
-    ball size), so a more compact quantizer's realized ball count can pack
-    more balls into that same budget -- which is what lets plot_quantization.py
-    use each row's recorded memory usage as the x-axis with one line per
-    quantize method, instead of faceting bars by dataset. That tracking is
-    imperfect for the most compact quantizers (see quantization_worker's
-    docstring): a quantizer compact enough to want more balls than the
-    construct set actually has saturates at n_construct balls short of the
-    nominal budget, so its memory-usage line goes flat across the k sweep
-    instead of spanning it -- real information about that quantizer being
-    construct-set-bound rather than a plotting bug.
+    Generate per-quantize-variant construction data for BallCoverFilter
+    (QUANTIZATION_SWEEP) on a single dataset, written to
+    results/quantization.csv. Every candidate shares one memory budget per k
+    (derived from the unquantized cover's byte-per-ball size), so a more
+    compact quantizer packs more balls into the same budget -- letting
+    plot_quantization.py use recorded memory usage as the x-axis. A
+    quantizer compact enough to want more balls than the construct set has
+    saturates at n_construct balls short of the nominal budget instead (see
+    quantization_worker) -- real information, not a plotting bug.
 
-    k and tau are both derived from num_vectors/percentage_construct rather
-    than hardcoded absolute values, so editing those two knobs rescales
-    the whole sweep instead of silently clamping/dropping stale constants:
-      - k_values = k_fractions * the construct set size, guaranteed below it
-        since every fraction is < 1 -- k >= the construct-set size makes
-        BallCoverFilter fall back to one zero-radius ball per point
-        (log10_J = -inf, unplottable).
-      - tau_values = duplicate_percentages-th percentile of the dataset's own
-        nearest-neighbour distance (calculate_nn_distance_threshold) -- an
-        absolute L2 distance means something different at every
-        construct-set scale, so the percentile is what stays meaningful as
-        num_vectors/percentage_construct change, not a raw float.
+    k_values/tau_values derive from num_vectors/percentage_construct rather
+    than hardcoded absolutes, so those two knobs rescale the whole sweep:
+    k_fractions stay < 1 (k >= the construct set makes BallCoverFilter fall
+    back to one zero-radius ball per point), and tau_values is a percentile
+    of the dataset's own nearest-neighbour distance rather than a raw float,
+    so it stays meaningful as the construct set's scale changes.
     """
     num_vectors            = STREAM_SIZE
     dim                    = 384
@@ -545,17 +471,17 @@ def generate_quantization() -> pd.DataFrame:
             f"No k_fraction in {k_fractions} produced a k below the construct set "
             f"({num_construct} vectors). Raise num_vectors/percentage_construct or lower k_fractions."
         )
-    print(f"Scaling k_values to {k_values} ({num_construct} vectors in the construct set)")
+    logger.info(f"Scaling k_values to {k_values} ({num_construct} vectors in the construct set)")
 
     tau_values = [calculate_nn_distance_threshold(vectors_construct, p) for p in duplicate_percentages]
-    print(f"Scaling tau_values to {tau_values} ({duplicate_percentages}-th percentile NN distance)")
+    logger.info(f"Scaling tau_values to {tau_values} ({duplicate_percentages}-th percentile NN distance)")
 
     # Kept for interface parity with quantization_worker's signature; unused there
     # now that BallCoverFilter's Gonzalez construction has no distance-
     # threshold knob to feed (only quantize varies the cover, not tau).
     construct_tau = float(np.median(tau_values))
 
-    print(f"Computing ground truth for tau in {tau_values}...")
+    logger.info(f"Computing ground truth for tau in {tau_values}...")
     actual_results_by_tau = {
         tau: compute_static_actual_results(vectors_construct, vectors_query, tau)
         for tau in tau_values
@@ -574,13 +500,13 @@ def generate_quantization() -> pd.DataFrame:
                 )
 
     job_results = runner.run()
-    print("Quantization evaluation completed.")
+    logger.info("Quantization evaluation completed.")
 
     df = pd.DataFrame([row for job_rows in job_results for row in job_rows])
 
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
     df.to_csv(output_csv, index=False)
-    print(f"Wrote {output_csv}")
+    logger.info(f"Wrote {output_csv}")
 
     return df
 
@@ -610,7 +536,7 @@ def generate_query_performance() -> pd.DataFrame:
     datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
     missing = [d for d in DATASET_KEYS if d not in datasets]
     if missing:
-        print(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
+        logger.warning(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
     if set(datasets) != set(DATASET_KEYS):
         raise RuntimeError(
             f"generate_query_performance needs all {len(DATASET_KEYS)} datasets "
@@ -626,7 +552,7 @@ def generate_query_performance() -> pd.DataFrame:
     usable_k_values = [k for k in k_values if k < min_construct]
     dropped_k = sorted(set(k_values) - set(usable_k_values))
     if dropped_k:
-        print(
+        logger.warning(
             f"Dropping k values >= smallest construct set ({min_construct} vectors, "
             f"from {min(construct_sizes, key=construct_sizes.get)}): {dropped_k}"
         )
@@ -658,13 +584,13 @@ def generate_query_performance() -> pd.DataFrame:
                 )
 
     job_results = runner.run()
-    print("Query performance evaluation completed.")
+    logger.info("Query performance evaluation completed.")
 
     df = pd.DataFrame([row for job_rows in job_results for row in job_rows])
 
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
     df.to_csv(output_csv, index=False)
-    print(f"Wrote {output_csv}")
+    logger.info(f"Wrote {output_csv}")
 
     return df
 
@@ -682,24 +608,14 @@ _SCALING_DATASET = "ELI5"
 
 def generate_scaling() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Measures three BallCoverFilter throughput surfaces, all plotted against
-    filter size k on the x-axis:
-      - query throughput: k x batch_size grid (batch_size -> one line each,
-        6 lines), querying a fixed-size stream held constant across the
-        whole batch_size sweep -- only k and batch_size vary here.
-      - insertion throughput: the same k x batch_size grid/lines, timing
-        add() instead of query().
-      - construction throughput: k x n grid (n, the stream/indexed-set
-        size -> one line each, 6 lines) -- this is the one panel where the
-        indexed-set size itself varies instead of being held fixed.
-    Runs on a single dataset (_SCALING_DATASET) -- see its comment above.
+    Measures three BallCoverFilter throughput surfaces against filter size k:
+    query throughput (k x batch_size grid), insertion throughput (same grid,
+    timing add() instead), and construction throughput (k x n, the one panel
+    where the indexed-set size itself varies). Runs on a single dataset
+    (_SCALING_DATASET).
 
-    Edit `stream_size` alone to rescale the construction sweep and the fixed
-    stream query/insertion throughput measure against: stream_sizes (halved
-    n_steps-1 times, the 6 construction lines) derives from it, the same
-    single-knob pattern used elsewhere in this file. k_values/batch_sizes
-    are the two other swept axes and stay independent knobs (they're not
-    size-of-data parameters); dim/tau_mid/seeds are independent too.
+    stream_sizes (the 6 construction lines) derive from `stream_size` alone;
+    k_values/batch_sizes are independent swept axes.
     """
     stream_size      = STREAM_SIZE
     dim              = 384
@@ -726,17 +642,14 @@ def generate_scaling() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     stream_sizes = sorted({max(1, stream_size // (2 ** i)) for i in range(n_steps)})
     max_stream = max(stream_sizes)
 
-    # k_values/batch_sizes must each stay below stream_size (max_stream):
-    # k needs room to be a strictly smaller filter-size budget than the
-    # indexed set, and batch_size chunks a stream sized off the same
-    # stream_size, so shrinking stream_size can put either sweep list out of
-    # range -- drop whatever no longer fits rather than raising, so changing
-    # stream_size alone never requires hand-editing k_values/batch_sizes too.
+    # Drop k_values/batch_sizes entries that no longer fit stream_size,
+    # rather than raising, so shrinking stream_size alone never requires
+    # hand-editing the sweep lists too.
     def _below_stream(values: list[int], name: str) -> list[int]:
         usable = sorted(v for v in values if v < max_stream)
         dropped = sorted(set(values) - set(usable))
         if dropped:
-            print(f"Dropping {name} value(s) >= stream_size ({max_stream}): {dropped}")
+            logger.warning(f"Dropping {name} value(s) >= stream_size ({max_stream}): {dropped}")
         if not usable:
             raise RuntimeError(
                 f"No {name} value in {values} is below stream_size ({max_stream}). "
@@ -796,7 +709,7 @@ def generate_scaling() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                 )
 
     job_results = runner.run()
-    print("Scaling evaluation completed.")
+    logger.info("Scaling evaluation completed.")
 
     # Jobs interleave all three modes and Runner.run() returns results in
     # completion order, not submission order -- split by each mode's own
@@ -810,7 +723,7 @@ def generate_scaling() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     ):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         df.to_csv(path, index=False)
-        print(f"Wrote {path}")
+        logger.info(f"Wrote {path}")
 
     return df_query, df_insert, df_construction
 
@@ -840,61 +753,28 @@ def _build_streaming_negative_set(
 
 def generate_streaming() -> Tuple[pd.DataFrame, int]:
     """
-    Compare BallCoverFilter's 4 insertion strategies (insertion_level:
-    "nearest", "least_inflation", "merge", "min_heap" -- see
-    runner._INSERT_STRATEGIES, which maps each name to the InsertInterface
-    object BallCoverFilter.insert() actually dispatches to) via
-    stream_rebuild_worker's policy="streaming", each sharing the identical
-    bootstrap-then-diverge
-    setup (see that worker's docstring). Produces the long-format data
-    behind the streaming figure's four panels:
-      (a) FPR vs. stream position (fixed k_fixed), + a dashed static-rebuild
-          reference (stream_rebuild_worker policy="oracle");
-      (b) threshold-expanded objective inflation vs. stream position (same
-          x-axis/checkpoints as (a));
-      (c) final FPR vs. ball budget k, one line per method;
-      (d) Pareto: mean FPR (2nd half of stream) vs. amortized cost/insertion,
-          one connected curve per method per k, + the same static-rebuild
-          reference as a dashed curve (the expensive-but-best baseline every
-          insertion method trades cost for).
+    Compare BallCoverFilter's 4 insertion strategies (see
+    runner._INSERT_STRATEGIES) via stream_rebuild_worker's policy="streaming".
+    Produces the long-format data behind the streaming figure's four panels:
+    (a) FPR vs. stream position + a static-rebuild reference, (b) threshold-
+    expanded objective inflation vs. stream position, (c) final FPR vs. ball
+    budget k, (d) Pareto of mean FPR vs. amortized cost/insertion.
 
-    Every dataset on disk caps out around ~100k vectors, so the spec's
-    "stream position from k to >= 10^3 * k" is only reachable at a small
-    k_fixed -- see k_fixed's derivation below. Panel (c)'s k-sweep goes up to
-    k=1024 but shares one fixed-length stream (n_stream_c = stream_size)
-    across every k, not a literal 10^3*k-scaled length -- documented here
-    rather than silently truncated; most consequential at k=1024 (~29*k at
-    the default stream_size, not 1000*k).
-
-    "Multiple starting offsets" (the paper's K-fold variance protocol) is
-    operationalized as overlapping offset windows into one shared
-    representative-dataset pool (true disjoint folds don't scale to a
-    useful count at this vector budget) -- a sliding-window robustness
-    check, not strict cross-validation.
+    "Multiple starting offsets" is operationalized as overlapping offset
+    windows into one shared representative-dataset pool (a sliding-window
+    robustness check, not strict cross-validation, since true disjoint folds
+    don't scale to a useful count at this vector budget).
 
     FNR=0 is asserted per checkpoint inside stream_rebuild_worker (raises,
-    not recorded) for every method -- the covering invariant is a
-    correctness requirement, not a plotted quantity.
+    not recorded) -- a correctness requirement, not a plotted quantity.
 
-    Edit `stream_size` alone to rescale the whole evaluation -- every other
-    size-related knob below derives from it, the same single-knob pattern
-    used by generate_scaling():
-      - n_stream_c: stream_size itself (the k-sweep's stream length).
-      - k_fixed: stream_size // 1000 (floored at 16), so the position-sweep
-        stream n_stream_ab = k_fixed * 1000 stays proportioned the same way
-        as the original 32-vs-32,000 relationship.
-      - stride_ab/stride_cd: a small fraction of their respective stream
-        lengths, so the K-fold offset windows stay proportioned regardless
-        of scale instead of needing separate tuning.
-      - k_values: dropped (with a printed reason) if too large relative to
-        stream_size for the k-sweep to be meaningful at that k, mirroring
-        generate_scaling()'s k_values/batch_sizes filtering.
-    dim/methods/duplicate_percentage/n_negative/seed aren't size-related, so
-    they stay independent knobs.
+    Every other size-related knob (k_fixed, stride_ab/cd, k_values) derives
+    from `stream_size` alone, the same single-knob pattern as
+    generate_scaling(); k_values are dropped (with a printed reason) if too
+    large relative to stream_size to be a meaningful sweep point.
 
-    Writes results/streaming.csv (panels a-d). Returns the long-format df
-    plus k_fixed, which plot_streaming() needs and can't derive from the
-    df alone.
+    Writes results/streaming.csv. Returns the long-format df plus k_fixed,
+    which plot_streaming() needs and can't derive from the df alone.
     """
     stream_size = STREAM_SIZE
     dim = 384
@@ -918,7 +798,7 @@ def generate_streaming() -> Tuple[pd.DataFrame, int]:
     usable_k_values = [k for k in k_values if k * 10 < n_stream_c]
     dropped_k = sorted(set(k_values) - set(usable_k_values))
     if dropped_k:
-        print(f"Dropping k value(s) too large for stream_size={stream_size}: {dropped_k}")
+        logger.warning(f"Dropping k value(s) too large for stream_size={stream_size}: {dropped_k}")
     if not usable_k_values:
         raise RuntimeError(
             f"No k value in {k_values} leaves room in a stream_size={stream_size} stream "
@@ -929,7 +809,7 @@ def generate_streaming() -> Tuple[pd.DataFrame, int]:
     datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
     missing = [d for d in DATASET_KEYS if d not in datasets]
     if missing:
-        print(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
+        logger.warning(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
     if set(datasets) != set(DATASET_KEYS):
         raise RuntimeError(
             f"generate_streaming needs all {len(DATASET_KEYS)} datasets "
@@ -962,12 +842,12 @@ def generate_streaming() -> Tuple[pd.DataFrame, int]:
     offsets_ab = [f * stride_ab for f in range(F_ab)]
     offsets_cd = [cd_start + f * stride_cd for f in range(F_cd)]
 
-    print(f"{rep_dataset}: calibrating tau_mid against the a/b stream...")
+    logger.info(f"{rep_dataset}: calibrating tau_mid against the a/b stream...")
     calib_vectors = load_embeds(rep_dataset, n_stream_ab)[0][:n_stream_ab]
     tau_mid = calculate_nn_distance_threshold(calib_vectors, duplicate_percentage)
-    print(f"tau_mid={tau_mid:.4f}")
+    logger.info(f"tau_mid={tau_mid:.4f}")
 
-    print(f"{rep_dataset}: building fixed streaming negative set...")
+    logger.info(f"{rep_dataset}: building fixed streaming negative set...")
     stream_union = load_embeds(rep_dataset, neg_start)[0]
     candidate_pool = load_embeds(rep_dataset, neg_start + negative_candidates_len)[0][neg_start:]
     negative_vectors = _build_streaming_negative_set(rep_dataset, stream_union, candidate_pool, tau_mid, n_negative)
@@ -979,14 +859,11 @@ def generate_streaming() -> Tuple[pd.DataFrame, int]:
         int(round(x)) for x in np.linspace(n_stream_c // 20, n_stream_c, num=20)
     ))
 
-    # Every row each worker returns is now self-describing (method/sweep/
-    # metric/fold_offset all included directly -- see stream_rebuild_worker's
-    # docstring), so results don't need positional reconstruction here --
-    # which matters because Runner's parallel mode returns results in
-    # *completion* order, not submission order. output_csv makes each Runner
-    # write every job's rows to disk as soon as that job finishes, so a
-    # mid-sweep crash still leaves whatever completed so far on disk instead
-    # of losing the whole run.
+    # Each row is self-describing (method/sweep/metric/fold_offset), so no
+    # positional reconstruction is needed even though Runner's parallel mode
+    # returns results in completion, not submission, order. output_csv writes
+    # each job's rows as soon as it finishes, so a mid-sweep crash doesn't
+    # lose completed work.
 
     # --- Runner A: panels (a)/(b), position sweep at fixed k_fixed ---
     runner_a = Runner(num_workers=MAX_WORKERS, output_csv=output_csv, truncate=True)
@@ -1008,7 +885,7 @@ def generate_streaming() -> Tuple[pd.DataFrame, int]:
             sweep="position", fold_offset=fold_offset,
         )
     rows_ab = runner_a.run()
-    print("Streaming position-sweep (a/b) evaluation completed.")
+    logger.info("Streaming position-sweep (a/b) evaluation completed.")
     df_ab = pd.DataFrame([row for job_rows in rows_ab for row in job_rows])
 
     # --- Runner B: panels (c)/(d), k sweep over a shared stream length ---
@@ -1024,13 +901,13 @@ def generate_streaming() -> Tuple[pd.DataFrame, int]:
                     checkpoints=checkpoints_cd, sweep="k_sweep", fold_offset=fold_offset,
                 )
     rows_cd = runner_b.run()
-    print("Streaming k-sweep (c/d) evaluation completed.")
+    logger.info("Streaming k-sweep (c/d) evaluation completed.")
     df_cd = pd.DataFrame([row for job_rows in rows_cd for row in job_rows])
 
     df = pd.concat([df_ab, df_cd], ignore_index=True)
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
     df.to_csv(output_csv, index=False)
-    print(f"Wrote {output_csv} (already written incrementally during the run; this is the final canonical pass)")
+    logger.info(f"Wrote {output_csv} (already written incrementally during the run; this is the final canonical pass)")
 
     return df, k_fixed
 
@@ -1074,44 +951,39 @@ def generate_dynamic() -> list:
                 )
 
     results = runner.run()
-    print("Dynamic evaluation completed.")
+    logger.info("Dynamic evaluation completed.")
     return results
 
 
 def generate_and_plot_all() -> None:
-    """
-    Run every active evaluation end-to-end (generate, then plot), the same
-    5 evaluations __main__ used to run inline, plus system_tau.
-    static/dynamic/equal_memory stay disabled -- they fail at the
-    100K-vector scale this file is currently configured for (see comments
-    below). The early return currently isolates system_tau for standalone
-    testing; remove it to also run the other 5.
-    """
-    # plot_quantization(generate_quantization())
-    # plot_scaling(*generate_scaling())
-    # plot_streaming(*generate_streaming())
+    """Run each generate_/plot_ pair end-to-end. Most are commented out below
+    for standalone testing of whichever one is currently active; uncomment
+    to run more."""
+    plot_quantization(generate_quantization())
+    plot_scaling(*generate_scaling())
+    plot_streaming(*generate_streaming())
     plot_equal_memory(generate_equal_memory()) # failed on 100K
-    # plot_system_tau(*generate_system_tau())
+    plot_system_tau(*generate_system_tau())
     return
     try:
         plot_quantization(generate_quantization())
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    except Exception:
+        logger.exception("An error occurred")
     return
     try:
         plot_query_performance(generate_query_performance())
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    except Exception:
+        logger.exception("An error occurred")
 
     try:
         plot_scaling(*generate_scaling())
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    except Exception:
+        logger.exception("An error occurred")
 
     try:
         plot_streaming(*generate_streaming())
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    except Exception:
+        logger.exception("An error occurred")
 
 
 def plot_all() -> None:
@@ -1129,35 +1001,35 @@ def plot_all() -> None:
     try:
         df = pd.read_csv("results/system_tau.csv")
         plot_system_tau(df, k=int(df["k"].iloc[0]))
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    except Exception:
+        logger.exception("An error occurred")
 
     try:
         df = pd.read_csv("results/quantization.csv")
         plot_quantization(df)
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    except Exception:
+        logger.exception("An error occurred")
 
     try:
         df = pd.read_csv("results/query_performance.csv")
         plot_query_performance(df)
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    except Exception:
+        logger.exception("An error occurred")
 
     try:
         df_query = pd.read_csv("results/scaling_query.csv")
         df_insert = pd.read_csv("results/scaling_insert.csv")
         df_construction = pd.read_csv("results/scaling_construction.csv")
         plot_scaling(df_query, df_insert, df_construction)
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    except Exception:
+        logger.exception("An error occurred")
 
     try:
         df = pd.read_csv("results/streaming.csv")
         k_fixed = int(df.loc[df["sweep"] == "position", "k"].iloc[0])
         plot_streaming(df, k_fixed=k_fixed)
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    except Exception:
+        logger.exception("An error occurred")
 
 
 if __name__ == "__main__":

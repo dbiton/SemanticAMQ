@@ -1,19 +1,14 @@
-"""Generate the six quantization-figure panels (+ shared legend) for the PVLDB paper,
-plus one diagnostic FNR sanity-check panel that isn't part of the paper figure set.
+"""Generate the six quantization-figure panels (+ shared legend), plus one
+diagnostic FNR sanity-check panel not part of the paper figure set.
 
-Self-contained: reads a long-format results file (one row per (quantize, k,
-seed) on a single dataset -- see main.py::generate_quantization), aggregates over
-seeds, and writes PNG (optionally PDF) panels sized for
-`\\includegraphics[width=\\linewidth]` inside `subfigure{0.24\\linewidth}` cells
-of a two-column `figure*`.
+Reads a long-format results file (one row per (quantize, k, seed) on a
+single dataset -- see main.py::generate_quantization), aggregates over
+seeds, and writes PNG (optionally PDF) panels sized for a two-column
+`figure*`.
 
-Each panel is a line plot: x-axis = memory usage (MB, log scale, driven by
-the k sweep -- see quantization_worker's docstring for how closely memory usage
-tracks k for a given quantize choice, which isn't exact for the most compact
-quantizers), one line per quantize method (color + marker), for the single
-dataset the input was generated on. This replaced an earlier per-dataset
-grouped-bar-at-fixed-k design; multi-dataset figures now belong to the other
-evaluations (plot_query_performance.py etc.), not this one.
+Each panel: x-axis = memory usage (MB, log scale, driven by the k sweep --
+not exact for the most compact quantizers, see quantization_worker), one
+line per quantize method, single dataset.
 
 Edit the CONFIG block below to change parameters -- no CLI flags.
 """

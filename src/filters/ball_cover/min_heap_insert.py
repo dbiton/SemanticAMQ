@@ -135,24 +135,16 @@ class MinHeapInsert(InsertInterface):
 
 
     def _compact_if_needed(self, filter: Filter) -> None:
-        """Lazy deletion (a version bump marks a heap entry stale instead of
-        physically removing it, checked in _merge_spheres's pop loop) is the
-        standard trick to avoid an O(n) removal on every merge, but without a
-        periodic sweep it lets stale entries accumulate without bound: each
-        add_sphere call pushes up to _MAX_NEIGHBORS new candidate pairs,
-        while _merge_spheres only pops (and discards, if stale) one entry
-        per point the filter is over budget by -- net growth of up to
-        _MAX_NEIGHBORS-1 live-list entries per insertion. Over a long stream
-        this makes the *reported* filter size (get_bytesize(), driven by
-        sys.getsizeof(self._minimal_pairs)) grow linearly with stream length
-        even though the true number of live candidate pairs stays bounded by
-        the (small, constant) active sphere count -- not a coverage bug (see
-        _merge_spheres's own containment fix for that), but a real
-        unbounded-memory one. Rebuilding the heap -- keeping only entries
-        whose recorded versions still match the current sphere_versions --
-        once it's grown well past its live-entry footprint keeps that
-        bounded without paying the O(n) filter cost on every single
-        insertion."""
+        """Lazy deletion (a version bump marks a heap entry stale rather than
+        removing it) avoids an O(n) removal on every merge, but without a
+        periodic sweep stale entries accumulate without bound: each
+        add_sphere pushes up to _MAX_NEIGHBORS candidates while
+        _merge_spheres only pops one. That makes get_bytesize() grow
+        linearly with stream length even though the true live-pair count
+        stays bounded -- not a coverage bug, a real unbounded-memory one.
+        Rebuilding the heap (keeping only still-current-version entries)
+        once it's grown past its live footprint keeps that bounded without
+        paying the O(n) cost on every insertion."""
         live_bound = max(
             64, filter.max_spheres * self._MAX_NEIGHBORS * self._COMPACT_THRESHOLD_MULTIPLIER
         )

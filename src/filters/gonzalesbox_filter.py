@@ -30,32 +30,11 @@ def box_query(queries: np.ndarray, boxes_min: np.ndarray, boxes_max: np.ndarray)
 
 
 class GonzalezBoxFilter(Filter):
-    """
-    A high-performance spatial filter that partitions high-dimensional vector data into axis-aligned bounding boxes.
-
-    The GonzalezBoxFilter combines greedy spatial clustering with hyperrectangular envelope fitting to efficiently 
-    approximate complex vector distributions using a bounded collection of axis-aligned boxes.
-
-    The partitioning strategy leverages:
-    - Gonzalez's algorithm for initial greedy k-center clustering to efficiently partition vectors into 
-      cohesive spatial clusters.
-    - Axis-aligned spatial bounding, calculating tight per-dimension minimum and maximum coordinates 
-      to encapsulate each vector cluster into a hyperrectangle.
-
-    The filter is designed with a strict one-sided error guarantee: it allows false positives 
-    for fast pruning, but guarantees zero false negatives (no FN), ensuring that any matching 
-    vector is never incorrectly excluded.
-
-    Attributes:
-        dim (int): The dimensionality of the vector space.
-        distance_threshold (float): Additional padding (margin of error) added to the minimum and maximum 
-                                    bounds of each box to ensure boundary vectors are fully enclosed.
-        max_memory (Optional[int]): The maximum memory limit in bytes allocated for storing boxes.
-        max_boxes (int): The maximum number of space partitions (boxes) allowed, automatically
-                         calculated based on the memory limit to prevent overflow.
-        all_boxes (np.ndarray): A 1D array of shape (K,) containing the active indices of the boxes.
-        all_boxes_min (np.ndarray): A 2D array of shape (K, D) storing the minimum coordinate bounds of all boxes.
-        all_boxes_max (np.ndarray): A 2D array of shape (K, D) storing the maximum coordinate bounds of all boxes.
+    """Partitions vectors into axis-aligned bounding boxes: Gonzalez greedy
+    k-center clustering, then a tight per-dimension min/max envelope around
+    each cluster. Zero false negatives (distance_threshold pads each box's
+    bounds to guarantee boundary vectors are enclosed); false positives are
+    the tradeoff for fast pruning.
     """
     _BYTES_PER_FLOAT32 = 4
     _BYTES_PER_FLOAT64 = 8

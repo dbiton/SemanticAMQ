@@ -1,29 +1,23 @@
 """
 QuantizedVectorFilter -- per-point quantization baseline: the "compress the
 vectors" counterpart to BallCoverFilter's "compress the geometry". Keeps
-every construct vector (rather than summarizing them into a ball cover),
-quantized to whichever scheme on a fixed fidelity ladder fits the memory
-budget, finest first: float16, then 8-bit scalar quantization, then 4-bit,
-then RaBitQ (~1 bit/dim, no codebook, theoretical error bound -- the
-aggressive end of the ladder). Exists to find the dataset size at which
-BallCoverFilter's geometric summary wins over storing (compressed) points
-directly.
+every construct vector, quantized to whichever scheme on a fixed fidelity
+ladder fits the memory budget, finest first: float16, 8-bit scalar, 4-bit
+scalar, then RaBitQ (~1 bit/dim, no codebook). Exists to find the dataset
+size at which BallCoverFilter's geometric summary wins over storing
+(compressed) points directly.
 
-Zero-false-negative by the same triangle-inequality argument BallCoverFilter
-uses (see BallCoverFilter._build_quantizer): d(q,x) <= tau implies
+Zero-false-negative by the same triangle-inequality argument
+BallCoverFilter._build_quantizer uses: d(q,x) <= tau implies
 d(q,x_hat) <= tau + ||x - x_hat||, so accepting whenever
-d(q, x_hat_i) <= tau + eps_i, with eps_i the *measured*
-||x_i - x_hat_i||_2 (never a probabilistic bound), can never produce a false
-negative, however coarse the quantizer -- the cost of a coarse level shows up
-as a wider false-positive margin instead.
+d(q, x_hat_i) <= tau + eps_i, with eps_i the *measured* reconstruction error
+(never a probabilistic bound), can never produce a false negative -- a
+coarse level costs false-positive margin instead.
 
-If not even the coarsest level (RaBitQ) fits max_memory for n vectors, this
-raises InsufficientMemoryError rather than silently dropping vectors,
-subsampling, or falling back to a lossy structure: that regime -- where
-per-point representation is impossible -- is exactly the point at which only
-a geometric summary can answer the query at all, and is a meaningful
-experimental outcome in its own right (see runner.py::equal_memory_worker's
-handling of this exception).
+If not even RaBitQ fits max_memory for n vectors, this raises
+InsufficientMemoryError rather than silently dropping vectors or
+subsampling: that's the regime where only a geometric summary can answer the
+query at all (see runner.py::equal_memory_worker's handling of it).
 """
 
 from enum import Enum
@@ -301,14 +295,11 @@ class QuantizedVectorFilter(Filter):
             d2, ids = self._sq_index.search(q, self._n)
             hit = (d2 <= thresh_sq[ids]).any(axis=1)
         else:
-            # RaBitQ has no exact-ADC fast path in faiss: IndexRaBitQ's own
-            # search()/distance_computer implements the paper's fast
-            # *probabilistic* estimator, not the exact distance to decode()
-            # eps_i was measured against -- using it here would silently
-            # reintroduce the probabilistic-bound failure mode this filter
-            # exists to avoid. Falling back to an explicit decode + batched
-            # distance computation instead: still vectorized (BLAS), just
-            # not the O(n*d/64) bitwise path the SIMD levels get.
+            # IndexRaBitQ's own search is the paper's fast *probabilistic*
+            # estimator, not the exact distance to decode() eps_i was
+            # measured against -- using it would reintroduce the
+            # probabilistic-bound failure mode this filter avoids. Falls
+            # back to an explicit decode + batched (BLAS) distance instead.
             decoded = self._rq.decode(self._codes)
             d2 = np.asarray(faiss.pairwise_distances(q, decoded))
             np.clip(d2, 0, None, out=d2)

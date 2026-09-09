@@ -1,28 +1,18 @@
 """
 HNSWFilter -- semantic AMQ baseline built directly on FAISS's HNSW
-(Hierarchical Navigable Small World) approximate nearest-neighbor index.
+approximate nearest-neighbor index.
 
-Unlike every other filter in this module, HNSWFilter makes no attempt at a
-compact/hashed representation: it stores full float32 vectors plus the HNSW
-graph and answers "is anything within tau?" via a real (approximate)
-nearest-neighbor search on real vectors. That gives it a property no other
-filter here has: it cannot produce a structural false positive (a returned
-neighbor's distance is measured exactly against the real stored vector, not
-inferred from a hash collision). What it trades away is BallCoverFilter's
-zero-false-negative guarantee -- HNSW
-search is approximate, so it can miss the true nearest neighbor and silently
-under-report duplicates; how often that happens is governed by
-ef_search/ef_construction/M, not bounded by construction the way a covering
-structure is.
+Unlike every other filter here, it stores full float32 vectors plus the HNSW
+graph and answers via a real (approximate) nearest-neighbor search: it
+cannot produce a structural false positive (distance is measured exactly
+against the real stored vector), but trades away BallCoverFilter's
+zero-false-negative guarantee -- HNSW search can miss the true neighbor and
+silently under-report duplicates, governed by ef_search/ef_construction/M.
 
-Memory is not budget-tunable the way max_memory works for the other filters
-here: IndexHNSWFlat stores full uncompressed vectors (n * dim * 4 bytes)
-plus the graph's neighbor lists, so at typical embedding dimensions the raw
-vector storage dominates M's contribution and there is no way to shrink it
-to an arbitrary target without dropping to a quantized HNSW variant (out of
-scope here -- this filter answers "what does a real ANN index cost as-is",
-not "how small can an ANN index get"). max_memory/max_spheres are accepted
-only for _instantiate_filter parity with the other direct-tau filters.
+Memory is not budget-tunable: IndexHNSWFlat stores full uncompressed
+vectors plus the graph's neighbor lists, with no way to shrink to an
+arbitrary target short of a quantized HNSW variant (out of scope here).
+max_memory/max_spheres are accepted only for _instantiate_filter parity.
 """
 
 from typing import List, Optional

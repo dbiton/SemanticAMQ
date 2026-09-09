@@ -7,34 +7,20 @@ Reads results/streaming.csv: one row per (method, checkpoint), tagged by
 `sweep` in {"position","k_sweep"} and `metric` in {"checkpoint",
 "static_reference"} (`method` is "static_rebuild" for the reference rows).
 
-Six panels:
+Six panels, all with a dashed static-rebuild reference (stream_rebuild_worker
+policy="oracle") except (c):
   (a) FPR vs. stream position at fixed k_fixed, median + IQR band over the
-      K-fold stream-offset sweep, + a dashed static-rebuild reference
-      (stream_rebuild_worker policy="oracle", position-sweep only).
-  (b) Geometric objective log10(J_tau) vs. the same stream-position x-axis --
-      checks whether the geometric objective actually tracks FPR, + the same
-      dashed static-rebuild reference.
-  (c) Insertion throughput (1 / amortized_cost_s) vs. ball budget k, from the
-      k-sweep data -- no reference line (the k-sweep doesn't submit an
-      oracle pass; a from-scratch rebuild's cost isn't a per-insertion
-      throughput to begin with).
-  (d) Number of balls vs. stream position, same position-sweep x-axis and
-      dashed static-rebuild reference as (a)/(b). Every insertion_level
-      maintains a hard ball-count budget of exactly k_fixed from bootstrap
-      onward (none of the four ever grows max_count_balls), so this is
-      expected to come out flat at k_fixed and identical across all four
-      methods -- a standalone validation check of that invariant, not a
-      discriminating comparison.
-  (e) Vectors inserted (solid) and ball count (dashed) vs. stream position,
-      on twin y-axes -- unlike (f)'s bytes/balls pairing, these two aren't
-      proportional, so this is the panel that visually makes the "unbounded
-      raw input, bounded structure" point explicit, rather than relying on
-      (d)'s flat line read on its own.
-  (f) Filter total size (bytes) and ball count vs. stream position, on twin
-      y-axes (solid = size, dashed = ball count, same color per method) --
-      the same ball-count series as (d), now overlaid against memory size to
-      show the two stay proportional (bytes_per_ball is constant), rather
-      than viewed on its own.
+      K-fold stream-offset sweep.
+  (b) Geometric objective log10(J_tau) vs. the same x-axis -- checks whether
+      it actually tracks FPR.
+  (c) Insertion throughput (1 / amortized_cost_s) vs. ball budget k.
+  (d) Number of balls vs. stream position -- expected flat at k_fixed and
+      identical across methods (every insertion_level holds a hard
+      ball-count budget), a validation check, not a discriminating panel.
+  (e) Vectors inserted (solid) vs. ball count (dashed), twin y-axes -- makes
+      the "unbounded input, bounded structure" point visually explicit.
+  (f) Filter size in bytes (solid) vs. ball count (dashed), twin y-axes --
+      shows the two stay proportional (bytes_per_ball is constant).
 """
 
 from __future__ import annotations

@@ -6,69 +6,33 @@ from filters.ball_cover.ball_interfaces import InsertInterface
 
 
 class DoublingInsert(InsertInterface):
-    """Amortized-rebuild insertion: a newly-arrived, not-already-covered raw
-    vector is added immediately as its own zero-radius ball (cheap -- an
-    array append, no merge work), letting the filter's *active* ball count
-    grow past `filter.max_spheres` between rebuilds instead of being kept at
-    a hard cap on every insertion the way NearestInsert/LeastInflationInsert/
-    MinHeapInsert/ExhaustiveMergeInsert all do. Once the active count reaches
-    `max_spheres * (1 + growth_budget_fraction)`, a single Gonzalez-style
-    re-clustering pass folds every currently-active ball -- old, already-
-    summarized ones and the raw zero-radius singletons added since the last
-    rebuild alike -- back down to at most `max_spheres` balls. Like a dynamic
-    array's doubling reallocation, this makes amortized per-insertion cost
-    O(1) (a coverage check + an append) at the price of an infrequent
-    O((max_spheres * (1 + growth_budget_fraction))^2 * d) rebuild spike,
-    trading the other strategies' steady per-point merge cost for occasional
-    latency spikes -- the point being to see whether a periodic *global*
-    re-optimization reaches better steady-state coverage quality than any
-    sequence of local, greedy per-point decisions can.
+    """Amortized-rebuild insertion: a newly-arrived, not-already-covered
+    vector is added immediately as its own zero-radius ball (an array
+    append, no merge work), letting the active ball count grow past
+    `filter.max_spheres` between rebuilds instead of enforcing a hard cap on
+    every insertion. Once the active count reaches
+    `max_spheres * (1 + growth_budget_fraction)`, a Gonzalez-style
+    re-clustering pass folds every active ball back down to at most
+    `max_spheres` -- amortized O(1) per insertion, at the price of an
+    infrequent rebuild spike, trading the other strategies' steady per-point
+    merge cost for occasional latency spikes.
 
     Every newly-added ball is immediately part of the filter's own queryable
-    structure (filter._all_centers/_all_radiuses/_all_spheres), so the zero-
-    false-negative guarantee holds at every single checkpoint, not just right
-    after a rebuild -- unlike keeping raw vectors in separate, query()-
-    invisible storage until the next rebuild fires.
+    structure, so the zero-false-negative guarantee holds at every
+    checkpoint, not just right after a rebuild.
 
-    growth_budget_fraction is set at construction (__init__) and is exactly
-    the "how much memory is reserved for this" knob: since insertion
-    strategy objects are instantiated independently of (and normally before)
-    the BallCoverFilter that will use them, this can't be an absolute byte
-    budget -- filter.max_memory/max_spheres aren't known yet. It's instead a
-    multiplier on filter.max_spheres, resolved lazily against whatever
-    max_spheres the filter that ends up owning this strategy turns out to
-    have. The default, 1.0, is what makes this "doubling": the active count
-    may grow to 2x max_spheres (max_spheres old balls plus up to
-    max_spheres freshly-added singletons) before a rebuild is forced. A
-    smaller fraction triggers more frequent, cheaper rebuilds; a larger one
-    defers longer, amortizing each rebuild's cost over more insertions at
-    the price of a bigger latency spike and a bigger transient memory
-    footprint (reflected automatically in filter.get_bytesize(), since the
-    extra balls live in the filter's own arrays -- this strategy needs no
-    separate byte accounting of its own).
+    growth_budget_fraction (default 1.0, hence "doubling": up to 2x
+    max_spheres before a forced rebuild) is a multiplier, not an absolute
+    budget, since the strategy object is constructed before the filter that
+    will own it and doesn't yet know max_spheres.
 
-    Rebuild construction, and why it isn't just GonzalesConstruct: a rebuild
-    must preserve coverage of every point absorbed by the *current* balls,
-    not just the freshly-added raw singletons -- but those original points
-    were never retained (that's the whole point of a covering-ball summary).
-    Each currently-active ball's center is fed into the same greedy
-    farthest-first selection, carrying its own existing radius as an
-    "uncertainty" allowance: the true points it once covered could be
-    anywhere within that radius, so a rebuilt ball absorbing that center
-    must have room to cover that whole region, not just the single center
-    point. Freshly-added singletons carry radius (and therefore uncertainty)
-    0, since they're genuine, exact points -- so this is a single uniform
-    rule ("use each active ball's own current radius as its uncertainty"),
-    not a special case. This is the same reconstruction-error "inflate the
-    radius by however much positional uncertainty exists" technique
-    BallCoverFilter._build_quantizer already uses for quantized centers, just
-    applied to old, already-summarized ball centers. GonzalesConstruct's own
-    construct_filter has no parameter for this per-point uncertainty (and
-    ConstructInterface is shared with IVFConstruct/RPTreeConstruct, so
-    changing its signature would ripple into unrelated construction
-    strategies), so the greedy selection + exact-radius algorithm is mirrored
-    here directly rather than reused, with the one addition (per-point
-    uncertainty added into the final radius) that correctness requires.
+    The rebuild can't just call GonzalesConstruct directly: each active
+    ball's own current radius must be carried into the re-clustering as
+    positional uncertainty (the points it once covered could be anywhere
+    within that radius), the same reconstruction-error technique
+    BallCoverFilter._build_quantizer uses for quantized centers -- so the
+    greedy farthest-first selection is mirrored here with that one addition
+    rather than reused as-is.
     """
 
     def __init__(self, growth_budget_fraction: float = 1.0):
@@ -178,12 +142,8 @@ class DoublingInsert(InsertInterface):
             points, uncertainty, filter.max_spheres
         )
 
-        # Retire every currently-active sphere (fold the whole active set
-        # back to the front-of-array free list) before re-adding the freshly
-        # computed set via the same add_sphere() every other strategy uses
-        # for a from-scratch build -- mirrors how MinHeapInsert._merge_spheres
-        # retires exactly the merged pair before re-adding the merge result,
-        # just for the entire active set at once here.
+        # Retire the whole active set, then re-add via the same add_sphere()
+        # every other strategy uses for a from-scratch build.
         filter._num_spheres = 0
         for center, radius in zip(new_centers, new_radii):
             self.add_sphere(filter, center, radius)
@@ -204,13 +164,9 @@ class DoublingInsert(InsertInterface):
 
         centers = filter.all_centers
         radii = filter.all_radiuses
-        # _exhaustive_search (FAISS index.search) returns dist/labels sorted
-        # by distance, with labels giving each match's original position in
-        # `centers` -- NOT the same order as `centers`/`radii` themselves.
-        # Comparing dist directly against radii[None, :] would pair each
-        # distance with the wrong ball's radius (whichever one happens to
-        # sit at that sorted rank), silently marking points "covered" by
-        # radii that have nothing to do with the actual nearest ball.
+        # labels give each match's position in `centers`, not sorted-rank
+        # order -- must index radii by labels, not compare against radii
+        # directly, or points get paired with the wrong ball's radius.
         dist, labels = self._exhaustive_search(centers, X)
         is_already_covered = np.any(dist <= radii[labels], axis=1)
         X = X[~is_already_covered]

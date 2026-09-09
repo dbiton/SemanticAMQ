@@ -1,38 +1,19 @@
 """
-LSBFFilter -- Locality-Sensitive Bloom Filter.
+LSBFFilter -- Locality-Sensitive Bloom Filter (Hua, Xiao, Veeravalli & Feng,
+IEEE TC 2012). Unlike DSBFFilter (separate bit array per table), LSBF uses
+one shared `m`-bit array: `num_hashes` hash functions each set/check one bit
+position, and membership requires **all** positions set -- an AND, not an
+OR or vote threshold. That AND/OR distinction is this baseline's defining
+property, verified by a unit test that would fail under an accidental OR.
 
-[VERIFY] Source
-----------------
-Hua, Xiao, Veeravalli & Feng, "Locality-Sensitive Bloom Filter for
-Approximate Membership Query" (IEEE Transactions on Computers, Vol. 61,
-No. 6, June 2012, pp. 817-830). Unlike DSBFFilter (Kirsch & Mitzenmacher,
-which keeps `m` *separate* bit arrays, one per table), LSBF uses a single
-shared `m`-bit array: `num_hashes` locality-sensitive hash functions each
-set (at insert) or check (at query) one bit position in that one array.
-Membership requires **all** `num_hashes` positions to be set -- an AND, not
-an OR or a vote threshold. This is the paper's defining property and is
-exactly what distinguishes it from DSBFFilter's threshold dial; getting the
-AND/OR distinction right is the point of this baseline, verified directly by
-a unit test that would fail under an accidental OR implementation.
-
-Per the paper (and secondary sources describing it, since the primary text
-does not fully specify the bit-level mechanics): "a bit vector is proposed
-to reduce False Positives (FP), and the bit vector can verify multiple
-attributes belonging to one member. An active overflowed scheme is also
-used to significantly decrease False Negatives (FN)." This implementation's
-`verify=True` path is a best-effort, clearly-flagged concretization of that
-stated-but-underspecified secondary structure: a small bank of fingerprint
-buckets, indexed by the first hash function's bit position, storing an
-OR-accumulated fingerprint of each member's raw vector bytes. It is checked
-only when the primary AND-test already passes, and is deliberately exposed
-as a togglable flag (`verify`) so its memory-vs-FPR contribution can be
-ablated independently of the base LSBF structure -- as opposed to the
-paper's own "active overflow" FN-mitigation mechanism, which is not
-reproduced here (this verify stage trades a small, honestly-documented
-amount of extra FNR *among near-but-not-identical neighbors* for lower FPR;
-exact re-insertion of the same vector is always recalled regardless, since
-its own fingerprint bits are set at insert time -- see the exact-recall
-invariant used by this module's unit tests).
+`verify=True` is a best-effort concretization of the paper's underspecified
+"active overflow" FN-mitigation idea: a small bank of fingerprint buckets,
+indexed by the first hash's bit position, storing an OR-accumulated
+fingerprint of each member's raw vector bytes, checked only after the
+primary AND-test passes. It's a togglable flag so its memory-vs-FPR
+contribution can be ablated independently -- it trades a small amount of
+extra FNR among near-but-not-identical neighbors for lower FPR; exact
+re-insertion of the same vector is always recalled regardless.
 """
 
 import math
@@ -46,17 +27,12 @@ from lsh import SimHashLSH
 
 
 class LSBFFilter(Filter):
-    """
-    Locality-sensitive Bloom filter (Hua, Xiao, Veeravalli & Feng, IEEE TC
-    2012), adapted to Euclidean/cosine distance on L2-normalized embeddings
-    the same way as DSBFFilter: each of the `num_hashes` "LSH hash
-    functions" is itself a `sub_bits_per_hash`-wide SimHash code (random
-    hyperplane sign bits), mapped into the shared `m`-bit array via a
-    secondary uniform hash.
+    """LSBF (see module docstring), adapted the same way as DSBFFilter: each
+    "LSH hash function" is a `sub_bits_per_hash`-wide SimHash code, mapped
+    into the shared `m`-bit array via a secondary uniform hash.
 
-    tau is baked in at construction via `distance_threshold` (mirrors
-    BallCoverFilter/FirstNFilter/DSBFFilter); `query(..., tau=t)` only
-    accepts t == distance_threshold or t=None.
+    tau is baked in at construction via `distance_threshold`; `query(...,
+    tau=t)` only accepts t == distance_threshold or t=None.
     """
 
     def __init__(
