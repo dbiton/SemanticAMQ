@@ -1,5 +1,6 @@
 import logging
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Must happen before numpy/faiss are imported (their BLAS/OpenMP backends
 # read these once at init and cache the thread count) -- otherwise each of
@@ -21,7 +22,7 @@ import pandas as pd
 faiss.omp_set_num_threads(1)  # belt-and-suspenders: explicit, not just env-var-dependent
 
 from logging_config import configure_logging
-from runner import Runner, QUANTIZATION_SWEEP
+from runner import Runner, QUANTIZATION_SWEEP, system_tau_ground_truth_worker
 from plots.plot_quantization import generate_quantization_figures
 from plots.plot_query_performance import generate_query_performance_figures
 from plots.plot_equal_memory import generate_equal_memory_figures
@@ -353,6 +354,13 @@ def generate_system_tau() -> Tuple[pd.DataFrame, int]:
     to 0). The query set ships as an ArrayVectorSource rather than a
     VectorSource since it generally isn't a contiguous on-disk range.
 
+    Ground truth (nearest-construct-set distance per query vector, one flat
+    L2 index build + search per (dataset, split)) is computed in parallel
+    across a ProcessPoolExecutor rather than serially in this process, and
+    cached to results/system_tau_ground_truth/ so a repeat call with the
+    same (dataset, num_vectors, construct_size, seed) doesn't redo that
+    (expensive, at STREAM_SIZE-scale) nearest-neighbor search.
+
     Writes results/system_tau.csv. Returns the long-format df plus k (fixed
     by construction, not swept, and not derivable from the df alone).
     """
@@ -364,6 +372,7 @@ def generate_system_tau() -> Tuple[pd.DataFrame, int]:
     k_fraction              = 0.1
     tau_values              = [float(t) for t in np.linspace(0.01, 0.1, 10)]
     output_csv              = "results/system_tau.csv"
+    ground_truth_dir        = "results/system_tau_ground_truth"
 
     datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
     missing = [d for d in DATASET_KEYS if d not in datasets]
@@ -387,42 +396,65 @@ def generate_system_tau() -> Tuple[pd.DataFrame, int]:
     # knob is a single global median instead of a per-dataset one.
     construct_tau = float(np.median(tau_values))
 
-    runner = Runner(num_workers=MAX_WORKERS)
-
+    # One entry per (dataset, split), built once and reused by both passes
+    # below: (dataset, start, stop, seed, vectors_construct, vectors_query).
+    splits = []
     for dataset in datasets:
         vectors = load_embeds(dataset, num_vectors)[0]
         n = len(vectors)  # a dataset may hold fewer than num_vectors
-
         if use_kfold:
-            fold_edges = [int(e) for e in np.linspace(0, n, k_folds + 1)]
-            splits = [(fold_edges[fold], fold_edges[fold + 1], fold) for fold in range(k_folds)]
+            edges = [int(e) for e in np.linspace(0, n, k_folds + 1)]
+            bounds = [(edges[f], edges[f + 1], f) for f in range(k_folds)]
         else:
-            splits = [(0, min(construct_size, n), 0)]
+            bounds = [(0, min(construct_size, n), 0)]
+        for start, stop, seed in bounds:
+            splits.append((
+                dataset, start, stop, seed,
+                vectors[start:stop], np.concatenate([vectors[:start], vectors[stop:]]),
+            ))
 
-        for start, stop, seed in splits:
-            vectors_construct = vectors[start:stop]
-            vectors_query = np.concatenate([vectors[:start], vectors[stop:]])
+    # Ground truth (nearest-construct-set distance per query vector): load
+    # whatever's already cached on disk, compute the rest in parallel.
+    os.makedirs(ground_truth_dir, exist_ok=True)
+    nn_dist_by_split = {}
+    to_compute = []
+    for dataset, start, stop, seed, vectors_construct, vectors_query in splits:
+        cache_path = os.path.join(ground_truth_dir, f"{dataset}_{num_vectors}_{stop - start}_{seed}.npy")
+        if os.path.exists(cache_path):
+            nn_dist_by_split[(dataset, seed)] = np.load(cache_path)
+        else:
+            to_compute.append((dataset, seed, cache_path, vectors_construct, vectors_query))
 
-            construct_source = VectorSource(dataset, start, stop)
-            query_source = ArrayVectorSource(dataset_name=dataset, start=0, stop=len(vectors_query),
-                                             array=vectors_query)
+    if to_compute:
+        logger.info(f"Computing ground truth for {len(to_compute)} (dataset, split) pair(s) not yet cached...")
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(system_tau_ground_truth_worker, dim, vc, vq): (dataset, seed, cache_path)
+                for dataset, seed, cache_path, vc, vq in to_compute
+            }
+            for future in as_completed(futures):
+                dataset, seed, cache_path = futures[future]
+                nn_dist = future.result()
+                np.save(cache_path, nn_dist)
+                nn_dist_by_split[(dataset, seed)] = nn_dist
+    else:
+        logger.info("All ground truth already cached on disk; skipping recomputation.")
 
-            split_label = f"fold {seed}/{k_folds}" if use_kfold else "single run"
-            logger.info(f"{dataset} {split_label}: computing ground truth at {len(tau_values)} fixed tau values...")
-            construct_arr = np.ascontiguousarray(vectors_construct, dtype=np.float32)
-            query_arr = np.ascontiguousarray(vectors_query, dtype=np.float32)
-            index = faiss.IndexFlatL2(dim)
-            index.add(construct_arr)
-            nn_sq_dist, _ = index.search(query_arr, 1)
-            nn_dist = np.sqrt(np.clip(nn_sq_dist[:, 0], 0, None))
-            actual_results_by_tau = {t: (nn_dist <= t).tolist() for t in tau_values}
+    runner = Runner(num_workers=MAX_WORKERS)
 
-            runner.submit(
-                'system_tau',
-                dim=dim, dataset=DATASET_KEYS[dataset],
-                k=k, tau_values=tau_values, seed=seed, construct_tau=construct_tau,
-                vectors_construct=construct_source, vectors_query=query_source,
-                actual_results_by_tau=actual_results_by_tau,
+    for dataset, start, stop, seed, _, vectors_query in splits:
+        nn_dist = nn_dist_by_split[(dataset, seed)]
+        actual_results_by_tau = {t: (nn_dist <= t).tolist() for t in tau_values}
+
+        runner.submit(
+            'system_tau',
+            dim=dim, dataset=DATASET_KEYS[dataset],
+            k=k, tau_values=tau_values, seed=seed, construct_tau=construct_tau,
+            vectors_construct=VectorSource(dataset, start, stop),
+            vectors_query=ArrayVectorSource(
+                dataset_name=dataset, start=0, stop=len(vectors_query), array=vectors_query
+            ),
+            actual_results_by_tau=actual_results_by_tau,
             )
 
     job_results = runner.run()

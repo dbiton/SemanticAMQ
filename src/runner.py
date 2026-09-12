@@ -754,6 +754,26 @@ def quantization_worker(
     return rows
 
 
+def system_tau_ground_truth_worker(
+    dim: int,
+    vectors_construct: VectorInput,
+    vectors_query: VectorInput,
+) -> np.ndarray:
+    """Nearest-construct-set-neighbor distance for every query vector, via a
+    brute-force flat index -- the ground-truth step generate_system_tau()
+    needs once per (dataset, split) before it can derive actual_results_by_tau
+    at each tau. Split out into its own worker (rather than computed inline
+    in the driver process, one dataset at a time) so main.py can run it
+    across a ProcessPoolExecutor and cache the result to disk, instead of
+    paying this cost serially on every call."""
+    construct_arr = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
+    query_arr = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
+    index = faiss.IndexFlatL2(dim)
+    index.add(construct_arr)
+    nn_sq_dist, _ = index.search(query_arr, 1)
+    return np.sqrt(np.clip(nn_sq_dist[:, 0], 0, None)).astype(np.float32)
+
+
 def system_tau_worker(
     dim: int,
     dataset: str,
