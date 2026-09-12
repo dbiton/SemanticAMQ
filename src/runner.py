@@ -5,11 +5,22 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
+# Must happen before numpy/faiss are imported -- see main.py's own copy of
+# this guard for why (BLAS/OpenMP thread-count x Runner's multiprocess
+# worker count multiply into CPU/memory oversubscription otherwise).
+# Repeated here (not just in main.py) since each ProcessPoolExecutor worker
+# re-imports this module fresh, and other entry points (tests, tradeoff.py)
+# may import runner.py directly without going through main.py first.
+for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_env_var, "1")
+
 import faiss
 import numpy as np
 import pandas as pd
 import time
 import inspect
+
+faiss.omp_set_num_threads(1)
 
 from scipy.special import logsumexp
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support

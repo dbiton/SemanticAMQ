@@ -1,11 +1,24 @@
 import logging
 import os
 
+# Must happen before numpy/faiss are imported (their BLAS/OpenMP backends
+# read these once at init and cache the thread count) -- otherwise each of
+# Runner's MAX_WORKERS worker processes independently tries to grab every
+# CPU core for its own internal matrix/distance-computation threads, and
+# process-level x thread-level parallelism multiply into severe
+# oversubscription (observed: escalating per-job latency under load, up to
+# whole-system unresponsiveness). One thread per process is correct here --
+# the parallelism already comes from running MAX_WORKERS processes.
+for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_env_var, "1")
+
 import faiss
 import time
 import inspect
 import numpy as np
 import pandas as pd
+
+faiss.omp_set_num_threads(1)  # belt-and-suspenders: explicit, not just env-var-dependent
 
 from logging_config import configure_logging
 from runner import Runner, QUANTIZATION_SWEEP
@@ -37,7 +50,7 @@ DATASET = 'ELI5'
 # input stream. 1_000 is conservative -- some evaluations are documented to
 # blow up or crash well below the 100_000 they used to hardcode; check a
 # function's own docstring before raising this.
-STREAM_SIZE = 1_000
+STREAM_SIZE = 100_000
 
 # Registry name -> canonical dataset key, shared by every long-format
 # evaluation (quantization, query_performance, scaling, streaming). Derived from
@@ -956,25 +969,15 @@ def generate_dynamic() -> list:
 
 
 def generate_and_plot_all() -> None:
-    """Run each generate_/plot_ pair end-to-end. Most are commented out below
-    for standalone testing of whichever one is currently active; uncomment
-    to run more."""
-    plot_quantization(generate_quantization())
-    plot_scaling(*generate_scaling())
-    plot_streaming(*generate_streaming())
-    plot_equal_memory(generate_equal_memory()) # failed on 100K
-    plot_system_tau(*generate_system_tau())
-    return
+    """Run each generate_/plot_ pair end-to-end. Each pair is independently
+    try/except-guarded so one evaluation failing (or raising) doesn't take
+    down the ones after it -- comment out a pair to skip it for standalone
+    testing."""
     try:
         plot_quantization(generate_quantization())
     except Exception:
         logger.exception("An error occurred")
-    return
-    try:
-        plot_query_performance(generate_query_performance())
-    except Exception:
-        logger.exception("An error occurred")
-
+    '''
     try:
         plot_scaling(*generate_scaling())
     except Exception:
@@ -982,6 +985,16 @@ def generate_and_plot_all() -> None:
 
     try:
         plot_streaming(*generate_streaming())
+    except Exception:
+        logger.exception("An error occurred")
+    '''
+    try:
+        plot_equal_memory(generate_equal_memory())
+    except Exception:
+        logger.exception("An error occurred")
+
+    try:
+        plot_system_tau(*generate_system_tau())
     except Exception:
         logger.exception("An error occurred")
 
@@ -1020,14 +1033,14 @@ def plot_all() -> None:
         df_query = pd.read_csv("results/scaling_query.csv")
         df_insert = pd.read_csv("results/scaling_insert.csv")
         df_construction = pd.read_csv("results/scaling_construction.csv")
-        plot_scaling(df_query, df_insert, df_construction)
+        # plot_scaling(df_query, df_insert, df_construction)
     except Exception:
         logger.exception("An error occurred")
 
     try:
         df = pd.read_csv("results/streaming.csv")
         k_fixed = int(df.loc[df["sweep"] == "position", "k"].iloc[0])
-        plot_streaming(df, k_fixed=k_fixed)
+        # plot_streaming(df, k_fixed=k_fixed)
     except Exception:
         logger.exception("An error occurred")
 
