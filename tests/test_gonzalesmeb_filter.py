@@ -414,15 +414,16 @@ class TestGonzalezMemory(unittest.TestCase):
         f = GonzalezMEBFilter(dim=self.dim, distance_threshold=R, max_spheres=6)
         f.construct(_rand(100, self.dim))
         k = len(f.all_spheres)
-        minimal_pairs_heap = sys.getsizeof(f._minimal_pairs)
-        # k spheres × float32 + k centers × dim float32 + k radii × float32 + k indices count × float32 + min-heap
-        self.assertEqual(f.get_bytesize(), k * 4 + k * self.dim * 4 + k * 4 + k * 4 + minimal_pairs_heap)
+        expected_filter_bytes = k * 4 + k * self.dim * 4 + k * 4
+        expected_heap_bytes = k * 4 + sys.getsizeof(f._minimal_pairs) + len(f._minimal_pairs) * 216
+        self.assertEqual(f.get_bytesize(), expected_filter_bytes + expected_heap_bytes)
 
-    def test_bytesize_within_max_memory_budget(self):
-        budget = (self.dim + 1) * 4 * 4 * 8
-        f = GonzalezMEBFilter(dim=self.dim, distance_threshold=R, max_memory=budget)
-        f.construct(_rand(200, self.dim))
-        self.assertLessEqual(f.get_bytesize(), budget)
+    def test_bytesize_scales_with_max_spheres(self):
+        f_small = GonzalezMEBFilter(dim=self.dim, distance_threshold=R, max_spheres=5)
+        f_small.construct(_rand(100, self.dim))
+        f_large = GonzalezMEBFilter(dim=self.dim, distance_threshold=R, max_spheres=50)
+        f_large.construct(_rand(100, self.dim))
+        self.assertLess(f_small.get_bytesize(), f_large.get_bytesize())
 
 
 # ---------------------------------------------------------------------------

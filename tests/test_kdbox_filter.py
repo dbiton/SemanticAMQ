@@ -347,20 +347,19 @@ class TestKDBoxDynamicUpdates(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestKDBoxMemoryAndState(unittest.TestCase):
+    dim = 16
+
     def test_bytesize_before_construct_is_zero(self):
         f = KDBoxFilter(dim=DIM, distance_threshold=R, max_spheres=10)
         self.assertEqual(f.get_bytesize(), 0)
 
     def test_bytesize_after_construct(self):
-        k = 6
-        f = KDBoxFilter(dim=DIM, distance_threshold=R, max_spheres=k)
-        f.construct(_rand(100))
-        active_boxes = f._all_boxes.nbytes
-        min_bytes = f._all_boxes_min.nbytes
-        max_bytes = f._all_boxes_max.nbytes
-        idx_bytes = f._indices_count.nbytes
-        heap_bytes = sys.getsizeof(f._minimal_pairs)
-        self.assertEqual(f.get_bytesize(), active_boxes + min_bytes + max_bytes + idx_bytes + heap_bytes)
+        f = KDBoxFilter(dim=self.dim, distance_threshold=R, max_spheres=6)
+        f.construct(_rand(100, self.dim))
+        k = len(f.all_boxes)
+        expected_filter_bytes = k * 4 + k * self.dim * 4 + k * self.dim * 4
+        expected_heap_bytes = k * 4 + sys.getsizeof(f._minimal_pairs) + len(f._minimal_pairs) * 216
+        self.assertEqual(f.get_bytesize(), expected_filter_bytes + expected_heap_bytes)
 
     def test_get_new_index_expands_capacity(self):
         f = KDBoxFilter(dim=DIM, distance_threshold=R, max_spheres=2)

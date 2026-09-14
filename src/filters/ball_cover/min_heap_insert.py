@@ -6,6 +6,7 @@ from filters.ball_cover.ball_interfaces import InsertInterface, Filter
 
 class MinHeapInsert(InsertInterface):
     _MAX_NEIGHBORS = 50
+    _COMPACTION_RATIO = 2
     _BATCH_SIZE = 2048
 
     def __init__(self):
@@ -37,11 +38,14 @@ class MinHeapInsert(InsertInterface):
         return np.maximum(sq_distances, 0.0)
 
 
-    def _remove_invalid_pairs(self) -> None:
-        if len(self._minimal_pairs) > 2 * filter.max_spheres * self._MAX_NEIGHBORS:
+    def _remove_invalid_pairs(self, filter: Filter) -> None:
+        if len(self._minimal_pairs) > self._COMPACTION_RATIO * filter.max_spheres * self._MAX_NEIGHBORS:
             versions = self._sphere_versions
-            self._minimal_pairs = [p for p in self._minimal_pairs 
-                    if versions[p[1]] == p[2] and versions[p[3]] == p[4]]
+            dtype = [('vol', 'f8'), ('i', 'i4'), ('ver_i', 'i4'), ('j', 'i4'), ('ver_j', 'i4')]
+            pairs = np.asarray(self._minimal_pairs, dtype=dtype)
+
+            valid_pairs = (versions[pairs['i']] == pairs['ver_i']) & (versions[pairs['j']] == pairs['ver_j'])
+            self._minimal_pairs = pairs[valid_pairs].tolist()
             heapq.heapify(self._minimal_pairs)
 
 
@@ -144,7 +148,7 @@ class MinHeapInsert(InsertInterface):
                 self.add_sphere(filter, vec, 0.0)
 
             self._merge_spheres(filter)
-            self._remove_invalid_pairs()
+            self._remove_invalid_pairs(filter)
 
 
     def remove(self, filter: Filter, vectors: np.ndarray) -> List[bool]:
@@ -152,4 +156,5 @@ class MinHeapInsert(InsertInterface):
 
 
     def get_bytesize(self) -> int:
-        return self._sphere_versions.nbytes + sys.getsizeof(self._minimal_pairs)
+        pair_size = 216 # PyTuple (80B) + PyFloat (24B) + 4 * PyInt (28B)
+        return self._sphere_versions.nbytes + sys.getsizeof(self._minimal_pairs) + pair_size * len(self._minimal_pairs)

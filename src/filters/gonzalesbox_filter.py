@@ -60,6 +60,7 @@ class GonzalezBoxFilter(Filter):
     _BYTES_PER_FLOAT32 = 4
     _BYTES_PER_FLOAT64 = 8
     _MAX_NEIGHBORS = 50
+    _COMPACTION_RATIO = 2
     _BATCH_SIZE = 2048
 
     def __init__(self, dim: int, distance_threshold: float, max_memory: Optional[int] = None, max_spheres: Optional[int] = None):
@@ -141,10 +142,13 @@ class GonzalezBoxFilter(Filter):
 
 
     def _remove_invalid_pairs(self) -> None:
-        if len(self._minimal_pairs) > 2 * self.max_boxes * self._MAX_NEIGHBORS:
-            counts = self._indices_count
-            self._minimal_pairs = [p for p in self._minimal_pairs 
-                    if counts[p[1]] == p[2] and counts[p[3]] == p[4]]
+        if len(self._minimal_pairs) > self._COMPACTION_RATIO * self.max_boxes * self._MAX_NEIGHBORS:
+            versions = self._indices_count
+            dtype = [('vol', 'f8'), ('i', 'i4'), ('ver_i', 'i4'), ('j', 'i4'), ('ver_j', 'i4')]
+            pairs = np.asarray(self._minimal_pairs, dtype=dtype)
+
+            valid_pairs = (versions[pairs['i']] == pairs['ver_i']) & (versions[pairs['j']] == pairs['ver_j'])
+            self._minimal_pairs = pairs[valid_pairs].tolist()
             heapq.heapify(self._minimal_pairs)
 
 
@@ -308,5 +312,7 @@ class GonzalezBoxFilter(Filter):
     def get_bytesize(self) -> int:
         if not self._constructed:
             return 0
-        return (self._all_boxes.nbytes + self._all_boxes_min.nbytes + self._all_boxes_max.nbytes + 
-                self._indices_count.nbytes + sys.getsizeof(self._minimal_pairs))
+        filter_bytes = self._all_boxes.nbytes + self._all_boxes_min.nbytes + self._all_boxes_max.nbytes
+        pair_size = 216 # PyTuple (80B) + PyFloat (24B) + 4 * PyInt (28B)
+        heap_bytes = self._indices_count.nbytes + sys.getsizeof(self._minimal_pairs) + pair_size * len(self._minimal_pairs)
+        return filter_bytes + heap_bytes
