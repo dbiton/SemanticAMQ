@@ -656,8 +656,8 @@ def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, flo
 # longer varies by quantize choice, so there's exactly one "ball" cover to
 # compare every real quantizer against, not one per candidate.
 QUANTIZATION_SWEEP = (
-    Quantize.NONE, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
-    Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.SQ2T, Quantize.PQ,
+    Quantize.NONE, Quantize.SQ8, Quantize.SQ4,
+    Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.PQ,
 )
 
 
@@ -722,6 +722,14 @@ def quantization_worker(
     radii = filt.all_radiuses
     log10_J = _log10_J(radii, dim)
 
+    # Per-ball radius inflation: the reconstruction error added onto each
+    # ball's radius to preserve the no-false-negative guarantee under this
+    # quantize choice's lossy center encoding (0 for Quantize.NONE by
+    # construction -- see BallCoverFilter._radius_inflation).
+    radius_inflation = filt.all_radius_inflation
+    radius_inflation_mean = float(np.mean(radius_inflation)) if len(radius_inflation) else 0.0
+    radius_inflation_std = float(np.std(radius_inflation)) if len(radius_inflation) else 0.0
+
     memory_bytes = filt.get_bytesize()
 
     predicted_by_tau: Dict[float, List[bool]] = {}
@@ -742,6 +750,8 @@ def quantization_worker(
             "stage_time_s": stage_time, "cum_time_s": stage_time,
             "query_throughput_qps": query_throughput_by_tau[t],
             "n_balls": filt._num_spheres, "memory_bytes": memory_bytes, "seed": seed,
+            "radius_inflation_mean": radius_inflation_mean,
+            "radius_inflation_std": radius_inflation_std,
         })
 
     bad = [r for r in rows if r["fnr"] != 0]

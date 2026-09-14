@@ -494,9 +494,9 @@ def generate_quantization() -> pd.DataFrame:
     """
     num_vectors            = STREAM_SIZE
     dim                    = 384
-    percentage_construct   = 20
-    k_fractions            = [0.03, 0.06, 0.125, 0.25]
-    duplicate_percentages  = [20]
+    percentage_construct   = 50
+    k_fractions            = [0.01, 0.02, 0.04, 0.08, 0.16]
+    duplicate_percentages  = [5]
     seeds                  = [0]
     output_csv             = "results/quantization.csv"
 
