@@ -55,56 +55,83 @@ class ExhaustiveMergeInsert(InsertInterface):
         return new_c, new_r
 
 
-    @staticmethod
-    def _cheapest_pair(centers: np.ndarray, radii: np.ndarray, dim: int) -> Tuple[int, int]:
-        """argmin over all pairs (i, j) of the merge objective delta
-        r_merged**d - r_i**d - r_j**d, log-space scaled the same way as
-        insert_least_inflation (shared M = max radius among these centers)."""
-        n = len(centers)
-        ci, cj = centers[:, None, :], centers[None, :, :]
-        ri, rj = radii[:, None], radii[None, :]
-        diff = ci - cj
-        dist = np.sqrt(np.maximum(np.sum(diff * diff, axis=-1), 0.0))
-        contains = dist + np.minimum(ri, rj) <= np.maximum(ri, rj)
-        merged = 0.5 * (dist + ri + rj)
-        r_merged = np.where(contains, np.maximum(ri, rj), merged)
-
-        M = float(max(radii.max(), r_merged.max())) if n else 0.0
-        safe_M = M if M > 0 else 1.0
-        with np.errstate(divide="ignore"):
-            scaled_i = np.exp(dim * np.log(np.maximum(ri, 0.0) / safe_M))
-            scaled_j = np.exp(dim * np.log(np.maximum(rj, 0.0) / safe_M))
-            scaled_m = np.exp(dim * np.log(np.maximum(r_merged, 0.0) / safe_M))
-        delta = (scaled_m - scaled_i - scaled_j) if M > 0 else np.zeros((n, n))
-
-        idx = np.arange(n)
-        delta[idx, idx] = np.inf
-        i, j = np.unravel_index(np.argmin(delta), delta.shape)
-        return int(i), int(j)
-
-
     def insert(self, filter: Filter, vectors: np.ndarray) -> None:
         dim = filter.dim
-        c = np.ascontiguousarray(filter.all_centers, dtype=np.float64)
-        r = np.asarray(filter.all_radiuses, dtype=np.float64)
-        X = np.ascontiguousarray(vectors, dtype=np.float32).astype(np.float64)
+        max_k = filter.max_spheres
+        n = filter._num_spheres
+
+        capacity = max(max_k, n) + 1
+        c = np.empty((capacity, dim), dtype=np.float64)
+        r = np.empty(capacity, dtype=np.float64)
+
+        if n > 0:
+            c[:n] = np.asarray(filter.all_centers[:n], dtype=np.float64)
+            r[:n] = np.asarray(filter.all_radiuses[:n], dtype=np.float64)
+
+        X = np.ascontiguousarray(vectors, dtype=np.float64)
 
         for x in X:
-            c = np.vstack([c, x[None, :]])
-            r = np.append(r, 0.0)
+            if n > 0:
+                diffs = c[:n] - x
+                dists_sq = np.einsum("ij,ij->i", diffs, diffs)
+                if np.any(dists_sq <= r[:n] * r[:n]):
+                    continue
 
-            if len(c) > filter.max_spheres:
-                i, j = self._cheapest_pair(c, r, dim)
+            c[n] = x
+            r[n] = 0.0
+            n += 1
+
+            while n > max_k:
+                C = c[:n]
+
+                norms = np.einsum("ij,ij->i", C, C)
+                gram = C @ C.T
+
+                dist_sq = norms[:, None] + norms[None, :] - 2.0 * gram
+                np.maximum(dist_sq, 0.0, out=dist_sq)
+                np.sqrt(dist_sq, out=dist_sq)
+                dist = dist_sq
+
+                ri = r[:n, None]
+                rj = r[:n][None, :]
+
+                rmin = np.minimum(ri, rj)
+                rmax = np.maximum(ri, rj)
+
+                contains = dist + rmin <= rmax
+                r_merged = 0.5 * (dist + ri + rj)
+                np.maximum(r_merged, rmax, out=r_merged, where=contains)
+
+                M = float(max(r[:n].max(), r_merged.max()))
+
+                if M > 0.0:
+                    inv_M = 1.0 / M
+                    scaled_i = np.power(ri * inv_M, dim)
+                    scaled_j = np.power(rj * inv_M, dim)
+                    scaled_m = np.power(r_merged * inv_M, dim)
+                    delta = scaled_m - scaled_i - scaled_j
+                else:
+                    delta = np.zeros((n, n), dtype=np.float64)
+
+                np.fill_diagonal(delta, np.inf)
+
+                i, j = np.unravel_index(np.argmin(delta), delta.shape)
+                i, j = int(i), int(j)
+
                 c_new, r_new = self._merge_two_balls(c[i], r[i], c[j], r[j])
-                keep = [idx for idx in range(len(c)) if idx not in (i, j)]
-                c = np.vstack([c[keep], c_new[None, :]])
-                r = np.append(r[keep], r_new)
+                c[i] = c_new
+                r[i] = r_new
 
-        n_new = len(c)
-        filter._ensure_capacity(n_new)
-        filter._all_centers[:n_new] = c.astype(np.float32)
-        filter._all_radiuses[:n_new] = r.astype(np.float32)
-        filter._num_spheres = n_new
+                if j != n - 1:
+                    c[j] = c[n - 1]
+                    r[j] = r[n - 1]
+
+                n -= 1
+
+        filter._ensure_capacity(n)
+        filter._all_centers[:n] = c[:n].astype(np.float32)
+        filter._all_radiuses[:n] = r[:n].astype(np.float32)
+        filter._num_spheres = n
 
 
     def remove(self, filter: Filter, vectors: np.ndarray) -> List[bool]:
