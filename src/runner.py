@@ -840,8 +840,11 @@ def system_tau_worker(
         rows.append({
             "dataset": dataset, "k": k, "tau": t, "seed": seed,
             "redundancy_rate": redundancy_rate,
+            "tp_rate_pct": redundancy_rate * 100.0,
             "throughput_improvement_pct": (throughput_with - throughput_without) / throughput_without * 100.0,
             "mean_index_accesses": n_index_accesses,
+            "n_queries": n_q,
+            "positive_rate_pct": n_index_accesses / max(n_q, 1) * 100.0,
             "fpr": rates["fpr"], "fnr": rates["fnr"],
             "j_tau": _J_tau(radii, dim, tau=t),
             "log10_j_tau": _log10_J(radii, dim, tau=t),

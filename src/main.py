@@ -51,7 +51,7 @@ DATASET = 'ELI5'
 # input stream. 1_000 is conservative -- some evaluations are documented to
 # blow up or crash well below the 100_000 they used to hardcode; check a
 # function's own docstring before raising this.
-STREAM_SIZE = 100_000
+STREAM_SIZE = 1_000
 
 # Registry name -> canonical dataset key, shared by every long-format
 # evaluation (quantization, query_performance, scaling, streaming). Derived from
@@ -368,9 +368,9 @@ def generate_system_tau() -> Tuple[pd.DataFrame, int]:
     dim                   = 384
     use_kfold             = False
     k_folds               = 5
-    construct_percentage  = 0.95
+    construct_percentage  = 0.75
     k_fraction              = 0.1
-    tau_values              = [float(t) for t in np.linspace(0.01, 0.1, 10)]
+    tau_values              = [float(t) for t in np.linspace(0.01, 0.15, 10)]
     output_csv              = "results/system_tau.csv"
     ground_truth_dir        = "results/system_tau_ground_truth"
 
@@ -1005,11 +1005,11 @@ def generate_and_plot_all() -> None:
     try/except-guarded so one evaluation failing (or raising) doesn't take
     down the ones after it -- comment out a pair to skip it for standalone
     testing."""
+    '''
     try:
         plot_quantization(generate_quantization())
     except Exception:
         logger.exception("An error occurred")
-    '''
     try:
         plot_scaling(*generate_scaling())
     except Exception:
@@ -1019,7 +1019,6 @@ def generate_and_plot_all() -> None:
         plot_streaming(*generate_streaming())
     except Exception:
         logger.exception("An error occurred")
-    '''
     try:
         plot_equal_memory(generate_equal_memory())
     except Exception:
@@ -1029,6 +1028,12 @@ def generate_and_plot_all() -> None:
         plot_system_tau(*generate_system_tau())
     except Exception:
         logger.exception("An error occurred")
+    '''
+    try:
+        plot_quantization(generate_quantization())
+    except Exception:
+        logger.exception("An error occurred")
+        
 
 
 def plot_all() -> None:

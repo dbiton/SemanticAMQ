@@ -5,7 +5,7 @@ distances applied identically to all datasets. redundancy_rate is
 therefore a reported *outcome* of a given tau here, not a quantity tau is
 solved for.
 
-Five panels, one line per dataset:
+Seven panels, one line per dataset:
   (a) Throughput Improvement (%) of the filtered pipeline over the
       unfiltered flat-index baseline.
   (b) Mean Full Index Accesses (queries that bypass the filter and reach
@@ -15,6 +15,14 @@ Five panels, one line per dataset:
       (r_i + tau)^d.
   (e) Measured redundancy rate -- how much of the query stream a given tau
       actually counts as a ground-truth duplicate.
+  (f) Predicted positive rate (%) -- mean_index_accesses / n_queries, i.e.
+      how much of the stream the *filter* flags as a possible duplicate,
+      as opposed to (e)'s ground-truth rate; the gap between the two is
+      the filter's false-positive margin at that tau.
+  (g) TP rate (%) -- percentage of query vectors that are an actual
+      duplicate (closer than tau to a construct vector); the same quantity
+      as (e)'s redundancy_rate, just as a percentage under an explicit
+      "TP" label rather than a [0,1] fraction.
 """
 
 from __future__ import annotations
@@ -37,8 +45,8 @@ EMIT_PDF = False
 DEMO = False
 
 _REQUIRED_COLUMNS = [
-    "dataset", "k", "tau", "seed", "redundancy_rate",
-    "throughput_improvement_pct", "mean_index_accesses",
+    "dataset", "k", "tau", "seed", "redundancy_rate", "tp_rate_pct",
+    "throughput_improvement_pct", "mean_index_accesses", "n_queries", "positive_rate_pct",
     "fpr", "fnr", "j_tau", "log10_j_tau", "n_balls",
 ]
 
@@ -77,8 +85,11 @@ def _synthesize_demo_data() -> pd.DataFrame:
                 rows.append({
                     "dataset": dataset, "k": k_fixed, "tau": float(tau), "seed": seed,
                     "redundancy_rate": redundancy_rate,
+                    "tp_rate_pct": redundancy_rate * 100.0,
                     "throughput_improvement_pct": throughput_improvement_pct,
                     "mean_index_accesses": mean_index_accesses,
+                    "n_queries": n_queries,
+                    "positive_rate_pct": mean_index_accesses / n_queries * 100.0,
                     "fpr": fpr, "fnr": 0.0,
                     "j_tau": float("inf"), "log10_j_tau": log10_j_tau,
                     "n_balls": k_fixed,
@@ -184,9 +195,27 @@ def panel_redundancy_rate(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
                        cfg, bounded_unit=True)
 
 
+def panel_tp_rate(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Percentage of query vectors that are an actual duplicate (closer
+    than tau to a construct vector) -- the same quantity as
+    panel_redundancy_rate, as an explicit "TP" percentage rather than a
+    [0,1] fraction."""
+    return _line_panel(df, "tp_rate_pct", "TP Rate (%)", "system-tau-tp-rate.png", cfg)
+
+
+def panel_positive_rate(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Percentage of the query stream the *filter* predicts positive
+    (mean_index_accesses / n_queries), as opposed to panel_redundancy_rate's
+    ground-truth rate -- the gap between the two at a given tau is the
+    filter's false-positive margin."""
+    return _line_panel(df, "positive_rate_pct", "Predicted Positive Rate (%)",
+                       "system-tau-positive-rate.png", cfg)
+
+
 def print_summary(df: pd.DataFrame, cfg: Config) -> None:
     print(f"\n--- System (fixed tau-sweep) summary (k={cfg.k_fixed}) ---")
-    cols = ("throughput_improvement_pct", "mean_index_accesses", "fpr", "log10_j_tau", "redundancy_rate")
+    cols = ("throughput_improvement_pct", "mean_index_accesses", "fpr", "log10_j_tau", "redundancy_rate",
+            "positive_rate_pct")
     aggs = {c: mean_ci95(df, ["dataset", "tau"], c) for c in cols}
     for dataset in DATASETS:
         for tau in sorted(df[df["dataset"] == dataset]["tau"].unique()):
@@ -194,6 +223,7 @@ def print_summary(df: pd.DataFrame, cfg: Config) -> None:
                 row = aggs[c][(aggs[c]["dataset"] == dataset) & (aggs[c]["tau"] == tau)]
                 return float(row["mean"].iloc[0]) if len(row) else float("nan")
             print(f"{dataset:<10} tau={tau:.3f} redundancy={_mean('redundancy_rate'):.3f} "
+                 f"predicted_positive={_mean('positive_rate_pct'):.1f}% "
                  f"throughput_gain={_mean('throughput_improvement_pct'):+.1f}% "
                  f"index_accesses={_mean('mean_index_accesses'):.0f} "
                  f"fpr={_mean('fpr'):.4f} log10_J_tau={_mean('log10_j_tau'):.2f}")
@@ -213,6 +243,8 @@ def generate_system_tau_figures(df: Optional[pd.DataFrame] = None, outdir: str =
     panel_fpr(df, cfg)
     panel_geometric_objective(df, cfg)
     panel_redundancy_rate(df, cfg)
+    panel_tp_rate(df, cfg)
+    panel_positive_rate(df, cfg)
     save_dataset_legend(cfg.outdir, cfg.dpi, cfg.emit_pdf)
     print_summary(df, cfg)
 
