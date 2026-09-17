@@ -12,6 +12,7 @@ from src.filters.ball_cover.min_heap_insert import MinHeapInsert
 from src.filters.ball_cover.nearest_insert import NearestInsert
 from src.filters.ball_cover.least_inflation_insert import LeastInflationInsert
 from src.filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
+from src.filters.ball_cover.doubling_insert import DoublingInsert
 
 DIM = 8
 
@@ -20,7 +21,8 @@ def get_insertion_strategies():
         'min_heap': MinHeapInsert(),
         'nearest': NearestInsert(),
         'least_inflation': LeastInflationInsert(),
-        'exhaustive_merge': ExhaustiveMergeInsert()
+        'exhaustive_merge': ExhaustiveMergeInsert(),
+        'doubling': DoublingInsert(),
     }
 
 
@@ -233,6 +235,79 @@ class TestMergeStrategy(unittest.TestCase):
         new_centers, new_radii = run_insert(ExhaustiveMergeInsert(), centers, radii, new_vectors, 40)
         self.assertEqual(new_centers.dtype, np.float32)
         self.assertEqual(new_radii.dtype, np.float32)
+
+
+# ---------------------------------------------------------------------------
+# DoublingInsert -- amortized rebuild: grows past max_spheres between
+# periodic Gonzalez re-clustering passes, instead of a hard per-insert cap.
+# ---------------------------------------------------------------------------
+
+class TestDoublingStrategy(unittest.TestCase):
+
+    def test_rejects_non_positive_growth_budget_fraction(self):
+        for bad in (0.0, -0.5):
+            with self.assertRaises(ValueError):
+                DoublingInsert(growth_budget_fraction=bad)
+
+    def test_new_balls_are_added_as_singletons_under_the_rebuild_threshold(self):
+        """Below the growth threshold, every not-already-covered vector
+        becomes its own zero-radius ball -- no merge/relocation, unlike
+        ExhaustiveMergeInsert/MinHeapInsert."""
+        centers, radii = _initial_cover(n=5, seed=30)
+        new_vectors = _rand(3, seed=31)
+        new_centers, new_radii = run_insert(DoublingInsert(), centers, radii, new_vectors, 40)
+        self.assertEqual(len(new_centers), 8)  # 5 existing + 3 new singletons
+        np.testing.assert_array_equal(new_radii[5:], np.zeros(3, dtype=np.float32))
+
+    def test_rebuild_collapses_back_to_at_most_max_spheres(self):
+        """Once the active count reaches max_spheres * (1 + growth_budget_fraction),
+        a rebuild must fire and bring the count back down to <= max_spheres."""
+        max_spheres = 10
+        strategy = DoublingInsert(growth_budget_fraction=1.0)
+        f = BallCoverFilter(dim=DIM, insert_method=strategy, max_spheres=max_spheres, quantize=Quantize.NONE)
+        f.construct(_rand(max_spheres, seed=32))
+        self.assertEqual(f._num_spheres, max_spheres)
+
+        # Insert one not-already-covered vector at a time -- each becomes a
+        # singleton, so this exercises the exact growth -> rebuild -> shrink
+        # cycle instead of jumping straight to the threshold in one batch.
+        rng = np.random.default_rng(33)
+        max_seen = f._num_spheres
+        for _ in range(max_spheres + 2):
+            f.insert(rng.standard_normal((1, DIM)).astype(np.float32))
+            max_seen = max(max_seen, f._num_spheres)
+
+        self.assertLessEqual(f._num_spheres, max_spheres)
+        self.assertGreater(max_seen, max_spheres)  # it did actually grow past budget first
+        self.assertLessEqual(max_seen, max_spheres * 2)  # never exceeds the configured cap
+
+    def test_covering_invariant_holds_across_a_long_insertion_stream(self):
+        """Regression test for the bug where a not-yet-rebuilt vector was
+        invisible to query(): every point ever inserted -- old and new,
+        pre- and post-rebuild -- must stay coverable at *every* checkpoint,
+        not just immediately after a rebuild."""
+        dim = 12
+        max_spheres = 12
+        f = BallCoverFilter(
+            dim=dim, insert_method=DoublingInsert(growth_budget_fraction=1.0),
+            max_spheres=max_spheres, quantize=Quantize.NONE,
+        )
+        rng = np.random.default_rng(34)
+        bootstrap = rng.standard_normal((max_spheres, dim)).astype(np.float32)
+        f.construct(bootstrap)
+
+        all_vectors = [bootstrap[i] for i in range(max_spheres)]
+        for _ in range(400):
+            vec = rng.standard_normal((1, dim)).astype(np.float32)
+            f.insert(vec)
+            all_vectors.append(vec[0])
+
+            all_arr = np.ascontiguousarray(np.array(all_vectors), dtype=np.float32)
+            found = f.query(all_arr, 1e-4)
+            missing = np.where(~np.array(found))[0]
+            self.assertEqual(len(missing), 0, f"false negative(s) at indices {missing.tolist()}")
+
+        self.assertLessEqual(f._num_spheres, max_spheres)
 
 
 if __name__ == "__main__":

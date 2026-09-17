@@ -6,25 +6,17 @@ from filters.ball_cover.ball_interfaces import InsertInterface
 
 class ExhaustiveMergeInsert(InsertInterface):
     """Insert each new vector as its own zero-radius ball; once at capacity,
-    evict by merging whichever pair of balls -- existing-existing or the
-    new singleton against an existing ball -- grows the covering objective
-    least. The choice is global: a point landing in genuinely new territory
-    gets to found a ball rather than deforming one, and redundancy gets
-    given up wherever it's cheapest, not wherever the new point happened to
-    land.
+    evict by merging whichever pair of balls grows the covering objective
+    least, chosen globally rather than locally to the new point.
 
-    Sequential per point (each merge changes the ball set the next point's
-    decision depends on, unlike insert_nearest/insert_least_inflation,
-    which can absorb a whole batch in one vectorized pass). Recomputes the
-    full k x k merge-cost matrix on every insertion at capacity --
-    O(k**2*d) per point, correct but not the O(k*d)-amortized version an
-    incremental row/column-cached heap would give.
+    Sequential per point (each merge changes the next point's decision),
+    unlike insert_nearest/insert_least_inflation's vectorized batch pass.
+    Recomputes the full k x k merge-cost matrix on every insertion at
+    capacity -- O(k**2*d) per point, not the amortized O(k*d) an incremental
+    cached heap would give.
 
-    Runs the whole batch in float64 numpy with no intermediate
-    re-quantization -- the caller quantizes once, from the final
-    (new_centers, new_radii), rather than re-quantizing (and reading centers
-    back out of the quantized index, compounding quantization error) after
-    every single point."""
+    Quantizes once from the final (new_centers, new_radii), not after every
+    point (which would compound quantization error)."""
 
     def ensure_capacity(self, required_cap: int) -> None:
         pass

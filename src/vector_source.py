@@ -14,18 +14,11 @@ from util.dataset_paths import dataset_filenames, HDF5_DATASET_KEY as _HDF5_DATA
 
 @dataclass(frozen=True)
 class VectorSource:
-    """
-    A lightweight, picklable pointer to a contiguous slice of a dataset's
-    vectors stored on disk.
-
-    It holds *no* vector data itself -- only the dataset name and slice bounds.
-    Vectors are streamed lazily from the backing HDF5 file on demand, one disk
-    chunk at a time, so handing a VectorSource to a job costs O(1) memory
-    regardless of how many vectors the slice covers.
-
-    This is what lets the query stream grow arbitrarily long: previously the
-    whole array was copied into every job (and pickled to every worker), so
-    memory scaled with num_jobs * stream_length. A VectorSource scales with 1.
+    """A lightweight, picklable pointer to a contiguous slice of a dataset's
+    vectors stored on disk. Holds no vector data itself -- vectors stream
+    lazily from the backing HDF5 file on demand, so handing this to a job
+    costs O(1) memory regardless of slice size (unlike copying the whole
+    array into every job, which scales memory with num_jobs * stream_length).
     """
 
     dataset_name: str
@@ -84,17 +77,10 @@ class VectorSource:
 
 @dataclass(frozen=True)
 class ArrayVectorSource(VectorSource):
-    """
-    An in-memory, drop-in replacement for VectorSource designed for 
-    dynamically generated or out-of-distribution (OOD) queries.
-
-    Unlike the parent class, this subclass explicitly holds vector data in RAM. 
-    It overrides all disk-bound methods to yield batches directly from the 
-    provided NumPy array, keeping the exact same API for downstream workers.
-
-    Because it holds the array, sending this source to multiple jobs scales 
-    memory with the array size during pickling. However, this trade-off allows 
-    fast generalization testing without polluting the disk with temporary HDF5 files.
+    """An in-memory drop-in replacement for VectorSource, for dynamically
+    generated or out-of-distribution queries: holds the array in RAM and
+    overrides the disk-bound methods to yield from it directly, at the cost
+    of pickling the full array to every job.
     """
     array: Optional[np.ndarray] = None
 

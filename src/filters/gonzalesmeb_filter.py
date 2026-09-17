@@ -6,32 +6,11 @@ from hyperspheres_volume import estimate_hypersphere_volume
 
 
 class GonzalezMEBFilter(Filter):
-    """
-    A high-performance spatial filter that partitions high-dimensional vector data into bounding spheres.
-
-    The GonzalezMEBFilter combines greedy spatial clustering with core-set optimization to efficiently 
-    approximate complex vector distributions using a bounded collection of hyperspheres.
-
-    The partitioning strategy leverages:
-    - Gonzalez's algorithm for initial greedy k-center clustering, which provides a fast
-      initialization and a 2-approximation of the cluster radius.
-    - Badoiu-Clarkson iterative core-set refinement to compute a tight Minimum 
-      Enclosing Ball (MEB) for each cluster, optimizing the spatial boundaries.
-
-    The filter is designed with a strict one-sided error guarantee: it allows false positives 
-    for fast pruning, but guarantees zero false negatives (no FN), ensuring that any matching 
-    vector is never incorrectly excluded.
-
-    Attributes:
-        dim (int): The dimensionality of the vector space.
-        distance_threshold (float): Additional padding (margin of error) added to the radius of each
-                                   bounding sphere to ensure boundary vectors are fully enclosed.
-        max_memory (Optional[int]): The maximum memory limit in bytes allocated for storing spheres.
-        max_spheres (int): The maximum number of space partitions (spheres) allowed, automatically
-                           calculated based on the memory limit to prevent overflow.
-        all_spheres (np.ndarray): A 1D array of shape (K,) containing the active indices of the spheres.
-        all_centers (np.ndarray): A 2D array of shape (K, D) storing the centroids of all spheres.
-        all_radiuses (np.ndarray): A 1D array of shape (K,) storing the bounding radiuses.
+    """Partitions vectors into bounding spheres: Gonzalez greedy k-center
+    clustering for initialization (a 2-approximation of cluster radius),
+    then Badoiu-Clarkson core-set refinement for a tight Minimum Enclosing
+    Ball per cluster. Zero false negatives (distance_threshold pads each
+    radius); false positives are the tradeoff for fast pruning.
     """
     _BYTES_PER_FLOAT32 = 4
     _BYTES_PER_FLOAT64 = 8

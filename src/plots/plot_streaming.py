@@ -1,30 +1,26 @@
-"""Streaming-evaluation figures: BallCoverFilter's 4 insertion methods
-(insertion_level: nearest / least_inflation / merge / doubling -- see
-BallCoverFilter.insert()'s dispatch), one line per method throughout.
+"""Streaming-evaluation figures: BallCoverFilter's 4 insertion strategies
+(insertion_level: nearest / least_inflation / merge / min_heap -- see
+runner._INSERT_STRATEGIES, dispatched via BallCoverFilter.insert_method),
+one line per method throughout.
 
 Reads results/streaming.csv: one row per (method, checkpoint), tagged by
 `sweep` in {"position","k_sweep"} and `metric` in {"checkpoint",
 "static_reference"} (`method` is "static_rebuild" for the reference rows).
 
-Four panels:
+Six panels, all with a dashed static-rebuild reference (stream_rebuild_worker
+policy="oracle") except (c):
   (a) FPR vs. stream position at fixed k_fixed, median + IQR band over the
-      K-fold stream-offset sweep, + a dashed static-rebuild reference
-      (stream_rebuild_worker policy="oracle", position-sweep only).
-  (b) Geometric objective log10(J_tau) vs. the same stream-position x-axis --
-      checks whether the geometric objective actually tracks FPR, + the same
-      dashed static-rebuild reference.
-  (c) Insertion throughput (1 / amortized_cost_s) vs. ball budget k, from the
-      k-sweep data -- no reference line (the k-sweep doesn't submit an
-      oracle pass; a from-scratch rebuild's cost isn't a per-insertion
-      throughput to begin with).
-  (d) Filter total size (bytes) and ball count vs. stream position, on twin
-      y-axes (solid = size, dashed = ball count, same color per method).
-      Every insertion_level maintains a hard ball-count budget of exactly
-      k_fixed from bootstrap onward (none of the four ever grows
-      max_count_balls), so under the default unquantized setup both curves
-      are expected to come out flat and identical across all four methods --
-      this panel is a validation check confirming that invariant holds
-      throughout the stream, not a discriminating comparison.
+      K-fold stream-offset sweep.
+  (b) Geometric objective log10(J_tau) vs. the same x-axis -- checks whether
+      it actually tracks FPR.
+  (c) Insertion throughput (1 / amortized_cost_s) vs. ball budget k.
+  (d) Number of balls vs. stream position -- expected flat at k_fixed and
+      identical across methods (every insertion_level holds a hard
+      ball-count budget), a validation check, not a discriminating panel.
+  (e) Vectors inserted (solid) vs. ball count (dashed), twin y-axes -- makes
+      the "unbounded input, bounded structure" point visually explicit.
+  (f) Filter size in bytes (solid) vs. ball count (dashed), twin y-axes --
+      shows the two stay proportional (bytes_per_ball is constant).
 """
 
 from __future__ import annotations
@@ -47,18 +43,18 @@ DPI = 300
 EMIT_PDF = False
 DEMO = False
 
-METHODS = ["nearest", "least_inflation", "merge", "doubling"]
+METHODS = ["nearest", "least_inflation", "merge", "min_heap"]
 METHOD_LABELS = {
     "nearest": "Nearest-center absorb",
     "least_inflation": "Least-inflation absorb",
-    "merge": "Singleton + cheapest-pair merge",
-    "doubling": "Doubling k-center",
+    "merge": "Exhaustive cheapest-pair merge",
+    "min_heap": "Heap-based cheapest-pair merge",
 }
 # Okabe-Ito-derived, distinct from plot_common.DATASET_COLORS (this figure is
 # single-dataset -- see main.py's _STREAMING_REPRESENTATIVE_DATASET -- so the
 # color channel is free to encode method instead).
 METHOD_COLORS = {
-    "nearest": "#0072B2", "least_inflation": "#E69F00", "merge": "#009E73", "doubling": "#D55E00",
+    "nearest": "#0072B2", "least_inflation": "#E69F00", "merge": "#009E73", "min_heap": "#D55E00",
 }
 
 _REQUIRED_COLUMNS = [
@@ -91,10 +87,10 @@ def _synthesize_demo_data() -> pd.DataFrame:
 
     # Rough relative quality/cost ordering used only to make the demo figure
     # legible: nearest worst FPR, merge near the static-rebuild reference at
-    # far lower cost, doubling/least_inflation in between.
-    base_fpr = {"nearest": 0.06, "least_inflation": 0.045, "merge": 0.012, "doubling": 0.03,
+    # far lower cost, min_heap/least_inflation in between.
+    base_fpr = {"nearest": 0.06, "least_inflation": 0.045, "merge": 0.012, "min_heap": 0.03,
                "static_rebuild": 0.008}
-    cost_scale = {"nearest": 1.0, "least_inflation": 1.1, "merge": 2.0, "doubling": 1.3, "static_rebuild": 40.0}
+    cost_scale = {"nearest": 1.0, "least_inflation": 1.1, "merge": 2.0, "min_heap": 1.3, "static_rebuild": 40.0}
 
     rows = []
     for method in METHODS:
@@ -269,6 +265,11 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     if not ref_agg.empty:
         ref_agg = ref_agg.sort_values("position")
         ax.plot(ref_agg["position"], ref_agg["median"], color="black", linestyle="--", linewidth=0.7, zorder=3)
+        # Same IQR-band treatment as the per-method lines above, in the
+        # reference's own (black) hue -- every policy on this panel gets a
+        # spread band matching its own line color, not just the 4 methods.
+        ax.fill_between(ref_agg["position"], ref_agg["q25"], ref_agg["q75"], color="black",
+                        alpha=0.15, linewidth=0, zorder=1)
         ax.text(0.97, 0.95, "dashed: static rebuild", transform=ax.transAxes, ha="right", va="top", fontsize=5)
 
     ax.set_xscale("log")
@@ -279,6 +280,97 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     save_figure(fig, "streaming-geometric-objective.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
     return agg
+
+
+# --------------------------------------------------------------------------- #
+# Panel (d): number of balls vs. stream position
+# --------------------------------------------------------------------------- #
+
+def panel_n_balls_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Standalone ball-count-over-the-stream view (see panel_filter_size for
+    the same series overlaid against memory size instead). Expected to be
+    flat at k_fixed for all four methods -- none of them ever grows
+    max_count_balls past its bootstrap value -- so this panel is a
+    validation check of that invariant, not a discriminating comparison."""
+    sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)]
+    agg = _median_iqr(sel, ["method", "position"], "n_balls")
+
+    ref = df[(df["sweep"] == "position") & (df["metric"] == "static_reference") & (df["k"] == cfg.k_fixed)]
+    ref_agg = _median_iqr(ref, ["position"], "n_balls")
+
+    apply_style(cfg.dpi)
+    fig, ax = plt.subplots()
+    for method in METHODS:
+        sub = agg[agg["method"] == method].sort_values("position")
+        if sub.empty:
+            continue
+        ax.plot(sub["position"], sub["median"], color=METHOD_COLORS[method], marker="o",
+               markersize=2.5, linewidth=0.8, zorder=2)
+        ax.fill_between(sub["position"], sub["q25"], sub["q75"], color=METHOD_COLORS[method],
+                        alpha=0.15, linewidth=0, zorder=1)
+
+    if not ref_agg.empty:
+        ref_agg = ref_agg.sort_values("position")
+        ax.plot(ref_agg["position"], ref_agg["median"], color="black", linestyle="--", linewidth=0.7, zorder=3)
+        ax.text(0.97, 0.95, "dashed: static rebuild", transform=ax.transAxes, ha="right", va="top", fontsize=5)
+
+    ax.set_xscale("log")
+    ax.set_xlabel("Stream Position")
+    ax.set_ylabel("Number of Balls")
+    ax.text(0.03, 0.06, rf"$k = {cfg.k_fixed}$", transform=ax.transAxes, ha="left", va="bottom", fontsize=5.5)
+    style_axes(ax)
+
+    save_figure(fig, "streaming-n-balls-vs-position.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
+    return agg
+
+
+# --------------------------------------------------------------------------- #
+# Panel: vectors inserted vs. number of balls, vs. stream position
+# --------------------------------------------------------------------------- #
+
+def panel_vectors_vs_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Cumulative vectors inserted so far (solid, left axis) and ball count
+    (dashed, right axis) vs. stream position, on twin y-axes, one pair of
+    lines per method. "Vectors inserted" is just the stream position itself
+    -- past bootstrap, every arrival is exactly one insert() call (see
+    generate_streaming()'s bootstrap-then-diverge setup) -- so the solid
+    line is a straight diagonal for every method by construction; that's
+    expected, not a bug. The point of this panel isn't that line's shape,
+    it's the *contrast* with the dashed ball-count line (expected flat at
+    k_fixed, per panel_n_balls_vs_position): unlike panel_filter_size's
+    bytes-vs-balls pairing, vectors and balls aren't proportional, so both
+    axes scale independently -- this is the panel that visually makes the
+    "unbounded raw input, bounded structure" point panel_n_balls_vs_position
+    only makes implicitly via its flat line."""
+    sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)]
+    vectors_agg = _median_iqr(sel, ["method", "position"], "position")
+    balls_agg = _median_iqr(sel, ["method", "position"], "n_balls")
+
+    apply_style(cfg.dpi)
+    fig, ax1 = plt.subplots()
+    ax2 = ax1.twinx()
+    for method in METHODS:
+        vectors_sub = vectors_agg[vectors_agg["method"] == method].sort_values("position")
+        balls_sub = balls_agg[balls_agg["method"] == method].sort_values("position")
+        if vectors_sub.empty:
+            continue
+        ax1.plot(vectors_sub["position"], vectors_sub["median"], color=METHOD_COLORS[method],
+                 marker="o", markersize=2.5, linewidth=1.1, linestyle="-", zorder=2)
+        ax2.plot(balls_sub["position"], balls_sub["median"], color=METHOD_COLORS[method],
+                 linewidth=1.6, linestyle="--", zorder=3, alpha=0.8)
+
+    ax1.set_xscale("log")
+    ax1.set_xlabel("Stream Position")
+    ax1.set_ylabel("Vectors Inserted")
+    ax2.set_ylabel("Number of Balls")
+
+    ax1.text(0.03, 0.94, rf"$k = {cfg.k_fixed}$", transform=ax1.transAxes, ha="left", va="top", fontsize=5.5)
+    ax1.text(0.97, 0.06, "solid: vectors inserted -- dashed: ball count", transform=ax1.transAxes,
+             ha="right", va="bottom", fontsize=5)
+    style_axes(ax1)
+
+    save_figure(fig, "streaming-vectors-vs-balls.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
+    return vectors_agg.merge(balls_agg, on=["method", "position"], suffixes=("_vectors", "_balls"))
 
 
 # --------------------------------------------------------------------------- #
@@ -372,11 +464,19 @@ def panel_filter_size(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 def save_method_legend(cfg: Config) -> None:
     apply_style(cfg.dpi)
-    fig, ax = plt.subplots(figsize=(4.6, 0.4))
+    fig, ax = plt.subplots(figsize=(4.6, 0.55))
     ax.axis("off")
     handles = [plt.Line2D([0], [0], color=METHOD_COLORS[m], marker="o", markersize=4, linewidth=1.0)
               for m in METHODS]
-    fig.legend(handles, [METHOD_LABELS[m] for m in METHODS], loc="center", ncol=2, frameon=False, fontsize=6.5)
+    labels = [METHOD_LABELS[m] for m in METHODS]
+    # The black dashed reference line drawn in panels (a)/(b)/(d) (the
+    # static-rebuild/oracle baseline every insertion method is compared
+    # against) currently only gets an in-panel text annotation ("dashed:
+    # static rebuild") -- give it its own shared-legend entry too, so it
+    # doesn't need re-explaining on every panel it appears in.
+    handles.append(plt.Line2D([0], [0], color="black", linestyle="--", linewidth=1.0))
+    labels.append("Static rebuild (oracle)")
+    fig.legend(handles, labels, loc="center", ncol=3, frameon=False, fontsize=6.5)
     fig.patch.set_alpha(0.0)
     save_figure(fig, "streaming-method-legend.png", cfg.outdir, cfg.dpi, cfg.emit_pdf, transparent=True)
 
@@ -408,6 +508,8 @@ def generate_streaming_figures(df: Optional[pd.DataFrame] = None, outdir: str = 
 
     panel_fpr_vs_position(df, cfg)
     panel_geometric_objective(df, cfg)
+    panel_n_balls_vs_position(df, cfg)
+    panel_vectors_vs_balls(df, cfg)
     panel_throughput_vs_k(df, cfg)
     panel_filter_size(df, cfg)
     save_method_legend(cfg)
@@ -427,6 +529,16 @@ def generate_streaming_figures(df: Optional[pd.DataFrame] = None, outdir: str = 
     \centering
     \includegraphics[width=\linewidth]{figures/streaming-geometric-objective.png}
     \caption{Geometric objective vs. stream position}
+\end{subfigure}
+\begin{subfigure}[b]{0.24\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/streaming-n-balls-vs-position.png}
+    \caption{Number of balls vs. stream position}
+\end{subfigure}
+\begin{subfigure}[b]{0.24\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/streaming-vectors-vs-balls.png}
+    \caption{Vectors inserted \& ball count vs. stream position}
 \end{subfigure}
 \begin{subfigure}[b]{0.24\linewidth}
     \centering

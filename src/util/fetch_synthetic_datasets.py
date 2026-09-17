@@ -15,27 +15,11 @@ def generate_synthetic_dataset(
     seed: int | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Generates a synthetic dataset of axis-aligned boxes within a [0, 1]^D unit hypercube.
-
-    This function produces a set of spatial regions (boxes) that occupy a cumulative 
-    volume equal to `target_vol`. It generates 'construct' vectors sampled 
-    proportionally to box volumes (simulating positive samples) and 'query' 
-    vectors sampled uniformly across the entire hypercube.
-
-    Args:
-        num_construct (int): Number of positive samples to generate.
-        num_query (int): Total number of test points.
-        dim (int): The dimensionality of the vector space.
-        target_vol (float): The cumulative fractional volume the boxes should occupy.
-        max_boxes (int): The maximum number of boxes to generate.
-        seed (int | None): Optional random seed for reproducibility.
-
-    Returns:
-        Tuple[np.ndarray, np.ndarray]: 
-            - construct_vectors: Sampled vectors located inside the generated boxes.
-            - query_vectors: Uniformly sampled points in the unit hypercube.
-            - boxes_d: The dimensions (side lengths) of the generated boxes.
-            - boxes_a: The coordinates of the lower bounds (origins) of the generated boxes.
+    Generates axis-aligned boxes occupying `target_vol` cumulative fraction of
+    a [0, 1]^D unit hypercube. construct_vectors are sampled proportionally to
+    box volumes (positive samples); query_vectors are uniform over the whole
+    hypercube. Returns (construct_vectors, query_vectors, boxes_d, boxes_a) --
+    boxes_d/boxes_a are each box's side lengths and lower-bound origin.
     """
     rng = np.random.default_rng(seed)
 

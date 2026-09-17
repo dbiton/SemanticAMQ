@@ -79,6 +79,11 @@ class BallCoverFilter(Filter):
         self._all_spheres = np.arange(self.max_spheres, dtype=np.int32)
         self._all_centers = None # temp array used only during insertions
         self._all_radiuses = np.empty((self.max_spheres,), dtype=np.float32)
+        # Per-ball radius inflation: 0 for Quantize.NONE, otherwise the
+        # ||center - decode(encode(center))|| reconstruction error added onto
+        # that ball's radius by _rebuild_from_centers to preserve the
+        # no-false-negative guarantee under a lossy center encoding.
+        self._radius_inflation = np.zeros((self.max_spheres,), dtype=np.float32)
 
         # initialize insertion method buffers
         self.insert_method.ensure_capacity(self.max_spheres)
@@ -102,6 +107,12 @@ class BallCoverFilter(Filter):
     def all_radiuses(self) -> np.ndarray:
         return self._all_radiuses[self.all_spheres]
 
+    @property
+    def all_radius_inflation(self) -> np.ndarray:
+        """Per-ball radius inflation (0 for Quantize.NONE) -- see
+        _radius_inflation's docstring in __init__."""
+        return self._radius_inflation[self.all_spheres]
+
     # ------------------------------------------------------------------ buffer operations
 
     def _ensure_capacity(self, required_cap: int) -> None:
@@ -123,6 +134,11 @@ class BallCoverFilter(Filter):
         new_radiuses = np.empty((new_cap,), dtype=np.float32)
         new_radiuses[:current_cap] = self._all_radiuses
         self._all_radiuses = new_radiuses
+
+        new_inflation = np.zeros((new_cap,), dtype=np.float32)
+        new_inflation[:current_cap] = self._radius_inflation
+        self._radius_inflation = new_inflation
+
         self.insert_method.ensure_capacity(new_cap)
 
 
@@ -253,6 +269,7 @@ class BallCoverFilter(Filter):
         radii = np.asarray(radii, dtype=np.float32)
         n = len(centers)
 
+        inflation = np.zeros(n, dtype=np.float32)
         if n == 0:
             index = self._make_faiss_index(Quantize.NONE)
         elif self.quantize == Quantize.NONE:
@@ -261,6 +278,7 @@ class BallCoverFilter(Filter):
         else:
             index, error = self._build_quantizer(self.quantize, centers)
             radii = radii + error
+            inflation = error
             index.add_with_ids(centers, sphere_indices)
 
         self._ensure_capacity(n)
@@ -269,6 +287,7 @@ class BallCoverFilter(Filter):
         self._all_centers = None
         self.all_centers_index = index
         self._all_radiuses[sphere_indices] = radii
+        self._radius_inflation[sphere_indices] = inflation
 
     # ------------------------------------------------------------------ construct & insert
 
@@ -294,6 +313,15 @@ class BallCoverFilter(Filter):
             return [False] * len(vectors)
 
         Q = np.ascontiguousarray(vectors, dtype=np.float32)
+        # self._all_centers_index (the raw ID-mapped index), not the
+        # all_centers_index *property* -- that property unwraps to the
+        # plain inner index for bytes_per_ball()/_codebook_bytes()'s
+        # isinstance checks, and searching the unwrapped index returns
+        # labels keyed by raw insertion *position*, not sphere ID. Sphere
+        # IDs stop matching their insertion position after any merge
+        # retires/reassigns some of them, so self._all_radiuses[labels]
+        # below would silently index by the wrong sphere's radius,
+        # producing false negatives on exactly those merged points.
         d2, labels = self.all_centers_index.search(Q, self._num_spheres)
         surface = np.sqrt(np.maximum(d2, 0.0)) - self._all_radiuses[labels]
         return (surface.min(axis=1) <= distance_threshold).tolist()

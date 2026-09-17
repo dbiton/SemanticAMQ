@@ -1,8 +1,18 @@
 from __future__ import annotations
 
+import logging
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+
+# Must happen before numpy/faiss are imported -- see main.py's own copy of
+# this guard for why (BLAS/OpenMP thread-count x Runner's multiprocess
+# worker count multiply into CPU/memory oversubscription otherwise).
+# Repeated here (not just in main.py) since each ProcessPoolExecutor worker
+# re-imports this module fresh, and other entry points (tests, tradeoff.py)
+# may import runner.py directly without going through main.py first.
+for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_env_var, "1")
 
 import faiss
 import numpy as np
@@ -10,15 +20,43 @@ import pandas as pd
 import time
 import inspect
 
+faiss.omp_set_num_threads(1)
+
 from scipy.special import logsumexp
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 
+from logging_config import configure_logging
 from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize, InsufficientMemoryError
+from filters.quantized_vector_filter import (
+    QuantizedVectorFilter, InsufficientMemoryError as QVFInsufficientMemoryError,
+)
+from filters.ball_cover.nearest_insert import NearestInsert
+from filters.ball_cover.least_inflation_insert import LeastInflationInsert
+from filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
+from filters.ball_cover.min_heap_insert import MinHeapInsert
+from filters.ball_cover.doubling_insert import DoublingInsert
 from hyperspheres_volume import estimate_hypersphere_volume
 from vector_source import VectorSource
 
+# Configured at import time so worker functions still log with a timestamp
+# when re-imported inside a ProcessPoolExecutor child process.
+configure_logging()
+logger = logging.getLogger(__name__)
+
+# String name -> InsertInterface class (classes, not instances -- each job
+# needs its own fresh strategy object with its own state). "doubling" is
+# registered but not in generate_streaming()'s own sweep list, a deliberate
+# opt-in since it adds real compute.
+_INSERT_STRATEGIES = {
+    "nearest": NearestInsert,
+    "least_inflation": LeastInflationInsert,
+    "merge": ExhaustiveMergeInsert,
+    "min_heap": MinHeapInsert,
+    "doubling": DoublingInsert,
+}
+
 VectorInput = Union[np.ndarray, VectorSource]
-_QUERY_BATCH = 4096
+_QUERY_BATCH = 32
 
 
 def _to_construct_array(vectors: VectorInput) -> np.ndarray:
@@ -96,7 +134,7 @@ def _radius_stats(filter_instance: Any) -> Dict[str, float]:
 _DIRECT_TAU_FILTERS = {
     "FirstNFilter", "BallCoverFilter",
     "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", "DSHFilter", "HNSWFilter",
-    "IVFFilter",
+    "IVFFilter", "QuantizedVectorFilter",
 }
 
 
@@ -307,10 +345,23 @@ def equal_memory_worker(
     calib_arr = _to_construct_array(vectors_calibration)
     calib_actual = np.asarray(actual_calibration, dtype=bool)
 
-    filter_instance, construction_time = _build_calibrated_filter(
-        filter_cls, dim, memory_budget, distance_threshold,
-        construct_arr, calib_arr, calib_actual,
-    )
+    try:
+        filter_instance, construction_time = _build_calibrated_filter(
+            filter_cls, dim, memory_budget, distance_threshold,
+            construct_arr, calib_arr, calib_actual,
+        )
+    except QVFInsufficientMemoryError as e:
+        # Expected outcome at small budgets (see QuantizedVectorFilter's
+        # docstring) -- recorded as an explicit infeasible row (NaN metrics)
+        # rather than dropped silently or crashing the sweep.
+        logger.warning(f"[Infeasible] {config} at memory_budget={memory_budget}: {e}")
+        return {
+            'Config': config, 'Dataset': dataset, 'Memory Budget': memory_budget,
+            'Memory Usage': float('nan'), 'Threshold': distance_threshold,
+            'FPR': float('nan'), 'FNR': float('nan'),
+            'Latency (ms)': float('nan'), 'Throughput (qps)': float('nan'),
+            'Infeasible': True,
+        }
 
     predicted: List[bool] = []
     start = time.perf_counter()
@@ -335,6 +386,7 @@ def equal_memory_worker(
         # included/excluded), not per-query serving cost.
         'Latency (ms)': construction_time * 1000,
         'Throughput (qps)': n_q / max(elapsed, 1e-9),
+        'Infeasible': False,
     }
 
 
@@ -515,7 +567,7 @@ def tradeoff_static_worker(
         memory_usage = filter_instance.get_bytesize()
 
     except Exception as e:
-        print(f"  [Skipped] {config} failed: {e}")
+        logger.warning(f"[Skipped] {config} failed: {e}")
         return None
 
     return _compute_tradeoff_metrics(predicted, actual_results, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
@@ -561,7 +613,7 @@ def tradeoff_dynamic_worker(
         memory_usage = filter_instance.get_bytesize()
 
     except Exception as e:
-        print(f"  [Skipped] {config} failed: {e}")
+        logger.warning(f"[Skipped] {config} failed: {e}")
         return None
 
     return _compute_tradeoff_metrics(predicted, actual_results, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
@@ -604,8 +656,8 @@ def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, flo
 # longer varies by quantize choice, so there's exactly one "ball" cover to
 # compare every real quantizer against, not one per candidate.
 QUANTIZATION_SWEEP = (
-    Quantize.NONE, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
-    Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.SQ2T, Quantize.PQ,
+    Quantize.NONE, Quantize.SQ8, Quantize.SQ4,
+    Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.PQ,
 )
 
 
@@ -621,48 +673,26 @@ def quantization_worker(
     vectors_query: VectorInput,
     actual_results_by_tau: Dict[float, List[bool]],
 ) -> List[Dict[str, Any]]:
-    """Builds one BallCoverFilter cover per (dataset, k, seed, quantize),
-    where `quantize` selects the scalar/product quantizer BallCoverFilter
-    applies during construction (Quantize.NONE for the raw, unquantized
-    Gonzalez cover), then evaluates it at every tau. Returns one row per tau,
-    tagged stage="ball" for quantize=Quantize.NONE and stage="quantizing"
-    otherwise, so a caller sweeping every QUANTIZATION_SWEEP member gets
-    one row group per member, with NONE serving as the baseline point in that
-    same sweep rather than a value repeated across jobs.
+    """Builds one BallCoverFilter cover per (dataset, k, seed, quantize) and
+    evaluates it at every tau. Returns one row per tau, tagged
+    stage="ball"/"quantizing".
 
     max_memory is derived from k using Quantize.NONE's byte-per-ball size and
-    then held fixed across every quantize candidate in the sweep (not
-    re-derived per candidate) -- this is what makes n_balls meaningfully
-    different per quantize choice (a more compact code packs more balls into
-    the same byte budget) rather than trivially equal to k for every
-    candidate, and is also what the recorded memory_bytes (filt.get_bytesize())
-    tracks as plot_quantization.py's x-axis. That tracking isn't exact for every
-    quantize choice, though: BallCoverFilter caps ball count at
-    min(max_count_balls, n_construct), so a quantizer compact enough that
-    max_count_balls exceeds the construct-set size (e.g. PQ, whose ~8-12
-    byte code is roughly two orders of magnitude smaller than NONE's
-    (dim+1)*4 bytes) saturates at n_construct balls well before the nominal
-    byte budget is used -- its realized memory usage then stays flat across
-    the whole k sweep instead of tracking k, which is real information (that
-    quantizer is construct-set-bound, not budget-bound, at these k_fractions)
-    rather than a plotting artifact. construct_tau is accepted for interface
-    parity with the other tau-sweep workers but unused: BallCoverFilter's own
-    construction has no distance-threshold knob to feed it (Gonzalez
-    construction only takes the vectors and a ball budget).
+    held fixed across every quantize candidate, so a more compact code packs
+    more balls into the same budget -- n_balls and memory_bytes then vary
+    meaningfully per quantize choice instead of trivially matching k. A
+    quantizer compact enough to saturate at n_construct balls before using
+    the full budget (e.g. PQ) will show flat memory usage across the k
+    sweep -- real information (construct-set-bound, not budget-bound), not a
+    plotting artifact. construct_tau is unused: BallCoverFilter's
+    construction has no distance-threshold knob.
 
-    FNR is asserted (raises on violation), never plotted. Each tau also times
-    its own filt.query(query_arr, ...) call (batched over the whole query
-    set, not per-query) to report query_throughput_qps -- query cost doesn't
-    conceptually depend on tau (every ball is still checked), so this is
-    mainly a per-quantize-candidate throughput estimate with tau_values-many
-    independent samples rather than a real tau sweep of the metric.
+    FNR is asserted (raises on violation), never plotted.
 
-    If constructing the filter itself raises (e.g. InsufficientMemoryError:
-    too tight a memory budget for PQ's minimum 2-center codebook -- see
-    BallCoverFilter._build_quantizer), that's treated as "this quantize
-    candidate isn't viable at this (dataset, k) point" rather than a fatal
-    error: the exception is caught, a message is printed, and this job
-    contributes zero rows (returns []) instead of aborting the whole sweep."""
+    If construction itself raises (e.g. InsufficientMemoryError -- too
+    tight a budget for PQ's minimum codebook), that candidate is treated as
+    non-viable at this (dataset, k) point: caught, logged, and this job
+    contributes zero rows rather than aborting the whole sweep."""
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
     n_q = len(query_arr)
@@ -683,7 +713,7 @@ def quantization_worker(
         filt = BallCoverFilter(dim=dim, max_memory=max_memory, quantize=quantize)
         filt.construct(construct_arr)
     except Exception as e:
-        print(
+        logger.warning(
             f"Skipping quantization job (dataset={dataset}, k={k}, quantize={quantize.value}, "
             f"seed={seed}): construction raised {type(e).__name__}: {e}"
         )
@@ -691,6 +721,14 @@ def quantization_worker(
     stage_time = time.perf_counter() - t0
     radii = filt.all_radiuses
     log10_J = _log10_J(radii, dim)
+
+    # Per-ball radius inflation: the reconstruction error added onto each
+    # ball's radius to preserve the no-false-negative guarantee under this
+    # quantize choice's lossy center encoding (0 for Quantize.NONE by
+    # construction -- see BallCoverFilter._radius_inflation).
+    radius_inflation = filt.all_radius_inflation
+    radius_inflation_mean = float(np.mean(radius_inflation)) if len(radius_inflation) else 0.0
+    radius_inflation_std = float(np.std(radius_inflation)) if len(radius_inflation) else 0.0
 
     memory_bytes = filt.get_bytesize()
 
@@ -712,6 +750,8 @@ def quantization_worker(
             "stage_time_s": stage_time, "cum_time_s": stage_time,
             "query_throughput_qps": query_throughput_by_tau[t],
             "n_balls": filt._num_spheres, "memory_bytes": memory_bytes, "seed": seed,
+            "radius_inflation_mean": radius_inflation_mean,
+            "radius_inflation_std": radius_inflation_std,
         })
 
     bad = [r for r in rows if r["fnr"] != 0]
@@ -722,6 +762,26 @@ def quantization_worker(
         )
 
     return rows
+
+
+def system_tau_ground_truth_worker(
+    dim: int,
+    vectors_construct: VectorInput,
+    vectors_query: VectorInput,
+) -> np.ndarray:
+    """Nearest-construct-set-neighbor distance for every query vector, via a
+    brute-force flat index -- the ground-truth step generate_system_tau()
+    needs once per (dataset, split) before it can derive actual_results_by_tau
+    at each tau. Split out into its own worker (rather than computed inline
+    in the driver process, one dataset at a time) so main.py can run it
+    across a ProcessPoolExecutor and cache the result to disk, instead of
+    paying this cost serially on every call."""
+    construct_arr = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
+    query_arr = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
+    index = faiss.IndexFlatL2(dim)
+    index.add(construct_arr)
+    nn_sq_dist, _ = index.search(query_arr, 1)
+    return np.sqrt(np.clip(nn_sq_dist[:, 0], 0, None)).astype(np.float32)
 
 
 def system_tau_worker(
@@ -790,8 +850,11 @@ def system_tau_worker(
         rows.append({
             "dataset": dataset, "k": k, "tau": t, "seed": seed,
             "redundancy_rate": redundancy_rate,
+            "tp_rate_pct": redundancy_rate * 100.0,
             "throughput_improvement_pct": (throughput_with - throughput_without) / throughput_without * 100.0,
             "mean_index_accesses": n_index_accesses,
+            "n_queries": n_q,
+            "positive_rate_pct": n_index_accesses / max(n_q, 1) * 100.0,
             "fpr": rates["fpr"], "fnr": rates["fnr"],
             "j_tau": _J_tau(radii, dim, tau=t),
             "log10_j_tau": _log10_J(radii, dim, tau=t),
@@ -954,10 +1017,9 @@ def _rebuild_policy_tags(policy: str, insertion_level: Optional[str]) -> tuple:
     a from-scratch rebuild regardless of insertion_level, so it gets one
     fixed reference tag; "streaming"/"periodic" report whichever
     insertion_level they actually ran (nearest/least_inflation/merge/
-    doubling) as the method tag, so all four are plotted as regular,
-    directly comparable lines rather than one of them (the old "merge",
-    formerly the only add() behavior) needing a special "exhaustive
-    reference" tag of its own."""
+    min_heap -- see _INSERT_STRATEGIES) as the method tag, so all four are
+    plotted as regular, directly comparable lines rather than one of them
+    needing a special "exhaustive reference" tag of its own."""
     if policy == "oracle":
         return "static_reference", "static_rebuild"
     return "checkpoint", insertion_level or "nearest"
@@ -980,8 +1042,9 @@ def stream_rebuild_worker(
 ) -> List[Dict[str, Any]]:
     """Simulates one rebuild policy over vectors_stream, reporting FPR and
     amortized cost per checkpoint.
-      "streaming": BallCoverFilter.insert() per arrival (using insertion_level),
-        never rebuilt.
+      "streaming": BallCoverFilter.insert() per arrival (using the
+        InsertInterface instance _INSERT_STRATEGIES[insertion_level]()
+        selects), never rebuilt.
       "periodic": like "streaming", rebuilt from scratch every T arrivals.
       "oracle": rebuilt from scratch at every checkpoint (insertion_level
         doesn't apply -- there's nothing to insert into).
@@ -1035,18 +1098,19 @@ def stream_rebuild_worker(
     if policy not in ("streaming", "periodic"):
         raise ValueError(f"Unknown policy {policy!r}; expected 'streaming', 'periodic', or 'oracle'")
 
+    if insertion_level not in _INSERT_STRATEGIES:
+        raise ValueError(
+            f"Unknown insertion_level {insertion_level!r}; expected one of "
+            f"{sorted(_INSERT_STRATEGIES)}"
+        )
     rebuild_every = T if (policy == "periodic" and T is not None) else None
     filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k),
-                             insertion_level=insertion_level)
-    # Bootstrap-then-diverge: the first k arrivals always become raw
-    # zero-radius singletons via one batch construct() (identical across
-    # every insertion_level), so checkpoint k+1 onward is a genuine
-    # comparison of each method's own decision rule -- not an artifact of
-    # add_nearest/add_least_inflation never creating new balls on their own
-    # (only add_merge/add_doubling do), which would otherwise collapse this
-    # streamed-from-empty setup to a single ball for those two methods.
-    # generate_streaming()'s checkpoints all sit above k, so this never
-    # skips a requested checkpoint.
+                             insert_method=_INSERT_STRATEGIES[insertion_level]())
+    # Bootstrap-then-diverge: the first k arrivals become raw zero-radius
+    # singletons via one batch construct() (identical across every
+    # insertion_level), so checkpoint k+1 onward is a genuine comparison of
+    # each method's own decision rule, not an artifact of some methods never
+    # creating new balls on their own.
     bootstrap_n = min(k, n)
     t0 = time.perf_counter()
     filt.construct(stream_arr[:bootstrap_n])
@@ -1173,7 +1237,7 @@ class Runner:
             fn = _WORKER_FNS[job['mode']]
             kwargs = {k: v for k, v in job.items() if k != 'mode'}
             result = fn(**kwargs)
-            print(f"Completed: {_describe_result(result)}")
+            logger.info(f"Completed: {_describe_result(result)}")
             results.append(result)
             self._rewrite_csv(results)
         return results
@@ -1189,7 +1253,7 @@ class Runner:
             results = []
             for f in as_completed(futures):
                 result = f.result()
-                print(f"Completed: {futures[f]}")
+                logger.info(f"Completed: {futures[f]}")
                 results.append(result)
                 self._rewrite_csv(results)
         return results

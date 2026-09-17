@@ -1,51 +1,22 @@
 """
-DSHFilter -- Distance-Sensitive Hashing.
+DSHFilter -- Distance-Sensitive Hashing (Aumuller, Christiani, Pagh &
+Silvestri, PODS 2018), instantiated as h(x) = 1 iff <a,x> in [-z, z] for
+Gaussian a (a window centered at 0, since this filter only needs sensitivity
+to a ball around the query, not the paper's more general off-origin
+annulus), concatenated `num_projections_per_table` times per table across
+`num_tables` tables. Calibration reduces to the single free parameter z.
 
-[VERIFY] Source and what was confirmed by reading the paper directly
-------------------------------------------------------------------------
-Aumuller, Christiani, Pagh & Silvestri, "Distance-Sensitive Hashing"
-(PODS 2018). A distance-sensitive hash (DSH) family is formally a
-distribution over pairs of functions (h, g) with a collision-probability
-function (CPF) of distance that need not be monotone -- unlike classical
-LSH, a DSH's CPF can *peak* at a nonzero target distance (e.g. for annulus/
-shell search). The paper gives a concrete Euclidean construction
-h(x) = floor((<a,x>+b)/w), g(x) = h(x) + k with a ~ N(0, I_d), and a
-"filter-based" spherical variant thresholding <a,x> against an interval.
-The paper does not give a closed-form formula for calibrating that interval
-to a target distance -- it states the asymptotic scaling but leaves
-practical calibration to the implementer.
-
-This baseline's use case (semantic AMQ: "is anything within tau of q?") only
-needs sensitivity to a *ball* around 0, not an off-origin annulus, so this
-implementation adopts the task brief's own suggested concrete instantiation
--- h(x) = 1 iff <a,x> in [-z, z] for Gaussian a, an interval centered at 0,
-concatenated `num_projections_per_table` times per table, `num_tables`
-tables -- and reduces calibration to the single free parameter z (the
-window half-width).
-
-Calibration objective (chosen deliberately, and different from a naive
-"maximize p(0) - p(tau)"): for this per-projection rule, two points at
-distance 0 collide with probability exactly 1 for *any* z (a point always
-matches itself), so p(0) carries no calibration signal at all. What actually
-needs separating is the collision probability AT the target radius,
-p(tau; z), from the collision probability at a *typical unrelated-pair*
-distance, p(r_far; z) -- r_far defaults to sqrt(2), the expected L2 distance
-between independent random points on the unit sphere in high dimension.
-Both are estimated by batched Monte Carlo simulation with a target-standard-
--error stopping rule (the same pattern already used by
+Calibration maximizes p(tau; z) - p(r_far; z) (r_far defaults to sqrt(2),
+the expected distance between independent unit-sphere points) rather than
+p(0) - p(tau): two points at distance 0 always collide regardless of z, so
+p(0) carries no calibration signal. Both probabilities are estimated by
+batched Monte Carlo (same pattern as
 `src/lsh.py::CrossPolytopeLSH._get_base_probabilities`), and z is chosen
-from a bounded grid to maximize p(tau; z) - p(r_far; z).
+from a bounded grid.
 
-If the best achievable gap on this grid falls below `calibration_min_gap`,
-the constructor raises `RuntimeError` with the measured gap rather than
-silently building a non-functional filter -- the fail-loud safety valve the
-task brief asks for when a DSH-family calibration does not converge to a
-useful operating point. In practice (verified against realistic tau values
-in [0.05, 0.8] at dim=384 on the unit sphere), the default grid finds a
-comfortably usable gap; the class is implemented and registered
-unconditionally, and any calibration-quality caveats specific to a given
-(dim, tau) combination are surfaced through this exception rather than
-hidden.
+If the best achievable gap falls below `calibration_min_gap`, the
+constructor raises RuntimeError with the measured gap rather than silently
+building a non-functional filter.
 """
 
 import math
@@ -59,16 +30,11 @@ from filters._hashing import signature_to_key
 
 
 class DSHFilter(Filter):
-    """
-    Distance-sensitive hashing (Aumuller, Christiani, Pagh & Silvestri,
-    PODS 2018), instantiated as a symmetric acceptance-window hash on
-    Gaussian projections (see module docstring for the calibration
-    approach and its documented departure from a naive interpretation of
-    the task brief's own suggestion).
+    """Distance-sensitive hashing (see module docstring).
 
-    tau is baked in at construction via `distance_threshold` (the window
-    half-width z and num_tables are both calibrated around it); `query(...,
-    tau=t)` only accepts t == distance_threshold or t=None.
+    tau is baked in at construction via `distance_threshold` (z and
+    num_tables are both calibrated around it); `query(..., tau=t)` only
+    accepts t == distance_threshold or t=None.
     """
 
     def __init__(
@@ -91,14 +57,9 @@ class DSHFilter(Filter):
         self.num_projections_per_table = num_projections_per_table
         self._error_rate = error_rate
         self._max_spheres = max_spheres  # unused; accepted for _instantiate_filter parity
-        # sqrt(2) is the expected L2 distance between independent points on a
-        # uniformly-random unit sphere, but real embedding corpora cluster
-        # much more tightly than that assumption (e.g. sentence embeddings
-        # occupy a narrow cone, not the full sphere), so a duplicate
-        # threshold derived from real data can end up close to or even past
-        # a fixed sqrt(2) reference -- leaving no room for the calibration to
-        # separate "near" from "far". Scaling the reference off tau itself
-        # keeps a healthy margin regardless of how the corpus is distributed.
+        # Real embeddings cluster much more tightly than a uniform-random
+        # unit sphere, so a fixed sqrt(2) reference can leave no calibration
+        # margin -- scale off tau itself instead.
         self.far_reference_distance = (
             far_reference_distance if far_reference_distance is not None
             else max(math.sqrt(2.0), 2.5 * self.distance_threshold)

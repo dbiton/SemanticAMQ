@@ -1,19 +1,14 @@
-"""Generate the six quantization-figure panels (+ shared legend) for the PVLDB paper,
-plus one diagnostic FNR sanity-check panel that isn't part of the paper figure set.
+"""Generate the six quantization-figure panels (+ shared legend), plus one
+diagnostic FNR sanity-check panel not part of the paper figure set.
 
-Self-contained: reads a long-format results file (one row per (quantize, k,
-seed) on a single dataset -- see main.py::generate_quantization), aggregates over
-seeds, and writes PNG (optionally PDF) panels sized for
-`\\includegraphics[width=\\linewidth]` inside `subfigure{0.24\\linewidth}` cells
-of a two-column `figure*`.
+Reads a long-format results file (one row per (quantize, k, seed) on a
+single dataset -- see main.py::generate_quantization), aggregates over
+seeds, and writes PNG (optionally PDF) panels sized for a two-column
+`figure*`.
 
-Each panel is a line plot: x-axis = memory usage (MB, log scale, driven by
-the k sweep -- see quantization_worker's docstring for how closely memory usage
-tracks k for a given quantize choice, which isn't exact for the most compact
-quantizers), one line per quantize method (color + marker), for the single
-dataset the input was generated on. This replaced an earlier per-dataset
-grouped-bar-at-fixed-k design; multi-dataset figures now belong to the other
-evaluations (plot_query_performance.py etc.), not this one.
+Each panel: x-axis = memory usage (MB, log scale, driven by the k sweep --
+not exact for the most compact quantizers, see quantization_worker), one
+line per quantize method, single dataset.
 
 Edit the CONFIG block below to change parameters -- no CLI flags.
 """
@@ -53,20 +48,18 @@ EMIT_PDF = False
 # (tagged stage="quantizing"), which is what makes the n-balls panel
 # meaningful: a more compact code packs more balls into the same budget.
 QUANTIZE_SWEEP = (
-    Quantize.NONE, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
-    Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.SQ2T, Quantize.PQ,
+    Quantize.NONE, Quantize.SQ8, Quantize.SQ4,
+    Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.PQ,
 )
 STAGES = [q.value for q in QUANTIZE_SWEEP]
 STAGE_LABELS = {
     Quantize.NONE.value: "None",
     Quantize.SQ8.value: "SQ8",
-    Quantize.SQ6.value: "SQ6",
     Quantize.SQ4.value: "SQ4",
     Quantize.FP16.value: "FP16",
     Quantize.BF16.value: "BF16",
     Quantize.SQ4T.value: "SQ4-T",
     Quantize.SQ8T.value: "SQ8-T",
-    Quantize.SQ2T.value: "SQ2-T",
     Quantize.PQ.value: "PQ",
 }
 # Reference stage for the two relative-objective panels: the raw/unquantized
@@ -126,6 +119,8 @@ _REQUIRED_COLUMNS = [
     "n_balls",
     "memory_bytes",
     "seed",
+    "radius_inflation_mean",
+    "radius_inflation_std",
 ]
 
 
@@ -417,6 +412,71 @@ def panel_n_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
+# Panel (g): radius inflation due to quantization
+# --------------------------------------------------------------------------- #
+
+def panel_radius_inflation(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Mean +/- stddev of each ball's radius inflation -- the per-center
+    quantization reconstruction error (||center - decode(encode(center))||)
+    that _rebuild_from_centers adds onto that ball's radius to preserve the
+    no-false-negative guarantee under a lossy center encoding (see
+    BallCoverFilter._build_quantizer / all_radius_inflation). Unlike the
+    other panels, whose error bars are a 95% CI over seeds, the mean/std here
+    are already collapsed *across balls* inside a single job (one job per
+    (k, quantize, seed)); the error bars plotted are that per-ball stddev
+    (averaged over seeds, since only one seed is swept), not a seed CI --
+    seed averaging on top would otherwise hide the ball-to-ball spread that's
+    the actual quantity of interest. Quantize.NONE has zero inflation by
+    construction (no quantizer applied), so it draws as a flat line at 0 --
+    the reference every other quantizer's inflation is measured against."""
+    mean_agg = aggregate(df, "radius_inflation_mean", cfg, use_tau=False)
+    std_agg = aggregate(df, "radius_inflation_std", cfg, use_tau=False)
+    std_agg = std_agg[["quantize", "k", "mean"]].rename(columns={"mean": "std"})
+    agg = mean_agg.merge(std_agg, on=["quantize", "k"])
+
+    apply_style()
+    fig, ax = plt.subplots()
+
+    for stage in STAGES:
+        sub = agg[agg["quantize"] == stage].sort_values("Memory (MB)")
+        if sub.empty:
+            continue
+        ax.plot(
+            sub["Memory (MB)"], sub["mean"],
+            color=STAGE_COLORS[stage], marker=STAGE_MARKERS[stage], markersize=2.5,
+            linewidth=0.8, zorder=2,
+        )
+        ax.errorbar(
+            sub["Memory (MB)"], sub["mean"], yerr=sub["std"],
+            fmt="none", ecolor=STAGE_COLORS[stage],
+            elinewidth=0.5, capsize=1.5, capthick=0.5, zorder=3,
+        )
+
+    ax.set_xscale("log", base=2)
+    ax.xaxis.set_major_locator(LogLocator(base=2.0))
+    ax.xaxis.set_major_formatter(LogFormatterMathtext(base=2.0))
+
+    # Log y: inflation spans orders of magnitude across quantize variants
+    # (coarser codes inflate far more than fine ones). Quantize.NONE's
+    # identically-0 inflation has no representation on a log axis -- its
+    # line silently drops off rather than plotting at y=0, same tradeoff
+    # _line_panel's log_y branch already accepts elsewhere in this file.
+    ax.set_yscale("log")
+    ax.yaxis.set_major_locator(LogLocator(base=10.0))
+    ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10.0))
+    ax.yaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10)))
+    ax.yaxis.set_minor_formatter(NullFormatter())
+    ax.tick_params(axis="y", which="minor", length=1.2, width=0.4)
+
+    ax.set_xlabel("Memory Usage (MB)")
+    ax.set_ylabel("Radius Inflation")
+    _style_axes(ax)
+
+    _save(fig, "quantization-radius-inflation.png", cfg)
+    return agg
+
+
+# --------------------------------------------------------------------------- #
 # Diagnostic panel (not part of the paper figure set): false negative rate
 # --------------------------------------------------------------------------- #
 
@@ -552,6 +612,7 @@ def generate_quantization_figures(
     panel_construction_time(df, cfg)
     panel_query_throughput(df, cfg)
     panel_n_balls(df, cfg)
+    panel_radius_inflation(df, cfg)
     panel_fnr(df, cfg)
     save_legend(df, cfg)
 
@@ -591,6 +652,11 @@ def generate_quantization_figures(
     \centering
     \includegraphics[width=\linewidth]{figures/quantization-n-balls.png}
     \caption{Ball count}
+\end{subfigure}
+\begin{subfigure}[b]{0.24\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/quantization-radius-inflation.png}
+    \caption{Radius inflation}
 \end{subfigure}
 """.strip("\n")
     print("--- subfigure snippet (paste above the panel row) ---")
