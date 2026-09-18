@@ -30,7 +30,7 @@ from plots.plot_scaling import generate_scaling_figures
 from plots.plot_streaming import generate_streaming_figures
 from plots.plot_system_tau import generate_system_tau_figures
 from plots.plot_common import DATASETS, DATASET_LABELS
-from typing import Tuple
+from typing import Any, List, Tuple
 from filters.ball_cover.ball_cover_filter import BallCoverFilter
 from filters.lsbf_filter import LSBFFilter
 from filters.dsh_filter import DSHFilter
@@ -189,6 +189,23 @@ def kfold_wrapped_split(vectors: np.ndarray, fold: int, k_folds: int) -> Tuple[n
     return vectors[construct_idx], vectors[query_idx]
 
 
+def rows_for_mode(job_results: List[Tuple[str, Any]], mode: str) -> list:
+    """Pulls one Runner mode's rows out of a shared Runner.run()'s combined
+    (mode, result) list -- result is either one dict per job (e.g.
+    'equal_memory') or a list of dicts per job (e.g. 'quantization',
+    'system_tau', 'stream_rebuild'), flattened uniformly here. Several
+    generate_* functions below submit to the same Runner instance so their
+    jobs run (and get load-balanced by Runner.shuffle()) together in one
+    combined batch; each save_* function then calls this to recover just
+    its own evaluation's rows before writing its own CSV."""
+    rows = []
+    for job_mode, result in job_results:
+        if job_mode != mode:
+            continue
+        rows.extend(result if isinstance(result, list) else [result])
+    return rows
+
+
 def compute_dynamic_actual_results(vectors: np.ndarray, distance_threshold: float) -> list[bool]:
     """
     Online ground-truth: the first vector is unique; each subsequent vector is a
@@ -292,7 +309,7 @@ def generate_static() -> list:
     return results
 
 
-def generate_equal_memory() -> list:
+def generate_equal_memory(runner: Runner) -> None:
     """
     Equal-memory comparison across equal_memory_filters (see its own comment
     for why some dynamic_filters baselines are excluded here). Sweeps
@@ -310,6 +327,10 @@ def generate_equal_memory() -> list:
     split between calibration and query). Section 5.6's SOTA-comparison
     figure names no specific dataset, so this uses the paper's default
     single-dataset representative, MMLU.
+
+    Only submits 'equal_memory' jobs to the given `runner` -- does not run
+    it. Call save_equal_memory() on the shared runner's combined results
+    after runner.run() to write results/equal_memory.csv.
     """
     num_vectors               = WORKLOAD_NUM_VECTORS
     dim                       = 384
@@ -350,7 +371,6 @@ def generate_equal_memory() -> list:
     max_memory_budget = int(num_construct * bytes_per_sphere_at_1to1)
     memory_budgets = np.linspace(0, max_memory_budget, count_memory_steps + 1, dtype=int)[1:]
 
-    runner = Runner(num_workers=MAX_WORKERS)
     for memory_budget in memory_budgets:
         logger.info(f"Submitting jobs for memory_budget={memory_budget} bytes...")
         for filter_cls in equal_memory_filters:
@@ -365,9 +385,11 @@ def generate_equal_memory() -> list:
                 dataset=dataset,
             )
 
-    results = runner.run()
-    logger.info("Equal-memory evaluation completed.")
 
+def save_equal_memory(job_results: List[Tuple[str, Any]]) -> list:
+    """Extracts this evaluation's rows from a shared Runner's combined
+    run() output (see generate_equal_memory()) and writes results/equal_memory.csv."""
+    results = rows_for_mode(job_results, 'equal_memory')
     results_df = pd.DataFrame(results)
     os.makedirs("results", exist_ok=True)
     results_df.to_csv("results/equal_memory.csv", index=False)
@@ -380,7 +402,7 @@ def plot_equal_memory(results: list) -> None:
     generate_equal_memory_figures(df=pd.DataFrame(results))
 
 
-def generate_system_tau() -> pd.DataFrame:
+def generate_system_tau(runner: Runner) -> None:
     """
     End-to-end filtering benefit (paper Section 5.2, Figure 2): one
     BallCoverFilter cover built per (dataset, fold, k), then queried at
@@ -409,8 +431,11 @@ def generate_system_tau() -> pd.DataFrame:
     call with the same (dataset, num_vectors, k_folds, fold) doesn't redo
     that (expensive, at 100K-scale) nearest-neighbor search.
 
-    Writes results/system_tau.csv. Returns the long-format df (k now varies
-    per row, so there's no single fixed k left to return alongside it).
+    Only submits 'system_tau' jobs to the given `runner` -- does not run
+    it. The ground-truth precomputation above still runs eagerly (in a
+    dedicated ProcessPoolExecutor, unrelated to `runner`) as soon as this
+    function is called. Call save_system_tau() on the shared runner's
+    combined results after runner.run() to write results/system_tau.csv.
     """
     num_vectors      = WORKLOAD_NUM_VECTORS
     dim              = 384
@@ -422,7 +447,6 @@ def generate_system_tau() -> pd.DataFrame:
     # more expensive to run than the paper's single-k evaluation.
     k_fractions      = [float(f) for f in np.linspace(0.01, 0.1, 5)]
     tau_values       = [float(t) for t in np.linspace(0.01, 0.10, 10)]
-    output_csv       = "results/system_tau.csv"
     ground_truth_dir = "results/system_tau_ground_truth"
 
     datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
@@ -481,8 +505,6 @@ def generate_system_tau() -> pd.DataFrame:
     else:
         logger.info("All ground truth already cached on disk; skipping recomputation.")
 
-    runner = Runner(num_workers=MAX_WORKERS)
-
     for dataset, fold, vectors_construct, vectors_query in splits:
         nn_dist = nn_dist_by_split[(dataset, fold)]
         actual_results_by_tau = {t: (nn_dist <= t).tolist() for t in tau_values}
@@ -505,10 +527,13 @@ def generate_system_tau() -> pd.DataFrame:
                 actual_results_by_tau=actual_results_by_tau,
                 )
 
-    job_results = runner.run()
-    logger.info("System (tau-sweep x k-sweep, K-fold) evaluation completed.")
 
-    df = pd.DataFrame([row for job_rows in job_results for row in job_rows])
+def save_system_tau(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
+    """Extracts this evaluation's rows from a shared Runner's combined
+    run() output (see generate_system_tau()) and writes results/system_tau.csv."""
+    output_csv = "results/system_tau.csv"
+    rows = rows_for_mode(job_results, 'system_tau')
+    df = pd.DataFrame(rows)
 
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
     df.to_csv(output_csv, index=False)
@@ -521,7 +546,7 @@ def plot_system_tau(df: pd.DataFrame) -> None:
     generate_system_tau_figures(df)
 
 
-def generate_quantization() -> pd.DataFrame:
+def generate_quantization(runner: Runner) -> None:
     """
     Generate per-quantize-variant construction data for BallCoverFilter
     (QUANTIZATION_SWEEP) on a single dataset, written to
@@ -554,13 +579,16 @@ def generate_quantization() -> pd.DataFrame:
     (not per fold, from fold 0's construct set) so every fold lands on the
     exact same tau and can be aggregated together; each fold's ground truth
     is still recomputed from that fold's own construct/query split.
+
+    Only submits 'quantization' jobs to the given `runner` -- does not run
+    it. Call save_quantization() on the shared runner's combined results
+    after runner.run() to write results/quantization.csv.
     """
     num_vectors            = WORKLOAD_NUM_VECTORS
     dim                    = 384
     k_folds                = 5
     k_fractions            = [0.01, 0.02, 0.04, 0.08, 0.16]
     duplicate_percentages  = [5]
-    output_csv             = "results/quantization.csv"
 
     dataset = "MsMarco"  # Figure 3: "We evaluate on MS MARCO"
     vectors = load_embeds(dataset, num_vectors)[0]
@@ -587,7 +615,6 @@ def generate_quantization() -> pd.DataFrame:
     # threshold knob to feed (only quantize varies the cover, not tau).
     construct_tau = float(np.median(tau_values))
 
-    runner = Runner(num_workers=MAX_WORKERS)
     for fold, (vectors_construct, vectors_query) in enumerate(splits):
         logger.info(f"Computing ground truth for fold {fold} (tau in {tau_values})...")
         actual_results_by_tau = {
@@ -610,10 +637,13 @@ def generate_quantization() -> pd.DataFrame:
                     actual_results_by_tau=actual_results_by_tau,
                 )
 
-    job_results = runner.run()
-    logger.info("Quantization evaluation completed.")
 
-    df = pd.DataFrame([row for job_rows in job_results for row in job_rows])
+def save_quantization(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
+    """Extracts this evaluation's rows from a shared Runner's combined
+    run() output (see generate_quantization()) and writes results/quantization.csv."""
+    output_csv = "results/quantization.csv"
+    rows = rows_for_mode(job_results, 'quantization')
+    df = pd.DataFrame(rows)
 
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
     df.to_csv(output_csv, index=False)
@@ -719,7 +749,7 @@ def plot_query_performance(df: pd.DataFrame) -> None:
 _SCALING_DATASET = "MMLU"
 
 
-def generate_scaling() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def generate_scaling(runner: Runner) -> None:
     """
     Measures three BallCoverFilter throughput surfaces against filter size k:
     query throughput (k x batch_size grid), insertion throughput (same grid,
@@ -738,6 +768,11 @@ def generate_scaling() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     genuinely different data, not just the same slice timed again. Tagged
     via seed=fold so plot_scaling's existing seed-based mean +/- 95% CI
     aggregation reports variance across folds.
+
+    Only submits 'scaling_query'/'scaling_insert'/'scaling_construction'
+    jobs to the given `runner` -- does not run it. Call save_scaling() on
+    the shared runner's combined results after runner.run() to write the
+    three results/scaling_*.csv files.
     """
     stream_size      = STREAM_SIZE
     dim              = 384
@@ -748,9 +783,6 @@ def generate_scaling() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     k_folds          = 5
     n_query_vectors  = 8192
     n_insert_vectors = 8192
-    query_csv        = "results/scaling_query.csv"
-    insert_csv       = "results/scaling_insert.csv"
-    construction_csv = "results/scaling_construction.csv"
 
     if _SCALING_DATASET not in DATASET_KEYS:
         raise RuntimeError(f"_SCALING_DATASET={_SCALING_DATASET!r} must be one of {sorted(DATASET_KEYS)}")
@@ -802,8 +834,6 @@ def generate_scaling() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     def _source(array: np.ndarray) -> ArrayVectorSource:
         return ArrayVectorSource(dataset_name=dataset_key, start=0, stop=len(array), array=array)
 
-    runner = Runner(num_workers=MAX_WORKERS)
-
     for k in k_values:
         for batch_size in batch_sizes:
             for fold in range(k_folds):
@@ -836,15 +866,21 @@ def generate_scaling() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                     vectors_construct=construct_source_n,
                 )
 
-    job_results = runner.run()
-    logger.info("Scaling evaluation completed.")
 
-    # Jobs interleave all three modes and Runner.run() returns results in
-    # completion order, not submission order -- split by each mode's own
-    # rate column (self-describing) rather than by position.
-    df_query = pd.DataFrame([r for r in job_results if "throughput_qps" in r])
-    df_insert = pd.DataFrame([r for r in job_results if "throughput_ips" in r])
-    df_construction = pd.DataFrame([r for r in job_results if "throughput_vps" in r])
+def save_scaling(job_results: List[Tuple[str, Any]]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Extracts this evaluation's rows from a shared Runner's combined
+    run() output (see generate_scaling()) and writes the three
+    results/scaling_*.csv files. Each of the three query/insert/
+    construction job types was submitted under its own mode name, so
+    rows_for_mode splits them apart directly -- no more need to guess by
+    inspecting each result dict's own rate column."""
+    query_csv = "results/scaling_query.csv"
+    insert_csv = "results/scaling_insert.csv"
+    construction_csv = "results/scaling_construction.csv"
+
+    df_query = pd.DataFrame(rows_for_mode(job_results, 'scaling_query'))
+    df_insert = pd.DataFrame(rows_for_mode(job_results, 'scaling_insert'))
+    df_construction = pd.DataFrame(rows_for_mode(job_results, 'scaling_construction'))
 
     for df, path in (
         (df_query, query_csv), (df_insert, insert_csv), (df_construction, construction_csv),
@@ -881,7 +917,7 @@ def _build_streaming_negative_set(
     return negatives[:n_negative]
 
 
-def generate_streaming() -> Tuple[pd.DataFrame, int]:
+def generate_streaming(runner: Runner) -> None:
     """
     The paper's "dynamic evaluation" (Section 5.1/5.4, Figure 4): compares
     BallCoverFilter's 4 insertion strategies (see runner._INSERT_STRATEGIES)
@@ -909,8 +945,16 @@ def generate_streaming() -> Tuple[pd.DataFrame, int]:
     stream pool size alone; k_values are dropped (with a printed reason) if
     too large relative to it to be a meaningful sweep point.
 
-    Writes results/streaming.csv. Returns the long-format df plus k_fixed,
-    which plot_streaming() needs and can't derive from the df alone.
+    Only submits 'stream_rebuild' jobs (both the position sweep and the k
+    sweep) to the given `runner` -- does not run it. Call save_streaming()
+    on the shared runner's combined results after runner.run() to write
+    results/streaming.csv. Sharing one runner across every generate_*
+    function means the per-job incremental CSV writes (output_csv/truncate)
+    the two sweeps used to get from their own dedicated Runners no longer
+    apply here -- a crash mid-run now loses the whole combined batch's
+    progress, not just this evaluation's, in exchange for keeping every
+    worker busy across the full combined job list instead of idling between
+    evaluations.
     """
     num_vectors = WORKLOAD_NUM_VECTORS
     dim = 384
@@ -921,7 +965,6 @@ def generate_streaming() -> Tuple[pd.DataFrame, int]:
     k_folds = 5  # "we do this 5 times" (Section 5.1)
     stream_fraction = 0.8  # mirrors the static evaluation's 80% construct share
     seed = 0  # fixed; fold_offset supplies the stream-order variance instead
-    output_csv = "results/streaming.csv"
 
     datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
     missing = [d for d in DATASET_KEYS if d not in datasets]
@@ -1001,15 +1044,12 @@ def generate_streaming() -> Tuple[pd.DataFrame, int]:
 
     # Each row is self-describing (method/sweep/metric/fold_offset), so no
     # positional reconstruction is needed even though Runner's parallel mode
-    # returns results in completion, not submission, order. output_csv writes
-    # each job's rows as soon as it finishes, so a mid-sweep crash doesn't
-    # lose completed work.
+    # returns results in completion, not submission, order.
 
-    # --- Runner A: panels (a)/(b), position sweep at fixed k_fixed ---
-    runner_a = Runner(num_workers=MAX_WORKERS, output_csv=output_csv, truncate=True)
+    # --- panels (a)/(b): position sweep at fixed k_fixed ---
     for method in methods:
         for fold_offset in offsets:
-            runner_a.submit(
+            runner.submit(
                 'stream_rebuild',
                 dim=dim, dataset=rep_key, k=k_fixed, seed=seed, tau_mid=tau_mid, policy="streaming", T=None,
                 insertion_level=method, vectors_stream=_rotated_source(fold_offset, n_stream_ab),
@@ -1017,37 +1057,41 @@ def generate_streaming() -> Tuple[pd.DataFrame, int]:
                 checkpoints=checkpoints_ab, sweep="position", fold_offset=fold_offset,
             )
     for fold_offset in offsets:
-        runner_a.submit(
+        runner.submit(
             'stream_rebuild',
             dim=dim, dataset=rep_key, k=k_fixed, seed=seed, tau_mid=tau_mid, policy="oracle", T=None,
             vectors_stream=_rotated_source(fold_offset, n_stream_ab), vectors_negative=negative_vectors,
             checkpoints=checkpoints_ab, sweep="position", fold_offset=fold_offset,
         )
-    rows_ab = runner_a.run()
-    logger.info("Streaming position-sweep (a/b) evaluation completed.")
-    df_ab = pd.DataFrame([row for job_rows in rows_ab for row in job_rows])
 
-    # --- Runner B: panels (c)/(d), k sweep over the shared stream pool ---
-    runner_b = Runner(num_workers=MAX_WORKERS, output_csv=output_csv, truncate=False)
+    # --- panels (c)/(d): k sweep over the shared stream pool ---
     for method in methods:
         for k in k_values:
             for fold_offset in offsets:
-                runner_b.submit(
+                runner.submit(
                     'stream_rebuild',
                     dim=dim, dataset=rep_key, k=k, seed=seed, tau_mid=tau_mid, policy="streaming", T=None,
                     insertion_level=method, vectors_stream=_rotated_source(fold_offset, n_stream_c),
                     vectors_negative=negative_vectors,
                     checkpoints=checkpoints_cd, sweep="k_sweep", fold_offset=fold_offset,
                 )
-    rows_cd = runner_b.run()
-    logger.info("Streaming k-sweep (c/d) evaluation completed.")
-    df_cd = pd.DataFrame([row for job_rows in rows_cd for row in job_rows])
 
-    df = pd.concat([df_ab, df_cd], ignore_index=True)
+
+def save_streaming(job_results: List[Tuple[str, Any]]) -> Tuple[pd.DataFrame, int]:
+    """Extracts this evaluation's rows from a shared Runner's combined
+    run() output (see generate_streaming()) and writes results/streaming.csv.
+    Returns the df plus k_fixed (the smallest k among 'position'-sweep rows,
+    matching plot_all()'s own derivation) for callers that still want it
+    directly instead of re-deriving it from the CSV."""
+    output_csv = "results/streaming.csv"
+    rows = rows_for_mode(job_results, 'stream_rebuild')
+    df = pd.DataFrame(rows)
+
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
     df.to_csv(output_csv, index=False)
-    logger.info(f"Wrote {output_csv} (already written incrementally during the run; this is the final canonical pass)")
+    logger.info(f"Wrote {output_csv}")
 
+    k_fixed = int(df.loc[df["sweep"] == "position", "k"].iloc[0])
     return df, k_fixed
 
 
@@ -1095,45 +1139,93 @@ def generate_dynamic() -> list:
 
 
 def generate_and_plot_all() -> None:
-    """Run each generate_/plot_ pair end-to-end. Each pair is independently
-    try/except-guarded so one evaluation failing (or raising) doesn't take
-    down the ones after it -- comment out a pair to skip it for standalone
-    testing."""
+    """
+    Submit-all, run-all, save-all, then plot-all: every generate_*
+    function below only submits its jobs to one shared Runner (created
+    here and passed in) instead of creating and running its own -- so the
+    whole combined job list executes as a single parallel batch, keeping
+    every worker busy across all five evaluations instead of idling
+    between them whenever one evaluation's own job count doesn't divide
+    evenly across MAX_WORKERS. runner.shuffle() interleaves fast and slow
+    jobs from different evaluations (e.g. quantization's PQ builds, tens
+    of minutes each, next to system_tau's much shorter per-fold queries)
+    across the combined queue so one worker doesn't get stuck draining an
+    entire slow evaluation back-to-back while others sit idle.
+
+    Each generate_ call is independently try/except-guarded so one
+    evaluation failing to even submit its jobs doesn't take down the
+    others -- comment out a call to skip it for standalone testing. A
+    failure inside runner.run() itself (rather than during submission)
+    aborts the whole combined batch, unlike the old per-evaluation
+    Runners' isolation; see generate_streaming()'s docstring for that
+    trade-off. Each save_ call is independently guarded the same way, so
+    one evaluation's rows failing to write still lets the others save and
+    plot_all() still render whatever's on disk.
+    """
+    runner = Runner(num_workers=MAX_WORKERS)
+
     try:
-        plot_quantization(generate_quantization())
+        generate_quantization(runner)
     except Exception:
         logger.exception("An error occurred")
     try:
-        plot_scaling(*generate_scaling())
+        generate_scaling(runner)
     except Exception:
         logger.exception("An error occurred")
     try:
-        plot_streaming(*generate_streaming())
+        generate_streaming(runner)
     except Exception:
         logger.exception("An error occurred")
     try:
-        plot_equal_memory(generate_equal_memory())
+        generate_equal_memory(runner)
     except Exception:
         logger.exception("An error occurred")
     try:
-        plot_system_tau(generate_system_tau())
+        generate_system_tau(runner)
     except Exception:
         logger.exception("An error occurred")
 
-        
+    runner.shuffle()
+    job_results = runner.run()
+    logger.info("All submitted jobs completed.")
+
+    try:
+        save_quantization(job_results)
+    except Exception:
+        logger.exception("An error occurred")
+    try:
+        save_scaling(job_results)
+    except Exception:
+        logger.exception("An error occurred")
+    try:
+        save_streaming(job_results)
+    except Exception:
+        logger.exception("An error occurred")
+    try:
+        save_equal_memory(job_results)
+    except Exception:
+        logger.exception("An error occurred")
+    try:
+        save_system_tau(job_results)
+    except Exception:
+        logger.exception("An error occurred")
+
+    plot_all()
 
 
 def plot_all() -> None:
     """
-    Re-render every figure from data a prior generate_and_plot_all() run
-    already persisted to disk, without repeating the (expensive) evaluation
-    sweeps -- handy for iterating on plot styling alone. Reads back
-    results/{quantization,query_performance,scaling,streaming,system_tau}.csv,
-    re-deriving whatever generate-time metadata (k, k_fixed,
-    T_representative) each plot_ needs directly from the loaded data instead
-    of threading it through from the generate_ call. Requires at least one
-    prior generate_and_plot_all() (or equivalent generate_X + plot_X) run to
-    have produced those files.
+    Re-render every figure from data already persisted to disk, without
+    repeating the (expensive) evaluation sweeps -- handy for iterating on
+    plot styling alone, and also called automatically at the end of
+    generate_and_plot_all() now that all five evaluations save their CSVs
+    only after the whole shared-Runner batch completes. Reads back
+    results/{quantization,query_performance,scaling,streaming,system_tau,
+    equal_memory}.csv, re-deriving whatever generate-time metadata (k,
+    k_fixed, T_representative) each plot_ needs directly from the loaded
+    data instead of threading it through from the generate_ call. Requires
+    at least one prior generate_and_plot_all() (or equivalent generate_X +
+    save_X) run to have produced those files.
     """
     try:
         df = pd.read_csv("results/system_tau.csv")
@@ -1148,6 +1240,12 @@ def plot_all() -> None:
         logger.exception("An error occurred")
 
     try:
+        results = pd.read_csv("results/equal_memory.csv").to_dict("records")
+        plot_equal_memory(results)
+    except Exception:
+        logger.exception("An error occurred")
+
+    try:
         df = pd.read_csv("results/query_performance.csv")
         plot_query_performance(df)
     except Exception:
@@ -1157,18 +1255,18 @@ def plot_all() -> None:
         df_query = pd.read_csv("results/scaling_query.csv")
         df_insert = pd.read_csv("results/scaling_insert.csv")
         df_construction = pd.read_csv("results/scaling_construction.csv")
-        # plot_scaling(df_query, df_insert, df_construction)
+        plot_scaling(df_query, df_insert, df_construction)
     except Exception:
         logger.exception("An error occurred")
 
     try:
         df = pd.read_csv("results/streaming.csv")
         k_fixed = int(df.loc[df["sweep"] == "position", "k"].iloc[0])
-        # plot_streaming(df, k_fixed=k_fixed)
+        plot_streaming(df, k_fixed=k_fixed)
     except Exception:
         logger.exception("An error occurred")
 
 
 if __name__ == "__main__":
-    generate_and_plot_all()
-    # plot_all()
+    generate_and_plot_all()  # runs every evaluation, saves results/*.csv, then plots (calls plot_all() itself)
+    # plot_all()  # alternative: re-render figures from an existing results/*.csv run without re-running any evaluation

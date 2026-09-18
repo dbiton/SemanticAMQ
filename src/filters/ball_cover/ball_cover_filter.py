@@ -350,11 +350,48 @@ class BallCoverFilter(Filter):
         if len(vectors) == 0:
             return
 
+        # Whether the FAISS center index needs rebuilding must be decided by
+        # BOTH the *set of active sphere ids* and the center *values* --
+        # neither alone is sufficient, because different insertion
+        # strategies key their bookkeeping differently:
+        #
+        # - MinHeapInsert tracks spheres *by id* (filter._all_spheres), and
+        #   its merge step can set new_center = center_i verbatim when two
+        #   centers being merged are exactly identical (distance_ij == 0.0
+        #   -- genuinely common with real embeddings, since near-duplicate
+        #   text produces near-duplicate vectors). That can make the merged
+        #   ball's value at its (possibly different) sphere id bit-for-bit
+        #   equal to some other, now-discarded id's old value at a different
+        #   row position -- so a value-only check can see "no change" even
+        #   though the id set genuinely changed, silently skipping the
+        #   rebuild FAISS needs.
+        # - ExhaustiveMergeInsert instead tracks spheres *purely
+        #   positionally*: it always writes filter._all_centers[:n] and
+        #   never touches filter._all_spheres at all, so its active id set
+        #   stays constant (e.g. always {0,...,n-1}) even while the values
+        #   at those same ids change substantially from merges -- so an
+        #   id-set-only check sees "no change" and skips a rebuild that's
+        #   very much needed.
+        #
+        # Either kind of false negative leaves the FAISS index silently out
+        # of sync with the filter's own bookkeeping. That drift stays
+        # invisible for a while (the numpy _all_centers cache, written
+        # directly by add_sphere/insert, still has correct data for
+        # querying) until some later, unrelated no-op insertion invalidates
+        # that cache and forces a refetch from the now-stale FAISS index --
+        # surfacing as either a "key not found" reconstruct error or,
+        # worse, silently wrong (stale) query answers. Checking both catches
+        # both strategies' failure modes.
+        old_spheres = set(self.all_spheres.tolist())
         old_centers = self.all_centers.copy()
         self.insert_method.insert(self, vectors)
+        new_spheres = set(self.all_spheres.tolist())
         new_centers = self.all_centers
 
-        if len(old_centers) != len(new_centers) or not np.array_equal(old_centers, new_centers):
+        spheres_changed = old_spheres != new_spheres
+        values_changed = len(old_centers) != len(new_centers) or not np.array_equal(old_centers, new_centers)
+
+        if spheres_changed or values_changed:
             self._rebuild_from_centers(self.all_spheres, self.all_centers, self.all_radiuses)
         else:
             self._all_centers = None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -1214,46 +1215,83 @@ class Runner:
             raise ValueError(f"Unknown mode {mode!r}. Valid: {list(_WORKER_FNS)}")
         self._jobs.append({'mode': mode, **kwargs})
 
-    def run(self) -> List[Dict[str, Any]]:
+    def shuffle(self, seed: Optional[int] = None) -> None:
+        """Randomizes submitted-job order in place. Lets several generate_
+        functions share one Runner (submit-all, then run-all once) without
+        one evaluation's slow jobs (e.g. PQ construction, tens of minutes
+        each) all landing on the same worker back-to-back while other
+        workers drain a faster evaluation and sit idle -- shuffling
+        interleaves fast and slow jobs across the whole combined queue so
+        workers finish around the same time. No effect on correctness,
+        only on job order and therefore wall-clock makespan."""
+        random.Random(seed).shuffle(self._jobs)
+
+    def run(self) -> List[Tuple[str, Any]]:
+        """Returns (mode, result) pairs, one per submitted job, in
+        completion order (parallel) or submission order (sequential) --
+        the mode tag is what lets a caller that shared this Runner across
+        several unrelated job types (see shuffle()'s docstring) split the
+        combined results back apart afterward without guessing from each
+        result's own schema."""
         return self._run_sequential() if self.num_workers == 1 else self._run_parallel()
 
     def clear(self) -> None:
         self._jobs.clear()
 
-    def _rewrite_csv(self, results_so_far: List[Any]) -> None:
+    def _rewrite_csv(self, results_so_far: List[Tuple[str, Any]]) -> None:
         if not self.output_csv:
             return
         rows: List[Dict[str, Any]] = list(self._prior_rows)
-        for result in results_so_far:
+        for _mode, result in results_so_far:
             rows.extend(result if isinstance(result, list) else [result])
         if not rows:
             return
         os.makedirs(os.path.dirname(self.output_csv), exist_ok=True)
         pd.DataFrame(rows).to_csv(self.output_csv, index=False)
 
-    def _run_sequential(self) -> List[Dict[str, Any]]:
+    def _run_sequential(self) -> List[Tuple[str, Any]]:
         results = []
         for job in self._jobs:
-            fn = _WORKER_FNS[job['mode']]
+            mode = job['mode']
+            fn = _WORKER_FNS[mode]
             kwargs = {k: v for k, v in job.items() if k != 'mode'}
-            result = fn(**kwargs)
+            try:
+                result = fn(**kwargs)
+            except Exception:
+                # One job's exception must not lose every other job's
+                # already-completed results -- especially now that several
+                # generate_* functions can share one Runner (see shuffle()),
+                # so a single bad job would otherwise wipe out a fully
+                # combined multi-evaluation batch instead of just its own
+                # evaluation's rows.
+                logger.exception(f"Job failed, skipping: {_describe_job(kwargs)}")
+                continue
             logger.info(f"Completed: {_describe_result(result)}")
-            results.append(result)
+            results.append((mode, result))
             self._rewrite_csv(results)
         return results
 
-    def _run_parallel(self) -> List[Dict[str, Any]]:
-        futures: Dict[Any, str] = {}
+    def _run_parallel(self) -> List[Tuple[str, Any]]:
+        futures: Dict[Any, Tuple[str, str]] = {}
         with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
             for job in self._jobs:
-                fn = _WORKER_FNS[job['mode']]
+                mode = job['mode']
+                fn = _WORKER_FNS[mode]
                 kwargs = {k: v for k, v in job.items() if k != 'mode'}
                 f = executor.submit(fn, **kwargs)
-                futures[f] = _describe_job(kwargs)
+                futures[f] = (mode, _describe_job(kwargs))
             results = []
             for f in as_completed(futures):
-                result = f.result()
-                logger.info(f"Completed: {futures[f]}")
-                results.append(result)
+                mode, desc = futures[f]
+                try:
+                    result = f.result()
+                except Exception:
+                    # See _run_sequential's comment: one job's exception
+                    # must not lose every other (possibly unrelated
+                    # evaluation's) already-completed job's results.
+                    logger.exception(f"Job failed, skipping: {desc}")
+                    continue
+                logger.info(f"Completed: {desc}")
+                results.append((mode, result))
                 self._rewrite_csv(results)
         return results
