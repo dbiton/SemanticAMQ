@@ -53,6 +53,35 @@ class BallCoverFilter(Filter):
     _BYTES_PER_FLOAT32 = 4
     _BYTES_PER_FLOAT64 = 8
 
+    # Coverage-comparison safety margin, not a knob to tune per call: every
+    # insertion strategy grows a ball's radius to exactly match a distance it
+    # measured itself (often via its own throwaway, single-vector FAISS
+    # search), with zero slack. FAISS's IndexFlatL2.search() isn't bit-
+    # reproducible across different query-batch shapes -- re-querying that
+    # same point later as part of a larger batch (e.g. a no-false-negative
+    # sweep over every point seen so far) computes a different squared
+    # distance for the identical point/center pair, which flips a boundary
+    # point from covered to uncovered whenever the caller's own
+    # distance_threshold has no margin of its own (distance_threshold=0.0,
+    # as the streaming evaluation's tau calibration can produce on datasets
+    # with real near-duplicate content). The error is a roughly fixed
+    # absolute amount in *squared*-distance space (consistent with float32
+    # rounding in a batched sum-of-384-terms), so taking sqrt() of a
+    # near-zero squared distance (a ball whose radius is itself ~0, i.e. an
+    # exact or near-exact duplicate) amplifies it hugely: reproduced directly
+    # against real MMLU embeddings at dim=384, this measured up to ~9.1e-4 in
+    # `surface` for an exact self-match (single-query search: exactly 0.0;
+    # the same point re-searched inside a several-hundred-row batch, as
+    # query()/the no-false-negative check actually do: ~9e-4), across k up to
+    # 1024 and batch sizes up to 4000. 1e-3 sits just above that observed
+    # worst case -- matching this project's own established tolerance for
+    # exactly this class of check (see test_ball_cover_construction.py's
+    # _covering_ok helper, tol=1e-3) -- and stays far below the smallest
+    # distance_threshold used anywhere in this project's actual sweeps
+    # (percentile-based tau values are on the order of 1e-2 or larger), so it
+    # cannot mask a real false negative.
+    _COVERAGE_EPSILON = 1e-3
+
     def __init__(
         self,
         dim: int,
@@ -338,7 +367,7 @@ class BallCoverFilter(Filter):
         # producing false negatives on exactly those merged points.
         d2, labels = self.all_centers_index.search(Q, self._num_spheres)
         surface = np.sqrt(np.maximum(d2, 0.0)) - self._all_radiuses[labels]
-        return (surface.min(axis=1) <= distance_threshold).tolist()
+        return (surface.min(axis=1) <= distance_threshold + self._COVERAGE_EPSILON).tolist()
 
     # ------------------------------------------------------------------ streaming / dynamic insertion
 
