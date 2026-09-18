@@ -51,7 +51,7 @@ DATASET = 'ELI5'
 # input stream. 1_000 is conservative -- some evaluations are documented to
 # blow up or crash well below the 100_000 they used to hardcode; check a
 # function's own docstring before raising this.
-STREAM_SIZE = 10_000
+STREAM_SIZE = 1_000
 
 # Vectors/dataset for the evaluations governed by the paper's Workloads
 # protocol (Section 5.1): "We utilize 100K queries from each dataset for
@@ -61,7 +61,7 @@ STREAM_SIZE = 10_000
 # scale -- so raising it only affects the ground-truth FPR/FNR evaluations
 # (system_tau, quantization, equal_memory, streaming) the paper actually
 # specifies this number for.
-WORKLOAD_NUM_VECTORS = 10_000
+WORKLOAD_NUM_VECTORS = 1_000
 
 # Registry name -> canonical dataset key, shared by every long-format
 # evaluation (quantization, query_performance, scaling, streaming). Derived from
@@ -1230,7 +1230,11 @@ def plot_all() -> None:
         logger.exception("An error occurred")
 
     try:
-        df = pd.read_csv(QUANTIZATION_CSV)
+        # keep_default_na=False: Quantize.NONE.value == "None", which pandas'
+        # default na_values list otherwise silently reads back as NaN,
+        # corrupting the quantize column into a mixed float/str dtype (see
+        # plot_quantization.py::load_data()'s own identical workaround).
+        df = pd.read_csv(QUANTIZATION_CSV, keep_default_na=False)
         plot_quantization(df)
     except Exception:
         logger.exception("An error occurred")
