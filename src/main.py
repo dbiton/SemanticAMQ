@@ -33,6 +33,7 @@ from filters.dsh_filter import DSHFilter
 from filters.hnsw_filter import HNSWFilter
 from filters.ivf_filter import IVFFilter
 from filters.quantized_vector_filter import QuantizedVectorFilter
+from filters.mlp_filter import MLPFilter
 from util.dataset_paths import dataset_filenames
 from util.fetch_datasets import load_embeds
 from vector_source import VectorSource
