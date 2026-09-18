@@ -183,6 +183,14 @@ class MinHeapInsert(InsertInterface):
         raise NotImplementedError("MinHeapInsert does not support remove operation.")
 
 
-    def get_bytesize(self) -> int:
+    def get_bytesize(self, filter: Filter) -> int:
         pair_size = 216 # PyTuple (80B) + PyFloat (24B) + 4 * PyInt (28B)
-        return self._sphere_versions.nbytes + sys.getsizeof(self._minimal_pairs) + pair_size * len(self._minimal_pairs)
+        # _sphere_versions is pre-allocated (via ensure_capacity) to
+        # filter.max_spheres -- the theoretical ball capacity the memory
+        # *budget* implies -- not to how many spheres construction actually
+        # placed. Once a quantizer is compact enough that max_spheres
+        # exceeds the construct-set size, that gap can be huge, so report
+        # bytes for the filter._num_spheres slots actually in use rather
+        # than the full pre-allocated array length.
+        active_version_bytes = filter._num_spheres * self._sphere_versions.itemsize
+        return active_version_bytes + sys.getsizeof(self._minimal_pairs) + pair_size * len(self._minimal_pairs)

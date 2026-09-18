@@ -56,8 +56,8 @@ class BallCoverFilter(Filter):
     def __init__(
         self,
         dim: int,
-        construct_method: Optional[ConstructInterface] = GonzalesConstruct(),
-        insert_method: Optional[InsertInterface] = MinHeapInsert(),
+        construct_method: Optional[ConstructInterface] = None,
+        insert_method: Optional[InsertInterface] = None,
         quantize: Quantize = Quantize.NONE,
         max_memory: Optional[int] = None,
         max_spheres: Optional[int] = None,
@@ -65,8 +65,22 @@ class BallCoverFilter(Filter):
     ) -> None:
         super().__init__(dim, max_memory=max_memory)
         self.quantize = quantize
-        self.construct_method = construct_method
-        self.insert_method = insert_method
+        # Must construct fresh instances here, not as the parameter defaults
+        # above: a mutable object used as a default argument value is
+        # evaluated exactly once, at function-definition time, and then
+        # shared by every call that doesn't override it -- so every
+        # BallCoverFilter built without an explicit construct_method/
+        # insert_method used to share the *same* GonzalesConstruct/
+        # MinHeapInsert instance. GonzalesConstruct is stateless (harmless
+        # to share), but MinHeapInsert carries real per-filter state
+        # (_sphere_versions, _minimal_pairs) that must not leak between
+        # instances: every filter built in the same process (e.g. one
+        # ProcessPoolExecutor worker handling many Runner jobs) was silently
+        # accumulating merge-candidate bookkeeping from every filter built
+        # before it, inflating get_bytesize() without bound and risking
+        # stale-version merge decisions once two live filters shared it.
+        self.construct_method = construct_method if construct_method is not None else GonzalesConstruct()
+        self.insert_method = insert_method if insert_method is not None else MinHeapInsert()
         self.insert_memory_percent = insert_memory_percent
         self.all_centers_index = self._make_faiss_index(self.quantize)
         self.max_spheres = (max_spheres if max_spheres is not None 
@@ -368,7 +382,7 @@ class BallCoverFilter(Filter):
             return 0
         filter_bytes = self._num_spheres * self.bytes_per_ball() + self._codebook_bytes()
         if self.insert_method:
-            filter_bytes += self.insert_method.get_bytesize()
+            filter_bytes += self.insert_method.get_bytesize(self)
         return filter_bytes
 
 

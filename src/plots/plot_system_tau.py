@@ -1,9 +1,13 @@
-"""System-evaluation figures for the fixed-tau sweep (see
-main.generate_system_tau): fixed ball budget k, tau itself is the swept
-independent variable -- a single, dataset-independent set of absolute L2
-distances applied identically to all datasets. redundancy_rate is
-therefore a reported *outcome* of a given tau here, not a quantity tau is
-solved for.
+"""System-evaluation figures for the tau sweep (see main.generate_system_tau):
+tau is the swept independent variable within a given k -- a single,
+dataset-independent set of absolute L2 distances applied identically to all
+datasets. redundancy_rate is therefore a reported *outcome* of a given tau
+here, not a quantity tau is solved for. Ball budget k is itself now swept in
+the underlying data (main.generate_system_tau's k_fractions), so this module
+renders one full panel set at a single representative k at a time (default:
+the median available k, same "pick one representative value" pattern
+plot_quantization.py uses for tau) -- pass k_fixed explicitly to render a
+different one.
 
 Seven panels, one line per dataset:
   (a) Throughput Improvement (%) of the filtered pipeline over the
@@ -39,7 +43,7 @@ from plots.plot_common import DATASETS, DATASET_COLORS, DATASET_MARKERS, apply_s
 
 INPUT_PATH = "results/system_tau.csv"
 OUTDIR = "plots/system_tau/"
-K_FIXED: Optional[int] = None  # None => the single k present in the data
+K_FIXED: Optional[int] = None  # None => the median k present in the data
 DPI = 300
 EMIT_PDF = False
 DEMO = False
@@ -104,8 +108,6 @@ def _validate_schema(df: pd.DataFrame) -> None:
     missing_ds = set(DATASETS) - set(df["dataset"].unique())
     if missing_ds:
         raise ValueError(f"Missing dataset(s) {sorted(missing_ds)}. Available: {sorted(df['dataset'].unique())}")
-    if df["k"].nunique() != 1:
-        raise ValueError(f"Expected a single fixed k, found: {sorted(df['k'].unique())}")
 
 
 def load_data() -> pd.DataFrame:
@@ -123,7 +125,10 @@ def resolve_config(df: pd.DataFrame, k_fixed: Optional[int] = K_FIXED, dpi: int 
                    emit_pdf: bool = EMIT_PDF, outdir: str = OUTDIR) -> Config:
     available_k = sorted(df["k"].unique())
     if k_fixed is None:
-        k_fixed = int(available_k[0])
+        # Median available k, nearest actual value present (k varies per
+        # dataset/fold since it's a fraction of each fold's construct-set
+        # size, so the exact median float may not itself be a present k).
+        k_fixed = int(min(available_k, key=lambda k: abs(k - np.median(available_k))))
     elif k_fixed not in available_k:
         raise ValueError(f"k_fixed={k_fixed} not present. Available: {available_k}")
     return Config(k_fixed=k_fixed, dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
@@ -138,8 +143,12 @@ def _line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cf
     read as "how much do folds actually disagree" rather than shrinking
     just because more folds were run. Each dataset also gets its own marker
     shape (DATASET_MARKERS), not just its own color, so lines stay
-    distinguishable without relying on color alone."""
-    agg = mean_std(df, ["dataset", "tau"], value_col)
+    distinguishable without relying on color alone. Filtered to cfg.k_fixed
+    first -- k now varies per row (see module docstring), so this must
+    select one k's rows before aggregating by (dataset, tau) or it would
+    silently blend results from different ball budgets together."""
+    sel = df[df["k"] == cfg.k_fixed]
+    agg = mean_std(sel, ["dataset", "tau"], value_col)
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots()
@@ -213,12 +222,13 @@ def panel_positive_rate(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 
 def print_summary(df: pd.DataFrame, cfg: Config) -> None:
-    print(f"\n--- System (fixed tau-sweep) summary (k={cfg.k_fixed}) ---")
+    print(f"\n--- System (tau-sweep) summary (k={cfg.k_fixed}) ---")
+    sel = df[df["k"] == cfg.k_fixed]
     cols = ("throughput_improvement_pct", "mean_index_accesses", "fpr", "log10_j_tau", "redundancy_rate",
             "positive_rate_pct")
-    aggs = {c: mean_ci95(df, ["dataset", "tau"], c) for c in cols}
+    aggs = {c: mean_ci95(sel, ["dataset", "tau"], c) for c in cols}
     for dataset in DATASETS:
-        for tau in sorted(df[df["dataset"] == dataset]["tau"].unique()):
+        for tau in sorted(sel[sel["dataset"] == dataset]["tau"].unique()):
             def _mean(c):
                 row = aggs[c][(aggs[c]["dataset"] == dataset) & (aggs[c]["tau"] == tau)]
                 return float(row["mean"].iloc[0]) if len(row) else float("nan")

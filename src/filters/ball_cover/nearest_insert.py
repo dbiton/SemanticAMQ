@@ -66,5 +66,5 @@ class NearestInsert(InsertInterface):
         raise NotImplementedError("NearestInsert does not support remove operation.")
 
 
-    def get_bytesize(self) -> int:
+    def get_bytesize(self, filter: Filter) -> int:
         return 0

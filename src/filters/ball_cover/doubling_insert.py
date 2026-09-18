@@ -180,5 +180,5 @@ class DoublingInsert(InsertInterface):
     def remove(self, filter: Filter, vectors: np.ndarray) -> List[bool]:
         raise NotImplementedError("DoublingInsert does not support remove operation.")
 
-    def get_bytesize(self) -> int:
+    def get_bytesize(self, filter: Filter) -> int:
         return 0

@@ -43,6 +43,12 @@ class InsertInterface(ABC):
         pass
 
     @abstractmethod
-    def get_bytesize(self) -> int:
-        """Returns memory consumed by internal insertion tracking structures."""
+    def get_bytesize(self, filter: 'Filter') -> int:
+        """Returns memory consumed by internal insertion tracking structures.
+        Takes the owning filter so an implementation can report bytes
+        proportional to how much of its capacity is actually in use (e.g.
+        filter._num_spheres) rather than however much capacity it was
+        pre-allocated for -- capacity can substantially exceed usage (e.g.
+        a compact quantizer's byte budget implies far more balls than the
+        construct set can ever fill)."""
         pass
