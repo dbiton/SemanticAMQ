@@ -1193,27 +1193,49 @@ def _describe_result(result: Any) -> str:
 
 
 class Runner:
-    def __init__(self, num_workers: int = 1, output_csv: Optional[str] = None, truncate: bool = True) -> None:
-        """output_csv, if set, is rewritten from every row completed so far
-        after each job (not appended -- job result schemas differ, and a
-        rewrite union-handles that safely), so a crash mid-sweep still
-        leaves completed work on disk. truncate=False loads and preserves an
-        existing file's rows instead of starting fresh."""
+    def __init__(self, num_workers: int = 1, truncate: bool = True) -> None:
+        """truncate controls what happens the first time a job targeting a
+        given output_csv (see submit()) is submitted: True (default) starts
+        that file fresh (removing any existing one); False loads and
+        preserves its existing rows instead, so a resumed run appends to
+        them rather than losing them."""
         self.num_workers = num_workers
-        self.output_csv = output_csv
+        self.truncate = truncate
         self._jobs: List[Dict[str, Any]] = []
-        self._prior_rows: List[Dict[str, Any]] = []
-        if output_csv:
-            if truncate:
-                if os.path.exists(output_csv):
-                    os.remove(output_csv)
-            elif os.path.exists(output_csv):
-                self._prior_rows = pd.read_csv(output_csv).to_dict("records")
+        self._rows_by_csv: Dict[str, List[Dict[str, Any]]] = {}
+        self._initialized_csvs: set = set()
 
-    def submit(self, mode: str, **kwargs: Any) -> None:
+    def submit(self, mode: str, output_csv: Optional[str] = None, **kwargs: Any) -> None:
+        """output_csv, if given, is this job's target CSV: rewritten from
+        every row completed so far *for that path* (not appended -- job
+        result schemas differ, and a rewrite union-handles that safely)
+        each time one of its jobs completes -- so a long-running sweep's
+        completed work is visible on disk well before the whole sweep
+        finishes, and a crash mid-sweep doesn't lose it. output_csv, not
+        mode, is the routing key several jobs (even of different modes)
+        can share one path, or each target its own -- e.g. generate_scaling()
+        submits three modes (scaling_query/insert/construction) to three
+        separate files, while generate_quantization() submits one mode to
+        one file. A job with no output_csv is only returned by run(), same
+        as before this per-job routing existed."""
         if mode not in _WORKER_FNS:
             raise ValueError(f"Unknown mode {mode!r}. Valid: {list(_WORKER_FNS)}")
-        self._jobs.append({'mode': mode, **kwargs})
+        if output_csv is not None and output_csv not in self._initialized_csvs:
+            self._init_csv(output_csv)
+        self._jobs.append({'mode': mode, 'output_csv': output_csv, **kwargs})
+
+    def _init_csv(self, output_csv: str) -> None:
+        """Runs once per distinct output_csv, at first submit() -- not at
+        run() time -- so truncation happens before any job targeting that
+        path has run, matching the old constructor-time truncation
+        semantics."""
+        self._initialized_csvs.add(output_csv)
+        if not self.truncate and os.path.exists(output_csv):
+            self._rows_by_csv[output_csv] = pd.read_csv(output_csv).to_dict("records")
+        else:
+            if os.path.exists(output_csv):
+                os.remove(output_csv)
+            self._rows_by_csv[output_csv] = []
 
     def shuffle(self, seed: Optional[int] = None) -> None:
         """Randomizes submitted-job order in place. Lets several generate_
@@ -1238,23 +1260,32 @@ class Runner:
     def clear(self) -> None:
         self._jobs.clear()
 
-    def _rewrite_csv(self, results_so_far: List[Tuple[str, Any]]) -> None:
-        if not self.output_csv:
+    def _record_result(self, output_csv: Optional[str], result: Any) -> None:
+        """Appends result's rows to output_csv's in-memory accumulator (seeded
+        by _init_csv at submit() time) and rewrites that one file from it --
+        called from the single coordinating process only (never from inside a
+        worker), both in the sequential loop and in _run_parallel's
+        as_completed loop, so multiple jobs targeting the same output_csv
+        never race to write it; no lock is needed because there is never more
+        than one writer."""
+        if not output_csv:
             return
-        rows: List[Dict[str, Any]] = list(self._prior_rows)
-        for _mode, result in results_so_far:
-            rows.extend(result if isinstance(result, list) else [result])
+        self._rows_by_csv[output_csv].extend(result if isinstance(result, list) else [result])
+        rows = self._rows_by_csv[output_csv]
         if not rows:
             return
-        os.makedirs(os.path.dirname(self.output_csv), exist_ok=True)
-        pd.DataFrame(rows).to_csv(self.output_csv, index=False)
+        out_dir = os.path.dirname(output_csv)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        pd.DataFrame(rows).to_csv(output_csv, index=False)
 
     def _run_sequential(self) -> List[Tuple[str, Any]]:
         results = []
         for job in self._jobs:
             mode = job['mode']
+            output_csv = job.get('output_csv')
             fn = _WORKER_FNS[mode]
-            kwargs = {k: v for k, v in job.items() if k != 'mode'}
+            kwargs = {k: v for k, v in job.items() if k not in ('mode', 'output_csv')}
             try:
                 result = fn(**kwargs)
             except Exception:
@@ -1268,21 +1299,22 @@ class Runner:
                 continue
             logger.info(f"Completed: {_describe_result(result)}")
             results.append((mode, result))
-            self._rewrite_csv(results)
+            self._record_result(output_csv, result)
         return results
 
     def _run_parallel(self) -> List[Tuple[str, Any]]:
-        futures: Dict[Any, Tuple[str, str]] = {}
+        futures: Dict[Any, Tuple[str, str, Optional[str]]] = {}
         with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
             for job in self._jobs:
                 mode = job['mode']
+                output_csv = job.get('output_csv')
                 fn = _WORKER_FNS[mode]
-                kwargs = {k: v for k, v in job.items() if k != 'mode'}
+                kwargs = {k: v for k, v in job.items() if k not in ('mode', 'output_csv')}
                 f = executor.submit(fn, **kwargs)
-                futures[f] = (mode, _describe_job(kwargs))
+                futures[f] = (mode, _describe_job(kwargs), output_csv)
             results = []
             for f in as_completed(futures):
-                mode, desc = futures[f]
+                mode, desc, output_csv = futures[f]
                 try:
                     result = f.result()
                 except Exception:
@@ -1293,5 +1325,5 @@ class Runner:
                     continue
                 logger.info(f"Completed: {desc}")
                 results.append((mode, result))
-                self._rewrite_csv(results)
+                self._record_result(output_csv, result)
         return results
