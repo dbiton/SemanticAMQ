@@ -1,13 +1,12 @@
 import numpy as np
 import faiss
+import sys
 from enum import Enum
 from typing import List, Tuple, Optional
 from hyperspheres_volume import estimate_hypersphere_volume
 from filters.filter import Filter
 from filters.ball_cover.ball_interfaces import ConstructInterface, InsertInterface
 from filters.ball_cover.gonzales_construct import GonzalesConstruct
-from filters.ball_cover.ivf_construct import IVFConstruct
-from filters.ball_cover.rptree_construct import RPTreeConstruct
 from filters.ball_cover.nearest_insert import NearestInsert
 from filters.ball_cover.least_inflation_insert import LeastInflationInsert
 from filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
@@ -27,11 +26,13 @@ class Quantize(Enum):
 
 PQ_MAX_NBITS = 8
 
+
 class InsufficientMemoryError(ValueError):
     """Raised when max_memory is too small to construct the requested
     quantizer -- currently only reachable for Quantize.PQ, whose k-means
     codebook training needs at least 2 ball centers for even a 1-bit
     codebook (see BallCoverFilter._pq_nbits_for)."""
+
 
 _QTYPES = {
     Quantize.BF16: faiss.ScalarQuantizer.QT_bf16,
@@ -125,7 +126,6 @@ class BallCoverFilter(Filter):
         _radius_inflation's docstring in __init__."""
         return self._radius_inflation[self.all_spheres]
 
-
     def _ensure_capacity(self, required_cap: int) -> None:
         current_cap = len(self._all_radiuses)
         if required_cap <= current_cap:
@@ -152,12 +152,10 @@ class BallCoverFilter(Filter):
 
         self.insert_method.ensure_capacity(new_cap)
 
-
     def _get_new_index(self) -> int:
         if self._num_spheres == len(self._all_radiuses):
             self._ensure_capacity(len(self._all_radiuses) * 2)
         return self._all_spheres[self._num_spheres]
-
 
     def _reset_buffers(self, capacity: int) -> None:
         self._ensure_capacity(capacity)
@@ -166,11 +164,12 @@ class BallCoverFilter(Filter):
         self.all_centers_index = self._make_faiss_index(self.quantize)
         self.insert_method.reset_buffers(capacity)
 
-
-    def _calculate_max_spheres(self, max_memory: int) -> int:
+    def _calculate_max_spheres(self, max_memory: Optional[int]) -> int:
+        if max_memory is None:
+            # When unconstrained, fallback to standard integer bounds to avoid crash
+            return sys.maxsize
         usable = max(0, max_memory - self._codebook_bytes())
         return max(1, usable // self.bytes_per_ball())
-
 
     def _calculate_max_construct_spheres(self, insertion_memory_percent: float) -> int:
         if insertion_memory_percent <= 0.0:
@@ -182,14 +181,12 @@ class BallCoverFilter(Filter):
 
         return max(1, int(self.max_spheres * (1.0 - insertion_memory_percent / 100.0)))
 
-
     @staticmethod
     def _choose_pq_m(dim: int) -> int:
-        for m in range(min(dim, PQ_MAX_NBITS), 0, -1):
+        for m in range(dim, 0, -1):
             if dim % m == 0:
                 return m
         return 1
-
 
     @staticmethod
     def _pq_nbits_for(n: int) -> Optional[int]:
@@ -197,7 +194,6 @@ class BallCoverFilter(Filter):
         while nbits < PQ_MAX_NBITS and (1 << (nbits + 1)) <= n:
             nbits += 1
         return nbits if nbits >= 1 else None
-
 
     def _make_faiss_index(self, quantize: Quantize, pq_nbits: int = PQ_MAX_NBITS) -> faiss.IndexIDMap2:
         if quantize == Quantize.NONE:
@@ -209,7 +205,6 @@ class BallCoverFilter(Filter):
             index = faiss.IndexScalarQuantizer(self.dim, _QTYPES[quantize], faiss.METRIC_L2)
         return faiss.IndexIDMap2(index)
 
-
     def bytes_per_ball(self) -> int:
         index = self.all_centers_index
         if isinstance(index, faiss.IndexIDMap2):
@@ -219,7 +214,6 @@ class BallCoverFilter(Filter):
         if isinstance(index, faiss.IndexScalarQuantizer):
             return index.sq.code_size + self._BYTES_PER_FLOAT32
         return (self.dim + 1) * self._BYTES_PER_FLOAT32
-
 
     def _codebook_bytes(self) -> int:
         index = self.all_centers_index
@@ -231,11 +225,11 @@ class BallCoverFilter(Filter):
             trained = faiss.vector_to_array(index.sq.trained)
             if len(trained) == 0:
                 probe = faiss.IndexScalarQuantizer(self.dim, index.sq.qtype, faiss.METRIC_L2)
-                probe.train(np.zeros((2, self.dim), dtype=np.float32))
+                # Use random probes to avoid crashing MSE-trained quantizer training loops
+                probe.train(np.random.rand(2, self.dim).astype(np.float32))
                 trained = faiss.vector_to_array(probe.sq.trained)
             return int(trained.nbytes)
         return 0
-
 
     def _build_quantizer(self, quantize: Quantize, centers: np.ndarray) -> Tuple[faiss.IndexIDMap2, np.ndarray]:
         """Returns (untrained index over `centers`, per-center reconstruction
@@ -254,15 +248,18 @@ class BallCoverFilter(Filter):
             base_idx = faiss.downcast_index(index.index)
             base_idx.pq.cp.min_points_per_centroid = 1
             index.train(centers)
-            decoded = base_idx.pq.decode(base_idx.pq.compute_codes(centers))
+            # Use sa_encode/sa_decode as uniform binding fallbacks 
+            codes = base_idx.sa_encode(centers)
+            decoded = base_idx.sa_decode(codes)
         else:
             index = self._make_faiss_index(quantize)
             base_idx = faiss.downcast_index(index.index)
             index.train(centers)
-            decoded = base_idx.sq.decode(base_idx.sq.compute_codes(centers))
+            codes = base_idx.sa_encode(centers)
+            decoded = base_idx.sa_decode(codes)
+            
         error = np.linalg.norm(centers - decoded, axis=1).astype(np.float32)
         return index, error
-
 
     def _rebuild_from_centers(self, sphere_indices: np.ndarray, centers: np.ndarray, radii: np.ndarray) -> None:
         """Re-derives ball state from an explicit (centers, radii) pair,
@@ -294,7 +291,6 @@ class BallCoverFilter(Filter):
         self._all_radiuses[sphere_indices] = radii
         self._radius_inflation[sphere_indices] = inflation
 
-
     def construct(self, vectors: np.ndarray) -> Tuple[float, float]:
         """Builds directly from construct_method's output, independent of
         insert_method: routing through insert_method.add_sphere() here was
@@ -309,7 +305,6 @@ class BallCoverFilter(Filter):
         self._constructed = True
 
         return self._log_volume_bounds()
-
 
     def query(self, vectors: np.ndarray, distance_threshold: float) -> list[bool]:
         if not self._constructed:
@@ -326,7 +321,6 @@ class BallCoverFilter(Filter):
         d2, labels = self.all_centers_index.search(Q, self._num_spheres)
         surface = np.sqrt(np.maximum(d2, 0.0)) - self._all_radiuses[labels]
         return (surface.min(axis=1) <= distance_threshold + self._COVERAGE_EPSILON).tolist()
-
 
     def insert(self, vectors: np.ndarray) -> None:
         if not self._constructed:
@@ -359,14 +353,11 @@ class BallCoverFilter(Filter):
         else:
             self._all_centers = None
 
-
     def add(self, vectors: np.ndarray) -> None:
         self.insert(vectors)
 
-
     def remove(self, vectors: np.ndarray) -> List[bool]:
         return self.insert_method.remove(self, vectors)
-
 
     def _log_volume_bounds(self) -> Tuple[float, float]:
         if self._num_spheres == 0:
@@ -375,7 +366,6 @@ class BallCoverFilter(Filter):
         self._all_centers = None
         return estimate_hypersphere_volume(current_centers, self.all_radiuses, return_log=True)
 
-
     def get_bytesize(self) -> int:
         if not self._constructed:
             return 0
@@ -383,7 +373,6 @@ class BallCoverFilter(Filter):
         if self.insert_method:
             filter_bytes += self.insert_method.get_bytesize(self)
         return filter_bytes
-
 
     def get_construction_bytesize(self) -> int:
         if not self.construct_method:

@@ -9,14 +9,12 @@ import numpy as np
 from src.filters.ball_cover.ball_cover_filter import BallCoverFilter
 from src.filters.ball_cover.ball_interfaces import ConstructInterface
 from src.filters.ball_cover.gonzales_construct import GonzalesConstruct
-from src.filters.ball_cover.rptree_construct import RPTreeConstruct
-from src.filters.ball_cover.ivf_construct import IVFConstruct
 
 DIM = 8
 
 def get_constructors():
-    """Generates the three core construct strategies."""
-    return [GonzalesConstruct(), RPTreeConstruct(), IVFConstruct()]
+    """Generates the (sole, live) construct strategy."""
+    return [GonzalesConstruct()]
 
 
 def run_construct(construct_method: ConstructInterface, budget: int, vecs: np.ndarray):
@@ -149,18 +147,14 @@ class TestSharedContract(unittest.TestCase):
             self.assertTrue(_covering_ok(vecs.astype(np.float32), centers, radii), construct.__class__.__name__)
 
     def test_deterministic_given_same_input(self):
-        """Gonzalez and rptree are both pure, seeded numpy pipelines with no
-        threaded reduction order to introduce nondeterminism. IVF is
-        excluded here -- see TestIVFConstruct.test_ball_count_and_output_
-        can_vary_run_to_run_at_scale, which documents that it genuinely
-        isn't reproducible at larger k."""
+        """Gonzalez is a pure, seeded numpy pipeline with no threaded
+        reduction order to introduce nondeterminism."""
         vecs = _rand(120, seed=17)
-        for construct in (GonzalesConstruct(), RPTreeConstruct(seed=0)):
-            name = construct.__class__.__name__
-            c1, r1 = run_construct(construct, 12, vecs)
-            c2, r2 = run_construct(construct, 12, vecs)
-            np.testing.assert_array_equal(c1, c2, err_msg=name)
-            np.testing.assert_array_equal(r1, r2, err_msg=name)
+        construct = GonzalesConstruct()
+        c1, r1 = run_construct(construct, 12, vecs)
+        c2, r2 = run_construct(construct, 12, vecs)
+        np.testing.assert_array_equal(c1, c2)
+        np.testing.assert_array_equal(r1, r2)
 
 
 # ---------------------------------------------------------------------------
@@ -170,8 +164,8 @@ class TestSharedContract(unittest.TestCase):
 class TestGonzalesConstruct(unittest.TestCase):
 
     def test_returns_exactly_k_balls(self):
-        """Unlike rptree/IVF, Gonzalez always fills the requested budget
-        exactly in the non-trivial case."""
+        """Gonzalez always fills the requested budget exactly in the
+        non-trivial case."""
         vecs = _rand(200, seed=3)
         centers, radii = run_construct(GonzalesConstruct(), 20, vecs)
         self.assertEqual(len(centers), 20)
@@ -221,127 +215,6 @@ class TestGonzalesConstruct(unittest.TestCase):
         expected_idx = reference(k, vecs)
         centers, _ = run_construct(GonzalesConstruct(), k, vecs)
         np.testing.assert_allclose(centers, vecs[expected_idx], atol=1e-3)
-
-
-# ---------------------------------------------------------------------------
-# RPTreeConstruct -- random-projection-tree specific properties
-# ---------------------------------------------------------------------------
-
-class TestRPTreeConstruct(unittest.TestCase):
-
-    def test_leaf_count_is_the_largest_power_of_two_at_most_k(self):
-        """depth = floor(log2(k)) is baked into the algorithm: the tree
-        always has exactly 2**depth leaves, which is k itself only when k is
-        already a power of 2 -- otherwise it's a real, deterministic
-        undershoot (e.g. k=99 -> 64 balls, not 99)."""
-        vecs = _rand(300, seed=1)
-        for k in (1, 2, 5, 20, 99, 200):
-            centers, radii = run_construct(RPTreeConstruct(seed=0), k, vecs)
-            expected = 2 ** int(np.floor(np.log2(k)))
-            self.assertEqual(len(centers), expected, f"k={k}")
-            self.assertEqual(len(radii), expected, f"k={k}")
-
-    def test_centers_are_leaf_centroids_not_original_points(self):
-        """Unlike Gonzalez, centers are means of each leaf's members, so
-        they generally aren't literal input vectors."""
-        vecs = _rand(100, seed=2)
-        centers, _ = run_construct(RPTreeConstruct(seed=0), 10, vecs)
-        for c in centers:
-            self.assertFalse(np.any(np.all(vecs == c, axis=1)))
-
-    def test_separates_clusters_when_k_matches_leaf_count(self):
-        """When k is already a power of 2 matching the true cluster count,
-        every leaf should land inside one cluster, not span the gap between
-        two -- radii should stay well under half the cluster separation."""
-        sep, spread = 25.0, 0.5
-        vecs = _clustered(n_clusters=4, per_cluster=60, spread=spread, sep=sep, seed=6)
-        _, radii = run_construct(RPTreeConstruct(seed=0), 4, vecs)
-        self.assertTrue(np.all(radii < sep / 2), f"radii {radii} span across clusters")
-
-    def test_non_power_of_two_k_can_merge_distinct_clusters(self):
-        """Documents a real, known trade-off rather than asserting rptree is
-        strictly better or worse than Gonzalez in general: with 6 true
-        clusters but k=6 rounding down to 4 leaves, at least one leaf must
-        absorb two separate clusters, inflating that leaf's radius far past
-        the within-cluster scale. If this ever stops reproducing (e.g. the
-        depth formula changes to round up, or to pick depth from a size
-        target instead of a power of 2), that's a real behavior change this
-        test is meant to catch."""
-        spread, sep = 0.5, 25.0
-        vecs = _clustered(n_clusters=6, per_cluster=40, spread=spread, sep=sep, seed=8)
-        _, radii = run_construct(RPTreeConstruct(seed=0), 6, vecs)
-        self.assertEqual(len(radii), 4)  # 2**floor(log2(6))
-        self.assertTrue(np.any(radii > sep / 2), "expected at least one leaf to span two clusters")
-
-    def test_deterministic_given_seed_varies_with_seed(self):
-        vecs = _rand(200, seed=14)
-        c1, r1 = run_construct(RPTreeConstruct(seed=0), 16, vecs)
-        c2, r2 = run_construct(RPTreeConstruct(seed=0), 16, vecs)
-        np.testing.assert_array_equal(c1, c2)
-        np.testing.assert_array_equal(r1, r2)
-        
-        c3, _ = run_construct(RPTreeConstruct(seed=1), 16, vecs)
-        self.assertFalse(np.array_equal(c1, c3), "different seeds should (almost always) pick different splits")
-
-
-# ---------------------------------------------------------------------------
-# IVFConstruct -- IVF-based specific properties
-# ---------------------------------------------------------------------------
-
-class TestIVFConstruct(unittest.TestCase):
-
-    def test_k_equals_one_special_case(self):
-        vecs = _rand(50, seed=15)
-        centers, radii = run_construct(IVFConstruct(), 1, vecs)
-        self.assertEqual(len(centers), 1)
-        self.assertEqual(len(radii), 1)
-        np.testing.assert_allclose(centers[0], vecs.mean(axis=0), atol=1e-4)
-        self.assertTrue(_covering_ok(vecs, centers, radii))
-
-    def test_returns_exactly_k_balls_below_hnsw_threshold(self):
-        """Below HNSW_QUANTIZER_MIN_K (2048) the coarse quantizer is an
-        exact IndexFlatL2 and k-means training reliably fills every list at
-        this n/k ratio -- verified empirically to hit the budget exactly
-        and reproducibly here, unlike the large-k/HNSW-quantizer regime
-        exercised in test_ball_count_can_undershoot_at_scale below."""
-        vecs = _rand(300, seed=16)
-        centers, radii = run_construct(IVFConstruct(), 50, vecs)
-        self.assertEqual(len(centers), 50)
-        self.assertEqual(len(radii), 50)
-        self.assertTrue(_covering_ok(vecs, centers, radii))
-
-    def test_crosses_hnsw_quantizer_boundary_safely(self):
-        """k just at/above HNSW_QUANTIZER_MIN_K switches the coarse
-        quantizer from IndexFlatL2 to IndexHNSWFlat -- must still produce a
-        valid, fully-covering set of balls, not just avoid crashing."""
-        vecs = _rand(3000, seed=18)
-        for k in (2047, 2048, 2100):
-            centers, radii = run_construct(IVFConstruct(), k, vecs)
-            self.assertLessEqual(len(centers), k, f"k={k}")
-            self.assertGreater(len(centers), 0, f"k={k}")
-            self.assertTrue(_covering_ok(vecs, centers, radii), f"k={k}")
-
-    def test_ball_count_can_undershoot_at_scale(self):
-        """At the project's real scale (n=20000, dim=384, k=5000 -- well
-        past the HNSW threshold), a handful of inverted lists routinely end
-        up empty after only 8 k-means iterations and get dropped, so the
-        returned ball count is noticeably below the k requested, and isn't
-        even the same from run to run (multi-threaded k-means/HNSW
-        construction isn't bit-reproducible here despite the fixed seed).
-        This is the caveat from the earlier IVF-vs-Gonzalez comparison,
-        pinned down as a test: BallCoverFilter's memory budget is still
-        respected (fewer balls than budgeted, never more) and the covering
-        invariant still holds -- just not an exact or reproducible ball
-        count at this scale."""
-        dim = 384
-        rng = np.random.default_rng(0)
-        X = rng.standard_normal((20_000, dim)).astype(np.float32)
-        X /= np.linalg.norm(X, axis=1, keepdims=True)
-
-        centers, radii = run_construct(IVFConstruct(), 5000, X)
-        self.assertLess(len(centers), 5000, "expected a real undershoot at this scale")
-        self.assertGreater(len(centers), 0)
-        self.assertTrue(_covering_ok(X, centers, radii))
 
 
 if __name__ == "__main__":

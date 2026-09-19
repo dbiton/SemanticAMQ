@@ -28,7 +28,6 @@ from plots.plot_system_tau import generate_system_tau_figures
 from plots.plot_common import DATASETS, DATASET_LABELS
 from typing import Any, List, Tuple
 from filters.ball_cover.ball_cover_filter import BallCoverFilter
-from filters.lsbf_filter import LSBFFilter
 from filters.dsh_filter import DSHFilter
 from filters.hnsw_filter import HNSWFilter
 from filters.ivf_filter import IVFFilter
@@ -40,17 +39,17 @@ from vector_source import VectorSource
 configure_logging()
 logger = logging.getLogger(__name__)
 
-MAX_WORKERS = 4
+MAX_WORKERS = 8
 DATASET = 'ELI5'
 
 # How many vectors throughput-only sweeps (scaling, query_performance) pull.
-STREAM_SIZE = 1_000
+STREAM_SIZE = 10_000
 
 # Vectors/dataset for the paper's Workloads protocol (Section 5.1): "100K
 # queries per dataset, 80% construction / 20% queries". Kept separate from
 # STREAM_SIZE, which only affects the ground-truth FPR/FNR evaluations
 # (system_tau, quantization, equal_memory, streaming).
-WORKLOAD_NUM_VECTORS = 1_000
+WORKLOAD_NUM_VECTORS = 10_000
 
 # Registry name -> canonical dataset key, one source of truth via plot_common.
 DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
@@ -65,55 +64,10 @@ SCALING_INSERT_CSV = "results/scaling_insert.csv"
 SCALING_CONSTRUCTION_CSV = "results/scaling_construction.csv"
 STREAMING_CSV = "results/streaming.csv"
 
-dynamic_filters = [BallCoverFilter, LSBFFilter, DSHFilter, HNSWFilter, IVFFilter]
-static_filters  = []
-
 # generate_equal_memory()'s own comparison set: excludes DSBFFilter/
 # CoveringLSHFallbackFilter/LSBFFilter, which degenerate to ~100% duplicate
 # predictions at realistic construct-set sizes (still used elsewhere).
 equal_memory_filters = [BallCoverFilter, HNSWFilter, IVFFilter, DSHFilter, QuantizedVectorFilter]
-
-def calculate_max_memory_budget_bytes(num_vectors: int, dimension: int, bytes_per_element: float) -> int:
-    return num_vectors * dimension * bytes_per_element // 64
-
-def calculate_memory_budgets(max_memory_budget: int, count_steps: int = 10, include_zero: bool = False) -> list[int]:
-    """Uniformly spaced budgets from max/count_steps (or 0 if `include_zero`) up to the full max budget."""
-    start = 0 if include_zero else max_memory_budget / count_steps
-    return [int(b) for b in np.linspace(start, max_memory_budget, count_steps)]
-
-def calculate_distance_threshold(
-    vectors: np.ndarray,
-    percentage: float,
-    max_pairs: int = 20_000_000,
-    seed: int = 42,
-) -> float:
-    """The `percentage`-th percentile of all pairwise L2 distances. Full
-    pairwise distance is O(n^2) memory (~40GB at n=100k), so this samples up
-    to `max_pairs // n` query rows against the full set instead -- within
-    ~0.2% of the exact percentile at bounded memory."""
-    n = len(vectors)
-    if n < 2:
-        return 0.0
-
-    vecs = np.ascontiguousarray(vectors, dtype=np.float32)
-
-    n_query = int(np.clip(max_pairs // n, 1, n))
-    if n_query >= n:
-        query_idx = np.arange(n)
-    else:
-        query_idx = np.random.default_rng(seed).choice(n, size=n_query, replace=False)
-
-    # faiss returns squared L2 distances (shape: n_query x n).
-    sq_dists = np.asarray(faiss.pairwise_distances(vecs[query_idx], vecs))
-    np.clip(sq_dists, 0, None, out=sq_dists)
-    distances = np.sqrt(sq_dists)
-
-    # Drop each sampled query's distance to itself (the 0 on the diagonal),
-    # matching the exact version's exclusion of self-pairs.
-    keep = np.ones(distances.shape, dtype=bool)
-    keep[np.arange(len(query_idx)), query_idx] = False
-    return float(np.percentile(distances[keep], percentage))
-
 
 def calculate_nn_distance_threshold(
     construct_vectors: np.ndarray,
@@ -122,12 +76,12 @@ def calculate_nn_distance_threshold(
     seed: int = 42,
 ) -> float:
     """The `percentage`-th percentile of nearest-*other*-neighbor distance
-    within a sample of construct_vectors. Unlike calculate_distance_threshold
-    (random pairwise distances), this ties the threshold to the actual test
-    compute_static_actual_results performs: at large construct-set sizes a
-    point's nearest neighbor is much closer than a random pair, so the
-    pairwise-percentile version silently pushes the duplicate rate toward
-    100%, collapsing FPR/FNR to degenerate values."""
+    within a sample of construct_vectors -- ties the threshold to the actual
+    test compute_static_actual_results performs, unlike a random-pairwise
+    percentile: at large construct-set sizes a point's nearest neighbor is
+    much closer than a random pair, so a random-pairwise percentile silently
+    pushes the duplicate rate toward 100%, collapsing FPR/FNR to degenerate
+    values."""
     n = len(construct_vectors)
     if n < 2:
         return 0.0
@@ -176,30 +130,6 @@ def rows_for_mode(job_results: List[Tuple[str, Any]], mode: str) -> list:
     return rows
 
 
-def compute_dynamic_actual_results(vectors: np.ndarray, distance_threshold: float) -> list[bool]:
-    """Online ground-truth: the first vector is unique; each subsequent
-    vector is a duplicate if within `distance_threshold` of any previously
-    accepted unique vector, otherwise it joins the reference set."""
-    vectors = np.ascontiguousarray(vectors, dtype=np.float32)
-
-    actual = [False]
-    thresh_sq = distance_threshold ** 2
-
-    index = faiss.IndexFlatL2(vectors.shape[1])
-    index.add(vectors[0:1])
-
-    for i in range(1, len(vectors)):
-        v = vectors[i:i+1]
-
-        nn_sq_dist, _ = index.search(v, 1)
-        is_dup = bool(nn_sq_dist[0, 0] <= thresh_sq)
-        actual.append(is_dup)
-        if not is_dup:
-            index.add(v)
-
-    return actual
-
-
 def compute_static_actual_results(
     construct_vectors: np.ndarray,
     query_vectors: np.ndarray,
@@ -221,57 +151,11 @@ def compute_static_actual_results(
     return (nn_sq_dist[:, 0] <= distance_threshold ** 2).tolist()
 
 
-def generate_static() -> list:
-    num_vectors              = STREAM_SIZE
-    dim                      = 384
-    min_percentage_duplicates = 1
-    max_percentage_duplicates = 9
-    count_steps              = 9
-    count_memory_steps       = 10
-    percentage_construct     = 10
-
-    dataset = DATASET
-    vectors = load_embeds(dataset, num_vectors)[0]
-    bytes_per_element = vectors.itemsize
-    num_construct   = num_vectors * percentage_construct // 100
-    vectors_construct = vectors[:num_construct]
-    vectors_query     = vectors[num_construct:]
-
-    # Lazy on-disk pointers, not array copies, so memory doesn't scale with num_jobs.
-    construct_source = VectorSource(dataset, 0, num_construct)
-    query_source     = VectorSource(dataset, num_construct, num_vectors)
-    max_memory_budget = calculate_max_memory_budget_bytes(num_vectors, dim, bytes_per_element)
-    memory_budgets    = calculate_memory_budgets(max_memory_budget, count_memory_steps)
-    runner = Runner(num_workers=MAX_WORKERS)
-
-    for percentage in np.linspace(min_percentage_duplicates, max_percentage_duplicates, count_steps):
-        logger.info(f"Processing {percentage:.1f}% duplicates...")
-        logger.info("Calculating distance threshold...")
-        distance_threshold = calculate_distance_threshold(vectors, percentage)
-        logger.info("Calculating actual results...")
-        actual_results     = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
-
-        for memory_budget in memory_budgets:
-            for filter_cls in static_filters + dynamic_filters:
-                runner.submit(
-                    'static',
-                    filter_cls=filter_cls,
-                    dim=dim, distance_threshold=distance_threshold,
-                    memory_budget=memory_budget,
-                    vectors_construct=construct_source, vectors_query=query_source,
-                    actual_results=actual_results, percentage=percentage,
-                )
-
-    results = runner.run()
-    logger.info("Static evaluation completed.")
-    return results
-
-
 def generate_equal_memory(runner: Runner) -> None:
     """Equal-memory comparison across equal_memory_filters. Sweeps
-    count_memory_steps budgets scaled off the construct set itself, not
-    calculate_max_memory_budget_bytes (tuned for generate_static()'s smaller
-    num_vectors). For each budget, every filter's best config is chosen on a
+    count_memory_steps budgets scaled off the construct set itself (one
+    sphere per point, see bytes_per_sphere_at_1to1 below). For each budget,
+    every filter's best config is chosen on a
     held-out calibration set (see runner.py::_build_calibrated_filter), then
     FPR/FNR/latency/throughput are measured on a separate held-out query
     set. Uses the paper's default single-dataset representative, MMLU
@@ -300,8 +184,8 @@ def generate_equal_memory(runner: Runner) -> None:
     query_source        = VectorSource(dataset, num_construct + num_calibration, num_vectors)
 
     logger.info("Calculating distance threshold...")
-    # calculate_nn_distance_threshold, not calculate_distance_threshold: at
-    # this construct-set size, the random-pairwise percentile is far more
+    # A nearest-neighbor threshold, not a random-pairwise percentile: at this
+    # construct-set size, a random-pairwise percentile is far more
     # permissive than the nearest-neighbor test actually used, pushing the
     # duplicate rate to ~100% and collapsing FPR/FNR to 0/0.
     distance_threshold = calculate_nn_distance_threshold(vectors_construct, duplicate_percentage)
@@ -309,7 +193,7 @@ def generate_equal_memory(runner: Runner) -> None:
     actual_calibration = compute_static_actual_results(vectors_construct, vectors_calibration, distance_threshold)
     actual_query       = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
 
-    # Scaled off the construct set itself (one sphere per point), not calculate_max_memory_budget_bytes.
+    # Scaled off the construct set itself: one sphere per point.
     bytes_per_sphere_at_1to1 = (dim + 1) * 4 * 4.0
     max_memory_budget = int(num_construct * bytes_per_sphere_at_1to1)
     memory_budgets = np.linspace(0, max_memory_budget, count_memory_steps + 1, dtype=int)[1:]
@@ -346,11 +230,10 @@ def plot_equal_memory(results: list) -> None:
 
 def generate_system_tau(runner: Runner) -> None:
     """End-to-end filtering benefit (paper Section 5.2, Figure 2): one
-    BallCoverFilter cover per (dataset, fold, k), queried at every tau in a
-    fixed sweep without ever rebuilding. k is swept as a ball-budget
-    fraction of each fold's construct-set size (k_fractions, 1%-10%) rather
-    than the paper's fixed k=400, so plot_system_tau can show how the
-    filtering benefit varies with memory budget, not just tau.
+    BallCoverFilter cover per (dataset, fold), queried at every tau in a
+    fixed sweep without ever rebuilding. Ball budget k is a fixed fraction
+    (k_fraction, 5%) of each fold's construct-set size rather than the
+    paper's fixed k=400.
 
     Implements the paper's Workloads protocol (Section 5.1): 5 datasets x
     k_folds=5 non-wrapping folds via advancing_fold_starts (80%
@@ -368,12 +251,7 @@ def generate_system_tau(runner: Runner) -> None:
     num_vectors      = WORKLOAD_NUM_VECTORS
     dim              = 384
     k_folds          = 5
-    # Ball budget as a fraction of each fold's construct-set size (~80,000
-    # vectors at num_vectors=100_000), swept 1%-10% instead of the paper's
-    # fixed k=400 -- note this yields much larger ball counts (roughly
-    # 800-8,000) than the paper's figure, so this sweep is significantly
-    # more expensive to run than the paper's single-k evaluation.
-    k_fractions      = [float(f) for f in np.linspace(0.01, 0.1, 5)]
+    k_fraction       = 0.05
     tau_values       = [float(t) for t in np.linspace(0.01, 0.10, 10)]
     ground_truth_dir = "results/system_tau_ground_truth"
 
@@ -387,7 +265,7 @@ def generate_system_tau(runner: Runner) -> None:
             f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
         )
 
-    logger.info(f"Ball budget swept as fractions of the construct set: {k_fractions}")
+    logger.info(f"Ball budget fixed as a fraction of the construct set: {k_fraction}")
     logger.info(f"Fixed tau sweep (shared across datasets): {tau_values}")
     logger.info(f"K-fold cross-validation: {k_folds} folds, non-wrapping contiguous 80/20 spans")
 
@@ -441,19 +319,17 @@ def generate_system_tau(runner: Runner) -> None:
         nn_dist = nn_dist_by_split[(dataset, fold)]
         actual_results_by_tau = {t: (nn_dist <= t).tolist() for t in tau_values}
 
-        k_values = sorted({max(1, round(f * construct_len)) for f in k_fractions})
-        k_values = [k for k in k_values if k < construct_len]
+        k = min(max(1, round(k_fraction * construct_len)), construct_len - 1)
 
-        for k in k_values:
-            runner.submit(
-                'system_tau',
-                output_csv=SYSTEM_TAU_CSV,
-                dim=dim, dataset=DATASET_KEYS[dataset],
-                k=k, tau_values=tau_values, seed=fold, construct_tau=construct_tau,
-                vectors_construct=construct_source,
-                vectors_query=query_source,
-                actual_results_by_tau=actual_results_by_tau,
-                )
+        runner.submit(
+            'system_tau',
+            output_csv=SYSTEM_TAU_CSV,
+            dim=dim, dataset=DATASET_KEYS[dataset],
+            k=k, tau_values=tau_values, seed=fold, construct_tau=construct_tau,
+            vectors_construct=construct_source,
+            vectors_query=query_source,
+            actual_results_by_tau=actual_results_by_tau,
+            )
 
 
 def save_system_tau(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
@@ -949,45 +825,6 @@ def plot_streaming(df: pd.DataFrame, k_fixed: int) -> None:
     generate_streaming_figures(df, k_fixed=k_fixed)
 
 
-def generate_dynamic() -> list:
-    num_vectors              = STREAM_SIZE
-    dim                      = 384
-    min_percentage_duplicates = 1
-    max_percentage_duplicates = 9
-    count_steps              = 10
-    count_memory_steps       = 10
-    percentage_construct     = 25
-
-    dataset       = DATASET
-    vectors       = load_embeds(dataset, num_vectors)[0]
-    bytes_per_element = vectors.itemsize
-    num_construct = num_vectors * percentage_construct // 100
-
-    construct_source = VectorSource(dataset, 0, num_construct)
-    query_source     = VectorSource(dataset, num_construct, num_vectors)
-    max_memory_budget = calculate_max_memory_budget_bytes(num_construct, dim, bytes_per_element)
-    memory_budgets    = calculate_memory_budgets(max_memory_budget, count_memory_steps)
-    runner = Runner(num_workers=MAX_WORKERS)
-
-    for percentage in np.linspace(min_percentage_duplicates, max_percentage_duplicates, count_steps):
-        distance_threshold = calculate_distance_threshold(vectors, percentage)
-        actual_results = compute_dynamic_actual_results(vectors, distance_threshold)[num_construct:]
-        for memory_budget in memory_budgets:
-            for filter_cls in dynamic_filters:
-                runner.submit(
-                    'dynamic',
-                    filter_cls=filter_cls,
-                    dim=dim, distance_threshold=distance_threshold,
-                    memory_budget=memory_budget,
-                    vectors_construct=construct_source, vectors_query=query_source,
-                    actual_results=actual_results, percentage=percentage,
-                )
-
-    results = runner.run()
-    logger.info("Dynamic evaluation completed.")
-    return results
-
-
 def generate_and_plot_all() -> None:
     """Submit-all, run-all, then plot-all: every generate_* function below
     only submits jobs to one shared Runner instead of running its own, so
@@ -1009,6 +846,12 @@ def generate_and_plot_all() -> None:
     runner = Runner(num_workers=MAX_WORKERS)
 
     try:
+        generate_system_tau(runner)
+    except Exception:
+        logger.exception("An error occurred")
+    
+    '''
+    try:
         generate_quantization(runner)
     except Exception:
         logger.exception("An error occurred")
@@ -1028,7 +871,7 @@ def generate_and_plot_all() -> None:
         generate_system_tau(runner)
     except Exception:
         logger.exception("An error occurred")
-
+    '''
     runner.shuffle()
     runner.run()
     logger.info("All submitted jobs completed.")
@@ -1086,5 +929,5 @@ def plot_all() -> None:
 
 
 if __name__ == "__main__":
-    # generate_and_plot_all()
-    plot_all()  # alternative: re-render figures from an existing results/*.csv run
+    generate_and_plot_all()
+    # plot_all()  # alternative: re-render figures from an existing results/*.csv run

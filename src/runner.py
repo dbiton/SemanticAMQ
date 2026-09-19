@@ -91,42 +91,6 @@ def _precision_recall_f1(predicted: Any, actual: Any) -> Tuple[float, float, flo
     return float(precision), float(recall), float(f1)
 
 
-def _compute_metrics(
-    predicted: List[bool],
-    actual: List[bool],
-    distance_threshold: float,
-    config: str,
-    percentage: float,
-    memory_usage: int,
-    memory_budget: int,
-) -> Dict[str, Any]:
-    tp, fp, fn, tn = _binary_confusion(predicted, actual)
-    precision, recall, f1 = _precision_recall_f1(predicted, actual)
-    return {
-        'Config':       config,
-        'Percentage':   percentage,
-        'Threshold':    distance_threshold,
-        'FPR':          fp / (fp + tn) if (fp + tn) > 0 else 0.0,
-        'FNR':          fn / (fn + tp) if (fn + tp) > 0 else 0.0,
-        'Precision':    precision,
-        'Recall':       recall,
-        'F1-Score':     f1,
-        'Memory Usage': memory_usage,
-        'Memory Budget': memory_budget,
-    }
-
-
-def _radius_stats(filter_instance: Any) -> Dict[str, float]:
-    radii = getattr(filter_instance, 'all_radiuses', None)
-    if radii is None or len(radii) == 0:
-        return {'Radius Mean': float('nan'), 'Radius Max': float('nan'),
-                'Radius Min': float('nan'), 'Radius Std': float('nan')}
-    return {
-        'Radius Mean': float(np.mean(radii)), 'Radius Max': float(np.max(radii)),
-        'Radius Min': float(np.min(radii)), 'Radius Std': float(np.std(radii)),
-    }
-
-
 _DIRECT_TAU_FILTERS = {
     "FirstNFilter", "BallCoverFilter",
     "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", "DSHFilter", "HNSWFilter",
@@ -189,55 +153,6 @@ def _instantiate_filter(filter_cls: Any, dim: int, memory_budget: int, distance_
             return filter_cls(dim=dim, max_memory=memory_budget, **extra_kwargs)
         except TypeError:
             return filter_cls(dim=dim, **extra_kwargs)
-
-
-def static_worker(
-    filter_cls: Any,
-    dim: int,
-    distance_threshold: float,
-    memory_budget: int,
-    vectors_construct: VectorInput,
-    vectors_query: VectorInput,
-    actual_results: List[bool],
-    percentage: float,
-) -> Dict[str, Any]:
-    config = filter_cls.__name__
-    filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold)
-    filter_instance.construct(_to_construct_array(vectors_construct))
-
-    predicted: List[bool] = []
-    for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
-        predicted.extend(filter_instance.query(block))
-
-    memory_usage = filter_instance.get_bytesize()
-    metrics = _compute_metrics(predicted, actual_results, distance_threshold, config, percentage, memory_usage, memory_budget)
-    metrics.update(_radius_stats(filter_instance))
-    return metrics
-
-
-def dynamic_worker(
-    filter_cls: Any,
-    dim: int,
-    distance_threshold: float,
-    memory_budget: int,
-    vectors_construct: VectorInput,
-    vectors_query: VectorInput,
-    actual_results: List[bool],
-    percentage: float,
-) -> Dict[str, Any]:
-    config = filter_cls.__name__
-    filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold)
-    filter_instance.construct(_to_construct_array(vectors_construct))
-
-    predicted: List[bool] = []
-    for v in _iter_query_vectors(vectors_query):
-        is_dup = filter_instance.query(np.array([v]))[0]
-        predicted.append(is_dup)
-        if not is_dup:
-            filter_instance.insert(np.array([v]))
-
-    memory_usage = filter_instance.get_bytesize()
-    return _compute_metrics(predicted, actual_results, distance_threshold, config, percentage, memory_usage, memory_budget)
 
 
 def _f1_score(predicted: np.ndarray, actual: np.ndarray) -> float:
@@ -376,224 +291,6 @@ def equal_memory_worker(
     }
 
 
-def _fpvr_bounds(
-    orig_log_low: Any, orig_log_high: Any, filt_log_low: float, filt_log_high: float,
-) -> tuple:
-    """Bounds on log(V_filter / V_original), kept in log space since the raw
-    ratio can overflow at high dimension. Floored at 0 (always >= 0, since
-    every true-duplicate ball is contained in its filter ball)."""
-    if (orig_log_low is None or orig_log_high is None
-            or np.isnan(filt_log_low) or np.isinf(filt_log_low)):
-        return float('nan'), float('nan')
-
-    log_ratio_lower = max(filt_log_low - orig_log_high, 0.0)
-    log_ratio_upper = max(filt_log_high - orig_log_low, log_ratio_lower)
-    return log_ratio_lower, log_ratio_upper
-
-
-def system_worker(
-    filter_cls: Any,
-    dim: int,
-    distance_threshold: float,
-    memory_budget: int,
-    vectors_construct: VectorInput,
-    vectors_query: VectorInput,
-    percentage: float,
-    dataset: str = "",
-    orig_vol_log_low: float = None,
-    orig_vol_log_high: float = None,
-) -> Dict[str, Any]:
-    """Measures how much a filter reduces flat-L2-index queries (one-sided:
-    filter negatives are trusted, positives get searched), timing the same
-    query stream with and without it. orig_vol_log_* is combined with the
-    filter's own covering volume into ground-truth-free FPVR bounds."""
-    config = filter_cls.__name__
-
-    construct = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
-
-    index = faiss.IndexFlatL2(dim)
-    index.add(construct)
-
-    filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold)
-    construct_result = filter_instance.construct(construct)
-    if isinstance(construct_result, tuple) and len(construct_result) == 2:
-        filt_vol_log_low, filt_vol_log_high = construct_result
-    else:
-        filt_vol_log_low, filt_vol_log_high = float('nan'), float('nan')
-    fpvr_lower, fpvr_upper = _fpvr_bounds(orig_vol_log_low, orig_vol_log_high, filt_vol_log_low, filt_vol_log_high)
-
-    sq_threshold = distance_threshold ** 2
-
-    n_queries = 0
-    baseline_pred: List[bool] = []
-    start = time.perf_counter()
-    for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
-        block = np.ascontiguousarray(block, dtype=np.float32)
-        n_queries += len(block)
-        nn_sq_dist, _ = index.search(block, 1)
-        baseline_pred.extend((nn_sq_dist[:, 0] <= sq_threshold).tolist())
-    time_without = time.perf_counter() - start
-
-    n_index_accesses = 0
-    filtered_pred: List[bool] = []
-    start = time.perf_counter()
-    for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
-        block = np.ascontiguousarray(block, dtype=np.float32)
-        positive_mask = np.array(filter_instance.query(block), dtype=bool)
-        block_pred = np.zeros(len(block), dtype=bool)
-        if positive_mask.any():
-            n_index_accesses += int(positive_mask.sum())
-            nn_sq_dist, _ = index.search(block[positive_mask], 1)
-            block_pred[positive_mask] = nn_sq_dist[:, 0] <= sq_threshold
-        filtered_pred.extend(block_pred.tolist())
-    time_with = time.perf_counter() - start
-
-    false_negatives = sum(1 for b, f in zip(baseline_pred, filtered_pred) if b and not f)
-
-    n_q = max(n_queries, 1)
-    return {
-        'Config':                       config,
-        'Dataset':                      dataset,
-        'Percentage':                   percentage,
-        'Threshold':                    distance_threshold,
-        'Memory Budget':                memory_budget,
-        'Filter Memory Usage':          filter_instance.get_bytesize(),
-        'Total Queries':                n_queries,
-        'Time Without Filter (s)':      time_without,
-        'Time With Filter (s)':         time_with,
-        'Latency Without Filter (ms)':  time_without / n_q * 1000,
-        'Latency With Filter (ms)':     time_with / n_q * 1000,
-        'Throughput Without Filter':    n_queries / max(time_without, 1e-9),
-        'Throughput With Filter':       n_queries / max(time_with, 1e-9),
-        'Speedup':                      time_without / max(time_with, 1e-9),
-        'Index Accesses':               n_index_accesses,
-        'Index Access Rate':            n_index_accesses / n_q,
-        'Filter False Negatives':       false_negatives,
-        'Original Volume Log Low':      orig_vol_log_low,
-        'Original Volume Log High':     orig_vol_log_high,
-        'Filter Volume Log Low':        filt_vol_log_low,
-        'Filter Volume Log High':       filt_vol_log_high,
-        'FPVR Lower':                   fpvr_lower,
-        'FPVR Upper':                   fpvr_upper,
-        **_radius_stats(filter_instance),
-    }
-
-
-def _compute_tradeoff_metrics(
-    predicted: List[bool],
-    actual: List[bool],
-    config: str,
-    max_spheres: int,
-    memory_budget: int,
-    memory_usage: int,
-    construct_time: float,
-    qps: float
-) -> Dict[str, Any]:
-    tp = sum(1 for p, a in zip(predicted, actual) if p and a)
-    fp = sum(1 for p, a in zip(predicted, actual) if p and not a)
-    fn = sum(1 for p, a in zip(predicted, actual) if not p and a)
-    tn = sum(1 for p, a in zip(predicted, actual) if not p and not a)
-
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-
-    return {
-        "Config": config,
-        "NumSpheres": max_spheres if max_spheres is not None else 0,
-        "MemoryBudget": memory_budget,
-        "MemoryUsage": memory_usage,
-        "FPR": fp / (fp + tn) if (fp + tn) > 0 else 0.0,
-        "FNR": fn / (fn + tp) if (fn + tp) > 0 else 0.0,
-        "Precision": precision,
-        "Recall": recall,
-        "F1-Score": f1,
-        "ConstructTime": construct_time,
-        "QPS": qps
-    }
-
-
-def tradeoff_static_worker(
-    filter_cls: Any,
-    dim: int,
-    distance_threshold: float,
-    vectors_construct: np.ndarray,
-    vectors_query: np.ndarray,
-    actual_results: List[bool],
-    max_spheres: int = None,
-    memory_budget: int = None,
-    insert_memory_percent: float = 0.0
-) -> Dict[str, Any]:
-    """Constructs a static filter once from the full dataset, measuring
-    construction time, memory usage, query throughput, and accuracy."""
-    try:
-        config = filter_cls.__name__
-        vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
-
-        construct_start = time.perf_counter()
-        filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold, max_spheres, insert_memory_percent)
-        filter_instance.construct(vectors_construct)
-        construct_latency = time.perf_counter() - construct_start
-
-        query_start = time.perf_counter()
-        predicted: List[bool] = []
-        for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
-            predicted.extend(filter_instance.query(block))
-        query_latency = time.perf_counter() - query_start
-
-        qps = len(vectors_query) / max(query_latency, 1e-9)
-        memory_usage = filter_instance.get_bytesize()
-
-    except Exception as e:
-        logger.warning(f"[Skipped] {config} failed: {e}")
-        return None
-
-    return _compute_tradeoff_metrics(predicted, actual_results, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
-
-
-def tradeoff_dynamic_worker(
-    filter_cls: Any,
-    dim: int,
-    distance_threshold: float,
-    vectors_construct: np.ndarray,
-    vectors_query: np.ndarray,
-    actual_results: List[bool],
-    max_spheres: int = None,
-    memory_budget: int = None,
-    insert_memory_percent: float = 0.0
-) -> Dict[str, Any]:
-    """Like tradeoff_static_worker, but inserts non-covered vectors
-    incrementally while measuring insertion time alongside the rest."""
-    try:
-        config = filter_cls.__name__
-        vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
-
-        construct_start = time.perf_counter()
-        filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold, max_spheres, insert_memory_percent)
-        filter_instance.construct(vectors_construct)
-        construct_latency = time.perf_counter() - construct_start
-
-        query_start = time.perf_counter()
-        predicted: List[bool] = []
-        for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
-            block_preds = filter_instance.query(block)
-            predicted.extend(block_preds)
-
-            misses = [block[i] for i, is_dup in enumerate(block_preds) if not is_dup]
-            if misses:
-                filter_instance.insert(np.array(misses, dtype=np.float32))
-        query_latency = time.perf_counter() - query_start
-
-        qps = len(vectors_query) / max(query_latency, 1e-9)
-        memory_usage = filter_instance.get_bytesize()
-
-    except Exception as e:
-        logger.warning(f"[Skipped] {config} failed: {e}")
-        return None
-
-    return _compute_tradeoff_metrics(predicted, actual_results, config, max_spheres, memory_budget, memory_usage, construct_latency, qps)
-
-
 _LN10 = float(np.log(10.0))
 
 
@@ -614,6 +311,25 @@ def _J_tau(radii: np.ndarray, dim: int, tau: float = 0.0) -> float:
         return 0.0
     with np.errstate(over='ignore'):
         return float(np.sum(r ** dim))
+
+
+def _tau_volume_bounds_log10(centers: np.ndarray, radii: np.ndarray, tau: float) -> Tuple[float, float]:
+    """Log10 (lower, upper) bounds on the volume actually covered by the
+    tau-expanded balls (radius + tau), via estimate_hypersphere_volume's
+    overlap-aware union bound -- the same estimator BallCoverFilter.construct()
+    uses for its own (tau=0) volume bounds, just re-run at each tau since
+    _log10_J's naive sum-of-volumes proxy ignores overlap entirely. High is
+    floored at low the same way _fpvr_bounds floored its log-ratio at 0:
+    floating-point error in the lens/Bonferroni terms can otherwise invert
+    them by a hair."""
+    if len(radii) == 0:
+        return float('nan'), float('nan')
+    log_low, log_high = estimate_hypersphere_volume(centers, radii + tau, return_log=True)
+    if np.isnan(log_low) or np.isinf(log_low):
+        return float('nan'), float('nan')
+    log_low /= _LN10
+    log_high = max(log_high / _LN10, log_low)
+    return log_low, log_high
 
 
 def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, float]:
@@ -761,7 +477,13 @@ def system_tau_worker(
     throughput/index-access/FPR/FNR at each tau. Queries are issued one at a
     time on both arms, reflecting a realistic online setting where the
     filtered path only falls through to index.search() on a possible match.
-    redundancy_rate is the measured (not nominal) duplicate fraction."""
+    redundancy_rate is the measured (not nominal) duplicate fraction.
+
+    Also reports log10_vol_low/log10_vol_high: overlap-aware lower/upper
+    bounds on the volume covered by the tau-expanded cover, from the same
+    estimator BallCoverFilter.construct() uses for its own volume bounds
+    (see _tau_volume_bounds_log10) -- a tighter picture than log10_j_tau's
+    naive sum-of-ball-volumes, which double-counts overlapping regions."""
     construct_arr = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
     query_arr = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
     n_q = len(query_arr)
@@ -777,6 +499,7 @@ def system_tau_worker(
     filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
     filt.construct(construct_arr)
     radii = filt.all_radiuses
+    centers = filt.all_centers
 
     rows: List[Dict[str, Any]] = []
     for t in tau_values:
@@ -802,6 +525,7 @@ def system_tau_worker(
         rates = _confusion_rates(predicted.tolist(), actual)
         throughput_without = n_q / max(time_without, 1e-9)
         throughput_with = n_q / max(time_with, 1e-9)
+        vol_log10_low, vol_log10_high = _tau_volume_bounds_log10(centers, radii, t)
 
         rows.append({
             "dataset": dataset, "k": k, "tau": t, "seed": seed,
@@ -814,6 +538,8 @@ def system_tau_worker(
             "fpr": rates["fpr"], "fnr": rates["fnr"],
             "j_tau": _J_tau(radii, dim, tau=t),
             "log10_j_tau": _log10_J(radii, dim, tau=t),
+            "log10_vol_low": vol_log10_low,
+            "log10_vol_high": vol_log10_high,
             "n_balls": len(radii),
         })
     return rows
@@ -1082,11 +808,6 @@ def stream_rebuild_worker(
 
 
 _WORKER_FNS: Dict[str, Any] = {
-    'static':  static_worker,
-    'dynamic': dynamic_worker,
-    'tradeoff_static': tradeoff_static_worker,
-    'tradeoff_dynamic': tradeoff_dynamic_worker,
-    'system':  system_worker,
     'system_tau': system_tau_worker,
     'quantization': quantization_worker,
     'query_performance': query_performance_worker,

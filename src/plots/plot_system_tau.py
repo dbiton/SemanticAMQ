@@ -9,14 +9,14 @@ the median available k, same "pick one representative value" pattern
 plot_quantization.py uses for tau) -- pass k_fixed explicitly to render a
 different one.
 
-Seven panels, one line per dataset:
+Eight panels, one line (or band) per dataset:
   (a) Throughput Improvement (%) of the filtered pipeline over the
       unfiltered flat-index baseline.
   (b) Mean Full Index Accesses (queries that bypass the filter and reach
       the backend index), averaged over the seed sweep.
   (c) Empirical FPR = FP / (FP + TN).
   (d) Threshold-expanded geometric objective log10 J_tau(C) = log10 sum_i
-      (r_i + tau)^d.
+      (r_i + tau)^d -- a naive, overlap-blind sum of ball volumes.
   (e) Measured redundancy rate -- how much of the query stream a given tau
       actually counts as a ground-truth duplicate.
   (f) Predicted positive rate (%) -- mean_index_accesses / n_queries, i.e.
@@ -27,6 +27,10 @@ Seven panels, one line per dataset:
       duplicate (closer than tau to a construct vector); the same quantity
       as (e)'s redundancy_rate, just as a percentage under an explicit
       "TP" label rather than a [0,1] fraction.
+  (h) Overlap-aware lower/upper bounds (shaded band) on the volume actually
+      covered by the tau-expanded cover, via the same union-volume estimator
+      BallCoverFilter.construct() uses for its own bounds -- tighter than
+      (d)'s naive sum, which double-counts overlapping regions.
 """
 
 from __future__ import annotations
@@ -51,7 +55,7 @@ DEMO = False
 _REQUIRED_COLUMNS = [
     "dataset", "k", "tau", "seed", "redundancy_rate", "tp_rate_pct",
     "throughput_improvement_pct", "mean_index_accesses", "n_queries", "positive_rate_pct",
-    "fpr", "fnr", "j_tau", "log10_j_tau", "n_balls",
+    "fpr", "fnr", "j_tau", "log10_j_tau", "log10_vol_low", "log10_vol_high", "n_balls",
 ]
 
 
@@ -86,6 +90,10 @@ def _synthesize_demo_data() -> pd.DataFrame:
                 mean_index_accesses = n_queries * redundancy_rate * rng.uniform(0.97, 1.03)
                 fpr = base_fpr[dataset] * (1.0 + redundancy_rate) * rng.uniform(0.9, 1.1)
                 log10_j_tau = base_log10_j[dataset] + k_fixed / 64.0 * np.log10(1.0 + tau) * 40 * noise
+                # Overlap-aware bounds are tighter than log10_j_tau's naive,
+                # overlap-blind sum-of-volumes -- mimic that gap here.
+                log10_vol_high = log10_j_tau - 0.05 * noise
+                log10_vol_low = log10_vol_high - 0.3 * noise
                 rows.append({
                     "dataset": dataset, "k": k_fixed, "tau": float(tau), "seed": seed,
                     "redundancy_rate": redundancy_rate,
@@ -96,6 +104,7 @@ def _synthesize_demo_data() -> pd.DataFrame:
                     "positive_rate_pct": mean_index_accesses / n_queries * 100.0,
                     "fpr": fpr, "fnr": 0.0,
                     "j_tau": float("inf"), "log10_j_tau": log10_j_tau,
+                    "log10_vol_low": log10_vol_low, "log10_vol_high": log10_vol_high,
                     "n_balls": k_fixed,
                 })
     return pd.DataFrame(rows)
@@ -197,6 +206,42 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _line_panel(df, "log10_j_tau", ylabel, "system-tau-geometric-objective.png", cfg)
 
 
+def panel_volume_bounds(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Lower/upper bounds (one shaded band per dataset) on the volume
+    actually covered by the tau-expanded cover -- see
+    runner._tau_volume_bounds_log10, which reuses
+    hyperspheres_volume.estimate_hypersphere_volume's overlap-aware union
+    bound. Tighter than panel_geometric_objective's log10_j_tau, which sums
+    each ball's volume independently and so double-counts overlaps."""
+    sel = df[df["k"] == cfg.k_fixed]
+    agg_low = mean_std(sel, ["dataset", "tau"], "log10_vol_low")[["dataset", "tau", "mean"]].rename(columns={"mean": "low"})
+    agg_high = mean_std(sel, ["dataset", "tau"], "log10_vol_high")[["dataset", "tau", "mean"]].rename(columns={"mean": "high"})
+    agg = agg_low.merge(agg_high, on=["dataset", "tau"])
+
+    apply_style(cfg.dpi)
+    fig, ax = plt.subplots()
+    for dataset in DATASETS:
+        sub = agg[agg["dataset"] == dataset].sort_values("tau")
+        if sub.empty:
+            continue
+        ax.plot(sub["tau"], sub["low"], color=DATASET_COLORS[dataset], marker=DATASET_MARKERS[dataset],
+               markersize=2.0, linewidth=0.6, linestyle="--", zorder=2)
+        ax.plot(sub["tau"], sub["high"], color=DATASET_COLORS[dataset], marker=DATASET_MARKERS[dataset],
+               markersize=2.0, linewidth=0.6, linestyle="-", zorder=2)
+        ax.fill_between(sub["tau"], sub["low"], sub["high"], color=DATASET_COLORS[dataset],
+                        alpha=0.15, linewidth=0, zorder=1)
+
+    ax.set_xlabel(r"$\tau$")
+    ax.set_ylabel(wrap_label(r"$\log_{10}$ Volume Bounds"))
+    ax.text(0.97, 0.06, "dashed: lower -- solid: upper", transform=ax.transAxes,
+           ha="right", va="bottom", fontsize=5)
+    style_axes(ax)
+
+    fig.subplots_adjust(left=0.26, right=0.97, top=0.95, bottom=0.24)
+    save_figure(fig, "system-tau-volume-bounds.png", cfg.outdir, cfg.dpi, cfg.emit_pdf, tight=False)
+    return agg
+
+
 def panel_redundancy_rate(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     """Redundancy rate as a function of tau -- the calibration curve this
     fixed-tau sweep lets a reader look up directly, since tau here isn't
@@ -256,6 +301,7 @@ def generate_system_tau_figures(df: Optional[pd.DataFrame] = None, outdir: str =
     panel_redundancy_rate(df, cfg)
     panel_tp_rate(df, cfg)
     panel_positive_rate(df, cfg)
+    panel_volume_bounds(df, cfg)
     save_dataset_legend(cfg.outdir, cfg.dpi, cfg.emit_pdf)
     print_summary(df, cfg)
 
