@@ -16,10 +16,10 @@ from datasets.combine import concatenate_datasets
 from scipy.cluster.hierarchy import DisjointSet
 from sklearn.preprocessing import normalize
 
-from util.dataset_paths import dataset_filenames  # re-exported for compatibility
+# from util.dataset_paths import dataset_filenames
 
 embeds_dir = "datasets"
-
+MAX_STREAM_LENGTH = 1_000_000  # 1 million
 models: Dict[str, SentenceTransformer] = {}
 
 def load_embeds(dataset_name: str, N: int):
@@ -65,7 +65,7 @@ def pack_and_dump(path: str, texts: List[str], meta: Dict[str, List[Any]], model
         if f is None:
             print(f'Skipping "{path}" because it already exists')
             return
-        embeds = embed_strings(texts[:100000], model_name=model_name)
+        embeds = embed_strings(texts[:MAX_STREAM_LENGTH], model_name=model_name)
         normalized_embeds = normalize(embeds)
         with h5py.File(f, "w") as hf:
             hf.create_dataset("embeds", data=embeds)
@@ -184,9 +184,12 @@ def build_mmlu() -> Tuple[List[str], Dict[str, List[Any]]]:
     return texts, meta
 
 def build_hotpotqa() -> Tuple[List[str], Dict[str, List[Any]]]:
-    # HotpotQA (Multi-hop reasoning)
+    # HotpotQA (Multi-hop reasoning). The unnamespaced "hotpot_qa" repo id was
+    # script-based and no longer loads on datasets>=4.0 ("dataset scripts are
+    # no longer supported"); "hotpotqa/hotpot_qa" is the maintainers' own
+    # Parquet-converted mirror, same "distractor" config and "question" field.
     print("Loading HotpotQA...")
-    ds = load_dataset("hotpot_qa", "distractor")    
+    ds = load_dataset("hotpotqa/hotpot_qa", "distractor")
     texts = []
     # Splits: 'train', 'validation'
     for split in ds:
@@ -226,14 +229,21 @@ def build_msmarco() -> Tuple[List[str], Dict[str, List[Any]]]:
     return texts, meta
 
 def build_pes2o() -> Tuple[List[str], Dict[str, List[Any]]]:
-    # peS2o is massive (~39M docs). Use streaming to avoid gigabytes of downloads.
-    # We only pull the first 100,000 to satisfy the pack_and_dump requirement.
-    print("Loading peS2o (streaming first 100k documents)...")
-    ds = load_dataset("allenai/peS2o", split="train", streaming=True, trust_remote_code=True)
+    # allenai/peS2o itself is still script-based (a custom loading script),
+    # which datasets>=4.0 refuses to run at all ("dataset scripts are no
+    # longer supported") -- trust_remote_code=True no longer has any effect,
+    # since the script-execution mechanism itself was removed from the
+    # library. common-pile/peS2o is a Parquet-native, openly-licensed subset
+    # derived from the same underlying peS2o/S2ORC corpus (~6.3M docs, not a
+    # byte-identical mirror of the original ~39M-doc allenai/peS2o -- see its
+    # dataset card), with the same "text" field. Use streaming to avoid
+    # gigabytes of downloads; we only pull the first MAX_STREAM_LENGTH docs.
+    print("Loading peS2o (streaming first 1M documents)...")
+    ds = load_dataset("common-pile/peS2o", split="train", streaming=True)
     
     texts = []
     for i, ex in enumerate(ds):
-        if i >= 100000:
+        if i >= MAX_STREAM_LENGTH:
             break
         if ex.get("text"):
             texts.append(ex["text"])
@@ -244,45 +254,74 @@ def build_pes2o() -> Tuple[List[str], Dict[str, List[Any]]]:
 if __name__ == "__main__":
     os.makedirs(embeds_dir, exist_ok=True)
 
-    print("generating StackOverflow...")
-    texts, meta = build_stackoverflow()
-    pack_and_dump(os.path.join(embeds_dir, "embeds_stackoverflow.pkl"), texts, meta)
-    '''
-    print("generating Quora Question Pairs...")
-    texts, meta = build_quora()
-    pack_and_dump(os.path.join(embeds_dir, "embeds_quora_qp.pkl"), texts, meta)
-    '''
-    print("generating WildChat...")
-    texts, meta = build_wildchat()
-    pack_and_dump(os.path.join(embeds_dir, "embeds_wildchat.pkl"), texts, meta)
+    try:
+        print("generating StackOverflow...")
+        texts, meta = build_stackoverflow()
+        pack_and_dump(os.path.join(embeds_dir, "embeds_stackoverflow.pkl"), texts, meta)
+    except Exception as e:
+        print(f"Failed to generate StackOverflow: {e}")
 
-    print("generating TriviaQA...")
-    texts, meta = build_triviaqa()
-    pack_and_dump(os.path.join(embeds_dir, "embeds_triviaqa.pkl"), texts, meta)
-    '''
-    print("generating HotpotQA...")
-    texts, meta = build_hotpotqa()
-    pack_and_dump(os.path.join(embeds_dir, "embeds_hotpotqa.pkl"), texts, meta)
-    '''
-    print("generating MMLU...")
-    texts, meta = build_mmlu()
-    pack_and_dump(os.path.join(embeds_dir, "embeds_mmlu.pkl"), texts, meta)
-    
-    print("generating ELI5...")
-    texts, meta = build_eli5()
-    pack_and_dump(os.path.join(embeds_dir, "embeds_eli5.pkl"), texts, meta)
-    '''
-    print("generating Natural Questions...")
-    texts, meta = build_nq()
-    pack_and_dump(os.path.join(embeds_dir, "embeds_nq.pkl"), texts, meta)
+    try:
+        print("generating Quora Question Pairs...")
+        texts, meta = build_quora()
+        pack_and_dump(os.path.join(embeds_dir, "embeds_quora_qp.pkl"), texts, meta)
+    except Exception as e:
+        print(f"Failed to generate Quora Question Pairs: {e}")
 
-    print("generating MS MARCO...")
-    texts, meta = build_msmarco()
-    pack_and_dump(os.path.join(embeds_dir, "embeds_msmarco.pkl"), texts, meta)
+    try:
+        print("generating WildChat...")
+        texts, meta = build_wildchat()
+        pack_and_dump(os.path.join(embeds_dir, "embeds_wildchat.pkl"), texts, meta)
+    except Exception as e:
+        print(f"Failed to generate WildChat: {e}")
 
-    print("generating peS2o...")
-    texts, meta = build_pes2o()
-    pack_and_dump(os.path.join(embeds_dir, "embeds_pes2o.pkl"), texts, meta)
-    '''
-    
+    try:
+        print("generating TriviaQA...")
+        texts, meta = build_triviaqa()
+        pack_and_dump(os.path.join(embeds_dir, "embeds_triviaqa.pkl"), texts, meta)
+    except Exception as e:
+        print(f"Failed to generate TriviaQA: {e}")
+
+    try:
+        print("generating HotpotQA...")
+        texts, meta = build_hotpotqa()
+        pack_and_dump(os.path.join(embeds_dir, "embeds_hotpotqa.pkl"), texts, meta)
+    except Exception as e:
+        print(f"Failed to generate HotpotQA: {e}")
+
+    try:
+        print("generating MMLU...")
+        texts, meta = build_mmlu()
+        pack_and_dump(os.path.join(embeds_dir, "embeds_mmlu.pkl"), texts, meta)
+    except Exception as e:
+        print(f"Failed to generate MMLU: {e}")
+
+    try:
+        print("generating ELI5...")
+        texts, meta = build_eli5()
+        pack_and_dump(os.path.join(embeds_dir, "embeds_eli5.pkl"), texts, meta)
+    except Exception as e:
+        print(f"Failed to generate ELI5: {e}")
+
+    try:
+        print("generating Natural Questions...")
+        texts, meta = build_nq()
+        pack_and_dump(os.path.join(embeds_dir, "embeds_nq.pkl"), texts, meta)
+    except Exception as e:
+        print(f"Failed to generate Natural Questions: {e}")
+
+    try:
+        print("generating MS MARCO...")
+        texts, meta = build_msmarco()
+        pack_and_dump(os.path.join(embeds_dir, "embeds_msmarco.pkl"), texts, meta)
+    except Exception as e:
+        print(f"Failed to generate MS MARCO: {e}")
+
+    try:
+        print("generating peS2o...")
+        texts, meta = build_pes2o()
+        pack_and_dump(os.path.join(embeds_dir, "embeds_pes2o.pkl"), texts, meta)
+    except Exception as e:
+        print(f"Failed to generate peS2o: {e}")
+
     print("Done.")
