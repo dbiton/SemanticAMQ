@@ -86,6 +86,13 @@ class BallCoverFilter(Filter):
         self.construct_method = construct_method if construct_method is not None else GonzalesConstruct()
         self.insert_method = insert_method if insert_method is not None else NearestInsert()
         self.insert_memory_percent = insert_memory_percent
+        # Codebook state. Both are fixed once, by construct(), and never
+        # retrained: insert() encodes new centers with whatever construct()
+        # fit. Retraining would re-encode every stored center under a new
+        # codebook while their radii still carry the old codebook's
+        # inflation -- and the unquantized centers needed to recompute that
+        # inflation no longer exist.
+        self._pq_nbits: Optional[int] = None
         self.all_centers_index = self._make_faiss_index(self.quantize)
         self.max_spheres = (max_spheres if max_spheres is not None 
                     else self._calculate_max_spheres(self.max_memory))
@@ -97,7 +104,7 @@ class BallCoverFilter(Filter):
         self._all_centers = None  # lazily rebuilt cache, not persistent state
         self._all_radiuses = np.empty((self.max_spheres,), dtype=np.float32)
         # Per-ball reconstruction error (||center - decode(encode(center))||),
-        # 0 for Quantize.NONE: added onto each radius by _rebuild_from_centers
+        # 0 for Quantize.NONE: added onto each radius by _store_spheres, once,
         # to preserve the no-false-negative guarantee under lossy encoding.
         self._radius_inflation = np.zeros((self.max_spheres,), dtype=np.float32)
 
@@ -161,7 +168,11 @@ class BallCoverFilter(Filter):
         self._ensure_capacity(capacity)
         self._num_spheres = 0
         self._all_centers = None
+        # Back to an untrained index: construct() has to run again to refit
+        # the codebook before any sphere can be stored.
         self.all_centers_index = self._make_faiss_index(self.quantize)
+        self._pq_nbits = None
+        self._constructed = False
         self.insert_method.reset_buffers(capacity)
 
     def _calculate_max_spheres(self, max_memory: Optional[int]) -> int:
@@ -201,6 +212,15 @@ class BallCoverFilter(Filter):
         elif quantize == Quantize.PQ:
             pq_m = self._choose_pq_m(self.dim)
             index = faiss.IndexPQ(self.dim, pq_m, pq_nbits, faiss.METRIC_L2)
+            # ST_PQ is asymmetric distance computation (ADC): the raw float32
+            # query is scored against the *decoded* stored codes, so the query
+            # is never encoded. That is what makes the one-sided radius
+            # inflation in _store_spheres correct and tight -- see query().
+            # ST_SDC/ST_polysemous encode the query too and would silently
+            # break the zero-false-negative guarantee, so pin it.
+            assert index.search_type == faiss.IndexPQ.ST_PQ, (
+                f"BallCoverFilter requires ADC (ST_PQ); got search_type={index.search_type}"
+            )
         else:
             index = faiss.IndexScalarQuantizer(self.dim, _QTYPES[quantize], faiss.METRIC_L2)
         return faiss.IndexIDMap2(index)
@@ -231,65 +251,97 @@ class BallCoverFilter(Filter):
             return int(trained.nbytes)
         return 0
 
-    def _build_quantizer(self, quantize: Quantize, centers: np.ndarray) -> Tuple[faiss.IndexIDMap2, np.ndarray]:
-        """Returns (untrained index over `centers`, per-center reconstruction
-        error). Raises InsufficientMemoryError for PQ with too few centers
-        for even a 1-bit codebook -- must check before constructing that
-        index, since IndexPQ.search segfaults if built with nbits=0."""
-        if quantize == Quantize.PQ:
-            nbits = self._pq_nbits_for(len(centers))
-            if nbits is None:
+    def _train_quantizer(self, centers: np.ndarray) -> None:
+        """Fits the one codebook this filter will ever use, on the ball
+        centers themselves, and fixes PQ's nbits. Called exactly once, by
+        construct().
+
+        Trained on `centers`, not on the construct set, because the centers
+        are the *only* vectors this index ever encodes: queries go in raw
+        (see query()) and the construct vectors are never stored. Fitting to
+        a wider sample is therefore a pure loss -- an SQ's per-dimension
+        min/max widens and its buckets coarsen, and PQ's k-means centroids
+        drift off the centers toward the bulk distribution. Measured at
+        dim=32 over 32 centers, training on the full construct set instead
+        cost ~1.22x the reconstruction error for SQ4/SQ8, nothing for the
+        TurboQuant variants, and turned PQ from exact (dsub=1, one codeword
+        per center) into ~1.8 mean error. All of that lands on every radius
+        as inflation, and so straight on the false-positive rate.
+
+        nbits is chosen here, from the construct-time center count, and
+        frozen: it sets pq.code_size, hence bytes_per_ball() and the
+        codebook size, so letting it move later would make the filter's
+        memory footprint jump mid-stream.
+        """
+        if self.quantize == Quantize.NONE:
+            self.all_centers_index = self._make_faiss_index(Quantize.NONE)
+            return
+
+        if self.quantize == Quantize.PQ:
+            # Must be checked before the index is constructed: IndexPQ.search
+            # segfaults if built with nbits=0.
+            self._pq_nbits = self._pq_nbits_for(len(centers))
+            if self._pq_nbits is None:
                 raise InsufficientMemoryError(
                     f"Not enough memory to construct a PQ index: {len(centers)} ball "
                     "center(s) is too few for even a 1-bit codebook (need >= 2 centers, "
                     "which requires a larger max_memory or a smaller ball budget)."
                 )
-            index = self._make_faiss_index(quantize, pq_nbits=nbits)
-            base_idx = faiss.downcast_index(index.index)
-            base_idx.pq.cp.min_points_per_centroid = 1
-            index.train(centers)
-            # Use sa_encode/sa_decode as uniform binding fallbacks 
-            codes = base_idx.sa_encode(centers)
-            decoded = base_idx.sa_decode(codes)
+            index = self._make_faiss_index(self.quantize, pq_nbits=self._pq_nbits)
+            faiss.downcast_index(index.index).pq.cp.min_points_per_centroid = 1
         else:
-            index = self._make_faiss_index(quantize)
-            base_idx = faiss.downcast_index(index.index)
-            index.train(centers)
-            codes = base_idx.sa_encode(centers)
-            decoded = base_idx.sa_decode(codes)
-            
-        error = np.linalg.norm(centers - decoded, axis=1).astype(np.float32)
-        return index, error
+            index = self._make_faiss_index(self.quantize)
 
-    def _rebuild_from_centers(self, sphere_indices: np.ndarray, centers: np.ndarray, radii: np.ndarray) -> None:
-        """Re-derives ball state from an explicit (centers, radii) pair,
-        applying the configured quantizer -- used by construct() and by
-        insert() whenever a strategy relocates/adds balls (e.g. merge)
-        rather than just growing an existing radius in place."""
+        index.train(centers)
+        self.all_centers_index = index
+
+    def _encoding_error(self, centers: np.ndarray) -> np.ndarray:
+        """Per-center ||c - decode(encode(c))||, measured against the trained
+        codebook -- never a probabilistic bound. sa_encode/sa_decode are used
+        as the uniform binding fallback across index types."""
+        if self.quantize == Quantize.NONE:
+            return np.zeros(len(centers), dtype=np.float32)
+        base = faiss.downcast_index(self.all_centers_index.index)
+        decoded = base.sa_decode(base.sa_encode(centers))
+        return np.linalg.norm(centers - decoded, axis=1).astype(np.float32)
+
+    def _store_spheres(self, sphere_indices: np.ndarray, centers: np.ndarray, radii: np.ndarray) -> None:
+        """Writes (center, radius) pairs into the already-trained index,
+        inflating each radius by that center's own encoding error.
+
+        The inflation is applied exactly once, here, at the moment a center
+        is written -- which is the whole reason nothing rebuilds. A radius
+        only needs inflating when it was measured against a center that is
+        about to be replaced by its lossy encoding (construct()'s radii, and
+        any center an insert strategy relocates). Once stored, `all_centers`
+        hands back the *decoded* center, so every radius an insert strategy
+        derives from it is already correct with respect to what query()
+        scores against, and must not be inflated again. Re-inflating on each
+        touch is what made the old rebuild path grow radii without bound.
+        """
         sphere_indices = np.ascontiguousarray(sphere_indices, dtype=np.int64)
+        if len(sphere_indices) == 0:
+            return
         centers = np.ascontiguousarray(centers, dtype=np.float32)
         radii = np.asarray(radii, dtype=np.float32)
-        n = len(centers)
 
-        inflation = np.zeros(n, dtype=np.float32)
-        if n == 0:
-            index = self._make_faiss_index(Quantize.NONE)
-        elif self.quantize == Quantize.NONE:
-            index = self._make_faiss_index(Quantize.NONE)
-            index.add_with_ids(centers, sphere_indices)
-        else:
-            index, error = self._build_quantizer(self.quantize, centers)
-            radii = radii + error
-            inflation = error
-            index.add_with_ids(centers, sphere_indices)
+        error = self._encoding_error(centers)
+        # add_with_ids appends rather than overwrites, so an id being
+        # rewritten (a relocated/merged ball) has to be dropped first.
+        if self.all_centers_index.ntotal > 0:
+            self.all_centers_index.remove_ids(faiss.IDSelectorBatch(sphere_indices))
+        self.all_centers_index.add_with_ids(centers, sphere_indices)
+        self._all_radiuses[sphere_indices] = radii + error
+        self._radius_inflation[sphere_indices] = error
 
-        self._ensure_capacity(n)
-        self._num_spheres = n
-        self._all_spheres[:n] = sphere_indices.astype(np.int32)
-        self._all_centers = None
-        self.all_centers_index = index
-        self._all_radiuses[sphere_indices] = radii
-        self._radius_inflation[sphere_indices] = inflation
+    def _drop_spheres(self, sphere_indices: np.ndarray) -> None:
+        """Evicts ids an insert strategy retired (merged away, absorbed) from
+        the index, so ntotal keeps tracking _num_spheres."""
+        sphere_indices = np.ascontiguousarray(sphere_indices, dtype=np.int64)
+        if len(sphere_indices) == 0 or self.all_centers_index.ntotal == 0:
+            return
+        self.all_centers_index.remove_ids(faiss.IDSelectorBatch(sphere_indices))
+        self._radius_inflation[sphere_indices] = 0.0
 
     def construct(self, vectors: np.ndarray) -> Tuple[float, float]:
         """Builds directly from construct_method's output, independent of
@@ -298,10 +350,33 @@ class BallCoverFilter(Filter):
         strategies with per-ball bookkeeping (e.g. MinHeapInsert's
         merge-candidate heap), unintentionally seeded that state from
         construction -- a cost only the streaming policy needs, paid by every
-        one-shot construct-then-query use of this filter."""
+        one-shot construct-then-query use of this filter.
+
+        This is also the only place the quantizer is ever trained, and the
+        only place PQ's nbits is chosen (see _train_quantizer)."""
         centers, radii = self.construct_method.construct_filter(self, vectors)
-        sphere_indices = np.arange(len(centers), dtype=np.int64)
-        self._rebuild_from_centers(sphere_indices, centers, radii)
+        centers = np.ascontiguousarray(centers, dtype=np.float32)
+        radii = np.asarray(radii, dtype=np.float32)
+        n = len(centers)
+
+        self._ensure_capacity(max(n, 1))
+        self._num_spheres = 0
+        self._all_centers = None
+        self._radius_inflation[:] = 0.0
+
+        if n == 0:
+            self.all_centers_index = self._make_faiss_index(Quantize.NONE)
+            self._constructed = True
+            return self._log_volume_bounds()
+
+        self._train_quantizer(centers)
+
+        sphere_indices = np.arange(n, dtype=np.int64)
+        self._all_spheres[:n] = sphere_indices.astype(np.int32)
+        self._num_spheres = n
+        # construct_method measures radii against the true fp32 centers, so
+        # this is where those radii pick up their encoding error.
+        self._store_spheres(sphere_indices, centers, radii)
         self._constructed = True
 
         return self._log_volume_bounds()
@@ -313,6 +388,21 @@ class BallCoverFilter(Filter):
         if self._num_spheres == 0 or len(vectors) == 0:
             return [False] * len(vectors)
 
+        # Q goes in raw and is never encoded: both IndexPQ (search_type
+        # ST_PQ, pinned in _make_faiss_index) and IndexScalarQuantizer score
+        # with asymmetric distance computation, comparing the float32 query
+        # against the *decoded* stored codes. Verified to match an exact
+        # float64 ||q - decode(c)|| to 2e-6 at dim=32 and 2e-5 at dim=384 --
+        # float32 accumulation noise, well inside _COVERAGE_EPSILON.
+        #
+        # That is what makes the single-sided inflation in _store_spheres
+        # both correct and tight:
+        #     d(q, c) <= d(q, decode(c)) + ||c - decode(c)||
+        # so d(q, c) <= tau implies d(q, decode(c)) <= tau + error_c, and
+        # only the center side of the triangle inequality is lossy. Adding a
+        # query-side term on top would be over-inflation, pure false
+        # positives for no gain. (For reference, if the query *were* encoded,
+        # SQ4 at dim=384 would need another ~2.7 on every radius.)
         Q = np.ascontiguousarray(vectors, dtype=np.float32)
         # The raw ID-mapped index, not the unwrapped inner one -- the latter
         # returns labels keyed by insertion position, which stops matching
@@ -323,35 +413,61 @@ class BallCoverFilter(Filter):
         return (surface.min(axis=1) <= distance_threshold + self._COVERAGE_EPSILON).tolist()
 
     def insert(self, vectors: np.ndarray) -> None:
+        """Streaming insertion into an already-constructed filter. Nothing is
+        retrained and nothing is rebuilt: whatever centers the strategy
+        leaves behind are encoded once, with construct()'s codebook, and
+        written straight into the index.
+
+        insert_method strategies mutate _all_centers/_all_radiuses/
+        _all_spheres in place, so the sync below is by sphere id: ids whose
+        center the strategy actually changed (relocated, merged, or newly
+        allocated) get re-encoded and re-inflated; ids it only grew the
+        radius of are left alone, because a radius measured against an
+        already-decoded center needs no inflation; ids it retired are dropped
+        from the index."""
         if not self._constructed:
-            self.construct(vectors)
-            return
+            raise ValueError(
+                "BallCoverFilter.insert() requires a constructed filter -- call construct() first. "
+                "insert() reuses the codebook and PQ nbits that construct() fixed, and has no "
+                "centers to fit them from on its own."
+            )
 
         if len(vectors) == 0:
             return
 
-        # Must check BOTH the sphere-id set and the center values -- neither
-        # alone is sufficient, since strategies key bookkeeping differently:
-        # MinHeapInsert tracks by id but can leave a merged ball's value
-        # bit-identical to some other (now-discarded) id's old value, so a
-        # value-only check misses the id change; ExhaustiveMergeInsert tracks
-        # purely positionally, so its id set never changes even when values
-        # do, and an id-only check misses that. Either false negative leaves
-        # the FAISS index silently stale until a later, unrelated insertion
-        # forces a refetch.
-        old_spheres = set(self.all_spheres.tolist())
-        old_centers = self.all_centers.copy()
+        prev_ids = self.all_spheres.copy()
+        # Materializes the _all_centers cache the strategies write through.
+        prev_centers = self.all_centers.copy()
+
         self.insert_method.insert(self, vectors)
-        new_spheres = set(self.all_spheres.tolist())
-        new_centers = self.all_centers
 
-        spheres_changed = old_spheres != new_spheres
-        values_changed = len(old_centers) != len(new_centers) or not np.array_equal(old_centers, new_centers)
+        new_ids = self.all_spheres.copy()
+        new_centers = self._all_centers[new_ids]
 
-        if spheres_changed or values_changed:
-            self._rebuild_from_centers(self.all_spheres, self.all_centers, self.all_radiuses)
-        else:
-            self._all_centers = None
+        # Position of each still-active id in the pre-insert snapshot, -1 for
+        # ids the strategy newly allocated.
+        prev_pos = np.full(len(self._all_radiuses), -1, dtype=np.int64)
+        prev_pos[prev_ids] = np.arange(len(prev_ids), dtype=np.int64)
+        pos = prev_pos[new_ids]
+
+        unchanged = pos >= 0
+        if unchanged.any():
+            unchanged[unchanged] = np.all(
+                new_centers[unchanged] == prev_centers[pos[unchanged]], axis=1
+            )
+        changed = ~unchanged
+
+        alive = np.zeros(len(self._all_radiuses), dtype=bool)
+        alive[new_ids] = True
+        self._drop_spheres(prev_ids[~alive[prev_ids]])
+
+        if changed.any():
+            changed_ids = new_ids[changed]
+            self._store_spheres(changed_ids, new_centers[changed], self._all_radiuses[changed_ids])
+
+        # Drop the cache so the next read comes back decoded, i.e. equal to
+        # what query() actually scores against.
+        self._all_centers = None
 
     def add(self, vectors: np.ndarray) -> None:
         self.insert(vectors)

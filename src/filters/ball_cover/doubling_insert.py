@@ -23,7 +23,7 @@ class DoublingInsert(InsertInterface):
     The rebuild can't call GonzalesConstruct directly: each active ball's
     own radius must carry into re-clustering as positional uncertainty (the
     points it covered could be anywhere within that radius) -- the same
-    reconstruction-error technique BallCoverFilter._build_quantizer uses for
+    reconstruction-error technique BallCoverFilter._store_spheres uses for
     quantized centers -- so the farthest-first selection is mirrored here
     with that one addition."""
 
@@ -127,7 +127,8 @@ class DoublingInsert(InsertInterface):
         filter._num_spheres = 0
         for center, radius in zip(new_centers, new_radii):
             self.add_sphere(filter, center, radius)
-        filter._rebuild_from_centers(filter.all_spheres, filter.all_centers, filter.all_radiuses)
+        # No index work here: BallCoverFilter.insert() encodes whatever
+        # centers this left in _all_centers and retires the ids it dropped.
 
     @staticmethod
     def _exhaustive_search(centers: np.ndarray, queries: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:

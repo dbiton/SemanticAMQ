@@ -43,13 +43,13 @@ MAX_WORKERS = 8
 DATASET = 'ELI5'
 
 # How many vectors throughput-only sweeps (scaling, query_performance) pull.
-STREAM_SIZE = 10_000
+STREAM_SIZE = 10_00
 
 # Vectors/dataset for the paper's Workloads protocol (Section 5.1): "100K
 # queries per dataset, 80% construction / 20% queries". Kept separate from
 # STREAM_SIZE, which only affects the ground-truth FPR/FNR evaluations
 # (system_tau, quantization, equal_memory, streaming).
-WORKLOAD_NUM_VECTORS = 10_000
+WORKLOAD_NUM_VECTORS = 10_00
 
 # Registry name -> canonical dataset key, one source of truth via plot_common.
 DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
@@ -850,11 +850,11 @@ def generate_and_plot_all() -> None:
     except Exception:
         logger.exception("An error occurred")
     
-    '''
     try:
         generate_quantization(runner)
     except Exception:
         logger.exception("An error occurred")
+    '''
     try:
         generate_scaling(runner)
     except Exception:

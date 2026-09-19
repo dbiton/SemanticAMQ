@@ -360,7 +360,7 @@ def panel_n_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 def panel_radius_inflation(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     """Mean +/- stddev of each ball's radius inflation (the per-center
-    quantization reconstruction error BallCoverFilter._build_quantizer adds
+    quantization reconstruction error BallCoverFilter._store_spheres adds
     to preserve the no-false-negative guarantee -- see all_radius_inflation).
     Unlike other panels' seed-CI error bars, mean/std here are collapsed
     *across balls* within one job, so the error bars show ball-to-ball

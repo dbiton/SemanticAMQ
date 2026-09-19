@@ -26,13 +26,28 @@ def get_insertion_strategies():
     }
 
 
+def _seed(f: BallCoverFilter, centers: np.ndarray, radii: np.ndarray) -> None:
+    """Puts an explicit ball set into `f` the way construct() would -- fit the
+    codebook on the centers, then store them once (which is where radii pick
+    up their encoding error). Mirrors BallCoverFilter.construct() minus the
+    construct_method, so these tests exercise the real invariants."""
+    centers = np.ascontiguousarray(centers, dtype=np.float32)
+    n = len(centers)
+    f._ensure_capacity(max(n, 1))
+    f._train_quantizer(centers)
+    ids = np.arange(n, dtype=np.int64)
+    f._all_spheres[:n] = ids.astype(np.int32)
+    f._num_spheres = n
+    f._all_centers = None
+    f._store_spheres(ids, centers, radii)
+    f._constructed = True
+
+
 def run_insert(insert_method: InsertInterface, centers: np.ndarray, radii: np.ndarray, new_vectors: np.ndarray, max_count_balls: int):
     """Helper to bridge the old functional tests to the new BallCoverFilter OOP design."""
     safe_budget = max(0, max_count_balls)
     f = BallCoverFilter(dim=DIM, insert_method=insert_method, max_spheres=safe_budget, quantize=Quantize.NONE)
-    if len(centers) > 0:
-        f._rebuild_from_centers(np.arange(len(centers)), centers, radii)
-    f._constructed = True
+    _seed(f, centers, radii)
     f.insert(new_vectors)
     return f.all_centers, f.all_radiuses
 
@@ -168,8 +183,7 @@ class TestNoRelocationStrategies(unittest.TestCase):
         new_vectors = _rand(6, seed=14)
         for name, strategy in [('nearest', NearestInsert()), ('least_inflation', LeastInflationInsert())]:
             f = BallCoverFilter(dim=DIM, insert_method=strategy, max_spheres=40, quantize=Quantize.NONE)
-            f._rebuild_from_centers(np.arange(len(centers)), centers, radii)
-            f._constructed = True
+            _seed(f, centers, radii)
             
             old_centers = f.all_centers
             strategy.insert(f, new_vectors)

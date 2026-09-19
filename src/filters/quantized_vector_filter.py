@@ -7,7 +7,7 @@ size at which BallCoverFilter's geometric summary wins over storing
 (compressed) points directly.
 
 Zero-false-negative by the same triangle-inequality argument
-BallCoverFilter._build_quantizer uses: d(q,x) <= tau implies
+BallCoverFilter._store_spheres uses: d(q,x) <= tau implies
 d(q,x_hat) <= tau + ||x - x_hat||, so accepting whenever
 d(q, x_hat_i) <= tau + eps_i, with eps_i the *measured* reconstruction error
 (never a probabilistic bound), can never produce a false negative.
