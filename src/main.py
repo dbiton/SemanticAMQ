@@ -893,7 +893,7 @@ def plot_all() -> None:
         logger.exception("An error occurred")
 
     try:
-        # keep_default_na=False: Quantize.NONE.value == "None", which pandas
+        # keep_default_na=False: stage/config strings are read verbatim; pandas
         # would otherwise read back as NaN (see plot_quantization.py::load_data()).
         df = pd.read_csv(QUANTIZATION_CSV, keep_default_na=False)
         plot_quantization(df)

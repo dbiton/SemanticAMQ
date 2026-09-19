@@ -36,24 +36,27 @@ EMIT_PDF = False
 # (stage="ball"); every other entry shares that cover's memory budget
 # (stage="quantizing"), so a more compact code packs more balls into it.
 QUANTIZE_SWEEP = (
-    Quantize.NONE, Quantize.SQ8, Quantize.SQ4,
-    Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.PQ,
+    Quantize.FP32, Quantize.FP16, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
+    Quantize.TQ3, Quantize.PQ4_R2, Quantize.PQ8_R2, Quantize.PQ4_R1, Quantize.RABITQ,
 )
 STAGES = [q.value for q in QUANTIZE_SWEEP]
 STAGE_LABELS = {
-    Quantize.NONE.value: "None",
-    Quantize.SQ8.value: "SQ8",
-    Quantize.SQ4.value: "SQ4",
-    Quantize.FP16.value: "FP16",
-    Quantize.BF16.value: "BF16",
-    Quantize.SQ4T.value: "SQ4-T",
-    Quantize.SQ8T.value: "SQ8-T",
-    Quantize.PQ.value: "PQ",
+    # Labelled by rate so the ladder reads in bits/dim order on an axis.
+    Quantize.FP32.value: "fp32 (32b)",
+    Quantize.FP16.value: "fp16 (16b)",
+    Quantize.SQ8.value: "SQ8 (8b)",
+    Quantize.SQ6.value: "SQ6 (6b)",
+    Quantize.SQ4.value: "SQ4 (4b)",
+    Quantize.TQ3.value: "TQ3 (3b)",
+    Quantize.PQ4_R2.value: "PQ4 (2b)",
+    Quantize.PQ8_R2.value: "PQ8 (2b)",
+    Quantize.PQ4_R1.value: "PQ4 (1b)",
+    Quantize.RABITQ.value: "RaBitQ (1b)",
 }
 # Reference stage for the two relative-objective panels: the raw/unquantized
 # cover, matching the "reduction relative to the ball cover" reading the
 # panels had before per-quantize breakdown existed.
-BASELINE_STAGE = Quantize.NONE.value
+BASELINE_STAGE = Quantize.FP32.value
 
 # tab10 has 10 qualitative colors; 10 quantize variants use exactly all of them.
 _STAGE_PALETTE = plt.get_cmap("tab10").colors
@@ -150,7 +153,7 @@ def load_data() -> pd.DataFrame:
     if INPUT_PATH.endswith(".parquet"):
         df = pd.read_parquet(INPUT_PATH)
     else:
-        # keep_default_na=False: Quantize.NONE.value == "None", which pandas'
+        # keep_default_na=False: stage/config strings are read verbatim; pandas'
         # default na_values list otherwise silently reads back as NaN,
         # corrupting the quantize column into a mixed float/str dtype.
         df = pd.read_csv(INPUT_PATH, keep_default_na=False)
@@ -364,7 +367,7 @@ def panel_radius_inflation(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     to preserve the no-false-negative guarantee -- see all_radius_inflation).
     Unlike other panels' seed-CI error bars, mean/std here are collapsed
     *across balls* within one job, so the error bars show ball-to-ball
-    spread, not seed variance. Quantize.NONE has zero inflation by
+    spread, not seed variance. Quantize.FP32 has zero inflation by
     construction, drawing as a flat reference line at 0."""
     mean_agg = aggregate(df, "radius_inflation_mean", cfg, use_tau=False)
     std_agg = aggregate(df, "radius_inflation_std", cfg, use_tau=False)
@@ -394,7 +397,7 @@ def panel_radius_inflation(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     ax.xaxis.set_major_formatter(LogFormatterMathtext(base=2.0))
 
     # Log y: inflation spans orders of magnitude across quantize variants.
-    # Quantize.NONE's identically-0 inflation has no representation on a log
+    # Quantize.FP32's identically-0 inflation has no representation on a log
     # axis, so its line silently drops off rather than plotting at y=0.
     ax.set_yscale("log")
     ax.yaxis.set_major_locator(LogLocator(base=10.0))

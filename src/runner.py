@@ -98,7 +98,7 @@ _DIRECT_TAU_FILTERS = {
 }
 
 
-def _ball_cover_max_memory(dim: int, k: int, quantize: Quantize = Quantize.NONE) -> int:
+def _ball_cover_max_memory(dim: int, k: int, quantize: Quantize = Quantize.FP32) -> int:
     """BallCoverFilter sizes its ball budget from a byte budget (max_memory),
     not a raw ball count -- this converts a desired count k into the
     max_memory that yields exactly k balls for the given quantize type."""
@@ -115,7 +115,7 @@ class _BallCoverFilterEvalAdapter:
     def __init__(self, dim: int, max_memory: int, distance_threshold: float,
                  max_spheres: Optional[int] = None, insert_mem_percent: Optional[float] = 0.0, **extra_kwargs: Any) -> None:
         self.distance_threshold = distance_threshold
-        quantize = extra_kwargs.get("quantize", Quantize.NONE)
+        quantize = extra_kwargs.get("quantize", Quantize.FP32)
         if max_spheres is not None:
             max_memory = _ball_cover_max_memory(dim, max_spheres, quantize)
         self._filt = BallCoverFilter(dim=dim, max_memory=max_memory, max_spheres=max_spheres, 
@@ -343,8 +343,8 @@ def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, flo
 # NONE is the raw/unquantized baseline point in this sweep (tagged
 # stage="ball"): one "ball" cover to compare every real quantizer against.
 QUANTIZATION_SWEEP = (
-    Quantize.NONE, Quantize.SQ8, Quantize.SQ4,
-    Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.PQ,
+    Quantize.FP32, Quantize.FP16, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
+    Quantize.TQ3, Quantize.PQ4_R2, Quantize.PQ8_R2, Quantize.PQ4_R1, Quantize.RABITQ,
 )
 
 
@@ -364,7 +364,7 @@ def quantization_worker(
     evaluates it at every tau. Returns one row per tau, tagged
     stage="ball"/"quantizing".
 
-    max_memory is derived from k using Quantize.NONE's byte-per-ball size and
+    max_memory is derived from k using Quantize.FP32's byte-per-ball size and
     held fixed across every quantize candidate, so a more compact code packs
     more balls into the same budget -- a quantizer compact enough to
     saturate at n_construct balls before using the full budget (e.g. PQ)
@@ -386,11 +386,11 @@ def quantization_worker(
             )
 
     actual_by_tau = {t: np.asarray(a, dtype=bool) for t, a in actual_results_by_tau.items()}
-    stage = "ball" if quantize == Quantize.NONE else "quantizing"
+    stage = "ball" if quantize == Quantize.FP32 else "quantizing"
 
     rows: List[Dict[str, Any]] = []
 
-    max_memory = _ball_cover_max_memory(dim, k, Quantize.NONE)
+    max_memory = _ball_cover_max_memory(dim, k, Quantize.FP32)
     t0 = time.perf_counter()
     try:
         filt = BallCoverFilter(dim=dim, max_memory=max_memory, quantize=quantize)

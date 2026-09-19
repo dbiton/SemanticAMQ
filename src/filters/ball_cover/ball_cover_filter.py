@@ -1,6 +1,7 @@
 import numpy as np
 import faiss
 import sys
+from dataclasses import dataclass
 from enum import Enum
 from typing import List, Tuple, Optional
 from hyperspheres_volume import estimate_hypersphere_volume
@@ -13,45 +14,106 @@ from filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
 
 
 class Quantize(Enum):
-    NONE = "None"
-    BF16 = "SQbf16"
-    FP16 = "SQfp16"
+    """Center encodings, one per rung of a bits-per-dimension ladder. Byte
+    figures are for dim=384 (this project's sweep dimension):
+
+      b/dim  member   encoding                     center B   codebook
+        32   FP32     raw float32                      1536   0
+        16   FP16     scalar fp16                       768   0
+         8   SQ8      scalar 8-bit                      384   3 KB
+         6   SQ6      scalar 6-bit                      288   3 KB
+         4   SQ4      scalar 4-bit                      192   3 KB
+         3   TQ3      rotation + TurboQuant 3-bit       144   60 B + seed
+         2   PQ4_R2   PQ, 4-bit subquantizers (m=192)    96   24 KB
+         2   PQ8_R2   PQ, 8-bit subquantizers (m=96)     96   384 KB
+         1   PQ4_R1   PQ, 4-bit subquantizers (m=96)     48   24 KB
+         1   RABITQ   rotation + RaBitQ                  56   seed only
+
+    Every ball also stores its radius as fp16, so a ball costs center + 2
+    bytes -- see bytes_per_ball().
+
+    Member names are dimension-independent: PQ4_R2 reads "4-bit
+    subquantizers at a 2 bit/dim rate", and the subquantizer count m is
+    derived from dim by _pq_m_for(), so the rates hold at any dimension that
+    admits them. The m values above are what dim=384 resolves to.
+    """
+    FP32 = "fp32"
+    NONE = "fp32"     # back-compat alias: FP32 *is* the unquantized baseline
+    FP16 = "fp16"
     SQ8 = "SQ8"
     SQ6 = "SQ6"
     SQ4 = "SQ4"
-    SQ4T = "SQ4_trained"
-    SQ8T = "SQ8_trained"
-    SQ2T = "SQ2_trained"
-    PQ = "PQ"
-
-PQ_MAX_NBITS = 8
+    TQ3 = "TQ3"
+    PQ4_R2 = "PQ4@2"
+    PQ8_R2 = "PQ8@2"
+    PQ4_R1 = "PQ4@1"
+    RABITQ = "RaBitQ"
 
 
 class InsufficientMemoryError(ValueError):
-    """Raised when max_memory is too small to construct the requested
-    quantizer -- currently only reachable for Quantize.PQ, whose k-means
-    codebook training needs at least 2 ball centers for even a 1-bit
-    codebook (see BallCoverFilter._pq_nbits_for)."""
+    """Raised when max_memory cannot support the requested encoding at all --
+    either its fixed codebook alone exhausts the budget (PQ8_R2's 384 KB is
+    the one that bites), or there are too few ball centers to fit a codebook
+    to."""
 
 
-_QTYPES = {
-    Quantize.BF16: faiss.ScalarQuantizer.QT_bf16,
-    Quantize.FP16: faiss.ScalarQuantizer.QT_fp16,
-    Quantize.SQ8: faiss.ScalarQuantizer.QT_8bit,
-    Quantize.SQ6: faiss.ScalarQuantizer.QT_6bit,
-    Quantize.SQ4: faiss.ScalarQuantizer.QT_4bit,
-    Quantize.SQ4T: faiss.ScalarQuantizer.QT_4bit_tqmse,
-    Quantize.SQ8T: faiss.ScalarQuantizer.QT_8bit_tqmse,
-    # No plain (min-max) QT_2bit exists in faiss -- 2 bits/component is only
-    # available as the MSE-trained TurboQuant variant, so SQ2T has no
-    # untrained SQ2 counterpart the way SQ4T/SQ8T do.
-    Quantize.SQ2T: faiss.ScalarQuantizer.QT_2bit_tqmse,
+@dataclass(frozen=True)
+class _Encoding:
+    """How one Quantize member maps onto faiss."""
+    rate: int                      # target bits per dimension
+    kind: str                      # "flat" | "sq" | "pq" | "rabitq"
+    qtype: Optional[int] = None    # ScalarQuantizer.QT_* -- kind == "sq"
+    nbits: int = 0                 # bits per subquantizer -- kind == "pq"
+    rotate: bool = False           # see _ROTATION_SEED
+
+
+# An orthonormal rotation in front of the quantizer. Orthonormal is the
+# load-bearing word: it preserves every L2 distance, so radii, the measured
+# encoding error and query()'s triangle-inequality argument all carry over
+# unchanged -- the rotation is invisible to the geometry and only changes how
+# energy is spread across coordinates before it is quantized.
+#
+# Applied only where it measurably pays. Measured on this project's real
+# embeddings (msmarco/nq/quora_qp, dim=384, unit norm), reconstruction error
+# over 1024 ball centers:
+#
+#                    mean               p99              max
+#     TurboQuant3   0.18808 -> 0.18508  0.21796 -> 0.21404  0.25265 -> 0.23092
+#     RaBitQ        0.76208 -> 0.74719  0.82933 -> 0.81938  0.86208 -> 0.85356
+#     PQ, plain SQ  no change (they already adapt per subspace or per
+#                   dimension, so there is nothing for a rotation to even out)
+#
+# Modest on the mean (~2%) but worth it on the tail (TurboQuant3's worst ball
+# improves 8.6%), and it is free at query time: the rotation is one batched
+# GEMM amortised over the ADC scan, and measured query throughput did not
+# drop. Note that an earlier synthetic benchmark put the gain at 23%; that
+# used deliberately anisotropic data and overstated it badly. Unit-norm
+# embeddings are far closer to isotropic, so there is much less for a
+# rotation to fix -- always re-measure this on real data.
+_ROTATION_SEED = 0x5EED
+_ROTATION_SEED_BYTES = 4
+
+
+_ENCODINGS = {
+    Quantize.FP32: _Encoding(rate=32, kind="flat"),
+    Quantize.FP16: _Encoding(rate=16, kind="sq", qtype=faiss.ScalarQuantizer.QT_fp16),
+    Quantize.SQ8: _Encoding(rate=8, kind="sq", qtype=faiss.ScalarQuantizer.QT_8bit),
+    Quantize.SQ6: _Encoding(rate=6, kind="sq", qtype=faiss.ScalarQuantizer.QT_6bit),
+    Quantize.SQ4: _Encoding(rate=4, kind="sq", qtype=faiss.ScalarQuantizer.QT_4bit),
+    # QT_3bit_tqmse is the MSE-trained TurboQuant variant; there is no plain
+    # (min-max) 3-bit scalar quantizer in faiss to compare it against.
+    Quantize.TQ3: _Encoding(rate=3, kind="sq", qtype=faiss.ScalarQuantizer.QT_3bit_tqmse, rotate=True),
+    Quantize.PQ4_R2: _Encoding(rate=2, kind="pq", nbits=4),
+    Quantize.PQ8_R2: _Encoding(rate=2, kind="pq", nbits=8),
+    Quantize.PQ4_R1: _Encoding(rate=1, kind="pq", nbits=4),
+    Quantize.RABITQ: _Encoding(rate=1, kind="rabitq", rotate=True),
 }
 
 
 class BallCoverFilter(Filter):
     _BYTES_PER_FLOAT32 = 4
     _BYTES_PER_FLOAT64 = 8
+    _BYTES_PER_FLOAT16 = 2
 
     # Coverage-comparison safety margin: FAISS's IndexFlatL2.search() isn't
     # bit-reproducible across different query-batch shapes, so a ball whose
@@ -86,13 +148,12 @@ class BallCoverFilter(Filter):
         self.construct_method = construct_method if construct_method is not None else GonzalesConstruct()
         self.insert_method = insert_method if insert_method is not None else NearestInsert()
         self.insert_memory_percent = insert_memory_percent
-        # Codebook state. Both are fixed once, by construct(), and never
-        # retrained: insert() encodes new centers with whatever construct()
-        # fit. Retraining would re-encode every stored center under a new
-        # codebook while their radii still carry the old codebook's
-        # inflation -- and the unquantized centers needed to recompute that
-        # inflation no longer exist.
-        self._pq_nbits: Optional[int] = None
+        # The codebook is fitted once, by construct(), and never retrained:
+        # insert() encodes new centers with whatever construct() fit.
+        # Retraining would re-encode every stored center under a new codebook
+        # while their radii still carry the old codebook's inflation -- and
+        # the unquantized centers needed to recompute that inflation no
+        # longer exist.
         self.all_centers_index = self._make_faiss_index(self.quantize)
         self.max_spheres = (max_spheres if max_spheres is not None 
                     else self._calculate_max_spheres(self.max_memory))
@@ -171,7 +232,6 @@ class BallCoverFilter(Filter):
         # Back to an untrained index: construct() has to run again to refit
         # the codebook before any sphere can be stored.
         self.all_centers_index = self._make_faiss_index(self.quantize)
-        self._pq_nbits = None
         self._constructed = False
         self.insert_method.reset_buffers(capacity)
 
@@ -193,25 +253,47 @@ class BallCoverFilter(Filter):
         return max(1, int(self.max_spheres * (1.0 - insertion_memory_percent / 100.0)))
 
     @staticmethod
-    def _choose_pq_m(dim: int) -> int:
-        for m in range(dim, 0, -1):
+    def _pq_m_for(dim: int, rate: int, nbits: int) -> int:
+        """Subquantizer count hitting `rate` bits/dim with `nbits`-bit codes:
+        m = dim * rate / nbits, snapped *down* to a divisor of dim (faiss
+        requires dim % m == 0, and rounding down can only come in under the
+        byte budget, never over). At dim=384 this gives the table's m: 192
+        for PQ4_R2, 96 for PQ8_R2 and PQ4_R1."""
+        target = min((dim * rate) // nbits, dim)
+        for m in range(target, 0, -1):
             if dim % m == 0:
                 return m
-        return 1
+        raise InsufficientMemoryError(
+            f"No valid PQ subquantizer count for dim={dim} at {rate} bit(s)/dim "
+            f"with {nbits}-bit codes."
+        )
 
     @staticmethod
-    def _pq_nbits_for(n: int) -> Optional[int]:
-        nbits = 0
-        while nbits < PQ_MAX_NBITS and (1 << (nbits + 1)) <= n:
-            nbits += 1
-        return nbits if nbits >= 1 else None
+    def _fp16_ceil(radii: np.ndarray) -> np.ndarray:
+        """Rounds each radius up to the nearest fp16 value, so the 2 bytes
+        bytes_per_ball() charges for it are honest.
 
-    def _make_faiss_index(self, quantize: Quantize, pq_nbits: int = PQ_MAX_NBITS) -> faiss.IndexIDMap2:
-        if quantize == Quantize.NONE:
-            index = faiss.IndexFlatL2(self.dim)
-        elif quantize == Quantize.PQ:
-            pq_m = self._choose_pq_m(self.dim)
-            index = faiss.IndexPQ(self.dim, pq_m, pq_nbits, faiss.METRIC_L2)
+        Up, never to-nearest: a radius that shrinks even by one ulp can drop
+        a point the ball was covering, which is a false negative. Rounding up
+        only ever over-covers. Radii past fp16's 65504 become +inf, which
+        over-covers absolutely and is still sound. Idempotent, so re-applying
+        it on every insert costs nothing."""
+        with np.errstate(over="ignore"):
+            half = radii.astype(np.float16)
+        up = np.nextafter(half, np.float16(np.inf))
+        return np.where(half.astype(np.float32) < radii, up, half).astype(np.float32)
+
+    def _make_faiss_index(self, quantize: Quantize) -> faiss.IndexIDMap2:
+        spec = _ENCODINGS[quantize]
+
+        if spec.kind == "flat":
+            return faiss.IndexIDMap2(faiss.IndexFlatL2(self.dim))
+
+        if spec.kind == "sq":
+            index = faiss.IndexScalarQuantizer(self.dim, spec.qtype, faiss.METRIC_L2)
+        elif spec.kind == "pq":
+            m = self._pq_m_for(self.dim, spec.rate, spec.nbits)
+            index = faiss.IndexPQ(self.dim, m, spec.nbits, faiss.METRIC_L2)
             # ST_PQ is asymmetric distance computation (ADC): the raw float32
             # query is scored against the *decoded* stored codes, so the query
             # is never encoded. That is what makes the one-sided radius
@@ -221,39 +303,96 @@ class BallCoverFilter(Filter):
             assert index.search_type == faiss.IndexPQ.ST_PQ, (
                 f"BallCoverFilter requires ADC (ST_PQ); got search_type={index.search_type}"
             )
+        elif spec.kind == "rabitq":
+            index = faiss.IndexRaBitQ(self.dim, faiss.METRIC_L2)
         else:
-            index = faiss.IndexScalarQuantizer(self.dim, _QTYPES[quantize], faiss.METRIC_L2)
+            raise ValueError(f"Unknown encoding kind {spec.kind!r} for {quantize}")
+
+        if spec.rotate:
+            index = faiss.IndexPreTransform(self._make_rotation(self.dim), index)
+
         return faiss.IndexIDMap2(index)
 
+    @staticmethod
+    def _make_rotation(dim: int) -> faiss.VectorTransform:
+        """faiss.HadamardRotation is the better transform wherever it applies:
+        same fidelity as a random rotation (measured identical to 3 decimals
+        on real embeddings at dim=512), ~25% cheaper to apply, and it stores
+        three sign vectors -- 6 KB at dim=512 -- rather than a dense d*d
+        matrix, 1 MB at the same dimension.
+
+        But it rounds d_out up to a power of two, and faiss refuses to invert
+        it when d_out != d_in ("HadamardRotation inverse requires equal
+        input/output dimensions"). That breaks sa_decode and reconstruct_batch,
+        which this filter needs for _encoding_error and all_centers. At
+        dim=384 it would also pad to 512 and inflate TQ3's code from 144 to
+        192 bytes, breaking the 3 b/dim rate outright -- and padding then
+        costs *more* accuracy than the rotation recovers (err 0.18590 at
+        192 B padded, against 0.18808 at 144 B unpadded).
+
+        So: Hadamard at power-of-two dimensions, RandomRotationMatrix
+        elsewhere -- which is what dim=384 gets.
+
+        Both are seeded explicitly rather than left to train(): a seeded
+        rotation is already is_trained, so IndexPreTransform.train() leaves it
+        alone. That makes the filter reproducible and lets _codebook_bytes()
+        charge 4 bytes for the seed rather than the matrix it expands to.
+        """
+        rotation = faiss.HadamardRotation(dim)
+        if rotation.d_out != dim:
+            rotation = faiss.RandomRotationMatrix(dim, dim)
+        rotation.init(_ROTATION_SEED)
+        return rotation
+
+    def _coder(self) -> faiss.Index:
+        """The level that owns sa_encode/sa_decode: the pre-transform wrapper
+        when there is one, so encoding applies the rotation and decoding
+        undoes it. Never the leaf -- encoding at the leaf would skip the
+        rotation and decode into the wrong basis."""
+        return faiss.downcast_index(self.all_centers_index.index)
+
+    def _leaf_index(self) -> faiss.Index:
+        """The quantizer itself, past any pre-transform -- for reading .pq /
+        .sq / RaBitQ model parameters."""
+        index = self._coder()
+        if isinstance(index, faiss.IndexPreTransform):
+            return faiss.downcast_index(index.index)
+        return index
+
     def bytes_per_ball(self) -> int:
-        index = self.all_centers_index
-        if isinstance(index, faiss.IndexIDMap2):
-            index = faiss.downcast_index(self.all_centers_index.index)
-        if isinstance(index, faiss.IndexPQ):
-            return index.pq.code_size + self._BYTES_PER_FLOAT32
-        if isinstance(index, faiss.IndexScalarQuantizer):
-            return index.sq.code_size + self._BYTES_PER_FLOAT32
-        return (self.dim + 1) * self._BYTES_PER_FLOAT32
+        """Encoded center + fp16 radius. sa_code_size() is well defined
+        before training and through a pre-transform, so this is callable at
+        __init__ time, when the memory budget is turned into a ball count."""
+        return self._coder().sa_code_size() + self._BYTES_PER_FLOAT16
 
     def _codebook_bytes(self) -> int:
-        index = self.all_centers_index
-        if isinstance(index, faiss.IndexIDMap2):
-            index = faiss.downcast_index(self.all_centers_index.index)
+        """Fixed, per-filter cost that does not scale with the ball count."""
+        total = _ROTATION_SEED_BYTES if _ENCODINGS[self.quantize].rotate else 0
+        index = self._leaf_index()
+
         if isinstance(index, faiss.IndexPQ):
-            return int(faiss.vector_to_array(index.pq.centroids).nbytes)
-        if isinstance(index, faiss.IndexScalarQuantizer):
+            # Computed from the layout, not from pq.centroids.nbytes, which
+            # reads 0 until the index is trained -- and __init__ sizes the
+            # ball budget against an untrained one.
+            pq = index.pq
+            total += int(pq.M) * (1 << int(pq.nbits)) * int(pq.dsub) * self._BYTES_PER_FLOAT32
+        elif isinstance(index, faiss.IndexScalarQuantizer):
             trained = faiss.vector_to_array(index.sq.trained)
             if len(trained) == 0:
                 probe = faiss.IndexScalarQuantizer(self.dim, index.sq.qtype, faiss.METRIC_L2)
-                # Use random probes to avoid crashing MSE-trained quantizer training loops
+                # Random probes, not zeros: the MSE-trained (TurboQuant)
+                # variants divide through by the spread while training.
                 probe.train(np.random.rand(2, self.dim).astype(np.float32))
                 trained = faiss.vector_to_array(probe.sq.trained)
-            return int(trained.nbytes)
-        return 0
+            total += int(trained.nbytes)
+        elif isinstance(index, faiss.IndexRaBitQ) and index.centered:
+            total += int(faiss.vector_to_array(index.center).nbytes)
+
+        return total
 
     def _train_quantizer(self, centers: np.ndarray) -> None:
         """Fits the one codebook this filter will ever use, on the ball
-        centers themselves, and fixes PQ's nbits. Called exactly once, by
+        centers themselves. Called exactly once, by
         construct().
 
         Trained on `centers`, not on the construct set, because the centers
@@ -268,41 +407,50 @@ class BallCoverFilter(Filter):
         per center) into ~1.8 mean error. All of that lands on every radius
         as inflation, and so straight on the false-positive rate.
 
-        nbits is chosen here, from the construct-time center count, and
-        frozen: it sets pq.code_size, hence bytes_per_ball() and the
-        codebook size, so letting it move later would make the filter's
-        memory footprint jump mid-stream.
+        The encoding's rate fixes the code size up front (see _ENCODINGS),
+        so unlike the codebook's *contents*, nothing about the filter's byte
+        footprint depends on what this sees -- only its fidelity does.
         """
-        if self.quantize == Quantize.NONE:
-            self.all_centers_index = self._make_faiss_index(Quantize.NONE)
+        if _ENCODINGS[self.quantize].kind == "flat":
+            self.all_centers_index = self._make_faiss_index(self.quantize)
             return
 
-        if self.quantize == Quantize.PQ:
-            # Must be checked before the index is constructed: IndexPQ.search
-            # segfaults if built with nbits=0.
-            self._pq_nbits = self._pq_nbits_for(len(centers))
-            if self._pq_nbits is None:
-                raise InsufficientMemoryError(
-                    f"Not enough memory to construct a PQ index: {len(centers)} ball "
-                    "center(s) is too few for even a 1-bit codebook (need >= 2 centers, "
-                    "which requires a larger max_memory or a smaller ball budget)."
-                )
-            index = self._make_faiss_index(self.quantize, pq_nbits=self._pq_nbits)
-            faiss.downcast_index(index.index).pq.cp.min_points_per_centroid = 1
-        else:
-            index = self._make_faiss_index(self.quantize)
+        if len(centers) < 2:
+            raise InsufficientMemoryError(
+                f"Not enough memory to fit a {self.quantize.value} codebook: {len(centers)} ball "
+                "center(s) is too few to train on (need >= 2, which requires a larger "
+                "max_memory or a smaller ball budget)."
+            )
+
+        index = self._make_faiss_index(self.quantize)
+        leaf = faiss.downcast_index(index.index)
+        if isinstance(leaf, faiss.IndexPreTransform):
+            leaf = faiss.downcast_index(leaf.index)
+        if isinstance(leaf, faiss.IndexPQ):
+            # k-means over ball centers, of which there are usually far fewer
+            # than the 39 * ksub faiss would like. The codebook is allowed to
+            # come out under-filled rather than refusing to build.
+            leaf.pq.cp.min_points_per_centroid = 1
 
         index.train(centers)
         self.all_centers_index = index
 
+        if self.max_memory is not None and self._codebook_bytes() + self.bytes_per_ball() > self.max_memory:
+            raise InsufficientMemoryError(
+                f"max_memory={self.max_memory} bytes cannot hold a {self.quantize.value} filter: its "
+                f"fixed codebook alone is {self._codebook_bytes()} bytes, leaving no room for even "
+                f"one {self.bytes_per_ball()}-byte ball."
+            )
+
     def _encoding_error(self, centers: np.ndarray) -> np.ndarray:
         """Per-center ||c - decode(encode(c))||, measured against the trained
         codebook -- never a probabilistic bound. sa_encode/sa_decode are used
-        as the uniform binding fallback across index types."""
-        if self.quantize == Quantize.NONE:
+        as the uniform binding fallback across index types, and at the _coder()
+        level so a rotation is applied on encode and undone on decode."""
+        if _ENCODINGS[self.quantize].kind == "flat":
             return np.zeros(len(centers), dtype=np.float32)
-        base = faiss.downcast_index(self.all_centers_index.index)
-        decoded = base.sa_decode(base.sa_encode(centers))
+        coder = self._coder()
+        decoded = coder.sa_decode(coder.sa_encode(centers))
         return np.linalg.norm(centers - decoded, axis=1).astype(np.float32)
 
     def _store_spheres(self, sphere_indices: np.ndarray, centers: np.ndarray, radii: np.ndarray) -> None:
@@ -331,7 +479,7 @@ class BallCoverFilter(Filter):
         if self.all_centers_index.ntotal > 0:
             self.all_centers_index.remove_ids(faiss.IDSelectorBatch(sphere_indices))
         self.all_centers_index.add_with_ids(centers, sphere_indices)
-        self._all_radiuses[sphere_indices] = radii + error
+        self._all_radiuses[sphere_indices] = self._fp16_ceil(radii + error)
         self._radius_inflation[sphere_indices] = error
 
     def _drop_spheres(self, sphere_indices: np.ndarray) -> None:
@@ -365,7 +513,7 @@ class BallCoverFilter(Filter):
         self._radius_inflation[:] = 0.0
 
         if n == 0:
-            self.all_centers_index = self._make_faiss_index(Quantize.NONE)
+            self.all_centers_index = self._make_faiss_index(Quantize.FP32)
             self._constructed = True
             return self._log_volume_bounds()
 
@@ -464,6 +612,11 @@ class BallCoverFilter(Filter):
         if changed.any():
             changed_ids = new_ids[changed]
             self._store_spheres(changed_ids, new_centers[changed], self._all_radiuses[changed_ids])
+
+        # Strategies write raw float32 radii straight into _all_radiuses, so
+        # re-settle every active ball onto the fp16 grid bytes_per_ball()
+        # charges for. Idempotent, and only ever rounds up.
+        self._all_radiuses[new_ids] = self._fp16_ceil(self._all_radiuses[new_ids])
 
         # Drop the cache so the next read comes back decoded, i.e. equal to
         # what query() actually scores against.
