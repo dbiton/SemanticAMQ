@@ -1,17 +1,10 @@
-"""Generate the six quantization-figure panels (+ shared legend), plus one
-diagnostic FNR sanity-check panel not part of the paper figure set.
+"""Generates the six quantization-figure panels (+ shared legend), plus one
+diagnostic FNR sanity-check panel not part of the paper figure set, from a
+long-format results file (one row per (quantize, k, seed) on a single
+dataset -- see main.py::generate_quantization). Each panel: x-axis = memory
+usage (MB, log scale), one line per quantize method, single dataset.
 
-Reads a long-format results file (one row per (quantize, k, seed) on a
-single dataset -- see main.py::generate_quantization), aggregates over
-seeds, and writes PNG (optionally PDF) panels sized for a two-column
-`figure*`.
-
-Each panel: x-axis = memory usage (MB, log scale, driven by the k sweep --
-not exact for the most compact quantizers, see quantization_worker), one
-line per quantize method, single dataset.
-
-Edit the CONFIG block below to change parameters -- no CLI flags.
-"""
+Edit the CONFIG block below to change parameters -- no CLI flags."""
 
 from __future__ import annotations
 
@@ -30,9 +23,7 @@ from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 from filters.ball_cover.ball_cover_filter import Quantize
 from plots.plot_common import apply_style as _apply_style, save_figure
 
-# --------------------------------------------------------------------------- #
 # CONFIG
-# --------------------------------------------------------------------------- #
 
 INPUT_PATH = "results/quantization.csv"
 OUTDIR = "plots/quantization/"
@@ -40,13 +31,10 @@ TAU: Optional[float] = None  # None => median tau present in the data
 DPI = 400
 EMIT_PDF = False
 
-# runner.QUANTIZATION_SWEEP, mirrored here (rather than imported) so
-# this module has no dependency on runner.py's multiprocessing/harness
-# machinery -- just the Quantize enum both sides already agree on. NONE is
-# the raw/unquantized cover (tagged stage="ball" by quantization_worker); every
-# other entry is a real quantizer sharing that same cover's memory budget
-# (tagged stage="quantizing"), which is what makes the n-balls panel
-# meaningful: a more compact code packs more balls into the same budget.
+# Mirrors runner.QUANTIZATION_SWEEP (not imported, to avoid a dependency on
+# runner.py's multiprocessing machinery). NONE is the raw/unquantized cover
+# (stage="ball"); every other entry shares that cover's memory budget
+# (stage="quantizing"), so a more compact code packs more balls into it.
 QUANTIZE_SWEEP = (
     Quantize.NONE, Quantize.SQ8, Quantize.SQ4,
     Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.PQ,
@@ -84,9 +72,7 @@ class Config:
     outdir: str
 
 
-# --------------------------------------------------------------------------- #
 # Style
-# --------------------------------------------------------------------------- #
 
 def apply_style() -> None:
     _apply_style(DPI)
@@ -99,9 +85,7 @@ def _style_axes(ax: plt.Axes) -> None:
         ax.spines[spine].set_linewidth(0.5)
 
 
-# --------------------------------------------------------------------------- #
 # Data loading
-# --------------------------------------------------------------------------- #
 
 _REQUIRED_COLUMNS = [
     "dataset",
@@ -149,13 +133,9 @@ def _validate_schema(df: pd.DataFrame) -> None:
     present = set(df["quantize"].unique())
     missing_combos = [s for s in STAGES if s not in present]
     if missing_combos:
-        # Not fatal: quantization_worker skips (contributes zero rows for) a
-        # candidate whose construction raises -- e.g. PQ needs >= 2 ball
-        # centers for even a 1-bit codebook (InsufficientMemoryError), which
-        # a tight enough memory budget can make true at every k in the
-        # sweep. Every panel/aggregate() call already tolerates an absent
-        # stage by just not drawing/counting it, so this is a heads-up, not
-        # a schema violation.
+        # Not fatal: quantization_worker skips a candidate whose construction
+        # raises (e.g. PQ needing >= 2 ball centers); every panel already
+        # tolerates an absent stage by not drawing/counting it.
         print(f"Note: quantize value(s) {missing_combos} have no rows (skipped during "
               f"generation, e.g. InsufficientMemoryError) and won't be plotted. "
               f"Available: {sorted(present)}")
@@ -197,18 +177,14 @@ def resolve_config(
     return Config(tau=tau, dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
 
 
-# --------------------------------------------------------------------------- #
 # Aggregation
-# --------------------------------------------------------------------------- #
 
 def aggregate(df: pd.DataFrame, value_col: str, cfg: Config, use_tau: bool = False,
              stages: list = STAGES) -> pd.DataFrame:
     """Mean + 95% CI of `value_col` over seed, per (quantize, k) -- k is the
-    real sweep/grouping key (memory_bytes is deterministic given (k,
-    quantize), so grouping by k and separately averaging memory_bytes gives
-    the same result more robustly than grouping by a float column directly),
-    restricted to the given `stages` (quantize values) and, if `use_tau`, to
-    cfg.tau."""
+    real grouping key (memory_bytes is deterministic given (k, quantize), so
+    grouping by k and separately averaging memory_bytes is more robust than
+    grouping by a float column). Restricted to `stages` and, if `use_tau`, cfg.tau."""
     sel = df[df["quantize"].isin(stages)]
     if use_tau:
         sel = sel[sel["tau"] == cfg.tau]
@@ -230,29 +206,20 @@ def aggregate(df: pd.DataFrame, value_col: str, cfg: Config, use_tau: bool = Fal
     mem = grouped["memory_bytes"].mean().reset_index(name="memory_bytes")
     agg = agg.merge(mem, on=["quantize", "k"])
     agg["Memory (MB)"] = agg["memory_bytes"] / (1024 * 1024)
-
-    # A stage with zero rows here means every k in the sweep failed to
-    # construct that quantizer (see _validate_schema's note) -- not an
-    # error, just nothing to plot/summarize for it; every caller already
-    # skips an empty per-stage slice rather than assuming one exists.
     return agg
 
 
 def _relative_to_baseline(agg: pd.DataFrame) -> pd.DataFrame:
     """Subtracts BASELINE_STAGE's mean (at the same k) from every stage's
     mean, so each line reads as "how much does this quantizer cost/save
-    relative to the unquantized cover at the same memory budget" -- the
-    generalization of the old fixed-k bar chart's per-dataset baseline
-    subtraction to a k-swept line chart."""
+    relative to the unquantized cover at the same memory budget"."""
     base = agg[agg["quantize"] == BASELINE_STAGE][["k", "mean"]].rename(columns={"mean": "base_mean"})
     rel = agg.merge(base, on="k", how="left")
     rel["mean"] = rel["mean"] - rel["base_mean"]
     return rel.drop(columns="base_mean")
 
 
-# --------------------------------------------------------------------------- #
 # Generic line panel: x = memory usage, one line per quantize method
-# --------------------------------------------------------------------------- #
 
 def _line_panel(
     df: pd.DataFrame,
@@ -311,13 +278,12 @@ def _line_panel(
     if extra is not None:
         extra(ax)
 
+    _fix_margins(fig)
     _save(fig, filename, cfg)
     return agg
 
 
-# --------------------------------------------------------------------------- #
 # Panel (a): geometric objective reduction
-# --------------------------------------------------------------------------- #
 
 def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _line_panel(
@@ -326,9 +292,7 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     )
 
 
-# --------------------------------------------------------------------------- #
 # Panel (b): tau-expanded objective reduction
-# --------------------------------------------------------------------------- #
 
 def panel_threshold_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     def annotate(ax: plt.Axes) -> None:
@@ -344,91 +308,64 @@ def panel_threshold_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     )
 
 
-# --------------------------------------------------------------------------- #
 # Panel (c): false positive rate
-# --------------------------------------------------------------------------- #
 
 def panel_fpr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    # Linear, not log: FPR is legitimately 0 for many quantize/memory points
-    # (that's the desired outcome, unlike FNR's "should always be exactly 0"
-    # invariant), and a log axis can't represent 0 at all -- it used to need
-    # a floor-clipping hack to fake it. y-min pinned to 0 (FPR can't be
-    # negative) so the axis isn't misleadingly truncated; top auto-scales to
-    # the data.
+    # Linear, not log: FPR is legitimately 0 for many points (a log axis
+    # can't represent 0). y-min pinned to 0, top auto-scales.
     return _line_panel(
         df, "fpr", "FPR", "quantization-false-positive-rate.png", cfg,
         use_tau=True, y_bounds=(0, None),
     )
 
 
-# --------------------------------------------------------------------------- #
 # Panel (d): construction time
-# --------------------------------------------------------------------------- #
 
 def panel_construction_time(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    # stage_time_s == cum_time_s in quantization_worker (each row is a single
-    # from-scratch construction, not a multi-stage pipeline), so there's no
-    # separate "cumulative" series to overlay here the way the old bar panel
-    # did -- one line per quantize method is the whole picture.
+    # stage_time_s == cum_time_s in quantization_worker (single from-scratch
+    # construction per row), so one line per quantize method is the whole picture.
     return _line_panel(
         df, "cum_time_s", "Time (s)", "quantization-construction-time.png", cfg,
         use_tau=False, log_y=True,
     )
 
 
-# --------------------------------------------------------------------------- #
 # Panel (e): query throughput
-# --------------------------------------------------------------------------- #
 
 def panel_query_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """Batched-query throughput (queries/s) of filt.query() over the whole
-    query set, per quantize variant. Query cost doesn't conceptually depend
-    on tau (every ball is still checked regardless of threshold), so this
-    is averaged over the tau sweep (use_tau=False) the same way
-    panel_construction_time averages a per-construction, tau-independent
-    quantity -- log-scaled since a quantizer's decode overhead (e.g. PQ) can
-    separate lines by more than an order of magnitude from the raw/NONE
-    cover."""
+    """Batched-query throughput of filt.query(), per quantize variant. Query
+    cost doesn't depend on tau (every ball is checked regardless of
+    threshold), so this averages over the tau sweep -- log-scaled since a
+    quantizer's decode overhead (e.g. PQ) can separate lines by an order of
+    magnitude from the raw/NONE cover."""
     return _line_panel(
-        df, "query_throughput_qps", "Query Throughput (queries/s)",
+        df, "query_throughput_qps", "Throughput (q/s)",
         "quantization-query-throughput.png", cfg, use_tau=False, log_y=True,
     )
 
 
-# --------------------------------------------------------------------------- #
 # Panel (f): ball count per quantize variant
-# --------------------------------------------------------------------------- #
 
 def panel_n_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     """Realized ball count per quantize variant across the memory-usage
-    sweep. Unlike a per-level sweep -- where n_balls would always equal k
-    regardless of construction strategy -- this is genuinely informative
-    here: a quantizer with a smaller per-center code packs more balls into
-    the same budget, so at a given x (memory usage) the lines are expected to
-    separate, with PQ/SQ4 highest and None/FP16/BF16 lowest."""
+    sweep: a quantizer with a smaller per-center code packs more balls into
+    the same budget, so at a given x the lines are expected to separate,
+    with PQ/SQ4 highest and None/FP16/BF16 lowest."""
     return _line_panel(
         df, "n_balls", "Number of Balls", "quantization-n-balls.png", cfg, use_tau=False,
     )
 
 
-# --------------------------------------------------------------------------- #
 # Panel (g): radius inflation due to quantization
-# --------------------------------------------------------------------------- #
 
 def panel_radius_inflation(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """Mean +/- stddev of each ball's radius inflation -- the per-center
-    quantization reconstruction error (||center - decode(encode(center))||)
-    that _rebuild_from_centers adds onto that ball's radius to preserve the
-    no-false-negative guarantee under a lossy center encoding (see
-    BallCoverFilter._build_quantizer / all_radius_inflation). Unlike the
-    other panels, whose error bars are a 95% CI over seeds, the mean/std here
-    are already collapsed *across balls* inside a single job (one job per
-    (k, quantize, seed)); the error bars plotted are that per-ball stddev
-    (averaged over seeds, since only one seed is swept), not a seed CI --
-    seed averaging on top would otherwise hide the ball-to-ball spread that's
-    the actual quantity of interest. Quantize.NONE has zero inflation by
-    construction (no quantizer applied), so it draws as a flat line at 0 --
-    the reference every other quantizer's inflation is measured against."""
+    """Mean +/- stddev of each ball's radius inflation (the per-center
+    quantization reconstruction error BallCoverFilter._build_quantizer adds
+    to preserve the no-false-negative guarantee -- see all_radius_inflation).
+    Unlike other panels' seed-CI error bars, mean/std here are collapsed
+    *across balls* within one job, so the error bars show ball-to-ball
+    spread, not seed variance. Quantize.NONE has zero inflation by
+    construction, drawing as a flat reference line at 0."""
     mean_agg = aggregate(df, "radius_inflation_mean", cfg, use_tau=False)
     std_agg = aggregate(df, "radius_inflation_std", cfg, use_tau=False)
     std_agg = std_agg[["quantize", "k", "mean"]].rename(columns={"mean": "std"})
@@ -456,11 +393,9 @@ def panel_radius_inflation(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     ax.xaxis.set_major_locator(LogLocator(base=2.0))
     ax.xaxis.set_major_formatter(LogFormatterMathtext(base=2.0))
 
-    # Log y: inflation spans orders of magnitude across quantize variants
-    # (coarser codes inflate far more than fine ones). Quantize.NONE's
-    # identically-0 inflation has no representation on a log axis -- its
-    # line silently drops off rather than plotting at y=0, same tradeoff
-    # _line_panel's log_y branch already accepts elsewhere in this file.
+    # Log y: inflation spans orders of magnitude across quantize variants.
+    # Quantize.NONE's identically-0 inflation has no representation on a log
+    # axis, so its line silently drops off rather than plotting at y=0.
     ax.set_yscale("log")
     ax.yaxis.set_major_locator(LogLocator(base=10.0))
     ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10.0))
@@ -472,41 +407,29 @@ def panel_radius_inflation(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     ax.set_ylabel("Radius Inflation")
     _style_axes(ax)
 
+    _fix_margins(fig)
     _save(fig, "quantization-radius-inflation.png", cfg)
     return agg
 
 
-# --------------------------------------------------------------------------- #
 # Diagnostic panel (not part of the paper figure set): false negative rate
-# --------------------------------------------------------------------------- #
 
 def panel_fnr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     """Sanity-check panel, not for the paper: FNR should be exactly 0 for
-    every row here -- it's BallCoverFilter's core no-false-negative
-    guarantee, already hard-asserted in quantization_worker (raises during
-    generation) and re-checked by _validate_schema before this module ever
-    plots anything. So under normal operation this renders as a flat line
-    pinned to 0; its only job is to make that visually obvious at a glance
-    (e.g. when skimming a run's figures) rather than only trusting an
-    assertion that ran silently offline. Fixed [0, 1] y-range -- the full
-    valid range for a rate -- so if the invariant were ever violated (a
-    corrupted/hand-edited CSV bypassing the hard checks above) it would be
-    dramatically visible instead of auto-scaling into a misleadingly
-    large-looking wobble around a tiny nonzero value."""
+    every row (already hard-asserted in quantization_worker and re-checked
+    by _validate_schema), so this renders as a flat line at 0 under normal
+    operation -- fixed [0, 1] y-range so a violation would be dramatically
+    visible instead of auto-scaling into a misleading wobble."""
     return _line_panel(
         df, "fnr", "FNR", "quantization-false-negative-rate.png", cfg,
         use_tau=True, y_bounds=(-0.02, 1.02),
     )
 
 
-# --------------------------------------------------------------------------- #
 # Shared legend
-# --------------------------------------------------------------------------- #
 
 def save_legend(df: pd.DataFrame, cfg: Config) -> None:
-    # Only legend a stage that actually has data -- a stage every k in the
-    # sweep failed to construct (see _validate_schema's note) has no line in
-    # any panel, so listing it here would be a legend key for nothing.
+    # Only legend a stage that actually has data.
     present = set(df["quantize"].unique())
     stages = [s for s in STAGES if s in present]
 
@@ -540,17 +463,21 @@ def save_legend(df: pd.DataFrame, cfg: Config) -> None:
     print(f"Wrote {path}")
 
 
-# --------------------------------------------------------------------------- #
 # Save helper
-# --------------------------------------------------------------------------- #
+
+def _fix_margins(fig: plt.Figure) -> None:
+    """Fixed margins (not bbox_inches="tight") so every panel in this figure
+    set shares the same canvas size and axes position -- needed since they
+    get placed side by side, and "tight" would crop each one differently
+    depending on its own y-label/tick width."""
+    fig.subplots_adjust(left=0.30, right=0.97, top=0.92, bottom=0.24)
+
 
 def _save(fig: plt.Figure, filename: str, cfg: Config) -> None:
-    save_figure(fig, filename, cfg.outdir, cfg.dpi, cfg.emit_pdf)
+    save_figure(fig, filename, cfg.outdir, cfg.dpi, cfg.emit_pdf, tight=False)
 
 
-# --------------------------------------------------------------------------- #
 # Summary table
-# --------------------------------------------------------------------------- #
 
 def print_summary(df: pd.DataFrame, cfg: Config) -> None:
     print(f"\n--- Quantization summary (tau={cfg.tau:g}) ---")
@@ -579,9 +506,7 @@ def print_summary(df: pd.DataFrame, cfg: Config) -> None:
     print()
 
 
-# --------------------------------------------------------------------------- #
 # Main
-# --------------------------------------------------------------------------- #
 
 def generate_quantization_figures(
     df: Optional[pd.DataFrame] = None,
@@ -590,15 +515,11 @@ def generate_quantization_figures(
     dpi: int = DPI,
     emit_pdf: bool = EMIT_PDF,
 ) -> None:
-    """
-    Library entry point: render the six paper panels + one diagnostic FNR
-    panel (+ legend) from an in-memory long-format DataFrame instead of
-    round-tripping through a file. The FNR panel (panel_fnr) is a sanity
-    check, not part of the paper figure set -- see its own docstring -- so
-    it's excluded from the LaTeX subfigure snippet printed below. If `df` is
-    omitted, falls back to `load_data()` (CONFIG-driven, reads INPUT_PATH)
-    so the script still works standalone.
-    """
+    """Library entry point: renders the six paper panels + one diagnostic
+    FNR panel (+ legend) from an in-memory DataFrame, or from `load_data()`
+    (reads INPUT_PATH) if `df` is omitted. panel_fnr is excluded from the
+    LaTeX subfigure snippet printed below, since it's a sanity check, not
+    part of the paper figure set."""
     if df is None:
         df = load_data()
     else:

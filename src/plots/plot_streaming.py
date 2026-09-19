@@ -1,27 +1,18 @@
 """Streaming-evaluation figures: BallCoverFilter's 4 insertion strategies
-(insertion_level: nearest / least_inflation / merge / min_heap -- see
-runner._INSERT_STRATEGIES, dispatched via BallCoverFilter.insert_method),
-one line per method throughout.
+(see runner._INSERT_STRATEGIES), one line per method throughout.
 
 Reads results/streaming.csv: one row per (method, checkpoint), tagged by
 `sweep` in {"position","k_sweep"} and `metric` in {"checkpoint",
 "static_reference"} (`method` is "static_rebuild" for the reference rows).
 
-Six panels, all with a dashed static-rebuild reference (stream_rebuild_worker
-policy="oracle") except (c):
-  (a) FPR vs. stream position at fixed k_fixed, median + IQR band over the
-      K-fold stream-offset sweep.
-  (b) Geometric objective log10(J_tau) vs. the same x-axis -- checks whether
-      it actually tracks FPR.
+Six panels, all with a dashed static-rebuild reference except (c):
+  (a) FPR vs. stream position at fixed k_fixed, median + IQR band over folds.
+  (b) Geometric objective log10(J_tau) vs. the same x-axis.
   (c) Insertion throughput (1 / amortized_cost_s) vs. ball budget k.
-  (d) Number of balls vs. stream position -- expected flat at k_fixed and
-      identical across methods (every insertion_level holds a hard
-      ball-count budget), a validation check, not a discriminating panel.
-  (e) Vectors inserted (solid) vs. ball count (dashed), twin y-axes -- makes
-      the "unbounded input, bounded structure" point visually explicit.
-  (f) Filter size in bytes (solid) vs. ball count (dashed), twin y-axes --
-      shows the two stay proportional (bytes_per_ball is constant).
-"""
+  (d) Number of balls vs. stream position -- a validation check (expected
+      flat/identical across methods), not a discriminating panel.
+  (e) Vectors inserted (solid) vs. ball count (dashed), twin y-axes.
+  (f) Filter size in bytes (solid) vs. ball count (dashed), twin y-axes."""
 
 from __future__ import annotations
 
@@ -50,9 +41,8 @@ METHOD_LABELS = {
     "merge": "Exhaustive cheapest-pair merge",
     "min_heap": "Heap-based cheapest-pair merge",
 }
-# Okabe-Ito-derived, distinct from plot_common.DATASET_COLORS (this figure is
-# single-dataset -- see main.py's _STREAMING_REPRESENTATIVE_DATASET -- so the
-# color channel is free to encode method instead).
+# Distinct from plot_common.DATASET_COLORS: this figure is single-dataset,
+# so the color channel is free to encode method instead.
 METHOD_COLORS = {
     "nearest": "#0072B2", "least_inflation": "#E69F00", "merge": "#009E73", "min_heap": "#D55E00",
 }
@@ -72,9 +62,7 @@ class Config:
     outdir: str
 
 
-# --------------------------------------------------------------------------- #
 # Demo data / schema / config
-# --------------------------------------------------------------------------- #
 
 def _synthesize_demo_data() -> pd.DataFrame:
     rng = np.random.default_rng(0)
@@ -85,9 +73,8 @@ def _synthesize_demo_data() -> pd.DataFrame:
     positions_ab = np.unique(np.round(np.logspace(np.log10(k_fixed + 1), np.log10(n_stream_ab), 12)).astype(int))
     positions_cd = np.unique(np.round(np.linspace(n_stream_c // 20, n_stream_c, 20)).astype(int))
 
-    # Rough relative quality/cost ordering used only to make the demo figure
-    # legible: nearest worst FPR, merge near the static-rebuild reference at
-    # far lower cost, min_heap/least_inflation in between.
+    # Rough ordering to make the demo figure legible: nearest worst FPR,
+    # merge near the static-rebuild reference at far lower cost.
     base_fpr = {"nearest": 0.06, "least_inflation": 0.045, "merge": 0.012, "min_heap": 0.03,
                "static_rebuild": 0.008}
     cost_scale = {"nearest": 1.0, "least_inflation": 1.1, "merge": 2.0, "min_heap": 1.3, "static_rebuild": 40.0}
@@ -178,9 +165,7 @@ def resolve_config(df: pd.DataFrame, k_fixed: Optional[int] = K_FIXED,
     return Config(k_fixed=k_fixed, dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
 
 
-# --------------------------------------------------------------------------- #
 # Styling helpers
-# --------------------------------------------------------------------------- #
 
 def _style_log_y(ax: plt.Axes) -> None:
     ax.set_yscale("log")
@@ -192,19 +177,16 @@ def _style_log_y(ax: plt.Axes) -> None:
 
 
 def _median_iqr(df: pd.DataFrame, group_cols: List[str], value_col: str) -> pd.DataFrame:
-    """Median + IQR (25th/75th percentile) of value_col over the K-fold
-    stream-offset sweep, grouped by group_cols -- used instead of mean+-CI95
-    since a handful of folds makes single traces cross meaninglessly at
-    these FPR scales."""
+    """Median + IQR of value_col over the K-fold stream-offset sweep --
+    used instead of mean+-CI95 since a handful of folds makes single traces
+    cross meaninglessly at these FPR scales."""
     agg = df.groupby(group_cols)[value_col].agg(
         median="median", q25=lambda s: s.quantile(0.25), q75=lambda s: s.quantile(0.75), n="count",
     ).reset_index()
     return agg
 
 
-# --------------------------------------------------------------------------- #
 # Panel (a): FPR vs. stream position
-# --------------------------------------------------------------------------- #
 
 def panel_fpr_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)]
@@ -240,9 +222,7 @@ def panel_fpr_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return agg
 
 
-# --------------------------------------------------------------------------- #
 # Panel (b): geometric objective vs. stream position
-# --------------------------------------------------------------------------- #
 
 def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)]
@@ -265,9 +245,6 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     if not ref_agg.empty:
         ref_agg = ref_agg.sort_values("position")
         ax.plot(ref_agg["position"], ref_agg["median"], color="black", linestyle="--", linewidth=0.7, zorder=3)
-        # Same IQR-band treatment as the per-method lines above, in the
-        # reference's own (black) hue -- every policy on this panel gets a
-        # spread band matching its own line color, not just the 4 methods.
         ax.fill_between(ref_agg["position"], ref_agg["q25"], ref_agg["q75"], color="black",
                         alpha=0.15, linewidth=0, zorder=1)
         ax.text(0.97, 0.95, "dashed: static rebuild", transform=ax.transAxes, ha="right", va="top", fontsize=5)
@@ -282,16 +259,12 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return agg
 
 
-# --------------------------------------------------------------------------- #
 # Panel (d): number of balls vs. stream position
-# --------------------------------------------------------------------------- #
 
 def panel_n_balls_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """Standalone ball-count-over-the-stream view (see panel_filter_size for
-    the same series overlaid against memory size instead). Expected to be
-    flat at k_fixed for all four methods -- none of them ever grows
-    max_count_balls past its bootstrap value -- so this panel is a
-    validation check of that invariant, not a discriminating comparison."""
+    """Ball count over the stream (see panel_filter_size for the same series
+    overlaid against memory size). Expected flat at k_fixed for all four
+    methods -- a validation check, not a discriminating comparison."""
     sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)]
     agg = _median_iqr(sel, ["method", "position"], "n_balls")
 
@@ -324,24 +297,15 @@ def panel_n_balls_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return agg
 
 
-# --------------------------------------------------------------------------- #
 # Panel: vectors inserted vs. number of balls, vs. stream position
-# --------------------------------------------------------------------------- #
 
 def panel_vectors_vs_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """Cumulative vectors inserted so far (solid, left axis) and ball count
-    (dashed, right axis) vs. stream position, on twin y-axes, one pair of
-    lines per method. "Vectors inserted" is just the stream position itself
-    -- past bootstrap, every arrival is exactly one insert() call (see
-    generate_streaming()'s bootstrap-then-diverge setup) -- so the solid
-    line is a straight diagonal for every method by construction; that's
-    expected, not a bug. The point of this panel isn't that line's shape,
-    it's the *contrast* with the dashed ball-count line (expected flat at
-    k_fixed, per panel_n_balls_vs_position): unlike panel_filter_size's
-    bytes-vs-balls pairing, vectors and balls aren't proportional, so both
-    axes scale independently -- this is the panel that visually makes the
-    "unbounded raw input, bounded structure" point panel_n_balls_vs_position
-    only makes implicitly via its flat line."""
+    """Cumulative vectors inserted (solid, left axis) vs. ball count
+    (dashed, right axis) vs. stream position, twin y-axes, one pair of lines
+    per method. "Vectors inserted" is just the stream position itself, so
+    the solid line is a straight diagonal by construction -- the point is
+    the *contrast* with the flat dashed ball-count line, making the
+    "unbounded input, bounded structure" claim visually explicit."""
     sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)]
     vectors_agg = _median_iqr(sel, ["method", "position"], "position")
     balls_agg = _median_iqr(sel, ["method", "position"], "n_balls")
@@ -373,9 +337,7 @@ def panel_vectors_vs_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return vectors_agg.merge(balls_agg, on=["method", "position"], suffixes=("_vectors", "_balls"))
 
 
-# --------------------------------------------------------------------------- #
 # Panel (c): insertion throughput vs. filter size (k)
-# --------------------------------------------------------------------------- #
 
 def panel_throughput_vs_k(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     sel = df[(df["sweep"] == "k_sweep") & (df["metric"] == "checkpoint")].copy()
@@ -407,19 +369,13 @@ def panel_throughput_vs_k(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return agg
 
 
-# --------------------------------------------------------------------------- #
 # Panel (d): filter size + ball count vs. stream position
-# --------------------------------------------------------------------------- #
 
 def panel_filter_size(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """Filter total size (bytes, solid) and ball count (dashed) vs. stream
-    position, on twin y-axes, one pair of lines per method. See this
-    module's docstring for why both are expected to come out flat and
-    identical across all 4 methods under the default unquantized setup --
-    this is a validation panel, not a discriminating comparison. The right
-    (ball-count) axis is scaled by the constant bytes_per_ball so the
-    dashed line overlays the solid one exactly, making that proportionality
-    visually explicit rather than just asserted."""
+    """Filter total size (bytes, solid) vs. ball count (dashed) vs. stream
+    position, twin y-axes -- a validation panel, not a discriminating
+    comparison. The right axis is scaled by the constant bytes_per_ball so
+    the dashed line overlays the solid one exactly."""
     sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)]
     size_agg = _median_iqr(sel, ["method", "position"], "memory_bytes")
     balls_agg = _median_iqr(sel, ["method", "position"], "n_balls")
@@ -443,9 +399,8 @@ def panel_filter_size(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     ax1.set_ylabel("Filter Total Size (bytes)")
     ax2.set_ylabel("Number of Balls")
 
-    # bytes_per_ball is constant for a given (dim, quantize) config, so
-    # rescaling the right axis by it makes the dashed (ball-count) curve
-    # coincide with the solid (size) curve pixel-for-pixel.
+    # Rescaling the right axis by the constant bytes_per_ball makes the
+    # dashed (ball-count) curve coincide with the solid (size) curve.
     y1_min, y1_max = ax1.get_ylim()
     ax2.set_ylim(y1_min / bytes_per_ball, y1_max / bytes_per_ball)
 
@@ -458,9 +413,7 @@ def panel_filter_size(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return size_agg.merge(balls_agg, on=["method", "position"], suffixes=("_size", "_balls"))
 
 
-# --------------------------------------------------------------------------- #
 # Legend
-# --------------------------------------------------------------------------- #
 
 def save_method_legend(cfg: Config) -> None:
     apply_style(cfg.dpi)
@@ -469,11 +422,8 @@ def save_method_legend(cfg: Config) -> None:
     handles = [plt.Line2D([0], [0], color=METHOD_COLORS[m], marker="o", markersize=4, linewidth=1.0)
               for m in METHODS]
     labels = [METHOD_LABELS[m] for m in METHODS]
-    # The black dashed reference line drawn in panels (a)/(b)/(d) (the
-    # static-rebuild/oracle baseline every insertion method is compared
-    # against) currently only gets an in-panel text annotation ("dashed:
-    # static rebuild") -- give it its own shared-legend entry too, so it
-    # doesn't need re-explaining on every panel it appears in.
+    # The static-rebuild reference line (panels a/b/d) gets its own legend
+    # entry too, instead of only an in-panel text annotation.
     handles.append(plt.Line2D([0], [0], color="black", linestyle="--", linewidth=1.0))
     labels.append("Static rebuild (oracle)")
     fig.legend(handles, labels, loc="center", ncol=3, frameon=False, fontsize=6.5)
@@ -481,9 +431,7 @@ def save_method_legend(cfg: Config) -> None:
     save_figure(fig, "streaming-method-legend.png", cfg.outdir, cfg.dpi, cfg.emit_pdf, transparent=True)
 
 
-# --------------------------------------------------------------------------- #
 # Text-report summary
-# --------------------------------------------------------------------------- #
 
 def print_summary(df: pd.DataFrame, cfg: Config) -> None:
     print(f"\n--- Streaming summary (k_fixed={cfg.k_fixed}) ---")
@@ -492,9 +440,7 @@ def print_summary(df: pd.DataFrame, cfg: Config) -> None:
     print()
 
 
-# --------------------------------------------------------------------------- #
 # Main
-# --------------------------------------------------------------------------- #
 
 def generate_streaming_figures(df: Optional[pd.DataFrame] = None, outdir: str = OUTDIR,
                                k_fixed: Optional[int] = K_FIXED,

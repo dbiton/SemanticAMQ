@@ -1,6 +1,5 @@
-"""
-QuantizedVectorFilter -- per-point quantization baseline: the "compress the
-vectors" counterpart to BallCoverFilter's "compress the geometry". Keeps
+"""QuantizedVectorFilter -- per-point quantization baseline: the "compress
+the vectors" counterpart to BallCoverFilter's "compress the geometry". Keeps
 every construct vector, quantized to whichever scheme on a fixed fidelity
 ladder fits the memory budget, finest first: float16, 8-bit scalar, 4-bit
 scalar, then RaBitQ (~1 bit/dim, no codebook). Exists to find the dataset
@@ -11,14 +10,11 @@ Zero-false-negative by the same triangle-inequality argument
 BallCoverFilter._build_quantizer uses: d(q,x) <= tau implies
 d(q,x_hat) <= tau + ||x - x_hat||, so accepting whenever
 d(q, x_hat_i) <= tau + eps_i, with eps_i the *measured* reconstruction error
-(never a probabilistic bound), can never produce a false negative -- a
-coarse level costs false-positive margin instead.
+(never a probabilistic bound), can never produce a false negative.
 
 If not even RaBitQ fits max_memory for n vectors, this raises
 InsufficientMemoryError rather than silently dropping vectors or
-subsampling: that's the regime where only a geometric summary can answer the
-query at all (see runner.py::equal_memory_worker's handling of it).
-"""
+subsampling (see runner.py::equal_memory_worker's handling of it)."""
 
 from enum import Enum
 from typing import List, Optional, Tuple
@@ -68,11 +64,8 @@ _BYTES_FP32 = 4
 _RABITQ_NB_BITS = 1
 
 
-# --------------------------------------------------------------------------- #
-# Layout accounting -- one formula, used both to pick a quantization level
-# against a byte budget (before any real data exists) and, after
-# construction, to report get_bytesize(), so the two can never drift apart.
-# --------------------------------------------------------------------------- #
+# Layout accounting: one formula used both to pick a level against a byte
+# budget and, after construction, to report get_bytesize(), so they can't drift apart.
 
 def _code_size(level: QuantizationLevel, dim: int) -> int:
     if level in _SQ_QTYPES:
@@ -83,9 +76,8 @@ def _code_size(level: QuantizationLevel, dim: int) -> int:
 def _fixed_overhead_bytes(level: QuantizationLevel, dim: int) -> int:
     """Per-structure cost independent of n: a scalar quantizer's trained
     per-dimension min/diff table, computed via a throwaway probe trained on
-    stand-in data (mirrors BallCoverFilter._codebook_bytes' own probe-train
-    trick, so this is knowable before real vectors exist). RaBitQ has no
-    such trained table."""
+    stand-in data so this is knowable before real vectors exist. RaBitQ has
+    no such trained table."""
     if level not in _SQ_QTYPES:
         return 0
     probe = faiss.ScalarQuantizer(dim, _SQ_QTYPES[level])
@@ -175,7 +167,6 @@ class QuantizedVectorFilter(Filter):
 
         self._constructed = False
 
-    # ------------------------------------------------------------------ level selection
 
     def _choose_level(self, n: int) -> QuantizationLevel:
         for level in _LADDER:
@@ -191,7 +182,6 @@ class QuantizedVectorFilter(Filter):
             f"{smallest} bytes. Only a geometric summary (e.g. BallCoverFilter) can operate under this budget."
         )
 
-    # ------------------------------------------------------------------ construct
 
     def construct(self, vectors: np.ndarray) -> None:
         vecs = np.ascontiguousarray(vectors, dtype=np.float32)
@@ -217,10 +207,8 @@ class QuantizedVectorFilter(Filter):
             decoded = rq.decode(codes)
             self._rq, self._codes, self._sq_index = rq, codes, None
 
-        # Measured directly against the quantizer's own decode() output --
-        # never a probabilistic bound, and computed before any further
-        # processing, so this is exactly the error the acceptance rule needs
-        # (see module docstring).
+        # Measured directly against decode() output -- never a probabilistic
+        # bound (see module docstring).
         eps = np.linalg.norm(vecs - decoded, axis=1).astype(np.float32)
         self._build_error_budget(vecs, eps)
 
@@ -239,8 +227,7 @@ class QuantizedVectorFilter(Filter):
             _, assign = km.index.search(vecs, 1)
             assign = assign[:, 0].astype(np.int64)
             table = np.zeros(k, dtype=np.float32)
-            # Per-cluster max, not mean -- the reconstructed eps for every
-            # member of a cluster must be >= its own true eps_i (round up).
+            # Max, not mean: a cluster's stored eps must be >= every member's true eps_i.
             np.maximum.at(table, assign, eps)
             self._eps_table = table
             self._cluster_ids = assign.astype(_id_dtype(k))
@@ -255,9 +242,7 @@ class QuantizedVectorFilter(Filter):
                 self._eps_bucket_ids = np.zeros(n, dtype=np.uint8)
                 return
             width = eps_max / levels
-            # Ceiling bucket assignment: bucket_id * width must never be
-            # less than the true eps_i, or the zero-false-negative guarantee
-            # breaks (see module docstring).
+            # Ceiling: bucket_id * width must never be less than the true eps_i.
             bucket_ids = np.minimum(np.ceil(eps / width).astype(np.int64), levels)
             self._eps_bucket_width = width
             self._eps_bucket_ids = bucket_ids.astype(np.uint8)
@@ -273,7 +258,6 @@ class QuantizedVectorFilter(Filter):
             return self._eps_table[self._cluster_ids].astype(np.float64)
         return self._eps_bucket_ids.astype(np.float64) * self._eps_bucket_width
 
-    # ------------------------------------------------------------------ query
 
     def query(self, vectors: np.ndarray, tau: Optional[float] = None) -> List[bool]:
         if not self._constructed:
@@ -287,19 +271,14 @@ class QuantizedVectorFilter(Filter):
         thresh_sq = (float(tau) + self._eps_per_vector()) ** 2
 
         if self._sq_index is not None:
-            # Exact SIMD asymmetric distance search: faiss's ScalarQuantizer
-            # ADC is exact w.r.t. decode() (no further approximation beyond
-            # the quantization already priced into eps_i), so this is safe
-            # for the zero-false-negative acceptance rule -- see module
-            # docstring.
+            # faiss's ScalarQuantizer ADC is exact w.r.t. decode(), so this
+            # is safe for the zero-false-negative acceptance rule.
             d2, ids = self._sq_index.search(q, self._n)
             hit = (d2 <= thresh_sq[ids]).any(axis=1)
         else:
-            # IndexRaBitQ's own search is the paper's fast *probabilistic*
-            # estimator, not the exact distance to decode() eps_i was
-            # measured against -- using it would reintroduce the
-            # probabilistic-bound failure mode this filter avoids. Falls
-            # back to an explicit decode + batched (BLAS) distance instead.
+            # RaBitQ's own search is a fast *probabilistic* estimator, not
+            # the exact distance eps_i was measured against -- would
+            # reintroduce the failure mode this filter avoids. Decode + batched distance instead.
             decoded = self._rq.decode(self._codes)
             d2 = np.asarray(faiss.pairwise_distances(q, decoded))
             np.clip(d2, 0, None, out=d2)
@@ -307,7 +286,6 @@ class QuantizedVectorFilter(Filter):
 
         return hit.tolist()
 
-    # ------------------------------------------------------------------ memory accounting
 
     def get_bytesize(self) -> int:
         if not self._constructed or self.level is None:

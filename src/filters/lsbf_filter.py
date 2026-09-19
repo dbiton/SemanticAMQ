@@ -1,20 +1,16 @@
-"""
-LSBFFilter -- Locality-Sensitive Bloom Filter (Hua, Xiao, Veeravalli & Feng,
-IEEE TC 2012). Unlike DSBFFilter (separate bit array per table), LSBF uses
-one shared `m`-bit array: `num_hashes` hash functions each set/check one bit
-position, and membership requires **all** positions set -- an AND, not an
-OR or vote threshold. That AND/OR distinction is this baseline's defining
+"""LSBFFilter -- Locality-Sensitive Bloom Filter (Hua, Xiao, Veeravalli &
+Feng, IEEE TC 2012). Unlike DSBFFilter (separate bit array per table), LSBF
+uses one shared `m`-bit array: `num_hashes` hash functions each set/check
+one bit position, and membership requires **all** positions set -- an AND,
+not an OR or vote threshold. That distinction is this baseline's defining
 property, verified by a unit test that would fail under an accidental OR.
 
 `verify=True` is a best-effort concretization of the paper's underspecified
 "active overflow" FN-mitigation idea: a small bank of fingerprint buckets,
-indexed by the first hash's bit position, storing an OR-accumulated
-fingerprint of each member's raw vector bytes, checked only after the
-primary AND-test passes. It's a togglable flag so its memory-vs-FPR
-contribution can be ablated independently -- it trades a small amount of
-extra FNR among near-but-not-identical neighbors for lower FPR; exact
-re-insertion of the same vector is always recalled regardless.
-"""
+checked only after the primary AND-test passes. Togglable so its
+memory-vs-FPR contribution can be ablated independently -- it trades a
+little extra FNR among near-but-not-identical neighbors for lower FPR;
+exact re-insertion of the same vector is always recalled regardless."""
 
 import math
 from typing import List, Optional
@@ -79,7 +75,6 @@ class LSBFFilter(Filter):
         self._verify_buckets: Optional[np.ndarray] = None
         self._n_inserted = 0
 
-    # ------------------------------------------------------------------ hashing / storage
 
     def _codes(self, vectors: np.ndarray) -> np.ndarray:
         """(n, num_hashes) opaque per-hash-function signature codes."""
@@ -124,7 +119,6 @@ class LSBFFilter(Filter):
                 self._set_bit(self._verify_buckets[bucket], fp_bit)
         self._n_inserted += len(vectors)
 
-    # ------------------------------------------------------------------ Filter interface
 
     def construct(self, vectors: np.ndarray) -> None:
         self._reset_storage()
@@ -165,11 +159,8 @@ class LSBFFilter(Filter):
             return
         self._insert_batch(vectors)
 
-    # Small fixed bookkeeping cost for the verify structure. Keeps
-    # get_bytesize() strictly larger for verify=True than for verify=False
-    # at equal max_memory even when the bit-budget split happens to round to
-    # the same byte count -- the two configurations are meant to be
-    # separately ablatable, not accidentally indistinguishable by rounding.
+    # Keeps get_bytesize() strictly larger for verify=True than verify=False
+    # even when the bit-budget split happens to round to the same byte count.
     _VERIFY_OVERHEAD_BYTES = 64
 
     def get_bytesize(self) -> int:

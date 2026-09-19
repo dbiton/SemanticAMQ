@@ -8,13 +8,9 @@ class MinHeapInsert(InsertInterface):
     _MAX_NEIGHBORS = 50
     _COMPACTION_RATIO = 2
     _BATCH_SIZE = 2048
-    # Compact self._minimal_pairs once it's grown to this many multiples of
-    # its steady-state live-entry footprint (max_spheres * _MAX_NEIGHBORS)
-    # -- see _compact_if_needed.
-    _COMPACT_THRESHOLD_MULTIPLIER = 4
+    _COMPACT_THRESHOLD_MULTIPLIER = 4  # see _compact_if_needed
 
     def __init__(self):
-        # streaming merge data structures, minimal pair heap and sphere version array
         self._sphere_versions = np.zeros(0, dtype=np.int32)
         self._minimal_pairs: List[Tuple[float, int, int, int, int]] = []
 
@@ -135,16 +131,11 @@ class MinHeapInsert(InsertInterface):
 
 
     def _compact_if_needed(self, filter: Filter) -> None:
-        """Lazy deletion (a version bump marks a heap entry stale rather than
-        removing it) avoids an O(n) removal on every merge, but without a
-        periodic sweep stale entries accumulate without bound: each
-        add_sphere pushes up to _MAX_NEIGHBORS candidates while
-        _merge_spheres only pops one. That makes get_bytesize() grow
-        linearly with stream length even though the true live-pair count
-        stays bounded -- not a coverage bug, a real unbounded-memory one.
-        Rebuilding the heap (keeping only still-current-version entries)
-        once it's grown past its live footprint keeps that bounded without
-        paying the O(n) cost on every insertion."""
+        """Lazy deletion (a version bump marks a heap entry stale) avoids an
+        O(n) removal per merge, but without a periodic sweep stale entries
+        accumulate unboundedly (add_sphere pushes up to _MAX_NEIGHBORS per
+        call, _merge_spheres pops one) -- a real unbounded-memory issue, not
+        just wasted heap space. Rebuild once past the live footprint."""
         live_bound = max(
             64, filter.max_spheres * self._MAX_NEIGHBORS * self._COMPACT_THRESHOLD_MULTIPLIER
         )
@@ -184,13 +175,9 @@ class MinHeapInsert(InsertInterface):
 
 
     def get_bytesize(self, filter: Filter) -> int:
-        pair_size = 216 # PyTuple (80B) + PyFloat (24B) + 4 * PyInt (28B)
-        # _sphere_versions is pre-allocated (via ensure_capacity) to
-        # filter.max_spheres -- the theoretical ball capacity the memory
-        # *budget* implies -- not to how many spheres construction actually
-        # placed. Once a quantizer is compact enough that max_spheres
-        # exceeds the construct-set size, that gap can be huge, so report
-        # bytes for the filter._num_spheres slots actually in use rather
-        # than the full pre-allocated array length.
+        pair_size = 216  # PyTuple (80B) + PyFloat (24B) + 4 * PyInt (28B)
+        # _sphere_versions is pre-allocated to filter.max_spheres (the budget's
+        # theoretical capacity), which can hugely exceed actual usage for a
+        # compact quantizer -- report bytes for slots actually in use instead.
         active_version_bytes = filter._num_spheres * self._sphere_versions.itemsize
         return active_version_bytes + sys.getsizeof(self._minimal_pairs) + pair_size * len(self._minimal_pairs)

@@ -6,20 +6,15 @@ from filters.ball_cover.ball_interfaces import InsertInterface
 
 
 class LeastInflationInsert(InsertInterface):
-    """Same O(m*k*d) exhaustive search as insert_nearest, but absorb into
-    whichever ball minimizes the actual objective delta
-    max(r_i, dist_i)**d - r_i**d, not whichever is nearest. Containment
-    (delta=0) is preferred for free, and a far-but-huge ball can beat a
-    near-but-tiny one whenever growing the tiny one would cost more volume
-    -- strictly better covering volume than insert_nearest at identical
-    asymptotics and no new memory. max_count_balls is accepted but unused,
-    same reason as insert_nearest.
+    """Like NearestInsert, but absorbs into whichever ball minimizes the
+    actual objective delta max(r_i, dist_i)**d - r_i**d, not whichever is
+    nearest -- a far-but-huge ball can beat a near-but-tiny one whenever
+    growing the tiny one would cost more volume.
 
     Computed in log space, scaled by each point's own largest candidate
     radius: r**d alone overflows float64 well inside float32's range at
-    d ~ 384, but the scaled terms are always in (0, 1] so they safely
-    underflow to 0 instead of overflowing, and dividing every candidate by
-    the same positive per-point scale preserves the argmin exactly."""
+    d ~ 384, but the scaled terms stay in (0, 1] and underflow safely
+    instead, preserving the argmin exactly."""
 
     def ensure_capacity(self, required_cap: int) -> None:
         pass
@@ -38,11 +33,9 @@ class LeastInflationInsert(InsertInterface):
 
     @staticmethod
     def _exhaustive_search(centers: np.ndarray, queries: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Exact distance from every query to every center, via a throwaway
-        faiss index rather than a raw (m, k, d) numpy broadcast -- the latter
-        materializes a full dense tensor (a real problem at scale: e.g.
-        20000 x 5000 x 384 floats is ~150GB) where this is O(m*k*d) compute
-        with no more than a (m, k) result ever held in memory."""
+        """Via a throwaway faiss index, not a raw (m, k, d) numpy broadcast
+        -- the latter materializes a full dense tensor (~150GB at
+        20000x5000x384) where this holds only the (m, k) result."""
         dim = centers.shape[1]
         index = faiss.IndexFlatL2(dim)
         index.add(centers)

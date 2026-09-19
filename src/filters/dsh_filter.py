@@ -1,23 +1,19 @@
-"""
-DSHFilter -- Distance-Sensitive Hashing (Aumuller, Christiani, Pagh &
+"""DSHFilter -- Distance-Sensitive Hashing (Aumuller, Christiani, Pagh &
 Silvestri, PODS 2018), instantiated as h(x) = 1 iff <a,x> in [-z, z] for
-Gaussian a (a window centered at 0, since this filter only needs sensitivity
-to a ball around the query, not the paper's more general off-origin
-annulus), concatenated `num_projections_per_table` times per table across
-`num_tables` tables. Calibration reduces to the single free parameter z.
+Gaussian a (a window centered at 0, since this only needs sensitivity to a
+ball around the query, not the paper's off-origin annulus), concatenated
+`num_projections_per_table` times per table across `num_tables` tables.
+Calibration reduces to the single free parameter z.
 
 Calibration maximizes p(tau; z) - p(r_far; z) (r_far defaults to sqrt(2),
-the expected distance between independent unit-sphere points) rather than
+the expected distance between independent unit-sphere points), not
 p(0) - p(tau): two points at distance 0 always collide regardless of z, so
-p(0) carries no calibration signal. Both probabilities are estimated by
-batched Monte Carlo (same pattern as
-`src/lsh.py::CrossPolytopeLSH._get_base_probabilities`), and z is chosen
-from a bounded grid.
+p(0) carries no signal. Both probabilities are estimated by batched Monte
+Carlo, and z is chosen from a bounded grid.
 
 If the best achievable gap falls below `calibration_min_gap`, the
-constructor raises RuntimeError with the measured gap rather than silently
-building a non-functional filter.
-"""
+constructor raises RuntimeError rather than silently building a
+non-functional filter."""
 
 import math
 from typing import List, Optional, Tuple
@@ -107,20 +103,16 @@ class DSHFilter(Filter):
 
         self.filter: Optional[_BloomFilter] = None
 
-    # ------------------------------------------------------------------ calibration
 
     @staticmethod
     def _match_probability(
         rng: np.random.Generator, dim: int, r: float, z: float,
         batch_size: int = 8_000, max_sims: int = 40_000, target_se: float = 0.004,
     ) -> float:
-        """
-        Monte Carlo estimate of P(bit(X) == bit(Q)) for a single Gaussian
-        projection with acceptance window [-z, z], where X is a random unit
-        vector and Q is at Euclidean distance r from X in a random direction
-        -- batched with a target-standard-error stopping rule, mirroring
-        `CrossPolytopeLSH._get_base_probabilities`.
-        """
+        """Monte Carlo estimate of P(bit(X) == bit(Q)) for a single Gaussian
+        projection with acceptance window [-z, z], X a random unit vector and
+        Q at distance r from X in a random direction -- batched with a
+        target-standard-error stopping rule."""
         if r <= 0.0:
             return 1.0
         matches = 0
@@ -163,7 +155,6 @@ class DSHFilter(Filter):
         p_table_tau = best_p_tau ** num_projections_per_table
         return best_z, best_gap, p_table_tau
 
-    # ------------------------------------------------------------------ hashing / storage
 
     def _codes(self, vectors: np.ndarray) -> np.ndarray:
         """(n, num_tables) opaque per-table signature codes: each table's code
@@ -186,7 +177,6 @@ class DSHFilter(Filter):
                 key = signature_to_key((t, row[t].tobytes()))
                 self.filter.add(key)
 
-    # ------------------------------------------------------------------ Filter interface
 
     def construct(self, vectors: np.ndarray) -> None:
         capacity = (

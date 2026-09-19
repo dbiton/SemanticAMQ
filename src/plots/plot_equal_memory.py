@@ -1,13 +1,8 @@
-"""Generate the equal-memory-comparison figures (+ shared legend) for the paper.
+"""Generates the equal-memory-comparison figures (+ shared legend). Reads a
+long-format results file (one row per filter config / memory budget), and
+writes PNG (optionally PDF) panels matching plot_quantization.py's styling.
 
-Self-contained: reads a long-format results file (one row per filter config /
-memory budget), and writes PNG (optionally PDF) panels sized for
-`\\includegraphics[width=\\linewidth]` inside `subfigure{0.24\\linewidth}` cells
-of a two-column `figure*`, matching plot_quantization.py / plot_query_performance.py's
-panel styling.
-
-Edit the CONFIG block below to change parameters -- no CLI flags.
-"""
+Edit the CONFIG block below to change parameters -- no CLI flags."""
 
 from __future__ import annotations
 
@@ -25,9 +20,7 @@ from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 
 from plots.plot_quantization import apply_style
 
-# --------------------------------------------------------------------------- #
 # CONFIG
-# --------------------------------------------------------------------------- #
 
 INPUT_PATH = "results/equal_memory.csv"
 OUTDIR = "plots/equal_memory/"
@@ -97,9 +90,7 @@ class Config:
     markers: dict
 
 
-# --------------------------------------------------------------------------- #
 # Data loading
-# --------------------------------------------------------------------------- #
 
 _REQUIRED_COLUMNS = ["Config", "Memory Budget", "FPR", "FNR", "Latency (ms)", "Throughput (qps)"]
 
@@ -131,15 +122,11 @@ def load_data() -> pd.DataFrame:
     return df
 
 
-# --------------------------------------------------------------------------- #
 # Aggregation
-# --------------------------------------------------------------------------- #
 
 def aggregate(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
-    """Mean + 95% CI of `value_col` over any repeated runs, per (filter, memory
-    budget). A single run per (filter, budget) is the common case -- ci95 is
-    then just 0 and no error bars are drawn -- but repeated runs (e.g. if the
-    caller adds a seed sweep later) are averaged transparently."""
+    """Mean + 95% CI of `value_col` over any repeated runs, per (filter,
+    memory budget); a single run per (filter, budget) gives ci95=0."""
     work = df.copy()
     work["filter"] = work["Config"].str.split(" + ", regex=False).str[0]
     work["Memory Budget (MB)"] = work["Memory Budget"] / (1024 * 1024)
@@ -150,9 +137,7 @@ def aggregate(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
     return agg
 
 
-# --------------------------------------------------------------------------- #
 # Line panels: x = memory budget, one line per filter config
-# --------------------------------------------------------------------------- #
 
 def _line_panel(
     df: pd.DataFrame,
@@ -234,9 +219,7 @@ def panel_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     )
 
 
-# --------------------------------------------------------------------------- #
 # Shared legend
-# --------------------------------------------------------------------------- #
 
 def save_legend(cfg: Config) -> None:
     apply_style()
@@ -268,9 +251,7 @@ def save_legend(cfg: Config) -> None:
     print(f"Wrote {path}")
 
 
-# --------------------------------------------------------------------------- #
 # Save helper
-# --------------------------------------------------------------------------- #
 
 def _save(fig: plt.Figure, filename: str, cfg: Config) -> None:
     os.makedirs(cfg.outdir, exist_ok=True)
@@ -282,9 +263,7 @@ def _save(fig: plt.Figure, filename: str, cfg: Config) -> None:
     print(f"Wrote {path}")
 
 
-# --------------------------------------------------------------------------- #
 # Summary table
-# --------------------------------------------------------------------------- #
 
 def print_summary(df: pd.DataFrame, cfg: Config) -> None:
     print("\n--- Equal-memory comparison summary ---")
@@ -312,9 +291,7 @@ def print_summary(df: pd.DataFrame, cfg: Config) -> None:
     print()
 
 
-# --------------------------------------------------------------------------- #
 # Main
-# --------------------------------------------------------------------------- #
 
 def generate_equal_memory_figures(
     df: Optional[pd.DataFrame] = None,
@@ -322,14 +299,9 @@ def generate_equal_memory_figures(
     dpi: int = DPI,
     emit_pdf: bool = EMIT_PDF,
 ) -> None:
-    """
-    Library entry point: render the four equal-memory-comparison panels
-    (+ legend) from an in-memory long-format DataFrame, the same way
-    plot_quantization.generate_quantization_figures is called directly on an
-    in-memory df instead of round-tripping through a file. If `df` is
-    omitted, falls back to load_data() (CONFIG-driven, reads INPUT_PATH) so
-    the script still works standalone.
-    """
+    """Library entry point: renders the four equal-memory-comparison panels
+    (+ legend) from an in-memory DataFrame, or from load_data() (reads
+    INPUT_PATH) if `df` is omitted."""
     if df is None:
         df = load_data()
     else:

@@ -1,9 +1,5 @@
-"""
-Small deterministic-hashing helpers shared by the LSH-based AMQ baselines
-(DSBFFilter, LSBFFilter, ...). SHA-256-based so results are independent of
-PYTHONHASHSEED, matching the approach already proven by
-`VacuumFilter._hash_to_int`.
-"""
+"""Deterministic-hashing helpers shared by the LSH-based AMQ baselines.
+SHA-256-based so results are independent of PYTHONHASHSEED."""
 
 import hashlib
 import struct
@@ -11,13 +7,8 @@ import numpy as np
 
 
 def stable_hash_to_int(key) -> int:
-    """
-    Deterministic 32-bit hash of `key`.
-
-    `key` is normally a str, but LSH signatures can also arrive as raw bytes
-    or numpy.void scalars (e.g. from SimHashLSH with L > 1), so any of those
-    are accepted directly.
-    """
+    """Deterministic 32-bit hash of `key`. Accepts str, bytes, or
+    numpy.void (LSH signatures can arrive as any of these)."""
     if isinstance(key, str):
         key_bytes = key.encode()
     elif isinstance(key, bytes):

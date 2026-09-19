@@ -2,14 +2,10 @@ import logging
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-# Must happen before numpy/faiss are imported (their BLAS/OpenMP backends
-# read these once at init and cache the thread count) -- otherwise each of
-# Runner's MAX_WORKERS worker processes independently tries to grab every
-# CPU core for its own internal matrix/distance-computation threads, and
-# process-level x thread-level parallelism multiply into severe
-# oversubscription (observed: escalating per-job latency under load, up to
-# whole-system unresponsiveness). One thread per process is correct here --
-# the parallelism already comes from running MAX_WORKERS processes.
+# Must happen before numpy/faiss are imported: otherwise each of Runner's
+# MAX_WORKERS processes also grabs every CPU core for its own internal
+# threads, and process x thread parallelism multiply into severe
+# oversubscription (observed: whole-system unresponsiveness).
 for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_env_var, "1")
 
@@ -19,7 +15,7 @@ import inspect
 import numpy as np
 import pandas as pd
 
-faiss.omp_set_num_threads(1)  # belt-and-suspenders: explicit, not just env-var-dependent
+faiss.omp_set_num_threads(1)  # belt-and-suspenders alongside the env vars above
 
 from logging_config import configure_logging
 from runner import Runner, QUANTIZATION_SWEEP, system_tau_ground_truth_worker
@@ -47,34 +43,20 @@ logger = logging.getLogger(__name__)
 MAX_WORKERS = 4
 DATASET = 'ELI5'
 
-# Single knob for how many vectors every generate_* evaluation pulls as its
-# input stream. 1_000 is conservative -- some evaluations are documented to
-# blow up or crash well below the 100_000 they used to hardcode; check a
-# function's own docstring before raising this.
+# How many vectors throughput-only sweeps (scaling, query_performance) pull.
 STREAM_SIZE = 1_000
 
-# Vectors/dataset for the evaluations governed by the paper's Workloads
-# protocol (Section 5.1): "We utilize 100K queries from each dataset for
-# evaluation, with 80% used for construction of the filter and 20% for
-# queries." Kept separate from STREAM_SIZE -- which throughput-only sweeps
-# (scaling, query_performance) still use at a smaller, paper-independent
-# scale -- so raising it only affects the ground-truth FPR/FNR evaluations
-# (system_tau, quantization, equal_memory, streaming) the paper actually
-# specifies this number for.
+# Vectors/dataset for the paper's Workloads protocol (Section 5.1): "100K
+# queries per dataset, 80% construction / 20% queries". Kept separate from
+# STREAM_SIZE, which only affects the ground-truth FPR/FNR evaluations
+# (system_tau, quantization, equal_memory, streaming).
 WORKLOAD_NUM_VECTORS = 1_000
 
-# Registry name -> canonical dataset key, shared by every long-format
-# evaluation (quantization, query_performance, scaling, streaming). Derived from
-# plot_common so the dataset trio has one source of truth.
+# Registry name -> canonical dataset key, one source of truth via plot_common.
 DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
 
-# Output CSV path per evaluation -- one source of truth shared by each
-# generate_* function's runner.submit(..., output_csv=...) calls (so the
-# Runner writes each evaluation's rows to its own file as its jobs complete,
-# not just once at the end), each save_* function's df, and plot_all()'s
-# from-disk reload. generate_scaling() submits three modes (scaling_query/
-# insert/construction) to three separate paths since each measures a
-# different throughput surface with its own schema.
+# Output CSV path per evaluation, shared by each generate_*'s
+# runner.submit(output_csv=...), each save_*'s df, and plot_all()'s reload.
 EQUAL_MEMORY_CSV = "results/equal_memory.csv"
 SYSTEM_TAU_CSV = "results/system_tau.csv"
 QUANTIZATION_CSV = "results/quantization.csv"
@@ -86,11 +68,9 @@ STREAMING_CSV = "results/streaming.csv"
 dynamic_filters = [BallCoverFilter, LSBFFilter, DSHFilter, HNSWFilter, IVFFilter]
 static_filters  = []
 
-# generate_equal_memory()'s own comparison set. The other dynamic_filters
-# entries (DSBFFilter, CoveringLSHFallbackFilter, LSBFFilter) degenerate to
-# ~100% duplicate predictions at realistic construct-set sizes, making them
-# uninformative for a budget-sensitivity comparison; they stay in
-# dynamic_filters for the other evaluations.
+# generate_equal_memory()'s own comparison set: excludes DSBFFilter/
+# CoveringLSHFallbackFilter/LSBFFilter, which degenerate to ~100% duplicate
+# predictions at realistic construct-set sizes (still used elsewhere).
 equal_memory_filters = [BallCoverFilter, HNSWFilter, IVFFilter, DSHFilter, QuantizedVectorFilter]
 
 def calculate_max_memory_budget_bytes(num_vectors: int, dimension: int, bytes_per_element: float) -> int:
@@ -107,23 +87,16 @@ def calculate_distance_threshold(
     max_pairs: int = 20_000_000,
     seed: int = 42,
 ) -> float:
-    """
-    Return the distance threshold at which `percentage`% of all pairwise L2
-    distances are considered duplicates (i.e., the `percentage`-th percentile).
-
-    Full pairwise distance is O(n^2) memory (~40 GB at n=100k), so this
-    samples up to `max_pairs // n` query rows and computes exact L2 against
-    the full set via faiss instead -- an unbiased sample of the pairwise
-    distribution, within ~0.2% of the exact percentile at bounded memory.
-    """
+    """The `percentage`-th percentile of all pairwise L2 distances. Full
+    pairwise distance is O(n^2) memory (~40GB at n=100k), so this samples up
+    to `max_pairs // n` query rows against the full set instead -- within
+    ~0.2% of the exact percentile at bounded memory."""
     n = len(vectors)
     if n < 2:
         return 0.0
 
     vecs = np.ascontiguousarray(vectors, dtype=np.float32)
 
-    # Sample enough query rows to pool ~max_pairs distances (all rows when n is
-    # small enough that the full set already fits the budget).
     n_query = int(np.clip(max_pairs // n, 1, n))
     if n_query >= n:
         query_idx = np.arange(n)
@@ -148,20 +121,13 @@ def calculate_nn_distance_threshold(
     sample_size: int = 5_000,
     seed: int = 42,
 ) -> float:
-    """
-    Return the distance threshold at which `percentage`% of a sample of
-    construct_vectors have their nearest *other* construct vector within that
-    distance.
-
-    Unlike calculate_distance_threshold (random pairwise distances), this
-    ties the threshold to the actual nearest-neighbour test
-    compute_static_actual_results performs -- at large construct-set sizes a
-    point's nearest neighbour is much closer than a random pair, so the
+    """The `percentage`-th percentile of nearest-*other*-neighbor distance
+    within a sample of construct_vectors. Unlike calculate_distance_threshold
+    (random pairwise distances), this ties the threshold to the actual test
+    compute_static_actual_results performs: at large construct-set sizes a
+    point's nearest neighbor is much closer than a random pair, so the
     pairwise-percentile version silently pushes the duplicate rate toward
-    100%, collapsing FPR/FNR to degenerate values. Used by
-    generate_equal_memory(), whose construct set is large enough for this to
-    matter.
-    """
+    100%, collapsing FPR/FNR to degenerate values."""
     n = len(construct_vectors)
     if n < 2:
         return 0.0
@@ -172,26 +138,18 @@ def calculate_nn_distance_threshold(
 
     index = faiss.IndexFlatL2(vecs.shape[1])
     index.add(vecs)
-    # k=2: a sampled point's own nearest neighbour within its own reference
-    # set is itself (distance 0) at rank 0, so the *other* nearest neighbour
-    # is rank 1.
+    # k=2: rank 0 is the point itself (distance 0); rank 1 is the *other* nearest neighbor.
     sq_dist, _ = index.search(vecs[sample_idx], 2)
     nn_dist = np.sqrt(np.clip(sq_dist[:, 1], 0, None))
     return float(np.percentile(nn_dist, percentage))
 
 
 def advancing_fold_starts(pool_len: int, k_folds: int, fold_stride: int, window_len: int) -> List[int]:
-    """
-    Non-wrapping K-fold-like sweep: fold f's window starts f*fold_stride
+    """Non-wrapping K-fold-like sweep: fold f's window starts f*fold_stride
     into the pool and is window_len vectors wide, never wrapping back to the
-    pool's start (replaces the old np.roll/modular-wraparound approach
-    every K-fold-style generate_* function used to rely on -- e.g. the old
-    kfold_wrapped_split's `% n` arithmetic). Callers are expected to point
-    at (or load) a stream long enough for the whole sweep up front; this
-    raises rather than silently reusing or wrapping a shorter one.
-
-    Returns the k_folds fold-start offsets (0, fold_stride, 2*fold_stride, ...).
-    """
+    start. Raises if the pool isn't long enough for all k_folds windows,
+    rather than silently reusing or wrapping a shorter one. Returns the
+    fold-start offsets (0, fold_stride, 2*fold_stride, ...)."""
     max_start = (k_folds - 1) * fold_stride
     required = max_start + window_len
     if pool_len < required:
@@ -207,13 +165,9 @@ def advancing_fold_starts(pool_len: int, k_folds: int, fold_stride: int, window_
 
 def rows_for_mode(job_results: List[Tuple[str, Any]], mode: str) -> list:
     """Pulls one Runner mode's rows out of a shared Runner.run()'s combined
-    (mode, result) list -- result is either one dict per job (e.g.
-    'equal_memory') or a list of dicts per job (e.g. 'quantization',
-    'system_tau', 'stream_rebuild'), flattened uniformly here. Several
-    generate_* functions below submit to the same Runner instance so their
-    jobs run (and get load-balanced by Runner.shuffle()) together in one
-    combined batch; each save_* function then calls this to recover just
-    its own evaluation's rows before writing its own CSV."""
+    (mode, result) list -- result is either one dict per job or a list of
+    dicts, flattened uniformly here. Used by save_* functions to recover
+    just their own evaluation's rows from a Runner several share."""
     rows = []
     for job_mode, result in job_results:
         if job_mode != mode:
@@ -223,11 +177,9 @@ def rows_for_mode(job_results: List[Tuple[str, Any]], mode: str) -> list:
 
 
 def compute_dynamic_actual_results(vectors: np.ndarray, distance_threshold: float) -> list[bool]:
-    """
-    Online ground-truth: the first vector is unique; each subsequent vector is a
-    duplicate if it falls within `distance_threshold` of any previously accepted
-    unique vector, otherwise it joins the reference set.
-    """
+    """Online ground-truth: the first vector is unique; each subsequent
+    vector is a duplicate if within `distance_threshold` of any previously
+    accepted unique vector, otherwise it joins the reference set."""
     vectors = np.ascontiguousarray(vectors, dtype=np.float32)
 
     actual = [False]
@@ -239,10 +191,7 @@ def compute_dynamic_actual_results(vectors: np.ndarray, distance_threshold: floa
     for i in range(1, len(vectors)):
         v = vectors[i:i+1]
 
-        # find the single nearest accepted vector
         nn_sq_dist, _ = index.search(v, 1)
-
-        # check if the closest vector is within the threshold
         is_dup = bool(nn_sq_dist[0, 0] <= thresh_sq)
         actual.append(is_dup)
         if not is_dup:
@@ -256,16 +205,10 @@ def compute_static_actual_results(
     query_vectors: np.ndarray,
     distance_threshold: float,
 ) -> list[bool]:
-    """
-    Static ground-truth: a query vector is a duplicate iff it falls within
-    `distance_threshold` of any vector in the fixed construct set.
-
-    "Within threshold of any construct vector" is exactly a nearest-neighbour
-    test, so we let faiss find each query's closest construct vector in one
-    batched, BLAS-accelerated call instead of a Python loop that builds a full
-    (n_construct,) distance array per query. faiss returns *squared* L2, so we
-    compare against distance_threshold**2 (equivalent to sqrt(...) <= threshold).
-    """
+    """Static ground-truth: a query vector is a duplicate iff within
+    `distance_threshold` of any vector in the fixed construct set. Uses one
+    batched faiss nearest-neighbor call rather than a per-query Python loop;
+    faiss returns squared L2, hence the distance_threshold**2 comparison."""
     construct = np.ascontiguousarray(construct_vectors, dtype=np.float32)
     queries = np.ascontiguousarray(query_vectors, dtype=np.float32)
 
@@ -274,7 +217,7 @@ def compute_static_actual_results(
 
     index = faiss.IndexFlatL2(construct.shape[1])
     index.add(construct)
-    nn_sq_dist, _ = index.search(queries, 1)  # squared L2 to nearest construct vector
+    nn_sq_dist, _ = index.search(queries, 1)
     return (nn_sq_dist[:, 0] <= distance_threshold ** 2).tolist()
 
 
@@ -294,8 +237,7 @@ def generate_static() -> list:
     vectors_construct = vectors[:num_construct]
     vectors_query     = vectors[num_construct:]
 
-    # Jobs receive lazy on-disk pointers instead of array copies, so the query
-    # stream length is bounded by disk, not by num_jobs * stream_length memory.
+    # Lazy on-disk pointers, not array copies, so memory doesn't scale with num_jobs.
     construct_source = VectorSource(dataset, 0, num_construct)
     query_source     = VectorSource(dataset, num_construct, num_vectors)
     max_memory_budget = calculate_max_memory_budget_bytes(num_vectors, dim, bytes_per_element)
@@ -326,30 +268,18 @@ def generate_static() -> list:
 
 
 def generate_equal_memory(runner: Runner) -> None:
-    """
-    Equal-memory comparison across equal_memory_filters (see its own comment
-    for why some dynamic_filters baselines are excluded here). Sweeps
-    count_memory_steps budgets up to max_memory_budget, scaled off the
-    construct set itself (not calculate_max_memory_budget_bytes, which is
-    tuned for generate_static()/generate_dynamic()'s smaller num_vectors).
+    """Equal-memory comparison across equal_memory_filters. Sweeps
+    count_memory_steps budgets scaled off the construct set itself, not
+    calculate_max_memory_budget_bytes (tuned for generate_static()'s smaller
+    num_vectors). For each budget, every filter's best config is chosen on a
+    held-out calibration set (see runner.py::_build_calibrated_filter), then
+    FPR/FNR/latency/throughput are measured on a separate held-out query
+    set. Uses the paper's default single-dataset representative, MMLU
+    (Section 5.6 names no specific dataset).
 
-    For each budget, every filter's best config is chosen on a held-out
-    calibration set (see runner.py::_build_calibrated_filter); FPR/FNR,
-    construction latency, and query throughput are then measured on a
-    separate held-out query set.
-
-    num_vectors/percentage_construct follow the paper's Workloads protocol
-    (Section 5.1): 100K vectors, 80% construct (the remaining 20% is then
-    split between calibration and query). Section 5.6's SOTA-comparison
-    figure names no specific dataset, so this uses the paper's default
-    single-dataset representative, MMLU.
-
-    Only submits 'equal_memory' jobs (each tagged output_csv=EQUAL_MEMORY_CSV)
-    to the given `runner` -- does not run it. The Runner itself writes
-    results/equal_memory.csv incrementally as each job completes; call
-    save_equal_memory() on the shared runner's combined run() output only if
-    you also want this evaluation's rows back as a DataFrame directly.
-    """
+    Only submits 'equal_memory' jobs (output_csv=EQUAL_MEMORY_CSV) to the
+    given `runner` -- does not run it. The Runner writes
+    results/equal_memory.csv incrementally as each job completes."""
     num_vectors               = WORKLOAD_NUM_VECTORS
     dim                       = 384
     percentage_construct      = 80
@@ -365,26 +295,21 @@ def generate_equal_memory(runner: Runner) -> None:
     vectors_calibration = vectors[num_construct:num_construct + num_calibration]
     vectors_query       = vectors[num_construct + num_calibration:]
 
-    # Jobs receive lazy on-disk pointers instead of array copies (same
-    # reasoning as generate_static).
     construct_source   = VectorSource(dataset, 0, num_construct)
     calibration_source = VectorSource(dataset, num_construct, num_construct + num_calibration)
     query_source        = VectorSource(dataset, num_construct + num_calibration, num_vectors)
 
     logger.info("Calculating distance threshold...")
-    # Nearest-neighbour-based, not calculate_distance_threshold's random-pairwise
-    # percentile: with a 40%-of-100k = 40k-vector construct set, a pairwise
-    # percentile is far more permissive than its nominal percentage once
-    # tested against "nearest of 40k candidates" (see calculate_nn_distance_threshold's
-    # docstring) -- that mismatch was pushing the actual duplicate rate to ~100%,
-    # collapsing both FPR and FNR to degenerate 0/0 values regardless of budget.
+    # calculate_nn_distance_threshold, not calculate_distance_threshold: at
+    # this construct-set size, the random-pairwise percentile is far more
+    # permissive than the nearest-neighbor test actually used, pushing the
+    # duplicate rate to ~100% and collapsing FPR/FNR to 0/0.
     distance_threshold = calculate_nn_distance_threshold(vectors_construct, duplicate_percentage)
     logger.info("Calculating calibration/query ground truth...")
     actual_calibration = compute_static_actual_results(vectors_construct, vectors_calibration, distance_threshold)
     actual_query       = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
 
-    # Scaled off the construct set itself (one sphere per point), not
-    # calculate_max_memory_budget_bytes -- see docstring.
+    # Scaled off the construct set itself (one sphere per point), not calculate_max_memory_budget_bytes.
     bytes_per_sphere_at_1to1 = (dim + 1) * 4 * 4.0
     max_memory_budget = int(num_construct * bytes_per_sphere_at_1to1)
     memory_budgets = np.linspace(0, max_memory_budget, count_memory_steps + 1, dtype=int)[1:]
@@ -420,45 +345,26 @@ def plot_equal_memory(results: list) -> None:
 
 
 def generate_system_tau(runner: Runner) -> None:
-    """
-    End-to-end filtering benefit (paper Section 5.2, Figure 2): one
-    BallCoverFilter cover built per (dataset, fold, k), then queried at
-    every tau in a fixed, dataset-independent sweep (system_tau_worker) --
-    the same constructed representation is reused across all thresholds,
-    never rebuilt. Unlike the paper's own fixed k=400, k here is swept as a
-    ball-budget fraction of each fold's construct-set size (k_fractions,
-    1%-10%) so plot_system_tau can show how the filtering benefit varies
-    with the memory budget, not just with tau.
+    """End-to-end filtering benefit (paper Section 5.2, Figure 2): one
+    BallCoverFilter cover per (dataset, fold, k), queried at every tau in a
+    fixed sweep without ever rebuilding. k is swept as a ball-budget
+    fraction of each fold's construct-set size (k_fractions, 1%-10%) rather
+    than the paper's fixed k=400, so plot_system_tau can show how the
+    filtering benefit varies with memory budget, not just tau.
 
-    Implements the paper's Workloads protocol (Section 5.1): for each of the
-    5 datasets, k_folds=5 non-wrapping folds are cut via
-    advancing_fold_starts (80% construct / 20% query per fold, fold f's
-    query span starting f query-span-widths further into the dataset than
-    fold 0's -- never wrapping back to the start). This means each dataset
-    must have at least num_vectors + (k_folds-1) * (num_vectors // k_folds)
-    vectors on disk; advancing_fold_starts raises if it doesn't, rather than
-    silently reusing/wrapping a shorter one. plot_system_tau then reports
-    the mean +/- std over these 5 folds (at whichever k it's rendering),
-    matching the paper's "error bars represent the standard deviation during
-    our 5 runs".
+    Implements the paper's Workloads protocol (Section 5.1): 5 datasets x
+    k_folds=5 non-wrapping folds via advancing_fold_starts (80%
+    construct/20% query per fold); each dataset needs enough vectors on
+    disk for that or it raises. plot_system_tau reports the mean +/- std
+    over the 5 folds, matching the paper's "5 runs" error bars.
 
-    Ground truth (nearest-construct-set distance per query vector, one flat
-    L2 index build + search per (dataset, fold)) does not depend on k, so it
-    is computed once per (dataset, fold) -- not per (dataset, fold, k) --
-    in parallel across a ProcessPoolExecutor rather than serially in this
-    process, and cached to results/system_tau_ground_truth/ so a repeat
-    call with the same (dataset, num_vectors, k_folds, fold) doesn't redo
-    that (expensive, at 100K-scale) nearest-neighbor search.
+    Ground truth (nearest-construct-set distance per query) doesn't depend
+    on k, so it's computed once per (dataset, fold) in parallel and cached
+    to results/system_tau_ground_truth/, not redone per (dataset, fold, k).
 
-    Only submits 'system_tau' jobs (each tagged output_csv=SYSTEM_TAU_CSV)
-    to the given `runner` -- does not run it. The ground-truth
-    precomputation above still runs eagerly (in a dedicated
-    ProcessPoolExecutor, unrelated to `runner`) as soon as this function is
-    called. The Runner itself writes results/system_tau.csv incrementally
-    as each job completes; call save_system_tau() on the shared runner's
-    combined run() output only if you also want this evaluation's rows back
-    as a DataFrame directly.
-    """
+    Only submits 'system_tau' jobs (output_csv=SYSTEM_TAU_CSV) -- does not
+    run `runner`. The ground-truth precomputation above still runs eagerly,
+    in its own dedicated ProcessPoolExecutor."""
     num_vectors      = WORKLOAD_NUM_VECTORS
     dim              = 384
     k_folds          = 5
@@ -485,18 +391,14 @@ def generate_system_tau(runner: Runner) -> None:
     logger.info(f"Fixed tau sweep (shared across datasets): {tau_values}")
     logger.info(f"K-fold cross-validation: {k_folds} folds, non-wrapping contiguous 80/20 spans")
 
-    # tau is fixed up front (not solved for), so the construction-tightness
-    # knob is a single global median instead of a per-dataset one.
+    # tau is fixed up front, so construction-tightness is one global median.
     construct_tau = float(np.median(tau_values))
 
     query_len = num_vectors // k_folds
     construct_len = num_vectors - query_len
 
-    # One entry per (dataset, fold), built once and reused by both passes
-    # below: (dataset, fold, construct_source, query_source). Both sources
-    # are lazy on-disk pointers (see generate_static's own comment) -- no
-    # array is materialized here at all, since system_tau_ground_truth_worker
-    # and system_tau_worker both accept VectorSource directly.
+    # (dataset, fold, construct_source, query_source), reused by both passes
+    # below -- lazy VectorSource pointers, no array materialized here.
     splits = []
     for dataset in datasets:
         total_rows = len(VectorSource(dataset))
@@ -567,48 +469,24 @@ def plot_system_tau(df: pd.DataFrame) -> None:
 
 
 def generate_quantization(runner: Runner) -> None:
-    """
-    Generate per-quantize-variant construction data for BallCoverFilter
-    (QUANTIZATION_SWEEP) on a single dataset, written to
-    results/quantization.csv. Every candidate shares one memory budget per k
-    (derived from the unquantized cover's byte-per-ball size), so a more
-    compact quantizer packs more balls into the same budget -- letting
-    plot_quantization.py use recorded memory usage as the x-axis. A
-    quantizer compact enough to want more balls than the construct set has
-    saturates at n_construct balls short of the nominal budget instead (see
-    quantization_worker) -- real information, not a plotting bug.
+    """Generates per-quantize-variant construction data for BallCoverFilter
+    (QUANTIZATION_SWEEP) on a single dataset. Every candidate shares one
+    memory budget per k (derived from the unquantized cover's byte-per-ball
+    size), so a more compact quantizer packs more balls into the same
+    budget, letting plot_quantization.py use recorded memory usage as the
+    x-axis. k_values/tau_values derive from num_vectors/percentage_construct
+    rather than hardcoded absolutes, so those two knobs rescale the whole
+    sweep. Dataset and duplicate percentage follow the paper's Figure 3
+    caption ("MS MARCO, tau such that 5% are duplicates").
 
-    k_values/tau_values derive from num_vectors/percentage_construct rather
-    than hardcoded absolutes, so those two knobs rescale the whole sweep:
-    k_fractions stay < 1 (k >= the construct set makes BallCoverFilter fall
-    back to one zero-radius ball per point), and tau_values is a percentile
-    of the dataset's own nearest-neighbour distance rather than a raw float,
-    so it stays meaningful as the construct set's scale changes.
+    K-fold cross-validation (Section 5.1): 5 non-wrapping folds via
+    advancing_fold_starts, tagged via seed=fold for plot_quantization's
+    seed-based mean +/- 95% CI aggregation. tau_values are calibrated once
+    from fold 0's construct set so every fold lands on the same tau; each
+    fold's ground truth is still recomputed from its own construct/query split.
 
-    Dataset and duplicate percentage follow the paper's Figure 3 caption
-    exactly ("We evaluate on MS MARCO, we select tau such that 5% of the
-    documents are duplicates"), while num_vectors/percentage_construct
-    follow the paper's general Workloads protocol (Section 5.1): 100K
-    vectors, 80% construct / 20% query.
-
-    K-fold cross-validation (Section 5.1): 5 non-wrapping contiguous-span
-    folds via advancing_fold_starts (fold f's span starts f query-span-
-    widths further into the dataset than fold 0's, never wrapping back --
-    the dataset must have at least num_vectors + (k_folds-1) *
-    (num_vectors // k_folds) vectors on disk, or this raises), tagged via
-    seed=fold so plot_quantization's existing seed-based mean +/- 95% CI
-    aggregation reports variance across folds instead of always drawing
-    0-width error bars from a single run. tau_values are calibrated once
-    (not per fold, from fold 0's construct set) so every fold lands on the
-    exact same tau and can be aggregated together; each fold's ground truth
-    is still recomputed from that fold's own construct/query split.
-
-    Only submits 'quantization' jobs (each tagged output_csv=QUANTIZATION_CSV)
-    to the given `runner` -- does not run it. The Runner itself writes
-    results/quantization.csv incrementally as each job completes; call
-    save_quantization() on the shared runner's combined run() output only if
-    you also want this evaluation's rows back as a DataFrame directly.
-    """
+    Only submits 'quantization' jobs (output_csv=QUANTIZATION_CSV) -- does
+    not run `runner`."""
     num_vectors            = WORKLOAD_NUM_VECTORS
     dim                    = 384
     k_folds                = 5
@@ -631,17 +509,14 @@ def generate_quantization(runner: Runner) -> None:
         )
     logger.info(f"Scaling k_values to {k_values} ({construct_len} vectors in the construct set)")
 
-    # tau_values are calibrated from fold 0's construct span alone -- loaded
-    # here as a real array just for this one-time calibration, not kept
-    # around for the job submissions below (those use lazy VectorSource).
+    # Calibrated from fold 0's construct span only, loaded as a real array
+    # just for this; job submissions below use lazy VectorSource instead.
     fold0_construct_start = fold_starts[0] + query_len
     fold0_construct = VectorSource(dataset, fold0_construct_start, fold0_construct_start + construct_len).to_array()
     tau_values = [calculate_nn_distance_threshold(fold0_construct, p) for p in duplicate_percentages]
     logger.info(f"Scaling tau_values to {tau_values} ({duplicate_percentages}-th percentile NN distance, fold 0)")
 
-    # Kept for interface parity with quantization_worker's signature; unused there
-    # now that BallCoverFilter's Gonzalez construction has no distance-
-    # threshold knob to feed (only quantize varies the cover, not tau).
+    # Unused by quantization_worker: Gonzalez construction has no distance-threshold knob.
     construct_tau = float(np.median(tau_values))
 
     for fold, fold_start in enumerate(fold_starts):
@@ -649,10 +524,8 @@ def generate_quantization(runner: Runner) -> None:
         construct_start, construct_end = query_end, query_end + construct_len
 
         logger.info(f"Computing ground truth for fold {fold} (tau in {tau_values})...")
-        # Ground truth needs real arrays (compute_static_actual_results runs
-        # in this driver process, not a worker) -- loaded once per fold here,
-        # separately from the lazy VectorSource handed to the many
-        # k x quantize jobs below.
+        # Ground truth runs in this driver process (not a worker), so it
+        # needs real arrays, loaded once per fold here.
         vectors_construct = VectorSource(dataset, construct_start, construct_end).to_array()
         vectors_query = VectorSource(dataset, query_start, query_end).to_array()
         actual_results_by_tau = {
@@ -686,14 +559,10 @@ def plot_quantization(df: pd.DataFrame) -> None:
 
 
 def generate_query_performance() -> pd.DataFrame:
-    """
-    Measure single-query vs. batched-query latency/throughput of a
-    BallCoverFilter cover as a function of filter size k, across the 3
-    datasets in DATASET_KEYS (unlike generate_quantization(), which now runs on
-    a single dataset). One job per (dataset, k, seed), flattened into a
-    long-format DataFrame, written to results/query_performance.csv. Render
-    with plot_query_performance().
-    """
+    """Measures single-query vs. batched-query latency/throughput of a
+    BallCoverFilter cover as a function of filter size k, across every
+    dataset in DATASET_KEYS. One job per (dataset, k, seed), written to
+    results/query_performance.csv."""
     num_vectors           = STREAM_SIZE
     dim                   = 384
     percentage_construct  = 20
@@ -714,9 +583,7 @@ def generate_query_performance() -> pd.DataFrame:
         )
 
     # k >= a dataset's construct-set size makes BallCoverFilter fall back to
-    # one zero-radius ball per point, so clamp the sweep the same way
-    # generate_quantization() does (kept defensive even though the 100K-row
-    # datasets comfortably support k=1024 at 20% construct).
+    # one zero-radius ball per point, so clamp the sweep like generate_quantization() does.
     construct_sizes = {d: len(load_embeds(d, num_vectors)[0]) * percentage_construct // 100 for d in datasets}
     min_construct = min(construct_sizes.values())
     usable_k_values = [k for k in k_values if k < min_construct]
@@ -769,45 +636,27 @@ def plot_query_performance(df: pd.DataFrame) -> None:
     generate_query_performance_figures(df)
 
 
-# These panels compare across batch_size/stream_size, not across datasets,
-# so sweeping all 3 datasets would only add runtime, not a comparison axis --
-# one representative dataset (same single-dataset pattern as
-# _STREAMING_REPRESENTATIVE_DATASET) is enough. Figure 5's caption: "The
-# specific dataset has no measurable effect on any of these values", so this
-# uses the paper's default single-dataset representative, MMLU.
+# These panels compare across batch_size/stream_size, not datasets, so one
+# representative dataset suffices (Figure 5: "no measurable effect" per-dataset).
 _SCALING_DATASET = "MMLU"
 
 
 def generate_scaling(runner: Runner) -> None:
-    """
-    Measures three BallCoverFilter throughput surfaces against filter size k:
-    query throughput (k x batch_size grid), insertion throughput (same grid,
-    timing add() instead), and construction throughput (k x n, the one panel
-    where the indexed-set size itself varies). Runs on a single dataset
-    (_SCALING_DATASET).
+    """Measures three BallCoverFilter throughput surfaces against filter
+    size k: query (k x batch_size grid), insertion (same grid, timing add()
+    instead), and construction (k x n, where indexed-set size itself
+    varies). Runs on a single dataset (_SCALING_DATASET); stream_sizes (the
+    6 construction lines) derive from `stream_size` alone.
 
-    stream_sizes (the 6 construction lines) derive from `stream_size` alone;
-    k_values/batch_sizes are independent swept axes.
-
-    K-fold cross-validation (paper Section 5.1): rather than 3 repeated
-    timing trials on one fixed construct/holdout split, fold f's
-    (construct, holdout) window starts f*fold_stride further into the
-    dataset than fold 0's -- non-wrapping, via advancing_fold_starts, so
-    each of the 5 repeats also measures throughput against genuinely
-    different data, not just the same slice timed again. This means the
-    dataset must have at least pool_needed + (k_folds-1)*fold_stride
-    vectors on disk; advancing_fold_starts raises if it doesn't. Tagged via
-    seed=fold so plot_scaling's existing seed-based mean +/- 95% CI
-    aggregation reports variance across folds.
+    K-fold cross-validation (Section 5.1): fold f's (construct, holdout)
+    window starts f*fold_stride further into the dataset than fold 0's,
+    non-wrapping via advancing_fold_starts, so each repeat measures
+    throughput against genuinely different data. Tagged via seed=fold for
+    plot_scaling's seed-based mean +/- 95% CI aggregation.
 
     Only submits 'scaling_query'/'scaling_insert'/'scaling_construction'
-    jobs to the given `runner` -- does not run it. Each is tagged with its
-    own output_csv (SCALING_QUERY_CSV/SCALING_INSERT_CSV/
-    SCALING_CONSTRUCTION_CSV), so the Runner itself writes all three
-    results/scaling_*.csv files incrementally as their jobs complete; call
-    save_scaling() on the shared runner's combined run() output only if you
-    also want this evaluation's rows back as DataFrames directly.
-    """
+    jobs -- does not run `runner`. Each targets its own output_csv, so the
+    Runner writes all three results/scaling_*.csv files incrementally."""
     stream_size      = STREAM_SIZE
     dim              = 384
     n_steps          = 6
@@ -848,10 +697,8 @@ def generate_scaling(runner: Runner) -> None:
     k_values = _below_stream(k_values, "k_values")
     batch_sizes = _below_stream(batch_sizes, "batch_sizes")
 
-    # Shared pool shape (the largest stream size + a disjoint holdout);
-    # fold f's copy of it starts fold_stride*f further into the dataset --
-    # only k/batch_size vary within a fold's (construct, holdout) pair in
-    # the query/insert sweeps.
+    # Pool shape (largest stream size + a disjoint holdout); fold f's copy
+    # starts fold_stride*f further into the dataset.
     holdout_size = max(n_query_vectors, n_insert_vectors)
     pool_needed = max_stream + holdout_size
     total_rows = len(VectorSource(dataset_key))
@@ -913,9 +760,7 @@ def plot_scaling(df_query: pd.DataFrame, df_insert: pd.DataFrame, df_constructio
     generate_scaling_figures(df_query, df_insert, df_construction)
 
 
-# Panels (b)/(c)/(d) collapse to one representative dataset -- Figure 4's
-# caption: "Different datasets do not really matter", so this uses the
-# paper's default single-dataset representative, MMLU.
+# Panels (b)/(c)/(d) collapse to one representative dataset (Figure 4: "different datasets do not really matter").
 _STREAMING_REPRESENTATIVE_DATASET = "MMLU"
 
 
@@ -923,10 +768,8 @@ def _build_streaming_negative_set(
     dataset: str, stream_vectors: np.ndarray, candidate_pool: np.ndarray, tau_mid: float, n_negative: int,
 ) -> np.ndarray:
     """A negative that's true against the FULL stream stays true against any
-    prefix of it, so this stays valid at every streaming checkpoint.
-    `stream_vectors` must cover every fold's own stream window (not just
-    fold 0's), since each fold now sees genuinely different data -- see
-    generate_streaming()'s own comment for how it sizes that span."""
+    prefix of it. `stream_vectors` must cover every fold's own stream
+    window (not just fold 0's), since folds see genuinely different data."""
     is_duplicate = compute_static_actual_results(stream_vectors, candidate_pool, tau_mid)
     negatives = candidate_pool[~np.asarray(is_duplicate, dtype=bool)]
     if len(negatives) < n_negative:
@@ -938,47 +781,26 @@ def _build_streaming_negative_set(
 
 
 def generate_streaming(runner: Runner) -> None:
-    """
-    The paper's "dynamic evaluation" (Section 5.1/5.4, Figure 4): compares
-    BallCoverFilter's 4 insertion strategies (see runner._INSERT_STRATEGIES)
-    via stream_rebuild_worker's policy="streaming". Produces the long-format
-    data behind the streaming figure's four panels: (a) FPR vs. stream
-    position + a static-rebuild reference, (b) threshold-expanded objective
-    inflation vs. stream position, (c) final FPR vs. ball budget k, (d)
+    """The paper's "dynamic evaluation" (Section 5.1/5.4, Figure 4): compares
+    BallCoverFilter's 4 insertion strategies via stream_rebuild_worker's
+    policy="streaming". Produces the streaming figure's four panels: (a) FPR
+    vs. position + a static-rebuild reference, (b) threshold-expanded
+    objective inflation vs. position, (c) final FPR vs. ball budget k, (d)
     Pareto of mean FPR vs. amortized cost/insertion.
 
-    Implements the paper's Workloads protocol (Section 5.1): "The dynamic
-    evaluation uses the same construction [as the static evaluation],
-    varying the stream starting position across folds so that insertions
-    arrive in the dataset order beginning at each fold offset." Each of the
-    k_folds=5 folds gets its own num_vectors*stream_fraction-vector stream
-    window, starting fold_stride further into the representative dataset
-    than fold 0's -- non-wrapping, via advancing_fold_starts, so distinct
-    folds genuinely see different data rather than the same pool reordered.
-    A further num_vectors*(1-stream_fraction)-vector span, past every
-    fold's window, is held out as the source of verified-negative queries.
-    This means the dataset needs at least (k_folds-1)*fold_stride +
-    num_vectors vectors on disk in total; this raises if it doesn't, rather
-    than silently reusing/wrapping a shorter one.
+    Implements the paper's Workloads protocol (Section 5.1): each of
+    k_folds=5 folds gets its own stream window, starting fold_stride further
+    into the representative dataset than fold 0's -- non-wrapping via
+    advancing_fold_starts, so folds see genuinely different data rather than
+    the same pool reordered. A further span past every fold's window is held
+    out as the source of verified-negative queries; the dataset needs enough
+    vectors on disk for both, or this raises.
 
     FNR=0 is asserted per checkpoint inside stream_rebuild_worker (raises,
     not recorded) -- a correctness requirement, not a plotted quantity.
 
-    Every other size-related knob (k_fixed, k_values) derives from the
-    stream pool size alone; k_values are dropped (with a printed reason) if
-    too large relative to it to be a meaningful sweep point.
-
-    Only submits 'stream_rebuild' jobs (both the position sweep and the k
-    sweep, each tagged output_csv=STREAMING_CSV) to the given `runner` --
-    does not run it. The Runner itself writes results/streaming.csv
-    incrementally as each job completes -- output_csv routes by path, not
-    by Runner instance, so sharing one runner across every generate_*
-    function (see generate_and_plot_all()) doesn't take this away: a crash
-    mid-run still only loses whichever jobs hadn't completed yet, same as
-    if this evaluation had its own dedicated Runner. Call save_streaming()
-    on the shared runner's combined run() output only if you also want this
-    evaluation's rows back as a DataFrame directly.
-    """
+    Only submits 'stream_rebuild' jobs (output_csv=STREAMING_CSV) -- does
+    not run `runner`."""
     num_vectors = WORKLOAD_NUM_VECTORS
     dim = 384
     k_values = [16, 32, 64, 128, 256, 512, 1024]
@@ -1012,10 +834,8 @@ def generate_streaming(runner: Runner) -> None:
     offsets = [f * fold_stride for f in range(k_folds)]
     negative_pool_size = num_vectors - n_stream_pool
 
-    # Every fold's own stream window (length n_stream_pool, starting at each
-    # offset in `offsets`) is contained in [0, offsets[-1] + n_stream_pool);
-    # the negative-candidate pool sits entirely past that, so it can never
-    # overlap with any fold's stream.
+    # Placed past every fold's window (all contained in [0, offsets[-1] +
+    # n_stream_pool)) so it can never overlap any fold's stream.
     negative_pool_start = offsets[-1] + n_stream_pool
     negative_pool_end = negative_pool_start + negative_pool_size
 
@@ -1030,12 +850,9 @@ def generate_streaming(runner: Runner) -> None:
             "vectors, or lower num_vectors."
         )
 
-    # The driver needs real arrays for exactly two things: calibrating
-    # tau_mid and building the fixed negative set (both one-time
-    # computations here, not per-job) -- everything else below stays lazy.
-    # `full_span` covers every fold's stream window (not just fold 0's, per
-    # _build_streaming_negative_set's own note) since folds now see
-    # genuinely different data instead of one pool reordered.
+    # The driver needs real arrays only for calibrating tau_mid and building
+    # the negative set (one-time, not per-job) -- everything else stays
+    # lazy. `full_span` covers every fold's window, not just fold 0's.
     full_span = VectorSource(rep_dataset, 0, negative_pool_start).to_array()
     negative_candidate_pool = VectorSource(rep_dataset, negative_pool_start, negative_pool_end).to_array()
     if len(negative_candidate_pool) < n_negative:
@@ -1049,10 +866,8 @@ def generate_streaming(runner: Runner) -> None:
     n_stream_ab = min(k_fixed * 1000, n_stream_pool)
     n_stream_c = n_stream_pool
 
-    # k must leave enough room in the k-sweep's shared stream to be a
-    # meaningful sweep point (not just barely fit) -- dropping oversized k
-    # values here means num_vectors alone can shrink the whole evaluation
-    # without also having to hand-edit k_values to match.
+    # Drop k values that don't leave enough room in the shared stream to be
+    # a meaningful sweep point, rather than hand-editing k_values per num_vectors.
     usable_k_values = [k for k in k_values if k * 10 < n_stream_c]
     dropped_k = sorted(set(k_values) - set(usable_k_values))
     if dropped_k:
@@ -1064,9 +879,7 @@ def generate_streaming(runner: Runner) -> None:
         )
     k_values = usable_k_values
 
-    # tau_mid is calibrated from fold 0's own window -- full_span's first
-    # n_stream_pool vectors, since fold 0's offset is 0 -- same as before
-    # this function stopped wrapping.
+    # Calibrated from fold 0's window (full_span's first n_stream_pool vectors).
     logger.info(f"{rep_dataset}: calibrating tau_mid against the stream pool...")
     tau_mid = calculate_nn_distance_threshold(full_span[:n_stream_ab], duplicate_percentage)
     logger.info(f"tau_mid={tau_mid:.4f}")
@@ -1087,8 +900,7 @@ def generate_streaming(runner: Runner) -> None:
         return VectorSource(rep_dataset, fold_offset, fold_offset + length)
 
     # Each row is self-describing (method/sweep/metric/fold_offset), so no
-    # positional reconstruction is needed even though Runner's parallel mode
-    # returns results in completion, not submission, order.
+    # positional reconstruction is needed despite Runner's completion-order results.
 
     # --- panels (a)/(b): position sweep at fixed k_fixed ---
     for method in methods:
@@ -1125,13 +937,9 @@ def generate_streaming(runner: Runner) -> None:
 
 
 def save_streaming(job_results: List[Tuple[str, Any]]) -> Tuple[pd.DataFrame, int]:
-    """Extracts this evaluation's rows from a shared Runner's combined
-    run() output (see generate_streaming()). The Runner itself already wrote
-    results/streaming.csv incrementally (see generate_streaming()'s
-    output_csv=), so this only rebuilds the DataFrame, plus k_fixed (the
-    smallest k among 'position'-sweep rows, matching plot_all()'s own
-    derivation) for callers that want it directly instead of re-deriving it
-    from the CSV."""
+    """Rebuilds this evaluation's DataFrame from a shared Runner's run()
+    output, plus k_fixed (the smallest k among 'position'-sweep rows,
+    matching plot_all()'s own derivation)."""
     df = pd.DataFrame(rows_for_mode(job_results, 'stream_rebuild'))
     k_fixed = int(df.loc[df["sweep"] == "position", "k"].iloc[0])
     return df, k_fixed
@@ -1181,42 +989,23 @@ def generate_dynamic() -> list:
 
 
 def generate_and_plot_all() -> None:
-    """
-    Submit-all, run-all, then plot-all: every generate_* function below
-    only submits its jobs to one shared Runner (created here and passed
-    in) instead of creating and running its own -- so the whole combined
-    job list executes as a single parallel batch, keeping every worker
-    busy across all five evaluations instead of idling between them
-    whenever one evaluation's own job count doesn't divide evenly across
-    MAX_WORKERS. runner.shuffle() interleaves fast and slow jobs from
-    different evaluations (e.g. quantization's PQ builds, tens of minutes
-    each, next to system_tau's much shorter per-fold queries) across the
-    combined queue so one worker doesn't get stuck draining an entire slow
-    evaluation back-to-back while others sit idle.
+    """Submit-all, run-all, then plot-all: every generate_* function below
+    only submits jobs to one shared Runner instead of running its own, so
+    the combined job list executes as a single parallel batch and
+    runner.shuffle() can interleave fast and slow jobs across evaluations
+    rather than one worker draining a whole slow evaluation alone.
 
-    Each generate_ function tags its own jobs with their evaluation's
-    output_csv (see e.g. generate_equal_memory()'s docstring), so the
-    Runner writes each of the five results/*.csv files incrementally, as
-    that evaluation's own jobs complete -- not after the whole combined
-    batch finishes. This means results are visible on disk well before a
-    long run ends, and a crash mid-run only loses whichever jobs hadn't
-    completed yet rather than an unwritten evaluation's entire output.
-    There is no separate save-all step any more: the save_* functions
-    still exist (for a caller that wants this evaluation's rows back as a
-    DataFrame directly instead of via plot_all()'s from-disk reload), but
-    generate_and_plot_all() itself doesn't need to call them, since the
-    files they'd write are already current.
+    Each generate_ function tags its jobs with its own output_csv, so the
+    Runner writes each results/*.csv file incrementally as that
+    evaluation's jobs complete, not after the whole batch finishes -- a
+    crash mid-run only loses whichever jobs hadn't completed yet. There's
+    no separate save-all step: save_* functions still exist for a caller
+    that wants rows back as a DataFrame directly, but aren't needed here.
 
     Each generate_ call is independently try/except-guarded so one
-    evaluation failing to even submit its jobs doesn't take down the
-    others -- comment out a call to skip it for standalone testing. A
-    failure inside runner.run() itself (rather than during submission)
-    aborts the whole combined batch, unlike the old per-evaluation
-    Runners' isolation; see generate_streaming()'s docstring for that
-    trade-off -- though because writes are now incremental per output_csv,
-    such a failure still leaves every job that *did* complete beforehand
-    on disk.
-    """
+    evaluation failing to submit doesn't take down the others. A failure
+    inside runner.run() itself aborts the whole batch, but every job that
+    did complete beforehand is still on disk."""
     runner = Runner(num_workers=MAX_WORKERS)
 
     try:
@@ -1248,20 +1037,12 @@ def generate_and_plot_all() -> None:
 
 
 def plot_all() -> None:
-    """
-    Re-render every figure from data already persisted to disk, without
-    repeating the (expensive) evaluation sweeps -- handy for iterating on
-    plot styling alone, and also called automatically at the end of
-    generate_and_plot_all() now that the Runner writes each evaluation's
-    CSV incrementally as its own jobs complete (see generate_and_plot_all()'s
-    docstring), so the files are already current by the time this runs.
-    Reads back results/{quantization,query_performance,scaling,streaming,
-    system_tau,equal_memory}.csv, re-deriving whatever generate-time
-    metadata (k, k_fixed, T_representative) each plot_ needs directly from
-    the loaded data instead of threading it through from the generate_
-    call. Requires at least one prior generate_and_plot_all() (or
-    equivalent generate_X + runner.run()) to have produced those files.
-    """
+    """Re-renders every figure from data already persisted to disk, without
+    repeating the evaluation sweeps -- handy for iterating on plot styling
+    alone. Re-derives whatever generate-time metadata (k, k_fixed) each
+    plot_ needs from the loaded data. Requires at least one prior
+    generate_and_plot_all() (or generate_X + runner.run()) to have produced
+    those files."""
     try:
         df = pd.read_csv(SYSTEM_TAU_CSV)
         plot_system_tau(df)
@@ -1269,10 +1050,8 @@ def plot_all() -> None:
         logger.exception("An error occurred")
 
     try:
-        # keep_default_na=False: Quantize.NONE.value == "None", which pandas'
-        # default na_values list otherwise silently reads back as NaN,
-        # corrupting the quantize column into a mixed float/str dtype (see
-        # plot_quantization.py::load_data()'s own identical workaround).
+        # keep_default_na=False: Quantize.NONE.value == "None", which pandas
+        # would otherwise read back as NaN (see plot_quantization.py::load_data()).
         df = pd.read_csv(QUANTIZATION_CSV, keep_default_na=False)
         plot_quantization(df)
     except Exception:
@@ -1307,5 +1086,5 @@ def plot_all() -> None:
 
 
 if __name__ == "__main__":
-    generate_and_plot_all()  # runs every evaluation, saves results/*.csv, then plots (calls plot_all() itself)
-    # plot_all()  # alternative: re-render figures from an existing results/*.csv run without re-running any evaluation
+    # generate_and_plot_all()
+    plot_all()  # alternative: re-render figures from an existing results/*.csv run

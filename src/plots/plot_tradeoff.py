@@ -6,22 +6,16 @@ from typing import Tuple, Dict, List
 
 
 def get_plot_mappings(all_filters: List[str]) -> Tuple[Dict, Dict, Dict]:
-    """
-    function to generate consistent plot mappings:
-    - Colors: Grouped by the base filter.
-    - Markers/Dashes: Unique based on individual config index.
-    """
-    # colors grouped by base filter
+    """Colors are grouped by the base filter name; markers/dashes cycle per config index."""
     available_marks = ['s', 'o', '^', 'D', 'v', 'p', '*', 'X', 'h', 'P', 'd', 'H', '<', '>']
     available_dashes = [(1, 1), (4, 1.5), (3, 1, 1.5, 1), (5, 2, 1, 2), (2, 2), (4, 1, 1, 1, 1, 1), (1, 3), (6, 1), (3, 3, 1, 3)]
     base_names = [c.split(' + ')[0] for c in all_filters]
-    unique_bases = list(dict.fromkeys(base_names)) # Preserve order
+    unique_bases = list(dict.fromkeys(base_names))
     base_palette = sns.color_palette("tab10", n_colors=len(unique_bases))
     base_color_map = dict(zip(unique_bases, base_palette))
 
     color_map = {config: base_color_map[config.split(' + ')[0]] for config in all_filters}
-    
-    # markers and dashes cycle for uniqueness
+
     marker_map = {config: available_marks[i % len(available_marks)] for i, config in enumerate(all_filters)}
     dash_map = {config: available_dashes[i % len(available_dashes)] for i, config in enumerate(all_filters)}
     
@@ -40,17 +34,13 @@ def load_tradeoff_results(folder: str = "plots/tradeoff_static") -> Tuple[List, 
 
 
 def plot_tradeoff_results(spheres_results: list, memory_results: list, folder: str = "plots/tradeoff_static") -> None:
-    """
-    Plots tradeoff evaluation results, comparing FPR, FNR, Precision, F1-Score, QPS, 
-    and ConstructTime across both geometric (spheres) and hardware (memory) sweeps.
-    """
+    """Plots tradeoff evaluation results, comparing FPR, FNR, Precision, F1-Score, QPS,
+    and ConstructTime across both geometric (spheres) and hardware (memory) sweeps."""
     os.makedirs(folder, exist_ok=True)
-    
-    # Initialize DataFrames and inject Mode labels
+
     df_spheres = pd.DataFrame(spheres_results) if spheres_results else pd.DataFrame()
     df_memory = pd.DataFrame(memory_results) if memory_results else pd.DataFrame()
 
-    # Check if both dataframes are empty, is so finish
     if df_spheres.empty and df_memory.empty:
         print("Both spheres results and memory results are empty. No plots generated.")
         return
@@ -60,21 +50,17 @@ def plot_tradeoff_results(spheres_results: list, memory_results: list, folder: s
     if not df_memory.empty and 'Mode' not in df_memory.columns:
         df_memory.insert(0, 'Mode', 'memory_test')
 
-    # Convert Bytes to MB for the memory plots
     if not df_memory.empty:
         df_memory['MemoryBudget_MB'] = df_memory['MemoryBudget'] / (1024 * 1024)
 
     sns.set_theme(style="whitegrid")
 
-    # Generate unified maps for colors, markers, and dash patterns
     spheres_configs = list(df_spheres['Config'].unique()) if not df_spheres.empty and 'Config' in df_spheres.columns else []
     memory_configs = list(df_memory['Config'].unique()) if not df_memory.empty and 'Config' in df_memory.columns else []
     all_filters = list(dict.fromkeys(spheres_configs + memory_configs))
 
-    # Plot filter colors, markers, and dash patterns
     color_map, marker_map, dash_map = get_plot_mappings(all_filters)
 
-    # Helper function to place a single legend below individual 1x1 plots
     def _add_bottom_legend(ax_obj):
         handles, labels = ax_obj.get_legend_handles_labels()
         if ax_obj.get_legend() is not None:
@@ -85,7 +71,6 @@ def plot_tradeoff_results(spheres_results: list, memory_results: list, folder: s
             ncol=min(3, len(labels)), fontsize=11, frameon=True
         )
 
-    # Dictionary of standard plot styling args to keep calls clean
     plot_kwargs = {
         'palette': color_map,
         'markers': marker_map,
@@ -96,7 +81,6 @@ def plot_tradeoff_results(spheres_results: list, memory_results: list, folder: s
         'alpha': 0.75
     }
 
-    # CHART 1: Evaluate how increasing sphere count impacts overall filtering accuracy
     if not df_spheres.empty:
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
         (ax1, ax2), (ax3, ax4) = axes
@@ -131,7 +115,6 @@ def plot_tradeoff_results(spheres_results: list, memory_results: list, folder: s
         plt.close()
         print(f"Saved {folder}/{filename1}")
 
-    # CHART 2: Analyze the trade-off between memory allocation and filtering accuracy
     if not df_memory.empty:
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
         (ax1, ax2), (ax3, ax4) = axes
@@ -166,7 +149,6 @@ def plot_tradeoff_results(spheres_results: list, memory_results: list, folder: s
         plt.close()
         print(f"Saved {folder}/{filename2}")
 
-    # CHART 3: Compare query performance scaling across different sphere densities
     if not df_spheres.empty and 'QPS' in df_spheres.columns:
         fig, ax = plt.subplots(figsize=(10, 6))
         sns.lineplot(
@@ -183,7 +165,6 @@ def plot_tradeoff_results(spheres_results: list, memory_results: list, folder: s
         plt.close()
         print(f"Saved {folder}/{filename3}")
 
-    # CHART 4: Assess how memory budget constraints affect query throughput (QPS)
     if not df_memory.empty and 'QPS' in df_memory.columns:
         fig, ax = plt.subplots(figsize=(10, 6))
         sns.lineplot(
@@ -200,7 +181,6 @@ def plot_tradeoff_results(spheres_results: list, memory_results: list, folder: s
         plt.close()
         print(f"Saved {folder}/{filename4}")
         
-    # CHART 5: Benchmark filter construction time relative to sphere complexity
     if not df_spheres.empty and 'ConstructTime' in df_spheres.columns:
         fig, ax = plt.subplots(figsize=(10, 6))
         sns.lineplot(
@@ -217,7 +197,6 @@ def plot_tradeoff_results(spheres_results: list, memory_results: list, folder: s
         plt.close()
         print(f"Saved {folder}/{filename5}")
 
-    # CHART 6: Measure the impact of memory capacity on filter initialization speed
     if not df_memory.empty and 'ConstructTime' in df_memory.columns:
         fig, ax = plt.subplots(figsize=(10, 6))
         sns.lineplot(
@@ -234,11 +213,9 @@ def plot_tradeoff_results(spheres_results: list, memory_results: list, folder: s
         plt.close()
         print(f"Saved {folder}/{filename6}")
 
-    # Final Result: Combine and save all experimental metrics for documentation
     if not df_spheres.empty or not df_memory.empty:
         final_df = pd.concat([df_spheres, df_memory], ignore_index=True)
 
-        # Save to current folder
         filename7 = "tradeoff_evaluations.csv"
         os.makedirs(folder, exist_ok=True)
         final_df.to_csv(f"{folder}/{filename7}", index=False)

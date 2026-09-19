@@ -19,17 +19,16 @@ class GonzalesConstruct(ConstructInterface):
         if n <= k:
             return X.copy(), np.zeros(n, dtype=np.float32)
 
-        # ||x||^2, one pass, no temporaries
         sq = np.einsum("ij,ij->i", X, X)
 
         chosen = np.empty(k, dtype=np.int64)
         min_d2 = np.empty(n, dtype=np.float32)
         d2 = np.empty(n, dtype=np.float32)
 
-        # d2(x, c) = ||x||^2 - 2 <x, c> + ||c||^2  -> one sgemv per center.
-        # Approximate (float32 cancellation for near-duplicate x, c), but that's
-        # fine here: min_d2 only drives *which* point to pick next, not any
-        # radius that ends up returned -- see the exact re-search below.
+        # d2(x,c) = ||x||^2 - 2<x,c> + ||c||^2 is approximate under float32
+        # cancellation for near-duplicate x,c, but that's fine here: min_d2
+        # only drives *which* point to pick next, not any returned radius --
+        # see the exact re-search below.
         chosen[0] = 0
         np.dot(X, X[0], out=min_d2)
         min_d2 *= -2.0
@@ -52,16 +51,11 @@ class GonzalesConstruct(ConstructInterface):
 
         centers = np.ascontiguousarray(X[chosen])
 
-        # Exact final assignment + radii via a real nearest-center search, not
-        # the approximate min_d2/labels tracked during selection above: reusing
-        # that running minimum directly as the squared radius let the same
-        # float32 cancellation error that only needed to be "good enough" to
-        # pick reasonable centers actually *understate* a returned radius by a
-        # tiny margin -- rare, but a real, verified violation of the
-        # zero-false-negative covering invariant every construction strategy
-        # promises (caught by test_ball_cover_construction.py on clustered
-        # data). The exact search costs one more O(n*k*d) pass, same order as
-        # selection, and is what rptree/ivf's own radius computations already do.
+        # Exact re-search, not the approximate min_d2 tracked during selection:
+        # reusing that running minimum directly as the squared radius let its
+        # float32 cancellation error *understate* a returned radius -- a real,
+        # verified zero-false-negative violation (caught by
+        # test_ball_cover_construction.py on clustered data).
         index = faiss.IndexFlatL2(dim)
         index.add(centers)
         d2_exact, labels = index.search(X, 1)

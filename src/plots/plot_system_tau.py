@@ -167,20 +167,24 @@ def _line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cf
 
     ax.set_xlabel(r"$\tau$")
     ax.set_ylabel(wrap_label(ylabel))
-    ax.text(0.03, 0.95, rf"$k = {cfg.k_fixed}$", transform=ax.transAxes, ha="left", va="top", fontsize=5.5)
     style_axes(ax)
 
-    save_figure(fig, filename, cfg.outdir, cfg.dpi, cfg.emit_pdf)
+    # Fixed margins (not bbox_inches="tight") so every panel in this figure
+    # set shares the same canvas size and axes position -- needed since they
+    # get placed side by side, and "tight" would crop each one differently
+    # depending on its own y-label width.
+    fig.subplots_adjust(left=0.26, right=0.97, top=0.95, bottom=0.24)
+    save_figure(fig, filename, cfg.outdir, cfg.dpi, cfg.emit_pdf, tight=False)
     return agg
 
 
 def panel_throughput_improvement(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    return _line_panel(df, "throughput_improvement_pct", "Throughput Improvement (%)",
+    return _line_panel(df, "throughput_improvement_pct", "Throughput Gain (%)",
                        "system-tau-throughput-improvement.png", cfg)
 
 
 def panel_index_accesses(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    return _line_panel(df, "mean_index_accesses", "Mean Full Index Accesses",
+    return _line_panel(df, "mean_index_accesses", "Index Accesses",
                        "system-tau-index-accesses.png", cfg)
 
 
@@ -189,10 +193,7 @@ def panel_fpr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 
 def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    # Hand-wrapped into two self-contained "$...$" spans -- wrap_label passes
-    # LaTeX through unchanged since generic word-wrapping would otherwise
-    # split a single "$...$" expression across lines and break mathtext.
-    ylabel = "$\\log_{10}$\n$J_\\tau(\\mathcal{C})$"
+    ylabel = r"$\log_{10} J_\tau(\mathcal{C})$"
     return _line_panel(df, "log10_j_tau", ylabel, "system-tau-geometric-objective.png", cfg)
 
 
@@ -217,7 +218,7 @@ def panel_positive_rate(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     (mean_index_accesses / n_queries), as opposed to panel_redundancy_rate's
     ground-truth rate -- the gap between the two at a given tau is the
     filter's false-positive margin."""
-    return _line_panel(df, "positive_rate_pct", "Predicted Positive Rate (%)",
+    return _line_panel(df, "positive_rate_pct", "Predicted Rate (%)",
                        "system-tau-positive-rate.png", cfg)
 
 

@@ -1,35 +1,22 @@
 """
-Tight lower/upper bounds on the volume of a union of hyperspheres.
+Tight lower/upper bounds on the volume of a union of hyperspheres, beyond
+the naive bounds (max single volume, sum of volumes):
 
-Improvements over the naive bounds (max single volume, sum of volumes):
+1. All work is done in log/scaled space -- pi^(d/2)/Gamma(d/2+1) and r^d
+   overflow/underflow float64 catastrophically at dim up to 1000.
+2. Spheres fully contained in another are removed (they don't change the
+   union but inflate the naive upper bound).
+3. Intersecting pairs are found via a radius-bucketed faiss range search;
+   each pair's exact "lens" volume is computed via the regularized
+   incomplete beta function.
+4. The intersection graph splits into connected components, computed and
+   summed independently. Per component C:
+     lower(C) = max(max_i V_i, sum_i V_i - sum_{(i,j) in C} V_ij)  -- degree-2 Bonferroni
+     upper(C) = sum_i V_i - weight(max spanning forest of C, weight V_ij)  -- Hunter's bound
+   Singleton and 2-sphere components come out exact.
 
-1.  All work is done in log/scaled space. In dim up to 1000, pi^(d/2)/Gamma(d/2+1)
-    and r^d overflow/underflow float64 catastrophically, so raw volumes are useless.
-
-2.  Spheres fully contained in another sphere are removed: they change neither
-    the union nor the bounds, but they inflate the naive upper bound.
-
-3.  The exact set of intersecting pairs is found with a (radius-bucketed) faiss
-    range search, and the exact d-dimensional "lens" volume of every intersecting
-    pair is computed analytically via the regularized incomplete beta function.
-
-4.  The intersection graph is split into connected components; components are
-    independent, so bounds are computed per component and summed. Per component C:
-
-      lower(C) = max( max_i V_i ,  sum_i V_i - sum_{(i,j) in C} V_ij )
-                 (degree-2 Bonferroni inequality, valid because we have ALL pairs)
-
-      upper(C) = sum_i V_i - weight(maximum spanning forest of C, edge weight V_ij)
-                 (Hunter's bound: valid for any tree subgraph of the intersection
-                  graph; the max-weight spanning tree gives the tightest one)
-
-    Singleton components are exact, and 2-sphere components are exact as well
-    (lower == upper == V1 + V2 - V12), which generalizes the special-casing of
-    "non-intersecting" and "intersecting once" spheres.
-
-Complexity: pair discovery is the dominant cost, O(n^2 * d) through faiss's
-BLAS-optimized exhaustive range search (fine up to n ~ 1e5 with threads).
-Everything downstream is O(P log n) in the number P of truly intersecting pairs.
+Complexity: pair discovery dominates, O(n^2 * d) via faiss's BLAS-optimized
+range search; everything downstream is O(P log n) in intersecting pairs P.
 """
 
 from typing import Tuple
@@ -86,15 +73,12 @@ def _pair_lens_scaled(d, r1, r2, w1, w2, dim):
 
 def _find_intersecting_pairs(centroids: np.ndarray, radii: np.ndarray,
                              n_buckets: int = 8, exact: bool = True):
-    """
-    Return (i, j, d) for every pair with ||c_i - c_j|| < r_i + r_j, i < j.
-    Exact mode: queries are bucketed by radius so each bucket uses the search
-    threshold (bucket_r_max + global_r_max)^2, which cannot miss a pair; the
-    coarse float32 candidates are then re-verified in float64.
-    Approximate mode (exact=False): an IVF index prunes the O(n^2 d) scan; it
-    may miss a few pairs, which keeps the upper bound valid (Hunter's bound
-    holds for any subgraph) but makes the lower bound heuristic.
-    """
+    """Returns (i, j, d) for every pair with ||c_i - c_j|| < r_i + r_j, i < j.
+    Exact mode buckets queries by radius so the search threshold can't miss
+    a pair; coarse float32 candidates are re-verified in float64. Approximate
+    mode (exact=False) uses an IVF index that may miss pairs -- the upper
+    bound stays valid (Hunter's bound holds for any subgraph), but the lower
+    bound becomes heuristic."""
     n, dim = centroids.shape
     xb = np.ascontiguousarray(centroids, dtype=np.float32)
     if exact or n < 20_000:
@@ -143,20 +127,11 @@ def estimate_hypersphere_volume(centroids: np.ndarray,
                                 radii: np.ndarray,
                                 return_log: bool = False,
                                 exact: bool = True) -> Tuple[float, float]:
-    """
-    Tight (lower_bound, upper_bound) on the volume of the union of the spheres.
-
-    centroids  : (n, dim) array
-    radii      : (n,) array of positive radii
-    return_log : if True, return (log_lower, log_upper). Strongly recommended for
-                 dim >~ 300, where the true volume itself under/overflows float64
-                 (e.g. a unit ball in dim=1000 has volume ~ 1e-711) and the linear
-                 result would degenerate to 0.0 or inf.
-    exact      : True guarantees both bounds. False switches pair discovery to an
-                 IVF index, which is much faster at n ~ 1e5 x dim ~ 1e3; the upper
-                 bound remains a true bound, the lower bound becomes heuristic
-                 (missed pairs could overestimate it).
-    """
+    """Tight (lower_bound, upper_bound) on the volume of the union of the
+    spheres. return_log=True is strongly recommended for dim >~ 300, where
+    the true volume itself under/overflows float64 (e.g. a unit ball in
+    dim=1000 has volume ~1e-711). exact=False speeds up pair discovery via
+    an IVF index at the cost of a heuristic (not guaranteed) lower bound."""
     centroids = np.asarray(centroids, dtype=np.float64)
     radii = np.asarray(radii, dtype=np.float64).ravel()
     centroids = centroids[radii > 0]

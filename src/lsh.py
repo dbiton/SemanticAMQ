@@ -52,8 +52,8 @@ class LSH(ABC):
 
     def hash(self, vectors: np.ndarray) -> np.ndarray:
         raw_hashes = self._compute_raw_hashes(vectors)  # (n_samples, L, K)
-        # View each K-element row as a single opaque byte string so numpy's == compares
-        # whole tuples without building Python objects.
+        # Each K-element row viewed as one opaque byte string, so numpy's ==
+        # compares whole tuples without building Python objects.
         contiguous = np.ascontiguousarray(raw_hashes)
         void_dt = np.dtype((np.void, contiguous.dtype.itemsize * self.K))
         return contiguous.view(void_dt).reshape(vectors.shape[0], self.L)
@@ -101,8 +101,8 @@ class CrossPolytopeLSH(LSH):
             sin_theta = np.sqrt(1.0 - cos_theta**2)
 
             batch_size = 25000
-            max_sims = 250000  # Hard ceiling to prevent infinite loops
-            target_se = 0.0015  # Target Standard Error (0.15%)
+            max_sims = 250000
+            target_se = 0.0015
 
             matches = 0
             total_sims = 0
@@ -150,9 +150,9 @@ import faiss
 class FaissSimHashLSH(LSH):
     def __init__(self, dim: int, L: int, K: int):
         super().__init__(dim, L, K)
-        # One index with L*K hyperplanes is statistically equivalent to L separate
-        # K-hyperplane tables because all hyperplanes are i.i.d. Gaussian. A single
-        # FAISS call avoids the L-iteration Python loop and its per-call overhead.
+        # One index with L*K hyperplanes is statistically equivalent to L
+        # separate K-hyperplane tables (all i.i.d. Gaussian), avoiding an
+        # L-iteration Python loop.
         self._index = faiss.IndexLSH(dim, L * K)
 
     def _get_base_probabilities(self, r1: float, r2: float) -> Tuple[float, float]:
@@ -165,8 +165,7 @@ class FaissSimHashLSH(LSH):
     def _compute_raw_hashes(self, vectors: np.ndarray) -> np.ndarray:
         vecs_f32 = np.ascontiguousarray(vectors, dtype=np.float32)
         n_samples = vecs_f32.shape[0]
-        # sa_encode packs bits LSB-first within each byte, so bitorder='little'
-        # is required to correctly extract bit i from position i%8 of byte i//8.
+        # sa_encode packs bits LSB-first, so bitorder='little' is required to extract them correctly.
         packed = self._index.sa_encode(vecs_f32)          # (n, ceil(L*K/8))
         bits = np.unpackbits(packed, axis=1, bitorder='little')[:, : self.L * self.K]
         return bits.reshape(n_samples, self.L, self.K)

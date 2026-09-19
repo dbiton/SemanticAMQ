@@ -1,24 +1,14 @@
-"""Shared logging setup: one timestamped format for every module's
-progress/status output, replacing ad hoc print() calls. Logs go to both the
-console and LOG_FILE.
+"""Shared logging setup: one timestamped format for console + LOG_FILE.
 
-configure_logging() is called at import time by every module that logs
-(main.py, runner.py) rather than left to whichever happens to import first,
-because runner.py's worker functions run inside separate processes under
-ProcessPoolExecutor (Runner._run_parallel): each spawned process re-imports
-runner.py fresh and would otherwise have no handler configured (Python's
-"handler of last resort" only surfaces WARNING+ through an unformatted,
-un-timestamped fallback). logging.basicConfig is a no-op once handlers
-exist, so calling this from multiple modules is safe regardless of import
-order.
+Called at import time by every module that logs, since each
+ProcessPoolExecutor worker re-imports runner.py fresh and would otherwise
+have no handler configured; logging.basicConfig is a no-op once handlers
+exist, so this is safe regardless of import order.
 
-LOG_FILE is cleared once per run, not once per call: every spawned worker
-process re-runs this function too, and truncating on each of those would
-wipe out lines other processes already wrote. _CLEAR_ENV_FLAG marks the
-clear as done in os.environ, which child processes inherit, so only the
-first call in the whole process tree truncates; every call (including the
-first) opens the file in append mode.
-"""
+LOG_FILE is truncated once per whole process tree, not once per call:
+_CLEAR_ENV_FLAG (inherited by child processes via os.environ) ensures only
+the first call clears it, so spawned workers don't wipe out lines other
+processes already wrote."""
 
 import logging
 import os

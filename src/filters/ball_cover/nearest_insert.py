@@ -7,12 +7,10 @@ from filters.ball_cover.ball_interfaces import InsertInterface
 
 class NearestInsert(InsertInterface):
     """Absorb each new vector into the nearest existing ball by raw
-    distance, growing that ball's radius if needed. O(m*k*d), no new balls
-    ever created -- max_count_balls is accepted but unused (there's nothing
-    to cap). Cheap and predictable, but nearest != cheapest to grow: a
-    far-but-huge ball may need no growth at all while the nearest one is a
-    tight singleton about to blow up by a factor of dist**d (see
-    insert_least_inflation)."""
+    distance, growing its radius if needed -- never creates new balls.
+    Cheap and predictable, but nearest != cheapest to grow: a far-but-huge
+    ball may need no growth while the nearest one is a tight singleton about
+    to blow up by dist**d (see LeastInflationInsert)."""
 
     def ensure_capacity(self, required_cap: int) -> None:
         pass
@@ -31,11 +29,9 @@ class NearestInsert(InsertInterface):
 
     @staticmethod
     def _exhaustive_search(centers: np.ndarray, queries: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Exact distance from every query to every center, via a throwaway
-        faiss index rather than a raw (m, k, d) numpy broadcast -- the latter
-        materializes a full dense tensor (a real problem at scale: e.g.
-        20000 x 5000 x 384 floats is ~150GB) where this is O(m*k*d) compute
-        with no more than a (m, k) result ever held in memory."""
+        """Via a throwaway faiss index, not a raw (m, k, d) numpy broadcast
+        -- the latter materializes a full dense tensor (~150GB at
+        20000x5000x384) where this holds only the (m, k) result."""
         dim = centers.shape[1]
         index = faiss.IndexFlatL2(dim)
         index.add(centers)

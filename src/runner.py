@@ -6,12 +6,10 @@ import random
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
-# Must happen before numpy/faiss are imported -- see main.py's own copy of
-# this guard for why (BLAS/OpenMP thread-count x Runner's multiprocess
-# worker count multiply into CPU/memory oversubscription otherwise).
-# Repeated here (not just in main.py) since each ProcessPoolExecutor worker
-# re-imports this module fresh, and other entry points (tests, tradeoff.py)
-# may import runner.py directly without going through main.py first.
+# Must happen before numpy/faiss are imported (BLAS/OpenMP thread count x
+# Runner's process count otherwise multiply into CPU/memory oversubscription
+# -- see main.py's copy of this guard). Repeated here since each
+# ProcessPoolExecutor worker re-imports this module fresh.
 for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_env_var, "1")
 
@@ -39,15 +37,12 @@ from filters.ball_cover.doubling_insert import DoublingInsert
 from hyperspheres_volume import estimate_hypersphere_volume
 from vector_source import VectorSource
 
-# Configured at import time so worker functions still log with a timestamp
-# when re-imported inside a ProcessPoolExecutor child process.
 configure_logging()
 logger = logging.getLogger(__name__)
 
-# String name -> InsertInterface class (classes, not instances -- each job
-# needs its own fresh strategy object with its own state). "doubling" is
-# registered but not in generate_streaming()'s own sweep list, a deliberate
-# opt-in since it adds real compute.
+# Classes, not instances -- each job needs its own fresh strategy object.
+# "doubling" is registered but opt-in only (not in generate_streaming()'s
+# sweep list) since it adds real compute.
 _INSERT_STRATEGIES = {
     "nearest": NearestInsert,
     "least_inflation": LeastInflationInsert,
@@ -149,11 +144,9 @@ def _ball_cover_max_memory(dim: int, k: int, quantize: Quantize = Quantize.NONE)
 
 class _BallCoverFilterEvalAdapter:
     """BallCoverFilter.query() takes an explicit per-call distance_threshold
-    rather than baking one in at construction time, unlike the other
-    _DIRECT_TAU_FILTERS below -- this adapter captures the threshold once at
-    construction so the generic single-arg `filter_instance.query(block)`
-    call sites elsewhere in this module (static/dynamic/system/equal_memory
-    workers) keep working unchanged."""
+    rather than baking one in at construction time like the other
+    _DIRECT_TAU_FILTERS -- this captures the threshold once so this module's
+    generic `filter_instance.query(block)` call sites keep working."""
 
     def __init__(self, dim: int, max_memory: int, distance_threshold: float,
                  max_spheres: Optional[int] = None, insert_mem_percent: Optional[float] = 0.0, **extra_kwargs: Any) -> None:
@@ -257,9 +250,7 @@ _IVF_NPROBE_CANDIDATES = (1, 2, 4, 8, 16, 32, 64)
 # Filters with a cheap post-construction query-time dial: score every candidate on one built instance.
 _POST_CONSTRUCTION_CONFIG_DIALS = {
     "DSBFFilter": lambda f: [("vote_threshold", t) for t in range(1, f.num_tables + 1)],
-    # nprobe is a pure query-time knob (IVFFilter.nprobe proxies to the built
-    # index, see its property docstring) -- swept on a log-ish grid up to
-    # nlist rather than exhaustively, since nlist can be in the hundreds.
+    # Swept on a log-ish grid up to nlist, not exhaustively (nlist can be in the hundreds).
     "IVFFilter": lambda f: [
         ("nprobe", p) for p in sorted({c for c in _IVF_NPROBE_CANDIDATES if c <= f.nlist} | {f.nlist})
     ],
@@ -282,21 +273,18 @@ def _build_calibrated_filter(
 ) -> Tuple[Any, float]:
     """Builds filter_cls at memory_budget, picking whichever registered config
     dial candidate scores best (F1) on the calibration set. Returns
-    (filter_instance, construction_seconds) -- construction_seconds sums only
-    the time spent inside .construct() calls (every candidate build, for a
-    construction-time dial), excluding the calibration-set .query() calls used
-    purely to score candidates, so it reflects the cost of reaching a
-    ready-to-query filter rather than this function's own search overhead."""
+    (filter_instance, construction_seconds) -- the latter sums only time
+    inside .construct() calls, excluding the calibration .query() calls used
+    to score candidates, so it reflects reaching a ready-to-query filter."""
     name = filter_cls.__name__
     construction_time = 0.0
 
     if name in _CONSTRUCTION_TIME_CONFIG_DIALS:
         best_f1, best_instance = -1.0, None
         for kwargs in _CONSTRUCTION_TIME_CONFIG_DIALS[name]:
-            # Routed through _instantiate_filter's own dispatch (not a
-            # hardcoded direct-tau constructor call) so a filter added to
-            # this dial registry that isn't in _DIRECT_TAU_FILTERS still
-            # gets built correctly.
+            # Via _instantiate_filter's own dispatch, not a hardcoded
+            # direct-tau call, so a dial-registry filter not in
+            # _DIRECT_TAU_FILTERS still gets built correctly.
             candidate = _instantiate_filter(
                 filter_cls, dim, memory_budget, distance_threshold, extra_kwargs=kwargs
             )
@@ -352,9 +340,8 @@ def equal_memory_worker(
             construct_arr, calib_arr, calib_actual,
         )
     except QVFInsufficientMemoryError as e:
-        # Expected outcome at small budgets (see QuantizedVectorFilter's
-        # docstring) -- recorded as an explicit infeasible row (NaN metrics)
-        # rather than dropped silently or crashing the sweep.
+        # Expected at small budgets -- recorded as an explicit infeasible
+        # row (NaN metrics) rather than dropped or crashing the sweep.
         logger.warning(f"[Infeasible] {config} at memory_budget={memory_budget}: {e}")
         return {
             'Config': config, 'Dataset': dataset, 'Memory Budget': memory_budget,
@@ -381,10 +368,8 @@ def equal_memory_worker(
         'Threshold': distance_threshold,
         'FPR': fp / (fp + tn) if (fp + tn) > 0 else 0.0,
         'FNR': fn / (fn + tp) if (fn + tp) > 0 else 0.0,
-        # Construction latency, not query latency -- this comparison cares
-        # about the one-time cost of building each filter at a given memory
-        # budget (see _build_calibrated_filter's docstring for what's
-        # included/excluded), not per-query serving cost.
+        # Construction latency, not query latency (see
+        # _build_calibrated_filter's docstring for what's included).
         'Latency (ms)': construction_time * 1000,
         'Throughput (qps)': n_q / max(elapsed, 1e-9),
         'Infeasible': False,
@@ -394,9 +379,9 @@ def equal_memory_worker(
 def _fpvr_bounds(
     orig_log_low: Any, orig_log_high: Any, filt_log_low: float, filt_log_high: float,
 ) -> tuple:
-    """Bounds on log(V_filter / V_original) -- kept in log space since the raw
-    ratio can overflow at high dimension. Always >= 0 since every true-duplicate
-    ball is contained in its filter ball; lower bound floored at 0."""
+    """Bounds on log(V_filter / V_original), kept in log space since the raw
+    ratio can overflow at high dimension. Floored at 0 (always >= 0, since
+    every true-duplicate ball is contained in its filter ball)."""
     if (orig_log_low is None or orig_log_high is None
             or np.isnan(filt_log_low) or np.isinf(filt_log_low)):
         return float('nan'), float('nan')
@@ -419,10 +404,9 @@ def system_worker(
     orig_vol_log_high: float = None,
 ) -> Dict[str, Any]:
     """Measures how much a filter reduces flat-L2-index queries (one-sided:
-    filter negatives are trusted, positives get searched) -- same query
-    stream timed with and without the filter. orig_vol_log_* is the caller's
-    precomputed true-duplicate-volume bound, combined with the filter's own
-    covering volume into ground-truth-free FPVR bounds."""
+    filter negatives are trusted, positives get searched), timing the same
+    query stream with and without it. orig_vol_log_* is combined with the
+    filter's own covering volume into ground-truth-free FPVR bounds."""
     config = filter_cls.__name__
 
     construct = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
@@ -505,9 +489,6 @@ def _compute_tradeoff_metrics(
     construct_time: float,
     qps: float
 ) -> Dict[str, Any]:
-    """
-    function for computing memory and sphere tradeoff metrics
-    """
     tp = sum(1 for p, a in zip(predicted, actual) if p and a)
     fp = sum(1 for p, a in zip(predicted, actual) if p and not a)
     fn = sum(1 for p, a in zip(predicted, actual) if not p and a)
@@ -543,26 +524,22 @@ def tradeoff_static_worker(
     memory_budget: int = None,
     insert_memory_percent: float = 0.0
 ) -> Dict[str, Any]:
-    """
-    Function for executing a single benchmarking trial of a static filter,
-    constructing the filter once from the full dataset and measuring
-    construction time, memory usage, query throughput, and accuracy metrics.
-    """
+    """Constructs a static filter once from the full dataset, measuring
+    construction time, memory usage, query throughput, and accuracy."""
     try:
         config = filter_cls.__name__
         vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
 
-        construct_start = time.perf_counter() # start construct timer
+        construct_start = time.perf_counter()
         filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold, max_spheres, insert_memory_percent)
         filter_instance.construct(vectors_construct)
-        construct_latency = time.perf_counter() - construct_start # final construct time
+        construct_latency = time.perf_counter() - construct_start
 
-        query_start = time.perf_counter() # start qps timer
-        # stream the query set in bounded blocks for efficiency
+        query_start = time.perf_counter()
         predicted: List[bool] = []
         for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
             predicted.extend(filter_instance.query(block))
-        query_latency = time.perf_counter() - query_start # final qps timer
+        query_latency = time.perf_counter() - query_start
 
         qps = len(vectors_query) / max(query_latency, 1e-9)
         memory_usage = filter_instance.get_bytesize()
@@ -585,21 +562,18 @@ def tradeoff_dynamic_worker(
     memory_budget: int = None,
     insert_memory_percent: float = 0.0
 ) -> Dict[str, Any]:
-    """
-    Function for executing a single benchmarking trial of a dynamic filter,
-    where vectors are inserted incrementally while measuring insertion time,
-    memory usage, query throughput, and accuracy metrics.
-    """
+    """Like tradeoff_static_worker, but inserts non-covered vectors
+    incrementally while measuring insertion time alongside the rest."""
     try:
         config = filter_cls.__name__
         vectors_construct, vectors_query = _to_construct_array(vectors_construct), _to_construct_array(vectors_query)
 
-        construct_start = time.perf_counter() # start construct timer
+        construct_start = time.perf_counter()
         filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold, max_spheres, insert_memory_percent)
         filter_instance.construct(vectors_construct)
-        construct_latency = time.perf_counter() - construct_start # final construct time
+        construct_latency = time.perf_counter() - construct_start
 
-        query_start = time.perf_counter() # start throughput timer
+        query_start = time.perf_counter()
         predicted: List[bool] = []
         for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
             block_preds = filter_instance.query(block)
@@ -608,7 +582,7 @@ def tradeoff_dynamic_worker(
             misses = [block[i] for i, is_dup in enumerate(block_preds) if not is_dup]
             if misses:
                 filter_instance.insert(np.array(misses, dtype=np.float32))
-        query_latency = time.perf_counter() - query_start # final throughput timer
+        query_latency = time.perf_counter() - query_start
 
         qps = len(vectors_query) / max(query_latency, 1e-9)
         memory_usage = filter_instance.get_bytesize()
@@ -650,12 +624,8 @@ def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, flo
     }
 
 
-# The quantization sweep varies BallCoverFilter's quantize choice rather than
-# the retired per-level construction strategies. NONE is included as the
-# raw/unquantized baseline point in this same sweep (tagged stage="ball")
-# rather than a separate per-candidate stage: Gonzalez construction no
-# longer varies by quantize choice, so there's exactly one "ball" cover to
-# compare every real quantizer against, not one per candidate.
+# NONE is the raw/unquantized baseline point in this sweep (tagged
+# stage="ball"): one "ball" cover to compare every real quantizer against.
 QUANTIZATION_SWEEP = (
     Quantize.NONE, Quantize.SQ8, Quantize.SQ4,
     Quantize.FP16, Quantize.BF16, Quantize.SQ4T, Quantize.SQ8T, Quantize.PQ,
@@ -680,20 +650,16 @@ def quantization_worker(
 
     max_memory is derived from k using Quantize.NONE's byte-per-ball size and
     held fixed across every quantize candidate, so a more compact code packs
-    more balls into the same budget -- n_balls and memory_bytes then vary
-    meaningfully per quantize choice instead of trivially matching k. A
-    quantizer compact enough to saturate at n_construct balls before using
-    the full budget (e.g. PQ) will show flat memory usage across the k
-    sweep -- real information (construct-set-bound, not budget-bound), not a
-    plotting artifact. construct_tau is unused: BallCoverFilter's
+    more balls into the same budget -- a quantizer compact enough to
+    saturate at n_construct balls before using the full budget (e.g. PQ)
+    will show flat memory usage across the k sweep, which is real
+    information, not a plotting artifact. construct_tau is unused: Gonzalez
     construction has no distance-threshold knob.
 
-    FNR is asserted (raises on violation), never plotted.
-
-    If construction itself raises (e.g. InsufficientMemoryError -- too
-    tight a budget for PQ's minimum codebook), that candidate is treated as
-    non-viable at this (dataset, k) point: caught, logged, and this job
-    contributes zero rows rather than aborting the whole sweep."""
+    FNR is asserted (raises on violation), never plotted. If construction
+    itself raises (e.g. InsufficientMemoryError, too tight a budget for PQ's
+    minimum codebook), that candidate is logged and contributes zero rows
+    rather than aborting the whole sweep."""
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
     n_q = len(query_arr)
@@ -723,10 +689,6 @@ def quantization_worker(
     radii = filt.all_radiuses
     log10_J = _log10_J(radii, dim)
 
-    # Per-ball radius inflation: the reconstruction error added onto each
-    # ball's radius to preserve the no-false-negative guarantee under this
-    # quantize choice's lossy center encoding (0 for Quantize.NONE by
-    # construction -- see BallCoverFilter._radius_inflation).
     radius_inflation = filt.all_radius_inflation
     radius_inflation_mean = float(np.mean(radius_inflation)) if len(radius_inflation) else 0.0
     radius_inflation_std = float(np.std(radius_inflation)) if len(radius_inflation) else 0.0
@@ -771,12 +733,9 @@ def system_tau_ground_truth_worker(
     vectors_query: VectorInput,
 ) -> np.ndarray:
     """Nearest-construct-set-neighbor distance for every query vector, via a
-    brute-force flat index -- the ground-truth step generate_system_tau()
-    needs once per (dataset, split) before it can derive actual_results_by_tau
-    at each tau. Split out into its own worker (rather than computed inline
-    in the driver process, one dataset at a time) so main.py can run it
-    across a ProcessPoolExecutor and cache the result to disk, instead of
-    paying this cost serially on every call."""
+    brute-force flat index. Split into its own worker so main.py can run it
+    across a ProcessPoolExecutor and cache the result to disk, rather than
+    generate_system_tau() paying this cost serially per dataset."""
     construct_arr = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
     query_arr = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
     index = faiss.IndexFlatL2(dim)
@@ -796,17 +755,13 @@ def system_tau_worker(
     vectors_query: VectorInput,
     actual_results_by_tau: Dict[float, List[bool]],
 ) -> List[Dict[str, Any]]:
-    """Builds one BallCoverFilter cover (fixed k) per (dataset, seed) plus a
-    flat L2 index over the same construct set, then sweeps the query-time
-    threshold tau over that single construction, measuring filtered vs.
-    unfiltered throughput/index-access/FPR/FNR at each tau. Queries are
-    issued one at a time (not batched), on both arms of the comparison, to
-    reflect a realistic online setting where each arrival is answered
-    individually: the filtered path calls filt.query() on that one vector
-    and only falls through to the backend index.search() when the filter
-    reports a possible match, skipping the index entirely otherwise.
-    redundancy_rate is the measured (not nominal) duplicate fraction of the
-    query stream."""
+    """Builds one BallCoverFilter cover (fixed k) plus a flat L2 index over
+    the same construct set, then sweeps the query-time threshold tau over
+    that single construction, measuring filtered vs. unfiltered
+    throughput/index-access/FPR/FNR at each tau. Queries are issued one at a
+    time on both arms, reflecting a realistic online setting where the
+    filtered path only falls through to index.search() on a possible match.
+    redundancy_rate is the measured (not nominal) duplicate fraction."""
     construct_arr = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
     query_arr = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
     n_q = len(query_arr)
@@ -876,8 +831,7 @@ def query_performance_worker(
     single_query_limit: int = 2000,
 ) -> List[Dict[str, Any]]:
     """Times one query at a time vs. batched queries against the same cover;
-    single-query mode is capped at single_query_limit (pays a Python call per
-    query), batched mode is left uncapped. Returns one row per mode."""
+    single-query mode is capped at single_query_limit, batched is uncapped."""
     construct_arr = _to_construct_array(vectors_construct)
 
     filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
@@ -927,11 +881,9 @@ def scaling_query_worker(
     vectors_query: VectorInput,
     n_query_vectors: int = 8192,
 ) -> Dict[str, Any]:
-    """Measures batched-query throughput (queries/sec) for a BallCoverFilter
-    built at filter size k (over a fixed stream held constant across the
-    whole batch_size sweep -- only k and batch_size vary here), querying in
-    batches of `batch_size`. The query pool is cycled up to n_query_vectors
-    so every batch_size times the same total query count."""
+    """Measures batched-query throughput for a BallCoverFilter at filter
+    size k, querying in batches of `batch_size`. The query pool is cycled
+    up to n_query_vectors so every batch_size times the same total count."""
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
 
@@ -962,11 +914,8 @@ def scaling_insert_worker(
     vectors_insert: VectorInput,
     n_insert_vectors: int = 8192,
 ) -> Dict[str, Any]:
-    """Measures batched-insertion throughput (vectors/sec) for a
-    BallCoverFilter built at filter size k (same fixed-stream setup as
-    scaling_query_worker), inserting via insert() in batches of `batch_size`
-    after the initial construct(). The insert pool is cycled up to
-    n_insert_vectors so every batch_size inserts the same total count."""
+    """Like scaling_query_worker, but times insert() in batches of
+    `batch_size` after the initial construct()."""
     construct_arr = _to_construct_array(vectors_construct)
     insert_arr = _to_construct_array(vectors_insert)
 
@@ -995,10 +944,8 @@ def scaling_construction_worker(
     seed: int,
     vectors_construct: VectorInput,
 ) -> Dict[str, Any]:
-    """Measures construction throughput (vectors/sec) for a BallCoverFilter
-    at filter size k built over n indexed vectors -- the (k, n) grid this is
-    swept over is the ablation-style basis for the construction-throughput-
-    vs-filter-size plot's per-stream-size lines."""
+    """Measures construction throughput for a BallCoverFilter at filter size
+    k built over n indexed vectors -- swept over a (k, n) grid."""
     construct_arr = _to_construct_array(vectors_construct)[:n]
 
     start = time.perf_counter()
@@ -1014,13 +961,10 @@ def scaling_construction_worker(
 
 
 def _rebuild_policy_tags(policy: str, insertion_level: Optional[str]) -> tuple:
-    """(metric, method) tag used by the streaming figure. "oracle" is always
-    a from-scratch rebuild regardless of insertion_level, so it gets one
-    fixed reference tag; "streaming"/"periodic" report whichever
-    insertion_level they actually ran (nearest/least_inflation/merge/
-    min_heap -- see _INSERT_STRATEGIES) as the method tag, so all four are
-    plotted as regular, directly comparable lines rather than one of them
-    needing a special "exhaustive reference" tag of its own."""
+    """(metric, method) tag used by the streaming figure. "oracle" always
+    gets one fixed reference tag; "streaming"/"periodic" report whichever
+    insertion_level they ran, so all methods plot as directly comparable
+    lines rather than one needing a special reference tag of its own."""
     if policy == "oracle":
         return "static_reference", "static_rebuild"
     return "checkpoint", insertion_level or "nearest"
@@ -1043,12 +987,9 @@ def stream_rebuild_worker(
 ) -> List[Dict[str, Any]]:
     """Simulates one rebuild policy over vectors_stream, reporting FPR and
     amortized cost per checkpoint.
-      "streaming": BallCoverFilter.insert() per arrival (using the
-        InsertInterface instance _INSERT_STRATEGIES[insertion_level]()
-        selects), never rebuilt.
+      "streaming": BallCoverFilter.insert() per arrival, never rebuilt.
       "periodic": like "streaming", rebuilt from scratch every T arrivals.
-      "oracle": rebuilt from scratch at every checkpoint (insertion_level
-        doesn't apply -- there's nothing to insert into).
+      "oracle": rebuilt from scratch at every checkpoint.
     sweep/fold_offset are pass-through tag columns only."""
     stream_arr = _to_construct_array(vectors_stream)
     negative_arr = _to_construct_array(vectors_negative)
@@ -1064,10 +1005,8 @@ def stream_rebuild_worker(
         return float(np.mean(predicted)) if len(predicted) else 0.0
 
     def _assert_fnr_zero(filt: BallCoverFilter, seen: np.ndarray, pos: int) -> None:
-        """The covering invariant is a correctness requirement, not a
-        plotted quantity: every stream vector seen so far must still be
-        recalled. Raises rather than recording a violation, matching every
-        other FNR check in this module."""
+        """Every stream vector seen so far must still be recalled; raises
+        rather than recording a violation, like every other FNR check here."""
         recalled = filt.query(seen, distance_threshold=tau_mid)
         fnr = float(np.mean(~np.asarray(recalled, dtype=bool))) if len(recalled) else 0.0
         if fnr != 0.0:
@@ -1107,11 +1046,8 @@ def stream_rebuild_worker(
     rebuild_every = T if (policy == "periodic" and T is not None) else None
     filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k),
                              insert_method=_INSERT_STRATEGIES[insertion_level]())
-    # Bootstrap-then-diverge: the first k arrivals become raw zero-radius
-    # singletons via one batch construct() (identical across every
-    # insertion_level), so checkpoint k+1 onward is a genuine comparison of
-    # each method's own decision rule, not an artifact of some methods never
-    # creating new balls on their own.
+    # Bootstrap via one shared construct() (identical across insertion_level)
+    # so checkpoint k+1 onward compares each method's own decision rule.
     bootstrap_n = min(k, n)
     t0 = time.perf_counter()
     filt.construct(stream_arr[:bootstrap_n])
@@ -1194,11 +1130,8 @@ def _describe_result(result: Any) -> str:
 
 class Runner:
     def __init__(self, num_workers: int = 1, truncate: bool = True) -> None:
-        """truncate controls what happens the first time a job targeting a
-        given output_csv (see submit()) is submitted: True (default) starts
-        that file fresh (removing any existing one); False loads and
-        preserves its existing rows instead, so a resumed run appends to
-        them rather than losing them."""
+        """truncate=False preserves an output_csv's existing rows (see
+        submit()) instead of starting fresh, so a resumed run appends."""
         self.num_workers = num_workers
         self.truncate = truncate
         self._jobs: List[Dict[str, Any]] = []
@@ -1207,17 +1140,11 @@ class Runner:
 
     def submit(self, mode: str, output_csv: Optional[str] = None, **kwargs: Any) -> None:
         """output_csv, if given, is this job's target CSV: rewritten from
-        every row completed so far *for that path* (not appended -- job
-        result schemas differ, and a rewrite union-handles that safely)
-        each time one of its jobs completes -- so a long-running sweep's
-        completed work is visible on disk well before the whole sweep
-        finishes, and a crash mid-sweep doesn't lose it. output_csv, not
-        mode, is the routing key several jobs (even of different modes)
-        can share one path, or each target its own -- e.g. generate_scaling()
-        submits three modes (scaling_query/insert/construction) to three
-        separate files, while generate_quantization() submits one mode to
-        one file. A job with no output_csv is only returned by run(), same
-        as before this per-job routing existed."""
+        every row completed so far for that path each time one of its jobs
+        completes, so a long-running sweep's progress is visible on disk
+        before it finishes. output_csv, not mode, is the routing key --
+        several jobs (even of different modes) can share one path, or each
+        target its own. A job with no output_csv is only returned by run()."""
         if mode not in _WORKER_FNS:
             raise ValueError(f"Unknown mode {mode!r}. Valid: {list(_WORKER_FNS)}")
         if output_csv is not None and output_csv not in self._initialized_csvs:
@@ -1225,10 +1152,8 @@ class Runner:
         self._jobs.append({'mode': mode, 'output_csv': output_csv, **kwargs})
 
     def _init_csv(self, output_csv: str) -> None:
-        """Runs once per distinct output_csv, at first submit() -- not at
-        run() time -- so truncation happens before any job targeting that
-        path has run, matching the old constructor-time truncation
-        semantics."""
+        """Runs once per distinct output_csv, at first submit(), so
+        truncation happens before any job targeting that path has run."""
         self._initialized_csvs.add(output_csv)
         if not self.truncate and os.path.exists(output_csv):
             self._rows_by_csv[output_csv] = pd.read_csv(output_csv).to_dict("records")
@@ -1238,36 +1163,27 @@ class Runner:
             self._rows_by_csv[output_csv] = []
 
     def shuffle(self, seed: Optional[int] = None) -> None:
-        """Randomizes submitted-job order in place. Lets several generate_
-        functions share one Runner (submit-all, then run-all once) without
-        one evaluation's slow jobs (e.g. PQ construction, tens of minutes
-        each) all landing on the same worker back-to-back while other
-        workers drain a faster evaluation and sit idle -- shuffling
-        interleaves fast and slow jobs across the whole combined queue so
-        workers finish around the same time. No effect on correctness,
-        only on job order and therefore wall-clock makespan."""
+        """Randomizes submitted-job order in place, so several generate_
+        functions sharing one Runner interleave fast and slow jobs (e.g.
+        PQ construction, tens of minutes each) rather than one worker
+        draining an entire slow evaluation while others sit idle. Affects
+        only wall-clock makespan, not correctness."""
         random.Random(seed).shuffle(self._jobs)
 
     def run(self) -> List[Tuple[str, Any]]:
-        """Returns (mode, result) pairs, one per submitted job, in
-        completion order (parallel) or submission order (sequential) --
-        the mode tag is what lets a caller that shared this Runner across
-        several unrelated job types (see shuffle()'s docstring) split the
-        combined results back apart afterward without guessing from each
-        result's own schema."""
+        """Returns (mode, result) pairs, in completion order (parallel) or
+        submission order (sequential) -- the mode tag lets a caller that
+        shared this Runner across job types split results back apart."""
         return self._run_sequential() if self.num_workers == 1 else self._run_parallel()
 
     def clear(self) -> None:
         self._jobs.clear()
 
     def _record_result(self, output_csv: Optional[str], result: Any) -> None:
-        """Appends result's rows to output_csv's in-memory accumulator (seeded
-        by _init_csv at submit() time) and rewrites that one file from it --
-        called from the single coordinating process only (never from inside a
-        worker), both in the sequential loop and in _run_parallel's
-        as_completed loop, so multiple jobs targeting the same output_csv
-        never race to write it; no lock is needed because there is never more
-        than one writer."""
+        """Appends to output_csv's in-memory accumulator and rewrites that
+        file -- called only from the single coordinating process (never a
+        worker), so multiple jobs sharing an output_csv never race; no lock
+        needed since there's never more than one writer."""
         if not output_csv:
             return
         self._rows_by_csv[output_csv].extend(result if isinstance(result, list) else [result])
@@ -1290,11 +1206,7 @@ class Runner:
                 result = fn(**kwargs)
             except Exception:
                 # One job's exception must not lose every other job's
-                # already-completed results -- especially now that several
-                # generate_* functions can share one Runner (see shuffle()),
-                # so a single bad job would otherwise wipe out a fully
-                # combined multi-evaluation batch instead of just its own
-                # evaluation's rows.
+                # already-completed results.
                 logger.exception(f"Job failed, skipping: {_describe_job(kwargs)}")
                 continue
             logger.info(f"Completed: {_describe_result(result)}")
@@ -1318,9 +1230,7 @@ class Runner:
                 try:
                     result = f.result()
                 except Exception:
-                    # See _run_sequential's comment: one job's exception
-                    # must not lose every other (possibly unrelated
-                    # evaluation's) already-completed job's results.
+                    # See _run_sequential's comment.
                     logger.exception(f"Job failed, skipping: {desc}")
                     continue
                 logger.info(f"Completed: {desc}")

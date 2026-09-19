@@ -61,18 +61,11 @@ def apply_style(dpi: int = 300) -> None:
 
 
 def wrap_label(text: str, width: int = 20) -> str:
-    """Word-wraps an axis label/title to `width` chars per line. The figure
-    size these scripts use (~1.7in wide) is narrower than many verbose
-    labels; bbox_inches="tight" silently clips the trailing text of a long
-    single-line label instead of expanding to fit it, so anything wordy
-    needs to be wrapped onto multiple lines before it's set on an axis.
-
-    Passed through unchanged if it contains a "$": textwrap breaks purely on
-    whitespace, so it can (and will) insert a newline in the middle of a
-    mathtext "$...$" span, leaving each half an unparseable expression that
-    mathtext falls back to rendering as literal text. Callers with a long
-    LaTeX label need to hand-wrap it into separate self-contained "$...$"
-    segments joined by "\\n" instead."""
+    """Word-wraps an axis label to `width` chars per line: bbox_inches="tight"
+    clips a long single-line label instead of expanding to fit it. Passed
+    through unchanged if it contains a "$" -- textwrap would insert a
+    newline mid-mathtext-span, breaking the expression; callers with a long
+    LaTeX label need to hand-wrap it into separate "$...$" segments instead."""
     if "$" in text:
         return text
     return textwrap.fill(text, width=width)
@@ -86,12 +79,17 @@ def style_axes(ax: plt.Axes) -> None:
 
 
 def save_figure(fig: plt.Figure, filename: str, outdir: str, dpi: int,
-                emit_pdf: bool = False, transparent: bool = False) -> None:
+                emit_pdf: bool = False, transparent: bool = False, tight: bool = True) -> None:
+    """tight=False saves the full figure canvas at its exact configured size
+    instead of cropping to content -- needed when a set of figures must align
+    when placed side by side, since bbox_inches="tight" crops each one to its
+    own label extent, shifting the axes by a different amount per figure."""
     os.makedirs(outdir, exist_ok=True)
     path = os.path.join(outdir, filename)
-    fig.savefig(path, dpi=dpi, bbox_inches="tight", pad_inches=0.01, transparent=transparent)
+    bbox_kwargs = dict(bbox_inches="tight", pad_inches=0.01) if tight else {}
+    fig.savefig(path, dpi=dpi, transparent=transparent, **bbox_kwargs)
     if emit_pdf:
-        fig.savefig(path.replace(".png", ".pdf"), bbox_inches="tight", pad_inches=0.01, transparent=transparent)
+        fig.savefig(path.replace(".png", ".pdf"), transparent=transparent, **bbox_kwargs)
     plt.close(fig)
     print(f"Wrote {path}")
 

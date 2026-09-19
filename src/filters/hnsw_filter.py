@@ -1,19 +1,13 @@
-"""
-HNSWFilter -- semantic AMQ baseline built directly on FAISS's HNSW
-approximate nearest-neighbor index.
+"""HNSWFilter -- semantic AMQ baseline built directly on FAISS's HNSW
+approximate nearest-neighbor index. Unlike every other filter here, it
+stores full float32 vectors plus the HNSW graph and answers via a real
+approximate NN search: no structural false positives, but it trades away
+BallCoverFilter's zero-false-negative guarantee (HNSW can miss the true
+neighbor, governed by ef_search/ef_construction/M).
 
-Unlike every other filter here, it stores full float32 vectors plus the HNSW
-graph and answers via a real (approximate) nearest-neighbor search: it
-cannot produce a structural false positive (distance is measured exactly
-against the real stored vector), but trades away BallCoverFilter's
-zero-false-negative guarantee -- HNSW search can miss the true neighbor and
-silently under-report duplicates, governed by ef_search/ef_construction/M.
-
-Memory is not budget-tunable: IndexHNSWFlat stores full uncompressed
-vectors plus the graph's neighbor lists, with no way to shrink to an
-arbitrary target short of a quantized HNSW variant (out of scope here).
-max_memory/max_spheres are accepted only for _instantiate_filter parity.
-"""
+Memory is not budget-tunable -- IndexHNSWFlat stores full uncompressed
+vectors, with no way to shrink short of a quantized HNSW variant (out of
+scope). max_memory/max_spheres are accepted only for _instantiate_filter parity."""
 
 from typing import List, Optional
 

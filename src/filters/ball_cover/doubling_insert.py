@@ -6,34 +6,26 @@ from filters.ball_cover.ball_interfaces import InsertInterface
 
 
 class DoublingInsert(InsertInterface):
-    """Amortized-rebuild insertion: a newly-arrived, not-already-covered
-    vector is added immediately as its own zero-radius ball (an array
-    append, no merge work), letting the active ball count grow past
-    `filter.max_spheres` between rebuilds instead of enforcing a hard cap on
-    every insertion. Once the active count reaches
-    `max_spheres * (1 + growth_budget_fraction)`, a Gonzalez-style
-    re-clustering pass folds every active ball back down to at most
-    `max_spheres` -- amortized O(1) per insertion, at the price of an
-    infrequent rebuild spike, trading the other strategies' steady per-point
-    merge cost for occasional latency spikes.
+    """Amortized-rebuild insertion: a not-already-covered vector is added
+    immediately as its own zero-radius ball (no merge work), letting the
+    active count grow past `filter.max_spheres` until it hits
+    `max_spheres * (1 + growth_budget_fraction)`, at which point a
+    Gonzalez-style re-clustering folds everything back down -- amortized
+    O(1) per insertion, at the price of an infrequent rebuild spike, in
+    exchange for the other strategies' steady per-point merge cost. Every
+    newly-added ball is immediately queryable, so the zero-false-negative
+    guarantee holds between rebuilds too, not just right after one.
 
-    Every newly-added ball is immediately part of the filter's own queryable
-    structure, so the zero-false-negative guarantee holds at every
-    checkpoint, not just right after a rebuild.
+    growth_budget_fraction (default 1.0, hence "doubling") is a multiplier
+    rather than an absolute budget since the strategy is constructed before
+    the filter that will own it, and doesn't yet know max_spheres.
 
-    growth_budget_fraction (default 1.0, hence "doubling": up to 2x
-    max_spheres before a forced rebuild) is a multiplier, not an absolute
-    budget, since the strategy object is constructed before the filter that
-    will own it and doesn't yet know max_spheres.
-
-    The rebuild can't just call GonzalesConstruct directly: each active
-    ball's own current radius must be carried into the re-clustering as
-    positional uncertainty (the points it once covered could be anywhere
-    within that radius), the same reconstruction-error technique
-    BallCoverFilter._build_quantizer uses for quantized centers -- so the
-    greedy farthest-first selection is mirrored here with that one addition
-    rather than reused as-is.
-    """
+    The rebuild can't call GonzalesConstruct directly: each active ball's
+    own radius must carry into re-clustering as positional uncertainty (the
+    points it covered could be anywhere within that radius) -- the same
+    reconstruction-error technique BallCoverFilter._build_quantizer uses for
+    quantized centers -- so the farthest-first selection is mirrored here
+    with that one addition."""
 
     def __init__(self, growth_budget_fraction: float = 1.0):
         if growth_budget_fraction <= 0.0:
@@ -43,11 +35,7 @@ class DoublingInsert(InsertInterface):
             )
         self.growth_budget_fraction = growth_budget_fraction
 
-    # ------------------------------------------------------------------ InsertInterface plumbing
-
     def ensure_capacity(self, required_cap: int) -> None:
-        # No strategy-local state beyond the filter's own sphere arrays,
-        # which already grow themselves via filter._get_new_index().
         pass
 
     def reset_buffers(self, capacity: int) -> None:
@@ -59,18 +47,14 @@ class DoublingInsert(InsertInterface):
         filter._all_radiuses[idx] = radius
         filter._num_spheres += 1
 
-    # ------------------------------------------------------------------ Gonzalez re-clustering
-
     @staticmethod
     def _gonzalez_select_with_uncertainty(
         points: np.ndarray, uncertainty: np.ndarray, k: int
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Gonzalez farthest-first center selection over `points`, each
-        carrying its own pre-existing uncertainty radius (see class
-        docstring). Mirrors GonzalesConstruct.construct_filter's own
-        greedy-selection-then-exact-radii algorithm; the only change is
-        `reach = distance-to-center + that point's own uncertainty` instead
-        of plain distance when computing each cluster's final radius."""
+        """Mirrors GonzalesConstruct's greedy-selection-then-exact-radii
+        algorithm; the only change is `reach = distance-to-center + that
+        point's own uncertainty` instead of plain distance for each
+        cluster's final radius (see class docstring)."""
         n = points.shape[0]
         dim = points.shape[1]
         k = min(k, n)
@@ -113,9 +97,7 @@ class DoublingInsert(InsertInterface):
         d_exact = np.sqrt(np.maximum(d2_exact.ravel(), 0.0))
         labels = labels.ravel()
 
-        # Each assigned point's contribution to its cluster's radius must
-        # cover the *region* it stands for, not just itself: distance to
-        # the new center, plus that point's own prior uncertainty radius.
+        # Covers the region a point stands for, not just itself.
         reach = (d_exact + uncertainty).astype(np.float32)
 
         order = np.argsort(labels, kind="stable")
@@ -142,14 +124,10 @@ class DoublingInsert(InsertInterface):
             points, uncertainty, filter.max_spheres
         )
 
-        # Retire the whole active set, then re-add via the same add_sphere()
-        # every other strategy uses for a from-scratch build.
         filter._num_spheres = 0
         for center, radius in zip(new_centers, new_radii):
             self.add_sphere(filter, center, radius)
         filter._rebuild_from_centers(filter.all_spheres, filter.all_centers, filter.all_radiuses)
-
-    # ------------------------------------------------------------------ InsertInterface: insert/remove
 
     @staticmethod
     def _exhaustive_search(centers: np.ndarray, queries: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -164,9 +142,8 @@ class DoublingInsert(InsertInterface):
 
         centers = filter.all_centers
         radii = filter.all_radiuses
-        # labels give each match's position in `centers`, not sorted-rank
-        # order -- must index radii by labels, not compare against radii
-        # directly, or points get paired with the wrong ball's radius.
+        # Must index radii by labels, not positionally -- labels give each
+        # match's position in `centers`, not sorted-rank order.
         dist, labels = self._exhaustive_search(centers, X)
         is_already_covered = np.any(dist <= radii[labels], axis=1)
         X = X[~is_already_covered]

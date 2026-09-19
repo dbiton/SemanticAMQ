@@ -179,12 +179,8 @@ def compute_static_actual_results(
 
 
 def generate_tradeoff_static() -> Tuple[List, List]:
-    """
-    A function that orchestrates the tradeoff benchmarking pipeline by generating static ground truth 
-    and evaluating filter performance across varying memory and sphere constraints. It supports 
-    routing between real-world embeddings and synthetic datasets, and optionally stress-tests 
-    generalization robustness using synthetically generated random queries.
-    """
+    """Orchestrates the tradeoff benchmarking pipeline: static ground truth,
+    then filter evaluation across sphere-count and memory-budget sweeps."""
     num_vectors = 100_000
     dim = 384
     percentage_construct = 10
@@ -193,43 +189,32 @@ def generate_tradeoff_static() -> Tuple[List, List]:
     random_test = False
     synthetic_test = False
 
-    # calculate number of vectors for construct and query based on given percentage
     num_construct = num_vectors * percentage_construct // 100
     num_query = num_vectors - num_construct
 
-    # if we are using synthetic dataset, load it using our saved dataset keys
     if synthetic_test:
         print(f"Loading synthetic dataset from '{dataset}' using targeted keys...")
-        # create construct and query vector objects for workers
         construct_vectors = VectorSource(dataset, 0, num_construct, dataset_key="construct_vectors")
         query_vectors = VectorSource(dataset, 0, num_query, dataset_key="query_vectors")
-    
-    # else we load regular real dataset, use regular api
     else:
         print(f"Loading real-world embeddings from dataset: '{dataset}'...")
-        # create construct and query vector objects for workers
         construct_vectors = VectorSource(dataset, 0, num_construct)
         query_vectors = VectorSource(dataset, num_construct, num_vectors)
 
-        # means we run test with randomly generated queires for testing generalization
         if random_test:
             print("\nPreparing Generalization Test (Random Vectors)...")
-            # generate random samples from a uniform distribution and normalize them for dataset consistency
             all_vectors = np.vstack((construct_vectors.to_array(), query_vectors.to_array()))
             random_queries = np.random.uniform(low=np.min(all_vectors), high=np.max(all_vectors), size=(num_query, dim)).astype(np.float32)
             random_queries_norms = np.linalg.norm(random_queries, axis=1, keepdims=True)
             random_queries = random_queries / np.where(random_queries_norms == 0, 1e-10, random_queries_norms)
             query_vectors = ArrayVectorSource("random_queries", array=random_queries)
 
-    # compute actual labels for query vectors for workers
     print("Calculating actual results for test queries...")
     actual_results = compute_static_actual_results(construct_vectors.to_array(), query_vectors.to_array(), distance_threshold)
 
     runner = Runner(num_workers=MAX_WORKERS)
 
-    # EXPERIMENT 1: Evaluate Geometric Filter Performance
-    # Tests how the number of spheres (spatial partitioning) impacts 
-    # search accuracy and speed for ball-based filters.
+    # Sphere-count sweep: search accuracy/speed vs. spatial partitioning granularity.
     num_spheres = [5, 10, 20, 40, 80, 160, 320, 640, 1000, 1500, 2000, 2300, 2600, 2900, 3200, 3600,
                     4000, 4400, 4800, 5300, 5800, 6000, 6300, 6800, 7400, 8000, 8700, 9000, 9700, 10000]
     num_spheres = [s for s in num_spheres if s < num_construct] + [num_construct]
@@ -246,12 +231,10 @@ def generate_tradeoff_static() -> Tuple[List, List]:
     print("\nExecuting sphere size evaluation...")
     raw_sphere_results = runner.run()
     sphere_results = [r for r in raw_sphere_results if r is not None]
-    runner.clear() # clear runner jobs
+    runner.clear()
     print("Sphere size evaluation completed.")
 
-    # EXPERIMENT 2: Benchmark Resource Efficiency
-    # Compares all available filter strategies under strict memory limits 
-    # to identify which methods perform best when storage is constrained.
+    # Memory-budget sweep: all filter strategies under strict memory limits.
     MB = 1024 * 1024
     memory_budgets = [int(0.5 * MB), int(0.75 * MB), int(1 * MB), int(1.5 * MB), int(2 * MB), int(3 * MB), int(4.5 * MB), 
                       int(6.5 * MB), int(9 * MB), int(13 * MB), int(18 * MB), int(26 * MB), int(38 * MB), int(54 * MB), int(64 * MB)]
@@ -278,12 +261,8 @@ def plot_tradeoff_static(sphere_results: List, memory_results: List) -> None:
 
 
 def generate_tradeoff_dynamic() -> Tuple[List, List]:
-    """
-    A function that orchestrates the tradeoff benchmarking pipeline by generating dynamic ground truth 
-    and evaluating filter performance across varying memory and sphere constraints. It supports 
-    routing between real-world embeddings and synthetic datasets, and optionally stress-tests 
-    generalization robustness using synthetically generated random queries.
-    """
+    """Orchestrates the tradeoff benchmarking pipeline: dynamic ground truth,
+    then filter evaluation across sphere-count and memory-budget sweeps."""
     num_vectors = 100_000
     dim = 384
     percentage_construct = 10
@@ -292,44 +271,33 @@ def generate_tradeoff_dynamic() -> Tuple[List, List]:
     random_test = False
     synthetic_test = False
 
-    # calculate number of vectors for construct and query based on given percentage
     num_construct = num_vectors * percentage_construct // 100
     num_query = num_vectors - num_construct
 
-    # if we are using synthetic dataset, load it using our saved dataset keys
     if synthetic_test:
         print(f"Loading synthetic dataset from '{dataset}' using targeted keys...")
-        # create construct and query vector objects for workers
         construct_vectors = VectorSource(dataset, 0, num_construct, dataset_key="construct_vectors")
         query_vectors = VectorSource(dataset, 0, num_query, dataset_key="query_vectors")
-    
-    # else we load regular real dataset, use regular api
     else:
         print(f"Loading real-world embeddings from dataset: '{dataset}'...")
-        # create construct and query vector objects for workers
         construct_vectors = VectorSource(dataset, 0, num_construct)
         query_vectors = VectorSource(dataset, num_construct, num_vectors)
 
-        # means we run test with randomly generated queires for testing generalization
         if random_test:
             print("\nPreparing Generalization Test (Random Vectors)...")
-            # generate random samples from a uniform distribution and normalize them for dataset consistency
             all_vectors = np.vstack((construct_vectors.to_array(), query_vectors.to_array()))
             random_queries = np.random.uniform(low=np.min(all_vectors), high=np.max(all_vectors), size=(num_query, dim)).astype(np.float32)
             random_queries_norms = np.linalg.norm(random_queries, axis=1, keepdims=True)
             random_queries = random_queries / np.where(random_queries_norms == 0, 1e-10, random_queries_norms)
             query_vectors = ArrayVectorSource("random_queries", array=random_queries)
 
-    # compute actual labels for query vectors for workers
     print("Calculating actual results for test queries...")
     all_vectors = np.vstack((construct_vectors.to_array(), query_vectors.to_array()))
     actual_results = compute_dynamic_actual_results(all_vectors, distance_threshold)[num_construct:]
 
     runner = Runner(num_workers=MAX_WORKERS)
 
-    # EXPERIMENT 1: Evaluate Geometric Filter Performance
-    # Tests how the number of spheres (spatial partitioning) impacts 
-    # search accuracy and speed for ball-based filters.
+    # Sphere-count sweep: search accuracy/speed vs. spatial partitioning granularity.
     num_spheres = [5, 10, 20, 40, 80, 160, 320, 640, 1000, 1500, 2000, 2300, 2600, 2900, 3200, 3600,
                     4000, 4400, 4800, 5300, 5800, 6000, 6300, 6800, 7400, 8000, 8700, 9000, 9700, 10000]
     num_spheres = [s for s in num_spheres if s < num_construct] + [num_construct]
@@ -346,12 +314,10 @@ def generate_tradeoff_dynamic() -> Tuple[List, List]:
     print("\nExecuting sphere size evaluation...")
     raw_sphere_results = runner.run()
     sphere_results = [r for r in raw_sphere_results if r is not None]
-    runner.clear() # clear runner jobs
+    runner.clear()
     print("Spheres size evaluation completed.")
 
-    # EXPERIMENT 2: Benchmark Resource Efficiency
-    # Compares all available filter strategies under strict memory limits 
-    # to identify which methods perform best when storage is constrained.
+    # Memory-budget sweep: all dynamic filter strategies under strict memory limits.
     MB = 1024 * 1024
     memory_budgets = [int(0.5 * MB), int(0.75 * MB), int(1 * MB), int(1.5 * MB), int(2 * MB), int(3 * MB), int(4.5 * MB), 
                       int(6.5 * MB), int(9 * MB), int(13 * MB), int(18 * MB), int(26 * MB), int(38 * MB), int(54 * MB), int(64 * MB)]

@@ -19,7 +19,7 @@ from sklearn.preprocessing import normalize
 # from util.dataset_paths import dataset_filenames
 
 embeds_dir = "datasets"
-MAX_STREAM_LENGTH = 1_000_000  # 1 million
+MAX_STREAM_LENGTH = 250_000  # 1 million
 models: Dict[str, SentenceTransformer] = {}
 
 def load_embeds(dataset_name: str, N: int):

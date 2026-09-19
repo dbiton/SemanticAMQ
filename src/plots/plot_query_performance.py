@@ -1,13 +1,7 @@
-"""Generate the query-performance figures (+ shared legend) for the PVLDB paper.
-
-Self-contained: reads a long-format results file (one row per
-dataset/k/seed/mode), aggregates over seeds, and writes PNG (optionally PDF)
-panels sized for `\\includegraphics[width=\\linewidth]` inside
-`subfigure{0.24\\linewidth}` cells of a two-column `figure*`, matching
-plot_quantization.py's panel styling.
-
-Edit the CONFIG block below to change parameters -- no CLI flags.
-"""
+"""Generates the query-performance figures (+ shared legend): reads a
+long-format results file (one row per dataset/k/seed/mode), aggregates over
+seeds, and writes PNG (optionally PDF) panels matching plot_quantization.py's
+styling. Edit the CONFIG block below to change parameters -- no CLI flags."""
 
 from __future__ import annotations
 
@@ -25,9 +19,7 @@ from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 
 from plots.plot_common import DATASETS, DATASET_LABELS, DATASET_COLORS, apply_style as _apply_style, save_figure, save_dataset_legend, mean_ci95
 
-# --------------------------------------------------------------------------- #
 # CONFIG
-# --------------------------------------------------------------------------- #
 
 INPUT_PATH = "results/query_performance.csv"
 OUTDIR = "plots/query_performance/"
@@ -45,9 +37,7 @@ class Config:
     outdir: str
 
 
-# --------------------------------------------------------------------------- #
 # Data loading
-# --------------------------------------------------------------------------- #
 
 _REQUIRED_COLUMNS = ["dataset", "k", "seed", "mode", "n_queries", "latency_ms", "throughput_qps"]
 
@@ -118,9 +108,7 @@ def load_data() -> pd.DataFrame:
     return df
 
 
-# --------------------------------------------------------------------------- #
 # Aggregation
-# --------------------------------------------------------------------------- #
 
 def apply_style() -> None:
     _apply_style(DPI)
@@ -131,9 +119,7 @@ def aggregate(df: pd.DataFrame, mode: str, value_col: str) -> pd.DataFrame:
     return mean_ci95(df[df["mode"] == mode], ["dataset", "k"], value_col)
 
 
-# --------------------------------------------------------------------------- #
 # Line panels: x = filter size k, one line per dataset
-# --------------------------------------------------------------------------- #
 
 def _line_panel(
     df: pd.DataFrame,
@@ -209,25 +195,19 @@ def panel_batched_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     )
 
 
-# --------------------------------------------------------------------------- #
 # Shared legend
-# --------------------------------------------------------------------------- #
 
 def save_legend(cfg: Config) -> None:
     save_dataset_legend(cfg.outdir, cfg.dpi, cfg.emit_pdf)
 
 
-# --------------------------------------------------------------------------- #
 # Save helper
-# --------------------------------------------------------------------------- #
 
 def _save(fig: plt.Figure, filename: str, cfg: Config) -> None:
     save_figure(fig, filename, cfg.outdir, cfg.dpi, cfg.emit_pdf)
 
 
-# --------------------------------------------------------------------------- #
 # Summary table
-# --------------------------------------------------------------------------- #
 
 def print_summary(df: pd.DataFrame) -> None:
     print("\n--- Query performance summary ---")
@@ -259,9 +239,7 @@ def print_summary(df: pd.DataFrame) -> None:
     print()
 
 
-# --------------------------------------------------------------------------- #
 # Main
-# --------------------------------------------------------------------------- #
 
 def generate_query_performance_figures(
     df: Optional[pd.DataFrame] = None,
@@ -269,14 +247,9 @@ def generate_query_performance_figures(
     dpi: int = DPI,
     emit_pdf: bool = EMIT_PDF,
 ) -> None:
-    """
-    Library entry point: render the four query-performance panels (+ legend)
-    from an in-memory long-format DataFrame, the same way
-    plot_quantization.generate_quantization_figures is called directly on an
-    in-memory df instead of round-tripping through a file. If `df` is
-    omitted, falls back to load_data() (CONFIG-driven, honors DEMO/INPUT_PATH)
-    so the script still works standalone.
-    """
+    """Renders the four query-performance panels (+ legend) from an in-memory
+    DataFrame, or from load_data() (reads INPUT_PATH, honors DEMO) if `df` is
+    omitted."""
     if df is None:
         df = load_data()
     else:

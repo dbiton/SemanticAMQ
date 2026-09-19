@@ -6,20 +6,16 @@ from typing import Iterator, Optional
 import h5py
 import numpy as np
 
-# Import from the lightweight registry (no torch / sentence_transformers /
-# datasets) so spawned workers that only read vectors don't drag in the whole
-# ML stack (~400 MB RSS per process).
+# Lightweight registry import (no torch / sentence_transformers / datasets)
+# so spawned workers that only read vectors don't drag in the whole ML stack.
 from util.dataset_paths import dataset_filenames, HDF5_DATASET_KEY as _HDF5_DATASET_KEY
 
 
 @dataclass(frozen=True)
 class VectorSource:
-    """A lightweight, picklable pointer to a contiguous slice of a dataset's
-    vectors stored on disk. Holds no vector data itself -- vectors stream
-    lazily from the backing HDF5 file on demand, so handing this to a job
-    costs O(1) memory regardless of slice size (unlike copying the whole
-    array into every job, which scales memory with num_jobs * stream_length).
-    """
+    """Lightweight, picklable pointer to a slice of a dataset on disk.
+    Streams lazily from HDF5 on demand, so handing this to a job costs O(1)
+    memory regardless of slice size or job count."""
 
     dataset_name: str
     start: int = 0
@@ -37,11 +33,8 @@ class VectorSource:
         return max(0, self._resolve_stop(dset_len) - self.start)
 
     def iter_batches(self, batch_size: Optional[int] = None) -> Iterator[np.ndarray]:
-        """
-        Yield the slice as consecutive 2D float32 blocks, reading one disk chunk
-        at a time. Never materialises more than `batch_size` rows at once, so an
-        arbitrarily long stream is processed in bounded memory.
-        """
+        """Never materializes more than `batch_size` rows at once, so an
+        arbitrarily long stream is processed in bounded memory."""
         batch_size = batch_size or self.chunk_size
         path = dataset_filenames[self.dataset_name]
         with h5py.File(path, "r") as f:
@@ -52,22 +45,14 @@ class VectorSource:
                 yield np.asarray(dset[base:end], dtype=np.float32)
 
     def __iter__(self) -> Iterator[np.ndarray]:
-        """
-        Yield the slice one vector (1D float32 array) at a time. Disk reads are
-        still chunked underneath, so per-vector iteration stays fast.
-        """
         for block in self.iter_batches():
             for vector in block:
                 yield vector
 
     def to_array(self) -> np.ndarray:
-        """
-        Materialise the whole slice as a single 2D array.
-
-        Use only where a batch is genuinely required at once (e.g. building a
-        static/immutable filter from all keys). For the query stream, prefer
-        iter_batches() / iteration so nothing larger than a chunk is held.
-        """
+        """Use only where a batch is genuinely required at once; prefer
+        iter_batches()/iteration otherwise so nothing larger than a chunk is
+        held."""
         path = dataset_filenames[self.dataset_name]
         with h5py.File(path, "r") as f:
             dset = f[self.dataset_key]
@@ -77,11 +62,9 @@ class VectorSource:
 
 @dataclass(frozen=True)
 class ArrayVectorSource(VectorSource):
-    """An in-memory drop-in replacement for VectorSource, for dynamically
-    generated or out-of-distribution queries: holds the array in RAM and
-    overrides the disk-bound methods to yield from it directly, at the cost
-    of pickling the full array to every job.
-    """
+    """In-memory drop-in for VectorSource (e.g. synthetic/out-of-distribution
+    queries not backed by a dataset file) -- costs a full array pickle per
+    job, unlike the lazy disk-backed base class."""
     array: Optional[np.ndarray] = None
 
     def __post_init__(self):
@@ -95,7 +78,6 @@ class ArrayVectorSource(VectorSource):
         return max(0, self._resolve_stop(self.array.shape[0]) - self.start)
 
     def iter_batches(self, batch_size: Optional[int] = None) -> Iterator[np.ndarray]:
-        """Yield the slice as consecutive 2D float32 blocks directly from RAM."""
         batch_size = batch_size or self.chunk_size
         stop = self._resolve_stop(self.array.shape[0])
         for base in range(self.start, stop, batch_size):
@@ -108,6 +90,5 @@ class ArrayVectorSource(VectorSource):
                 yield vector
 
     def to_array(self) -> np.ndarray:
-        """Return the requested slice of the in-memory array."""
         stop = self._resolve_stop(self.array.shape[0])
         return np.asarray(self.array[self.start:stop], dtype=np.float32)

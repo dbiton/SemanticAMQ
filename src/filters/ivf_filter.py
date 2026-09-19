@@ -1,23 +1,18 @@
-"""
-IVFFilter -- semantic AMQ baseline built on FAISS's IVF (Inverted File) index
-with product-quantized codes (IndexIVFPQ).
+"""IVFFilter -- semantic AMQ baseline built on FAISS's IVF (Inverted File)
+index with product-quantized codes (IndexIVFPQ).
 
 Like BallCoverFilter, a memory budget picks a compact per-point encoding
-(`pq_m`-byte PQ code); unlike it, construct vectors are first assigned to one
-of `nlist` Voronoi cells (a k-means coarse quantizer), and a query only
-decodes/compares codes in the `nprobe` nearest cells -- sublinear query, at
-the cost of two lossy steps (coarse assignment + PQ residual) instead of
-BallCoverFilter's single exact-covering-radius test. Because both steps are
-lossy, the estimated nearest-neighbor distance itself can quietly
-under-report the true distance to a non-duplicate -- an FPR mode with no
-simple closed-form "structural" formula, unlike a Bloom filter's load factor.
+(`pq_m`-byte PQ code); unlike it, construct vectors are first assigned to
+one of `nlist` Voronoi cells, and a query only decodes/compares codes in the
+`nprobe` nearest cells -- sublinear query, at the cost of two lossy steps
+(coarse assignment + PQ residual) instead of BallCoverFilter's single exact
+covering-radius test. Because both steps are lossy, the estimated
+nearest-neighbor distance can quietly under-report the true distance -- an
+FPR mode with no closed-form "structural" formula.
 
-Memory sizing (construct-time, since it needs n): `nlist` centroids and the
-PQ codebook are fixed overhead independent of `pq_m`; `nbits` is picked as
-large as the construct set can train (mirrors
-BallCoverFilter._pq_nbits_for), then whatever budget remains per vector
-sizes `pq_m` to the finest code that fits.
-"""
+Memory sizing (construct-time, since it needs n): nlist centroids and the PQ
+codebook are fixed overhead independent of pq_m; nbits is picked as large as
+the construct set can train, then remaining budget sizes pq_m."""
 
 from typing import List, Optional
 
@@ -67,12 +62,9 @@ class IVFFilter(Filter):
 
     @property
     def nprobe(self) -> int:
-        """Query-time cell count. A property (not a plain attribute) so the
-        equal-memory calibration dial (_POST_CONSTRUCTION_CONFIG_DIALS, which
-        works by `setattr(filter_instance, "nprobe", value)` on an already-
-        built instance) actually reaches the underlying faiss index, which
-        reads its own `index.nprobe` field at search time rather than
-        anything on this wrapper."""
+        """A property, not a plain attribute, so the equal-memory
+        calibration dial's `setattr(filter_instance, "nprobe", value)` on an
+        already-built instance actually reaches the underlying faiss index."""
         return self.index.nprobe if self.index is not None else self._nprobe
 
     @nprobe.setter
@@ -80,8 +72,6 @@ class IVFFilter(Filter):
         self._nprobe = value
         if self.index is not None:
             self.index.nprobe = value
-
-    # ------------------------------------------------------------------ sizing
 
     @staticmethod
     def _choose_pq_m(dim: int, byte_budget: int) -> int:
@@ -96,9 +86,7 @@ class IVFFilter(Filter):
     @staticmethod
     def _pq_nbits_for(n: int) -> Optional[int]:
         """Largest nbits (<= 8) whose 2**nbits codebook can be trained on n
-        points (with a 2x safety margin, mirroring
-        BallCoverFilter._pq_nbits_for), or None if there aren't even enough
-        points for a 1-bit codebook."""
+        points, or None if there aren't even enough for a 1-bit codebook."""
         nbits = 0
         while nbits < _PQ_MAX_NBITS and (1 << (nbits + 1)) <= n:
             nbits += 1
@@ -106,9 +94,7 @@ class IVFFilter(Filter):
 
     def _overhead_bytes(self, nlist: int, nbits: int) -> int:
         """Fixed cost independent of pq_m: nlist coarse-quantizer centroids
-        plus the 2**nbits-entry PQ codebook, both stored as float32 vectors
-        of the full dimension (see module docstring -- codebook total size
-        doesn't depend on how it's split across pq_m sub-quantizers)."""
+        plus the 2**nbits-entry PQ codebook, as full-dimension float32s."""
         return (nlist * self.dim + (1 << nbits) * self.dim) * 4
 
     def _choose_params(self, n: int) -> None:
@@ -119,9 +105,8 @@ class IVFFilter(Filter):
         nlist = max(1, min(nlist, n))
 
         if self.max_memory is not None:
-            # nbits/nlist overhead alone can blow the whole budget at small
-            # n*dim; shrink nbits first (cheaper per step), then nlist,
-            # until at least half the budget remains for per-vector codes.
+            # Shrink nbits first (cheaper per step), then nlist, until at
+            # least half the budget remains for per-vector codes.
             half = self.max_memory // 2
             while nbits > 1 and self._overhead_bytes(nlist, nbits) > half:
                 nbits -= 1
@@ -139,7 +124,6 @@ class IVFFilter(Filter):
 
         self.nlist, self.pq_m, self.pq_nbits = nlist, pq_m, nbits
 
-    # ------------------------------------------------------------------ Filter interface
 
     def construct(self, vectors: np.ndarray) -> None:
         vecs = np.ascontiguousarray(vectors, dtype=np.float32)
@@ -152,10 +136,7 @@ class IVFFilter(Filter):
         quantizer = faiss.IndexFlatL2(self.dim)
         if n < 2:
             # PQ needs >= 2 training points for even a 1-bit codebook (faiss
-            # hard-errors below that -- "nx >= k" in Clustering::train_encoded).
-            # A singleton construct set can't train one, so fall back to an
-            # uncompressed IndexIVFFlat, whose only training step is the
-            # (trivial, single-point) coarse quantizer.
+            # hard-errors below that); fall back to an uncompressed IndexIVFFlat.
             self.nlist, self.pq_m, self.pq_nbits = 1, None, None
             index = faiss.IndexIVFFlat(quantizer, self.dim, 1)
             index.cp.min_points_per_centroid = 1
