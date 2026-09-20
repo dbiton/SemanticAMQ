@@ -107,6 +107,40 @@ def _validate_schema(df: pd.DataFrame) -> None:
         raise ValueError("Input has a 'Config' column but no filter configs in it.")
 
 
+def check_budget_compliance(df: pd.DataFrame) -> None:
+    """Every plotted point sits at the budget it was *given*, so a filter
+    that overran its budget would be drawn as if it had been cheap. Filters
+    now refuse those budgets at construct() time (runner.py records them as
+    infeasible instead), so a surviving overrun means a filter's
+    get_bytesize() disagrees with its own budget check -- worth shouting
+    about rather than silently plotting."""
+    if "Memory Usage" not in df.columns:
+        return  # results predating the Memory Usage column
+    usage = pd.to_numeric(df["Memory Usage"], errors="coerce")
+    budget = pd.to_numeric(df["Memory Budget"], errors="coerce")
+    over = df[usage > budget]
+    if not over.empty:
+        worst = (usage / budget).max()
+        print(
+            f"WARNING: {len(over)} row(s) report Memory Usage above their Memory Budget "
+            f"(worst {worst:.2f}x); these are plotted at a budget they did not respect. "
+            f"Affected filters: {sorted(over['Config'].unique())}"
+        )
+
+
+def drop_infeasible(df: pd.DataFrame) -> pd.DataFrame:
+    """Budgets a filter could not build at all carry NaN metrics. Dropping
+    them leaves a gap in that filter's line, which is the honest rendering:
+    it has no FPR at that budget, as opposed to a bad one."""
+    if "Infeasible" not in df.columns:
+        return df
+    infeasible = df["Infeasible"].fillna(False).astype(bool)
+    if infeasible.any():
+        for name, count in df[infeasible]["Config"].value_counts().items():
+            print(f"Note: {name} was infeasible at {count} budget(s); those points are omitted.")
+    return df[~infeasible].copy()
+
+
 def load_data() -> pd.DataFrame:
     if not os.path.exists(INPUT_PATH):
         raise FileNotFoundError(
@@ -267,7 +301,15 @@ def _save(fig: plt.Figure, filename: str, cfg: Config) -> None:
 
 def print_summary(df: pd.DataFrame, cfg: Config) -> None:
     print("\n--- Equal-memory comparison summary ---")
-    header = f"{'filter':<24} {'budget (MB)':>12} {'FPR':>8} {'FNR':>8} {'construct (ms)':>15} {'QPS':>12}"
+    # "used" and "used/budget" are here because the x-axis is the budget a
+    # filter was *given*, not what it spent: IVFPQ saturates at dim bytes
+    # per vector and then ignores every further MB, so a flat tail in its
+    # curve is a filter that stopped growing, not one that stopped
+    # improving. Without this column that distinction is invisible.
+    header = (
+        f"{'filter':<24} {'budget (MB)':>12} {'used (MB)':>10} {'used/budget':>12} "
+        f"{'FPR':>8} {'FNR':>8} {'construct (ms)':>15} {'QPS':>12}"
+    )
     print(header)
     print("-" * len(header))
 
@@ -275,16 +317,21 @@ def print_summary(df: pd.DataFrame, cfg: Config) -> None:
     fnr_agg = aggregate(df, "FNR")
     lat_agg = aggregate(df, "Latency (ms)")
     qps_agg = aggregate(df, "Throughput (qps)")
+    use_agg = aggregate(df, "Memory Usage") if "Memory Usage" in df.columns else None
 
     for name in cfg.configs:
         budgets = sorted(fpr_agg[fpr_agg["filter"] == name]["Memory Budget (MB)"].unique())
         for budget in budgets:
-            def _mean(agg: pd.DataFrame) -> float:
+            def _mean(agg: Optional[pd.DataFrame]) -> float:
+                if agg is None:
+                    return float("nan")
                 row = agg[(agg["filter"] == name) & (agg["Memory Budget (MB)"] == budget)]
                 return float(row["mean"].iloc[0]) if len(row) else float("nan")
 
+            used_mb = _mean(use_agg) / (1024 * 1024)
             print(
-                f"{cfg.labels[name]:<24} {budget:>12.3f} "
+                f"{cfg.labels[name]:<24} {budget:>12.3f} {used_mb:>10.3f} "
+                f"{used_mb / budget if budget else float('nan'):>12.3f} "
                 f"{_mean(fpr_agg):>8.3f} {_mean(fnr_agg):>8.3f} "
                 f"{_mean(lat_agg):>15.4f} {_mean(qps_agg):>12.1f}"
             )
@@ -306,6 +353,11 @@ def generate_equal_memory_figures(
         df = load_data()
     else:
         _validate_schema(df)
+
+    check_budget_compliance(df)
+    df = drop_infeasible(df)
+    if df.empty:
+        raise ValueError("No feasible rows to plot: every result row is marked infeasible.")
 
     configs = _derive_configs(df)
     labels, colors, markers = _derive_style_maps(configs)

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List, Tuple, Optional
 from hyperspheres_volume import estimate_hypersphere_volume
-from filters.filter import Filter
+from filters.filter import Filter, InsufficientMemoryError
 from filters.ball_cover.ball_interfaces import ConstructInterface, InsertInterface
 from filters.ball_cover.gonzales_construct import GonzalesConstruct
 from filters.ball_cover.nearest_insert import NearestInsert
@@ -32,6 +32,17 @@ class Quantize(Enum):
     Every ball also stores its radius as fp16, so a ball costs center + 2
     bytes -- see bytes_per_ball().
 
+    CAVEAT on RABITQ: the other nine rows are exact ADC, so search() returns
+    ||q - decode(c)|| and the one-sided inflation in _store_spheres is a
+    proof. RaBitQ instead scores through its own estimator, which is not tied
+    to sa_decode's output: measured against exact distances over 3.6M
+    (query, center) pairs on real embeddings it under-estimated every single
+    time, by 0.13 to 0.33, which is safe (an under-estimate only over-accepts)
+    but is an empirical observation, not a bound. At qb=1 it over-estimates
+    3.2% of the time by up to +0.37, so the one-sidedness is a property of
+    the configuration, not of the scheme. RABITQ's zero-false-negative
+    guarantee is therefore weaker in kind than the rest of the ladder's.
+
     Member names are dimension-independent: PQ4_R2 reads "4-bit
     subquantizers at a 2 bit/dim rate", and the subquantizer count m is
     derived from dim by _pq_m_for(), so the rates hold at any dimension that
@@ -48,13 +59,6 @@ class Quantize(Enum):
     PQ8_R2 = "PQ8@2"
     PQ4_R1 = "PQ4@1"
     RABITQ = "RaBitQ"
-
-
-class InsufficientMemoryError(ValueError):
-    """Raised when max_memory cannot support the requested encoding at all --
-    either its fixed codebook alone exhausts the budget (PQ8_R2's 384 KB is
-    the one that bites), or there are too few ball centers to fit a codebook
-    to."""
 
 
 @dataclass(frozen=True)
@@ -92,6 +96,9 @@ class _Encoding:
 # rotation to fix -- always re-measure this on real data.
 _ROTATION_SEED = 0x5EED
 _ROTATION_SEED_BYTES = 4
+
+# Private stream for _codebook_bytes()'s throwaway probe -- see there.
+_PROBE_RNG = np.random.default_rng(0x5EED)
 
 
 _ENCODINGS = {
@@ -305,6 +312,14 @@ class BallCoverFilter(Filter):
             )
         elif spec.kind == "rabitq":
             index = faiss.IndexRaBitQ(self.dim, faiss.METRIC_L2)
+            # faiss defaults qb=4, i.e. it quantizes the *query* to 4 bits.
+            # That contradicts the invariant every other row relies on (see
+            # query()), so pin it off. Note this does NOT make RaBitQ's
+            # search exact: unlike ADC, it scores through its own estimator
+            # rather than against sa_decode's output, so search() and
+            # _encoding_error() describe different reconstructions -- see
+            # the caveat on Quantize.RABITQ.
+            index.qb = 0
         else:
             raise ValueError(f"Unknown encoding kind {spec.kind!r} for {quantize}")
 
@@ -344,31 +359,36 @@ class BallCoverFilter(Filter):
         rotation.init(_ROTATION_SEED)
         return rotation
 
-    def _coder(self) -> faiss.Index:
+    def _coder(self, index: Optional[faiss.IndexIDMap2] = None) -> faiss.Index:
         """The level that owns sa_encode/sa_decode: the pre-transform wrapper
         when there is one, so encoding applies the rotation and decoding
         undoes it. Never the leaf -- encoding at the leaf would skip the
-        rotation and decode into the wrong basis."""
-        return faiss.downcast_index(self.all_centers_index.index)
+        rotation and decode into the wrong basis.
 
-    def _leaf_index(self) -> faiss.Index:
+        `index` overrides the committed one, so construct() can price an
+        index it has built but not yet installed."""
+        if index is None:
+            index = self.all_centers_index
+        return faiss.downcast_index(index.index)
+
+    def _leaf_index(self, index: Optional[faiss.IndexIDMap2] = None) -> faiss.Index:
         """The quantizer itself, past any pre-transform -- for reading .pq /
         .sq / RaBitQ model parameters."""
-        index = self._coder()
-        if isinstance(index, faiss.IndexPreTransform):
-            return faiss.downcast_index(index.index)
-        return index
+        leaf = self._coder(index)
+        if isinstance(leaf, faiss.IndexPreTransform):
+            return faiss.downcast_index(leaf.index)
+        return leaf
 
-    def bytes_per_ball(self) -> int:
+    def bytes_per_ball(self, index: Optional[faiss.IndexIDMap2] = None) -> int:
         """Encoded center + fp16 radius. sa_code_size() is well defined
         before training and through a pre-transform, so this is callable at
         __init__ time, when the memory budget is turned into a ball count."""
-        return self._coder().sa_code_size() + self._BYTES_PER_FLOAT16
+        return self._coder(index).sa_code_size() + self._BYTES_PER_FLOAT16
 
-    def _codebook_bytes(self) -> int:
+    def _codebook_bytes(self, index: Optional[faiss.IndexIDMap2] = None) -> int:
         """Fixed, per-filter cost that does not scale with the ball count."""
         total = _ROTATION_SEED_BYTES if _ENCODINGS[self.quantize].rotate else 0
-        index = self._leaf_index()
+        index = self._leaf_index(index)
 
         if isinstance(index, faiss.IndexPQ):
             # Computed from the layout, not from pq.centroids.nbytes, which
@@ -382,7 +402,11 @@ class BallCoverFilter(Filter):
                 probe = faiss.IndexScalarQuantizer(self.dim, index.sq.qtype, faiss.METRIC_L2)
                 # Random probes, not zeros: the MSE-trained (TurboQuant)
                 # variants divide through by the spread while training.
-                probe.train(np.random.rand(2, self.dim).astype(np.float32))
+                # A local Generator, never np.random.*: this runs from
+                # __init__, and drawing from the global stream would shift
+                # every globally-seeded sequence downstream (runner seeds per
+                # fold), making results depend on how many filters got built.
+                probe.train(_PROBE_RNG.random((2, self.dim)).astype(np.float32))
                 trained = faiss.vector_to_array(probe.sq.trained)
             total += int(trained.nbytes)
         elif isinstance(index, faiss.IndexRaBitQ) and index.centered:
@@ -390,10 +414,14 @@ class BallCoverFilter(Filter):
 
         return total
 
-    def _train_quantizer(self, centers: np.ndarray) -> None:
+    def _train_quantizer(self, centers: np.ndarray) -> faiss.IndexIDMap2:
         """Fits the one codebook this filter will ever use, on the ball
-        centers themselves. Called exactly once, by
+        centers themselves, and *returns* the index. Called exactly once, by
         construct().
+
+        Returns rather than assigns so that every way this can fail happens
+        before construct() has touched any filter state -- see the commit
+        ordering there.
 
         Trained on `centers`, not on the construct set, because the centers
         are the *only* vectors this index ever encodes: queries go in raw
@@ -412,14 +440,21 @@ class BallCoverFilter(Filter):
         footprint depends on what this sees -- only its fidelity does.
         """
         if _ENCODINGS[self.quantize].kind == "flat":
-            self.all_centers_index = self._make_faiss_index(self.quantize)
-            return
+            return self._make_faiss_index(self.quantize)
 
-        if len(centers) < 2:
+        spec = _ENCODINGS[self.quantize]
+        # PQ k-means is a hard floor, not a warning: faiss asserts
+        # nx >= k inside Clustering::train_encoded, so a PQ codebook with
+        # ksub = 2**nbits centroids cannot be fitted to fewer than ksub ball
+        # centers. PQ8_R2 needs 256. Caught here so a too-tight budget
+        # surfaces as InsufficientMemoryError (which runner records as an
+        # infeasible row) instead of an unhandled RuntimeError mid-sweep.
+        min_centers = (1 << spec.nbits) if spec.kind == "pq" else 2
+        if len(centers) < min_centers:
             raise InsufficientMemoryError(
                 f"Not enough memory to fit a {self.quantize.value} codebook: {len(centers)} ball "
-                "center(s) is too few to train on (need >= 2, which requires a larger "
-                "max_memory or a smaller ball budget)."
+                f"center(s), but this encoding needs at least {min_centers} to train on. "
+                "Requires a larger max_memory or a coarser encoding."
             )
 
         index = self._make_faiss_index(self.quantize)
@@ -433,14 +468,15 @@ class BallCoverFilter(Filter):
             leaf.pq.cp.min_points_per_centroid = 1
 
         index.train(centers)
-        self.all_centers_index = index
 
-        if self.max_memory is not None and self._codebook_bytes() + self.bytes_per_ball() > self.max_memory:
+        codebook, per_ball = self._codebook_bytes(index), self.bytes_per_ball(index)
+        if self.max_memory is not None and codebook + per_ball > self.max_memory:
             raise InsufficientMemoryError(
                 f"max_memory={self.max_memory} bytes cannot hold a {self.quantize.value} filter: its "
-                f"fixed codebook alone is {self._codebook_bytes()} bytes, leaving no room for even "
-                f"one {self.bytes_per_ball()}-byte ball."
+                f"fixed codebook alone is {codebook} bytes, leaving no room for even "
+                f"one {per_ball}-byte ball."
             )
+        return index
 
     def _encoding_error(self, centers: np.ndarray) -> np.ndarray:
         """Per-center ||c - decode(encode(c))||, measured against the trained
@@ -500,32 +536,64 @@ class BallCoverFilter(Filter):
         construction -- a cost only the streaming policy needs, paid by every
         one-shot construct-then-query use of this filter.
 
-        This is also the only place the quantizer is ever trained, and the
-        only place PQ's nbits is chosen (see _train_quantizer)."""
+        This is also the only place the quantizer is ever trained (see
+        _train_quantizer), and it is re-runnable: calling it again on a
+        filter that has already been constructed and inserted into is what
+        runner's "periodic" streaming policy does, so it fully resets the id
+        pool, the per-ball inflation and the insert strategy's bookkeeping."""
         centers, radii = self.construct_method.construct_filter(self, vectors)
         centers = np.ascontiguousarray(centers, dtype=np.float32)
         radii = np.asarray(radii, dtype=np.float32)
         n = len(centers)
 
+        # Build and validate the new index FIRST, while the filter is still
+        # untouched. _train_quantizer raises on a budget too tight for the
+        # codebook or a center count below its k-means floor, and construct()
+        # is called mid-stream by runner's "periodic" policy -- so failing
+        # after resetting _num_spheres would leave a filter that still
+        # reports _constructed but answers False to everything, i.e. silent
+        # false negatives on a filter that used to be correct. Nothing below
+        # this line is allowed to raise.
+        index = self._make_faiss_index(self.quantize) if n == 0 else self._train_quantizer(centers)
+
         self._ensure_capacity(max(n, 1))
         self._num_spheres = 0
         self._all_centers = None
         self._radius_inflation[:] = 0.0
+        # Clear the strategy's per-ball bookkeeping. construct() re-derives
+        # the whole ball set and reassigns every id, so anything keyed by
+        # sphere id is stale afterwards. MinHeapInsert is the one that bites:
+        # its merge heap keeps (i, j, version) tuples, and construct() does
+        # not bump the versions, so a stale pair validates and pops ids that
+        # are no longer active -- which then desynchronises _all_spheres from
+        # _num_spheres ("could not broadcast (302,) into (301,)"). Reachable
+        # from runner's "periodic" streaming policy. Note this *clears*
+        # state; it deliberately still does not *seed* any (see above).
+        self.insert_method.reset_buffers(len(self._all_radiuses))
+        self.all_centers_index = index
+        self._constructed = True
 
         if n == 0:
-            self.all_centers_index = self._make_faiss_index(Quantize.FP32)
-            self._constructed = True
+            # Keep the configured encoding's (untrained) index rather than
+            # swapping in a flat one: bytes_per_ball() is read off this, so a
+            # flat stand-in would price a PQ4_R2 ball at 1538 bytes instead
+            # of 98. insert() refuses on an untrained codebook.
             return self._log_volume_bounds()
 
-        self._train_quantizer(centers)
-
         sphere_indices = np.arange(n, dtype=np.int64)
-        self._all_spheres[:n] = sphere_indices.astype(np.int32)
+        # Reset the WHOLE id pool, not just the first n. _all_spheres is a
+        # permutation of the id space (merging strategies reorder it in
+        # place); writing arange(n) over only the front leaves the ids it
+        # displaced still sitting in the tail, so the array stops being
+        # injective. _get_new_index() hands out _all_spheres[_num_spheres],
+        # which would then be an id that is already live -- the next inserted
+        # ball would land on an occupied slot and add_with_ids would put a
+        # duplicate id in the index.
+        self._all_spheres[:] = np.arange(len(self._all_spheres), dtype=np.int32)
         self._num_spheres = n
         # construct_method measures radii against the true fp32 centers, so
         # this is where those radii pick up their encoding error.
         self._store_spheres(sphere_indices, centers, radii)
-        self._constructed = True
 
         return self._log_volume_bounds()
 
@@ -557,7 +625,15 @@ class BallCoverFilter(Filter):
         # sphere ID after a merge reassigns some, silently indexing
         # self._all_radiuses[labels] by the wrong sphere.
         d2, labels = self.all_centers_index.search(Q, self._num_spheres)
-        surface = np.sqrt(np.maximum(d2, 0.0)) - self._all_radiuses[labels]
+        # faiss pads short result rows with label -1. That should not happen
+        # here (k == _num_spheres == ntotal), but -1 indexes the *tail* of
+        # _all_radiuses -- uninitialised capacity, not an error -- so any
+        # future drift between ntotal and _num_spheres would silently compare
+        # against a garbage radius. Mask instead.
+        missing = labels < 0
+        surface = np.sqrt(np.maximum(d2, 0.0)) - self._all_radiuses[np.where(missing, 0, labels)]
+        if missing.any():
+            surface = np.where(missing, np.inf, surface)
         return (surface.min(axis=1) <= distance_threshold + self._COVERAGE_EPSILON).tolist()
 
     def insert(self, vectors: np.ndarray) -> None:
@@ -578,6 +654,13 @@ class BallCoverFilter(Filter):
                 "BallCoverFilter.insert() requires a constructed filter -- call construct() first. "
                 "insert() reuses the codebook and PQ nbits that construct() fixed, and has no "
                 "centers to fit them from on its own."
+            )
+
+        if not self._coder().is_trained:
+            raise ValueError(
+                "BallCoverFilter.insert() has no codebook to encode with: construct() produced "
+                "zero balls, so the quantizer was never fitted. Call construct() on a non-empty "
+                "vector set first."
             )
 
         if len(vectors) == 0:

@@ -42,14 +42,12 @@ logger = logging.getLogger(__name__)
 MAX_WORKERS = 8
 DATASET = 'ELI5'
 
-# How many vectors throughput-only sweeps (scaling, query_performance) pull.
-STREAM_SIZE = 10_00
-
 # Vectors/dataset for the paper's Workloads protocol (Section 5.1): "100K
-# queries per dataset, 80% construction / 20% queries". Kept separate from
-# STREAM_SIZE, which only affects the ground-truth FPR/FNR evaluations
-# (system_tau, quantization, equal_memory, streaming).
-WORKLOAD_NUM_VECTORS = 10_00
+# queries per dataset, 80% construction / 20% queries". One knob for every
+# evaluation: the ground-truth FPR/FNR ones (system_tau, quantization,
+# equal_memory, streaming) and the throughput-only sweeps (scaling,
+# query_performance), which used to read a separate STREAM_SIZE.
+WORKLOAD_NUM_VECTORS = 1_000
 
 # Registry name -> canonical dataset key, one source of truth via plot_common.
 DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
@@ -251,7 +249,7 @@ def generate_system_tau(runner: Runner) -> None:
     num_vectors      = WORKLOAD_NUM_VECTORS
     dim              = 384
     k_folds          = 5
-    k_fraction       = 0.05
+    k_fraction       = 0.5
     tau_values       = [float(t) for t in np.linspace(0.01, 0.10, 10)]
     ground_truth_dir = "results/system_tau_ground_truth"
 
@@ -357,9 +355,11 @@ def generate_quantization(runner: Runner) -> None:
 
     K-fold cross-validation (Section 5.1): 5 non-wrapping folds via
     advancing_fold_starts, tagged via seed=fold for plot_quantization's
-    seed-based mean +/- 95% CI aggregation. tau_values are calibrated once
-    from fold 0's construct set so every fold lands on the same tau; each
-    fold's ground truth is still recomputed from its own construct/query split.
+    seed-based mean +/- 95% CI aggregation. tau is a single value, calibrated
+    once from fold 0's construct set so every fold lands on the same
+    threshold; each fold's ground truth is still recomputed from its own
+    construct/query split. This sweep varies the quantizer, not the
+    threshold -- the tau sweep lives in generate_system_tau().
 
     Only submits 'quantization' jobs (output_csv=QUANTIZATION_CSV) -- does
     not run `runner`."""
@@ -367,7 +367,7 @@ def generate_quantization(runner: Runner) -> None:
     dim                    = 384
     k_folds                = 5
     k_fractions            = [0.01, 0.02, 0.04, 0.08, 0.16]
-    duplicate_percentages  = [5]
+    duplicate_percentage   = 5
 
     dataset = "MsMarco"  # Figure 3: "We evaluate on MS MARCO"
 
@@ -389,25 +389,22 @@ def generate_quantization(runner: Runner) -> None:
     # just for this; job submissions below use lazy VectorSource instead.
     fold0_construct_start = fold_starts[0] + query_len
     fold0_construct = VectorSource(dataset, fold0_construct_start, fold0_construct_start + construct_len).to_array()
-    tau_values = [calculate_nn_distance_threshold(fold0_construct, p) for p in duplicate_percentages]
-    logger.info(f"Scaling tau_values to {tau_values} ({duplicate_percentages}-th percentile NN distance, fold 0)")
+    tau = calculate_nn_distance_threshold(fold0_construct, duplicate_percentage)
+    logger.info(f"Scaling tau to {tau} ({duplicate_percentage}-th percentile NN distance, fold 0)")
 
     # Unused by quantization_worker: Gonzalez construction has no distance-threshold knob.
-    construct_tau = float(np.median(tau_values))
+    construct_tau = tau
 
     for fold, fold_start in enumerate(fold_starts):
         query_start, query_end = fold_start, fold_start + query_len
         construct_start, construct_end = query_end, query_end + construct_len
 
-        logger.info(f"Computing ground truth for fold {fold} (tau in {tau_values})...")
+        logger.info(f"Computing ground truth for fold {fold} (tau={tau})...")
         # Ground truth runs in this driver process (not a worker), so it
         # needs real arrays, loaded once per fold here.
         vectors_construct = VectorSource(dataset, construct_start, construct_end).to_array()
         vectors_query = VectorSource(dataset, query_start, query_end).to_array()
-        actual_results_by_tau = {
-            tau: compute_static_actual_results(vectors_construct, vectors_query, tau)
-            for tau in tau_values
-        }
+        actual_results = compute_static_actual_results(vectors_construct, vectors_query, tau)
         construct_source = VectorSource(dataset, construct_start, construct_end)
         query_source = VectorSource(dataset, query_start, query_end)
         for k in k_values:
@@ -416,9 +413,9 @@ def generate_quantization(runner: Runner) -> None:
                     'quantization',
                     output_csv=QUANTIZATION_CSV,
                     dim=dim, dataset=dataset,
-                    k=k, quantize=quantize, tau_values=tau_values, seed=fold, construct_tau=construct_tau,
+                    k=k, quantize=quantize, tau=tau, seed=fold, construct_tau=construct_tau,
                     vectors_construct=construct_source, vectors_query=query_source,
-                    actual_results_by_tau=actual_results_by_tau,
+                    actual_results=actual_results,
                 )
 
 
@@ -439,7 +436,7 @@ def generate_query_performance() -> pd.DataFrame:
     BallCoverFilter cover as a function of filter size k, across every
     dataset in DATASET_KEYS. One job per (dataset, k, seed), written to
     results/query_performance.csv."""
-    num_vectors           = STREAM_SIZE
+    num_vectors           = WORKLOAD_NUM_VECTORS
     dim                   = 384
     percentage_construct  = 20
     k_values              = [16, 32, 64, 128, 256, 512, 1024]
@@ -533,7 +530,7 @@ def generate_scaling(runner: Runner) -> None:
     Only submits 'scaling_query'/'scaling_insert'/'scaling_construction'
     jobs -- does not run `runner`. Each targets its own output_csv, so the
     Runner writes all three results/scaling_*.csv files incrementally."""
-    stream_size      = STREAM_SIZE
+    stream_size      = WORKLOAD_NUM_VECTORS
     dim              = 384
     n_steps          = 6
     k_values         = [16, 32, 64, 128, 256, 512]

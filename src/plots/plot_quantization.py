@@ -1,4 +1,4 @@
-"""Generates the six quantization-figure panels (+ shared legend), plus one
+"""Generates the seven quantization-figure panels (+ shared legend), plus one
 diagnostic FNR sanity-check panel not part of the paper figure set, from a
 long-format results file (one row per (quantize, k, seed) on a single
 dataset -- see main.py::generate_quantization). Each panel: x-axis = memory
@@ -27,7 +27,11 @@ from plots.plot_common import apply_style as _apply_style, save_figure
 
 INPUT_PATH = "results/quantization.csv"
 OUTDIR = "plots/quantization/"
-TAU: Optional[float] = None  # None => median tau present in the data
+# The quantization sweep is single-tau by design (see
+# main.py::generate_quantization): every row shares one threshold, so there
+# is nothing to select. Left as a config knob only to pin an expected value
+# -- None accepts whatever single tau the data carries.
+TAU: Optional[float] = None
 DPI = 400
 EMIT_PDF = False
 
@@ -37,7 +41,11 @@ EMIT_PDF = False
 # (stage="quantizing"), so a more compact code packs more balls into it.
 QUANTIZE_SWEEP = (
     Quantize.FP32, Quantize.FP16, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
-    Quantize.TQ3, Quantize.PQ4_R2, Quantize.PQ8_R2, Quantize.PQ4_R1, Quantize.RABITQ,
+    Quantize.TQ3, Quantize.PQ4_R2, Quantize.PQ8_R2, Quantize.PQ4_R1,
+    # Quantize.RABITQ is deliberately left out: it is the one rung whose
+    # search() is not exact ADC, so its zero-false-negative property rests on
+    # a measured one-sided estimator rather than a proof -- see the CAVEAT on
+    # Quantize.RABITQ. Still constructible, just not swept.
 )
 STAGES = [q.value for q in QUANTIZE_SWEEP]
 STAGE_LABELS = {
@@ -103,6 +111,9 @@ _REQUIRED_COLUMNS = [
     "stage_time_s",
     "cum_time_s",
     "query_throughput_qps",
+    "n_queries",
+    "n_index_accesses",
+    "index_accesses_saved_pct",
     "n_balls",
     "memory_bytes",
     "seed",
@@ -170,14 +181,17 @@ def resolve_config(
     outdir: str = OUTDIR,
 ) -> Config:
     available_tau = sorted(df["tau"].unique())
-    if tau is None:
-        tau = float(df["tau"].median())
-        if tau not in available_tau:
-            tau = min(available_tau, key=lambda t: abs(t - tau))
-    elif tau not in available_tau:
-        raise ValueError(f"tau={tau} not present in data. Available tau values: {available_tau}")
+    if len(available_tau) != 1:
+        raise ValueError(
+            f"Expected exactly one tau in the quantization data, found {len(available_tau)}: "
+            f"{available_tau}. This sweep varies the quantizer at a fixed threshold; a "
+            "multi-tau sweep belongs in plot_system_tau."
+        )
+    data_tau = float(available_tau[0])
+    if tau is not None and tau != data_tau:
+        raise ValueError(f"tau={tau} not present in data. The data's tau is {data_tau}.")
 
-    return Config(tau=tau, dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
+    return Config(tau=data_tau, dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
 
 
 # Aggregation
@@ -336,18 +350,48 @@ def panel_construction_time(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 # Panel (e): query throughput
 
 def panel_query_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """Batched-query throughput of filt.query(), per quantize variant. Query
-    cost doesn't depend on tau (every ball is checked regardless of
-    threshold), so this averages over the tau sweep -- log-scaled since a
-    quantizer's decode overhead (e.g. PQ) can separate lines by an order of
-    magnitude from the raw/NONE cover."""
+    """Batched-query throughput of filt.query(), per quantize variant.
+    Measured at the sweep's single tau, which costs no generality: query cost
+    doesn't depend on the threshold (every ball is checked regardless).
+    Log-scaled since a quantizer's decode overhead (e.g. PQ) can separate
+    lines by an order of magnitude from the raw/NONE cover."""
     return _line_panel(
         df, "query_throughput_qps", "Throughput (q/s)",
         "quantization-query-throughput.png", cfg, use_tau=False, log_y=True,
     )
 
 
-# Panel (f): ball count per quantize variant
+# Panel (f): main-index accesses saved
+
+def panel_index_accesses_saved(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Share of queries the filter answers on its own, so they never reach
+    the main index. A rejected query is a saved access; a positive (true or
+    false) falls through, so saved% == 100 - positive rate. This is the
+    system-level reading of panel (c): FPR is the filter's error rate, this
+    is what that error rate costs downstream once the workload's real
+    duplicate rate is folded in.
+
+    The ceiling is the non-duplicate share of the workload (95% at the
+    calibrated tau -- a duplicate *should* reach the index), so a perfect
+    filter sits there, not at 100%. Linear axis pinned to [0, 100]: the
+    interesting range is the top of it, and a degenerate cover that accepts
+    everything sits at 0."""
+    def annotate(ax: plt.Axes) -> None:
+        ax.text(
+            # Top-left, not top-right like panel (b): this curve rises with
+            # memory, so the right half is where the lines are.
+            0.03, 0.95, rf"$\tau = {cfg.tau:g}$",
+            transform=ax.transAxes, ha="left", va="top", fontsize=5.5,
+        )
+
+    return _line_panel(
+        df, "index_accesses_saved_pct", "Index Accesses Saved (%)",
+        "quantization-index-accesses-saved.png", cfg, use_tau=True,
+        y_bounds=(0, 100), extra=annotate,
+    )
+
+
+# Panel (g): ball count per quantize variant
 
 def panel_n_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     """Realized ball count per quantize variant across the memory-usage
@@ -359,7 +403,7 @@ def panel_n_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     )
 
 
-# Panel (g): radius inflation due to quantization
+# Panel (h): radius inflation due to quantization
 
 def panel_radius_inflation(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     """Mean +/- stddev of each ball's radius inflation (the per-center
@@ -485,12 +529,13 @@ def _save(fig: plt.Figure, filename: str, cfg: Config) -> None:
 def print_summary(df: pd.DataFrame, cfg: Config) -> None:
     print(f"\n--- Quantization summary (tau={cfg.tau:g}) ---")
     header = (f"{'quantize':>9} {'memory (MB)':>12} {'d(log10 J) vs None':>20} "
-              f"{'fpr':>12} {'time (s)':>10} {'qps':>10} {'n_balls':>8}")
+              f"{'fpr':>12} {'saved (%)':>10} {'time (s)':>10} {'qps':>10} {'n_balls':>8}")
     print(header)
     print("-" * len(header))
 
     j_agg = _relative_to_baseline(aggregate(df, "log10_J", cfg, use_tau=False))
     fpr_agg = aggregate(df, "fpr", cfg, use_tau=True)
+    saved_agg = aggregate(df, "index_accesses_saved_pct", cfg, use_tau=True)
     time_agg = aggregate(df, "cum_time_s", cfg, use_tau=False)
     qps_agg = aggregate(df, "query_throughput_qps", cfg, use_tau=False)
     balls_agg = aggregate(df, "n_balls", cfg, use_tau=False)
@@ -499,12 +544,14 @@ def print_summary(df: pd.DataFrame, cfg: Config) -> None:
         for _, row in j_agg[j_agg["quantize"] == stage].sort_values("k").iterrows():
             k = row["k"]
             this_fpr = fpr_agg[(fpr_agg["quantize"] == stage) & (fpr_agg["k"] == k)]["mean"].iloc[0]
+            this_saved = saved_agg[(saved_agg["quantize"] == stage) & (saved_agg["k"] == k)]["mean"].iloc[0]
             this_time = time_agg[(time_agg["quantize"] == stage) & (time_agg["k"] == k)]["mean"].iloc[0]
             this_qps = qps_agg[(qps_agg["quantize"] == stage) & (qps_agg["k"] == k)]["mean"].iloc[0]
             this_balls = balls_agg[(balls_agg["quantize"] == stage) & (balls_agg["k"] == k)]["mean"].iloc[0]
             print(
                 f"{STAGE_LABELS[stage]:>9} {row['Memory (MB)']:>12.3f} {row['mean']:>20.3f} "
-                f"{this_fpr:>12.2e} {this_time:>10.3f} {this_qps:>10.1f} {this_balls:>8.1f}"
+                f"{this_fpr:>12.2e} {this_saved:>10.2f} {this_time:>10.3f} {this_qps:>10.1f} "
+                f"{this_balls:>8.1f}"
             )
     print()
 
@@ -518,7 +565,7 @@ def generate_quantization_figures(
     dpi: int = DPI,
     emit_pdf: bool = EMIT_PDF,
 ) -> None:
-    """Library entry point: renders the six paper panels + one diagnostic
+    """Library entry point: renders the seven paper panels + one diagnostic
     FNR panel (+ legend) from an in-memory DataFrame, or from `load_data()`
     (reads INPUT_PATH) if `df` is omitted. panel_fnr is excluded from the
     LaTeX subfigure snippet printed below, since it's a sanity check, not
@@ -535,6 +582,7 @@ def generate_quantization_figures(
     panel_fpr(df, cfg)
     panel_construction_time(df, cfg)
     panel_query_throughput(df, cfg)
+    panel_index_accesses_saved(df, cfg)
     panel_n_balls(df, cfg)
     panel_radius_inflation(df, cfg)
     panel_fnr(df, cfg)
@@ -571,6 +619,11 @@ def generate_quantization_figures(
     \centering
     \includegraphics[width=\linewidth]{figures/quantization-query-throughput.png}
     \caption{Query throughput}
+\end{subfigure}
+\begin{subfigure}[b]{0.24\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/quantization-index-accesses-saved.png}
+    \caption{Index accesses saved}
 \end{subfigure}
 \begin{subfigure}[b]{0.24\linewidth}
     \centering

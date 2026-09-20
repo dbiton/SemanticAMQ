@@ -22,7 +22,7 @@ from typing import List, Optional, Tuple
 import faiss
 import numpy as np
 
-from filters.filter import Filter
+from filters.filter import Filter, InsufficientMemoryError
 
 
 class QuantizationLevel(Enum):
@@ -36,12 +36,6 @@ class ErrorBudgetMode(Enum):
     GLOBAL = "global"
     PER_CLUSTER = "per_cluster"
     PER_VECTOR = "per_vector"
-
-
-class InsufficientMemoryError(ValueError):
-    """Raised when max_memory is too small to store every construct vector
-    at even the coarsest quantization level (RaBitQ) -- see module
-    docstring."""
 
 
 # Finest -> coarsest. Walked in this order by _choose_level.

@@ -21,7 +21,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 from pybloom_live import BloomFilter as _BloomFilter
 
-from filters.filter import Filter
+from filters.filter import Filter, InsufficientMemoryError
 from filters._hashing import signature_to_key
 
 
@@ -93,11 +93,26 @@ class DSHFilter(Filter):
             (self.num_tables, num_projections_per_table, dim)
         ).astype(np.float32)
 
+        proj_bytes = int(self._projections.nbytes)
         if max_memory is not None:
-            bits_available = max_memory * 8
+            # The projection matrix is part of the filter and get_bytesize()
+            # counts it, so only what is left of the budget may go to the
+            # Bloom filter. Sizing the Bloom against the *whole* budget put
+            # every DSH point over its budget by exactly proj_bytes -- small
+            # in relative terms, but it is the one thing an equal-memory
+            # comparison may not get wrong.
+            bits_available = max(0, max_memory - proj_bytes) * 8
             self._capacity = max(
                 1, int(bits_available * (math.log(2) ** 2) / (-math.log(error_rate)))
             )
+            total_bytes = proj_bytes + self._bloom_bytes_for(self._capacity, error_rate)
+            if total_bytes > max_memory:
+                raise InsufficientMemoryError(
+                    f"max_memory={max_memory} bytes is too small for DSHFilter: its "
+                    f"{self.num_tables}x{num_projections_per_table}x{dim} float32 projection "
+                    f"matrix alone needs {proj_bytes} bytes, leaving too little for even a "
+                    f"minimum-capacity Bloom filter ({total_bytes} bytes needed in total)."
+                )
         else:
             self._capacity = 1_000 * self.num_tables
 
@@ -212,10 +227,17 @@ class DSHFilter(Filter):
             return
         self._insert_batch(vectors)
 
+    @staticmethod
+    def _bloom_bytes_for(capacity: int, error_rate: float) -> int:
+        """Bytes pybloom_live's bit array needs at this capacity and error
+        rate. Shared by the max_memory sizing in __init__ and by
+        get_bytesize() so the budget the filter is built to and the size it
+        reports cannot drift apart."""
+        bits_needed = -capacity * math.log(error_rate) / (math.log(2) ** 2)
+        return int(math.ceil(bits_needed / 8))
+
     def get_bytesize(self) -> int:
         proj_bytes = int(self._projections.nbytes)
         if self.filter is None:
             return proj_bytes
-        bits_needed = -self.filter.capacity * math.log(self._error_rate) / (math.log(2) ** 2)
-        bloom_bytes = int(math.ceil(bits_needed / 8))
-        return bloom_bytes + proj_bytes
+        return self._bloom_bytes_for(self.filter.capacity, self._error_rate) + proj_bytes

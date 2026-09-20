@@ -25,10 +25,9 @@ from scipy.special import logsumexp
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 
 from logging_config import configure_logging
-from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize, InsufficientMemoryError
-from filters.quantized_vector_filter import (
-    QuantizedVectorFilter, InsufficientMemoryError as QVFInsufficientMemoryError,
-)
+from filters.filter import InsufficientMemoryError
+from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize
+from filters.quantized_vector_filter import QuantizedVectorFilter
 from filters.ball_cover.nearest_insert import NearestInsert
 from filters.ball_cover.least_inflation_insert import LeastInflationInsert
 from filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
@@ -160,15 +159,24 @@ def _f1_score(predicted: np.ndarray, actual: np.ndarray) -> float:
 
 
 _IVF_NPROBE_CANDIDATES = (1, 2, 4, 8, 16, 32, 64)
+_HNSW_EF_SEARCH_CANDIDATES = (16, 32, 64, 128, 256, 512)
 
 
 # Filters with a cheap post-construction query-time dial: score every candidate on one built instance.
+# Every dial here must reach the underlying index, not just set a Python
+# attribute -- see IVFFilter.nprobe / HNSWFilter.ef_search, both properties
+# for exactly that reason.
 _POST_CONSTRUCTION_CONFIG_DIALS = {
     "DSBFFilter": lambda f: [("vote_threshold", t) for t in range(1, f.num_tables + 1)],
     # Swept on a log-ish grid up to nlist, not exhaustively (nlist can be in the hundreds).
     "IVFFilter": lambda f: [
         ("nprobe", p) for p in sorted({c for c in _IVF_NPROBE_CANDIDATES if c <= f.nlist} | {f.nlist})
     ],
+    # efSearch is HNSW's accuracy/speed dial and costs no memory, exactly
+    # like IVF's nprobe. Without it HNSW competed at a fixed efSearch=64
+    # against an IVF whose nprobe was tuned per budget -- not an equal
+    # comparison of the two baselines.
+    "HNSWFilter": lambda f: [("ef_search", e) for e in _HNSW_EF_SEARCH_CANDIDATES],
 }
 
 # Filters whose configuration changes memory layout at construction time: one build per candidate.
@@ -254,13 +262,17 @@ def equal_memory_worker(
             filter_cls, dim, memory_budget, distance_threshold,
             construct_arr, calib_arr, calib_actual,
         )
-    except QVFInsufficientMemoryError as e:
+    except InsufficientMemoryError as e:
         # Expected at small budgets -- recorded as an explicit infeasible
-        # row (NaN metrics) rather than dropped or crashing the sweep.
+        # row (NaN metrics) rather than dropped or crashing the sweep. Every
+        # filter raises the one shared class from filters.filter; this used
+        # to name only QuantizedVectorFilter's copy, so the same condition
+        # from BallCoverFilter took the whole job down instead.
         logger.warning(f"[Infeasible] {config} at memory_budget={memory_budget}: {e}")
         return {
             'Config': config, 'Dataset': dataset, 'Memory Budget': memory_budget,
-            'Memory Usage': float('nan'), 'Threshold': distance_threshold,
+            'Memory Usage': float('nan'), 'Over Budget': False,
+            'Threshold': distance_threshold,
             'FPR': float('nan'), 'FNR': float('nan'),
             'Latency (ms)': float('nan'), 'Throughput (qps)': float('nan'),
             'Infeasible': True,
@@ -275,11 +287,26 @@ def equal_memory_worker(
     tp, fp, fn, tn = _binary_confusion(predicted, actual_query)
     n_q = max(len(actual_query), 1)
 
+    # The premise of the whole experiment is that a point plotted at a given
+    # budget respects it. Filters enforce that themselves (raising
+    # InsufficientMemoryError above rather than shipping an over-budget
+    # index), so anything caught here is a filter bug, not a tight budget --
+    # hence a loud warning and a flagged row rather than a silent datapoint.
+    memory_usage = filter_instance.get_bytesize()
+    over_budget = memory_usage > memory_budget
+    if over_budget:
+        logger.warning(
+            f"[Over budget] {config} at memory_budget={memory_budget} used {memory_usage} bytes "
+            f"({memory_usage / max(memory_budget, 1):.2f}x). Its get_bytesize() and its "
+            f"construct()-time budget check disagree; treat this row as unsound."
+        )
+
     return {
         'Config': config,
         'Dataset': dataset,
         'Memory Budget': memory_budget,
-        'Memory Usage': filter_instance.get_bytesize(),
+        'Memory Usage': memory_usage,
+        'Over Budget': over_budget,
         'Threshold': distance_threshold,
         'FPR': fp / (fp + tn) if (fp + tn) > 0 else 0.0,
         'FNR': fn / (fn + tp) if (fn + tp) > 0 else 0.0,
@@ -344,7 +371,11 @@ def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, flo
 # stage="ball"): one "ball" cover to compare every real quantizer against.
 QUANTIZATION_SWEEP = (
     Quantize.FP32, Quantize.FP16, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
-    Quantize.TQ3, Quantize.PQ4_R2, Quantize.PQ8_R2, Quantize.PQ4_R1, Quantize.RABITQ,
+    Quantize.TQ3, Quantize.PQ4_R2, Quantize.PQ8_R2, Quantize.PQ4_R1,
+    # Quantize.RABITQ is deliberately left out: it is the one rung whose
+    # search() is not exact ADC, so its zero-false-negative property rests on
+    # a measured one-sided estimator rather than a proof -- see the CAVEAT on
+    # Quantize.RABITQ. Still constructible, just not swept.
 )
 
 
@@ -353,16 +384,22 @@ def quantization_worker(
     dataset: str,
     k: int,
     quantize: Quantize,
-    tau_values: List[float],
+    tau: float,
     seed: int,
     construct_tau: float,
     vectors_construct: VectorInput,
     vectors_query: VectorInput,
-    actual_results_by_tau: Dict[float, List[bool]],
+    actual_results: List[bool],
 ) -> List[Dict[str, Any]]:
     """Builds one BallCoverFilter cover per (dataset, k, seed, quantize) and
-    evaluates it at every tau. Returns one row per tau, tagged
+    evaluates it at a single tau. Returns one row, tagged
     stage="ball"/"quantizing".
+
+    Unlike system_tau_worker, this sweep is single-tau by design: it varies
+    the quantizer at a fixed threshold (the paper's Figure 3 fixes tau so 5%
+    of queries are duplicates), so the tau-dependent columns (fpr,
+    log10_J_tau, index_accesses_saved_pct) are unambiguous without the plots
+    having to pick one tau out of several.
 
     max_memory is derived from k using Quantize.FP32's byte-per-ball size and
     held fixed across every quantize candidate, so a more compact code packs
@@ -379,13 +416,12 @@ def quantization_worker(
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
     n_q = len(query_arr)
-    for t, actual in actual_results_by_tau.items():
-        if len(actual) != n_q:
-            raise ValueError(
-                f"vectors_query ({n_q}) and actual_results_by_tau[{t}] ({len(actual)}) length mismatch"
-            )
+    if len(actual_results) != n_q:
+        raise ValueError(
+            f"vectors_query ({n_q}) and actual_results ({len(actual_results)}) length mismatch"
+        )
 
-    actual_by_tau = {t: np.asarray(a, dtype=bool) for t, a in actual_results_by_tau.items()}
+    actual = np.asarray(actual_results, dtype=bool)
     stage = "ball" if quantize == Quantize.FP32 else "quantizing"
 
     rows: List[Dict[str, Any]] = []
@@ -411,27 +447,37 @@ def quantization_worker(
 
     memory_bytes = filt.get_bytesize()
 
-    predicted_by_tau: Dict[float, List[bool]] = {}
-    query_throughput_by_tau: Dict[float, float] = {}
-    for t in tau_values:
-        q0 = time.perf_counter()
-        predicted_by_tau[t] = filt.query(query_arr, distance_threshold=t)
-        query_time = time.perf_counter() - q0
-        query_throughput_by_tau[t] = n_q / max(query_time, 1e-9)
+    q0 = time.perf_counter()
+    predicted = filt.query(query_arr, distance_threshold=tau)
+    query_time = time.perf_counter() - q0
 
-    for t in tau_values:
-        rates = _confusion_rates(predicted_by_tau[t], actual_by_tau[t])
-        rows.append({
-            "dataset": dataset, "k": k, "quantize": quantize.value, "stage": stage, "tau": t,
-            "log10_J": log10_J,
-            "log10_J_tau": _log10_J(radii, dim, tau=t),
-            "fpr": rates["fpr"], "fnr": rates["fnr"],
-            "stage_time_s": stage_time, "cum_time_s": stage_time,
-            "query_throughput_qps": query_throughput_by_tau[t],
-            "n_balls": filt._num_spheres, "memory_bytes": memory_bytes, "seed": seed,
-            "radius_inflation_mean": radius_inflation_mean,
-            "radius_inflation_std": radius_inflation_std,
-        })
+    # What the filter buys a downstream system: a query it rejects never
+    # reaches the main index, so accesses == positives and everything else
+    # is saved. Same accounting as system_tau_worker's mean_index_accesses,
+    # counted rather than timed -- no index is built here, since the count
+    # is a property of the filter's decisions, not of what sits behind it.
+    # Given the zero-false-negative guarantee this is determined by fpr and
+    # the duplicate rate, but it is the number a system integrator reads,
+    # and fpr alone doesn't give it without knowing the redundancy rate.
+    predicted_arr = np.asarray(predicted, dtype=bool)
+    n_index_accesses = int(predicted_arr.sum())
+
+    rates = _confusion_rates(predicted, actual)
+    rows.append({
+        "dataset": dataset, "k": k, "quantize": quantize.value, "stage": stage, "tau": tau,
+        "log10_J": log10_J,
+        "log10_J_tau": _log10_J(radii, dim, tau=tau),
+        "fpr": rates["fpr"], "fnr": rates["fnr"],
+        "stage_time_s": stage_time, "cum_time_s": stage_time,
+        "query_throughput_qps": n_q / max(query_time, 1e-9),
+        "n_queries": n_q,
+        "n_index_accesses": n_index_accesses,
+        "index_accesses_saved": n_q - n_index_accesses,
+        "index_accesses_saved_pct": (1.0 - n_index_accesses / max(n_q, 1)) * 100.0,
+        "n_balls": filt._num_spheres, "memory_bytes": memory_bytes, "seed": seed,
+        "radius_inflation_mean": radius_inflation_mean,
+        "radius_inflation_std": radius_inflation_std,
+    })
 
     bad = [r for r in rows if r["fnr"] != 0]
     if bad:
@@ -824,6 +870,8 @@ def _describe_job(kwargs: Dict[str, Any]) -> str:
         return kwargs['filter_cls'].__name__
     if {'dataset', 'k', 'tau_values', 'seed'} <= kwargs.keys():
         return f"{kwargs['dataset']} k={kwargs['k']} tau_values={kwargs['tau_values']} seed={kwargs['seed']}"
+    if {'dataset', 'k', 'tau', 'seed'} <= kwargs.keys():
+        return f"{kwargs['dataset']} k={kwargs['k']} tau={kwargs['tau']:g} seed={kwargs['seed']}"
     if {'dataset', 'method', 'k', 'seed'} <= kwargs.keys():
         fold = f" fold_offset={kwargs['fold_offset']}" if 'fold_offset' in kwargs else ""
         return f"{kwargs['dataset']} method={kwargs['method']} k={kwargs['k']} seed={kwargs['seed']}{fold}"
