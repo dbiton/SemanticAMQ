@@ -47,7 +47,7 @@ DATASET = 'ELI5'
 # evaluation: the ground-truth FPR/FNR ones (system_tau, quantization,
 # equal_memory, streaming) and the throughput-only sweeps (scaling,
 # query_performance), which used to read a separate STREAM_SIZE.
-WORKLOAD_NUM_VECTORS = 10_000
+WORKLOAD_NUM_VECTORS = 4_000
 
 # Registry name -> canonical dataset key, one source of truth via plot_common.
 DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
@@ -249,8 +249,8 @@ def generate_system_tau(runner: Runner) -> None:
     num_vectors      = WORKLOAD_NUM_VECTORS
     dim              = 384
     k_folds          = 5
-    k_fraction       = 0.5
-    tau_values       = [float(t) for t in np.linspace(0.01, 0.10, 10)]
+    k_fraction       = 0.1
+    tau_values       = [float(t) for t in np.logspace(-2, -0.5, num=10)]
     ground_truth_dir = "results/system_tau_ground_truth"
 
     datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
@@ -539,7 +539,7 @@ def generate_scaling(runner: Runner) -> None:
     # 80% of the protocol's 100K per fold. Not WORKLOAD_NUM_VECTORS itself:
     # that is the whole 100K, and using it here would make the construct set
     # the full workload and push the pool (construct + holdout) past it.
-    stream_size      = 80_000
+    stream_size      = WORKLOAD_NUM_VECTORS * 70 // 100
     dim              = 384
     n_steps          = 6
     k_values         = [16, 32, 64, 128, 256, 512]
@@ -554,8 +554,8 @@ def generate_scaling(runner: Runner) -> None:
     # The protocol's 20% query split. n_insert_vectors stays smaller: insert()
     # mutates the cover, so its cost per vector grows with the ball count and
     # a 20K stream would dominate the sweep's runtime for no extra resolution.
-    n_query_vectors  = 20_000
-    n_insert_vectors = 8_192
+    n_query_vectors  = WORKLOAD_NUM_VECTORS * 20 // 100
+    n_insert_vectors = WORKLOAD_NUM_VECTORS * 10 // 100
 
     if _SCALING_DATASET not in DATASET_KEYS:
         raise RuntimeError(f"_SCALING_DATASET={_SCALING_DATASET!r} must be one of {sorted(DATASET_KEYS)}")
@@ -677,18 +677,35 @@ def _build_streaming_negative_set(
 def generate_streaming(runner: Runner) -> None:
     """The paper's "dynamic evaluation" (Section 5.1/5.4, Figure 4): compares
     BallCoverFilter's 4 insertion strategies via stream_rebuild_worker's
-    policy="streaming". Produces the streaming figure's four panels: (a) FPR
-    vs. position + a static-rebuild reference, (b) threshold-expanded
-    objective inflation vs. position, (c) final FPR vs. ball budget k, (d)
-    Pareto of mean FPR vs. amortized cost/insertion.
+    policy="streaming". Produces the streaming figure's panels: (a) FPR vs.
+    position + a static-rebuild reference, (b) threshold-expanded objective
+    inflation vs. position -- no k sweep: the ball budget k stays fixed for
+    the whole run, and only the stream position varies.
 
-    Implements the paper's Workloads protocol (Section 5.1): each of
-    k_folds=5 folds gets its own stream window, starting fold_stride further
-    into the representative dataset than fold 0's -- non-wrapping via
-    advancing_fold_starts, so folds see genuinely different data rather than
-    the same pool reordered. A further span past every fold's window is held
-    out as the source of verified-negative queries; the dataset needs enough
-    vectors on disk for both, or this raises.
+    The ball budget k, the bootstrap (construct) window, and the subsequent
+    insert-only window are each sized as their own fraction of num_vectors:
+    k_percent_stream sets k itself, init_percent_stream controls how many
+    vectors seed construct() before any insert() call, and
+    insert_percent_stream controls how many are then streamed in one at a
+    time. Decoupling the bootstrap window from k matters: the old scheme
+    bootstrapped on exactly k vectors (bootstrap_n = min(k, n)), which for
+    k <= n gives GonzalesConstruct one point per center and hence
+    zero-radius balls at position 0 -- a degenerate starting point that
+    saturates FPR to ~1 within a few dozen insertions regardless of method.
+    Bootstrapping on a window an order of magnitude larger than k gives the
+    filter genuinely non-trivial radii before streaming even starts.
+
+    Implements the paper's Workloads protocol (Section 5.1, "80% construction
+    / 20% queries"): init_percent_stream + insert_percent_stream is the
+    construction share (default 0.4 + 0.4 = 0.8) and the remaining
+    1 - init_percent_stream - insert_percent_stream of num_vectors, past
+    every fold's window, is held out as the source of verified-negative
+    queries. Each of k_folds=5 folds gets its own stream window, starting
+    fold_stride further into the representative dataset than fold 0's --
+    non-wrapping via advancing_fold_starts, so folds see genuinely different
+    data rather than the same pool reordered. The dataset needs enough
+    vectors on disk for both the folds' windows and the query span, or this
+    raises.
 
     FNR=0 is asserted per checkpoint inside stream_rebuild_worker (raises,
     not recorded) -- a correctness requirement, not a plotted quantity.
@@ -697,13 +714,14 @@ def generate_streaming(runner: Runner) -> None:
     not run `runner`."""
     num_vectors = WORKLOAD_NUM_VECTORS
     dim = 384
-    k_values = [16, 32, 64, 128, 256, 512, 1024]
     methods = ["nearest", "least_inflation", "merge", "min_heap"]
     n_negative = 500
     duplicate_percentage = 10.0  # calibrates tau_mid; see calculate_nn_distance_threshold
     k_folds = 5  # "we do this 5 times" (Section 5.1)
-    stream_fraction = 0.8  # mirrors the static evaluation's 80% construct share
     seed = 0  # fixed; fold_offset supplies the stream-order variance instead
+    k_percent_stream = 0.1  # ball budget k, as a fraction of num_vectors
+    init_percent_stream = 0.4  # bootstrap/construct window, as a fraction of num_vectors
+    insert_percent_stream = 0.4  # vectors streamed via insert() after bootstrap, as a fraction of num_vectors
 
     datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
     missing = [d for d in DATASET_KEYS if d not in datasets]
@@ -723,14 +741,28 @@ def generate_streaming(runner: Runner) -> None:
     rep_dataset = _STREAMING_REPRESENTATIVE_DATASET
     rep_key = DATASET_KEYS[rep_dataset]
 
-    n_stream_pool = int(num_vectors * stream_fraction)
-    fold_stride = n_stream_pool // k_folds
+    k_fixed = max(16, round(k_percent_stream * num_vectors))
+
+    n_init = max(1, round(init_percent_stream * num_vectors))
+    n_insert = max(1, round(insert_percent_stream * num_vectors))
+    n_stream_window = n_init + n_insert
+    if n_stream_window > num_vectors:
+        raise RuntimeError(
+            f"init_percent_stream={init_percent_stream} + insert_percent_stream="
+            f"{insert_percent_stream} needs {n_stream_window} vectors per fold, but "
+            f"num_vectors is only {num_vectors}. Lower either percentage or raise num_vectors."
+        )
+
+    # construct()+insert() consume n_stream_window vectors per fold; the
+    # remainder of num_vectors, past every fold's window, is held out as the
+    # source of verified-negative queries.
+    fold_stride = n_stream_window // k_folds
     offsets = [f * fold_stride for f in range(k_folds)]
-    negative_pool_size = num_vectors - n_stream_pool
+    negative_pool_size = num_vectors - n_stream_window
 
     # Placed past every fold's window (all contained in [0, offsets[-1] +
-    # n_stream_pool)) so it can never overlap any fold's stream.
-    negative_pool_start = offsets[-1] + n_stream_pool
+    # n_stream_window)) so it can never overlap any fold's stream.
+    negative_pool_start = offsets[-1] + n_stream_window
     negative_pool_end = negative_pool_start + negative_pool_size
 
     total_rows = len(VectorSource(rep_dataset))
@@ -738,7 +770,7 @@ def generate_streaming(runner: Runner) -> None:
         raise RuntimeError(
             f"{rep_dataset}: has only {total_rows} vectors on disk; generate_streaming's "
             f"non-wrapping {k_folds}-fold sweep at num_vectors={num_vectors} needs at least "
-            f"{negative_pool_end} (room for {k_folds} stream windows of {n_stream_pool} "
+            f"{negative_pool_end} (room for {k_folds} stream windows of {n_stream_window} "
             f"vectors each, advancing by {fold_stride}, plus a {negative_pool_size}-vector "
             "negative-candidate pool past the last one). Raise the dataset's available "
             "vectors, or lower num_vectors."
@@ -756,26 +788,9 @@ def generate_streaming(runner: Runner) -> None:
             "Raise num_vectors or lower n_negative."
         )
 
-    k_fixed = max(16, n_stream_pool // 1000)
-    n_stream_ab = min(k_fixed * 1000, n_stream_pool)
-    n_stream_c = n_stream_pool
-
-    # Drop k values that don't leave enough room in the shared stream to be
-    # a meaningful sweep point, rather than hand-editing k_values per num_vectors.
-    usable_k_values = [k for k in k_values if k * 10 < n_stream_c]
-    dropped_k = sorted(set(k_values) - set(usable_k_values))
-    if dropped_k:
-        logger.warning(f"Dropping k value(s) too large for the stream pool ({n_stream_c}): {dropped_k}")
-    if not usable_k_values:
-        raise RuntimeError(
-            f"No k value in {k_values} leaves room in a stream pool of {n_stream_c} vectors "
-            "(k*10 < pool size required). Raise num_vectors or lower k_values."
-        )
-    k_values = usable_k_values
-
-    # Calibrated from fold 0's window (full_span's first n_stream_pool vectors).
-    logger.info(f"{rep_dataset}: calibrating tau_mid against the stream pool...")
-    tau_mid = calculate_nn_distance_threshold(full_span[:n_stream_ab], duplicate_percentage)
+    # Calibrated from fold 0's window (full_span's first n_stream_window vectors).
+    logger.info(f"{rep_dataset}: calibrating tau_mid against the stream window...")
+    tau_mid = calculate_nn_distance_threshold(full_span[:n_stream_window], duplicate_percentage)
     logger.info(f"tau_mid={tau_mid:.4f}")
 
     logger.info(f"{rep_dataset}: building fixed streaming negative set from the held-out span...")
@@ -783,11 +798,11 @@ def generate_streaming(runner: Runner) -> None:
         rep_dataset, full_span, negative_candidate_pool, tau_mid, n_negative,
     )
 
-    checkpoints_ab = sorted(set(
-        int(round(x)) for x in np.logspace(np.log10(k_fixed + 1), np.log10(n_stream_ab), num=12)
-    ))
-    checkpoints_cd = sorted(set(
-        int(round(x)) for x in np.linspace(n_stream_c // 20, n_stream_c, num=20)
+    # Bootstrap (construct()) covers positions [0, n_init); the position
+    # sweep only checkpoints the subsequent insert-only span, since nothing
+    # streams in before n_init.
+    checkpoints = sorted(set(
+        int(round(x)) for x in np.logspace(np.log10(n_init + 1), np.log10(n_stream_window), num=12)
     ))
 
     def _fold_source(fold_offset: int, length: int) -> VectorSource:
@@ -796,38 +811,25 @@ def generate_streaming(runner: Runner) -> None:
     # Each row is self-describing (method/sweep/metric/fold_offset), so no
     # positional reconstruction is needed despite Runner's completion-order results.
 
-    # --- panels (a)/(b): position sweep at fixed k_fixed ---
+    # --- panels (a)/(b): position sweep at fixed k_fixed, decoupled bootstrap/insert windows ---
     for method in methods:
         for fold_offset in offsets:
             runner.submit(
                 'stream_rebuild',
                 output_csv=STREAMING_CSV,
                 dim=dim, dataset=rep_key, k=k_fixed, seed=seed, tau_mid=tau_mid, policy="streaming", T=None,
-                insertion_level=method, vectors_stream=_fold_source(fold_offset, n_stream_ab),
-                vectors_negative=negative_vectors,
-                checkpoints=checkpoints_ab, sweep="position", fold_offset=fold_offset,
+                insertion_level=method, vectors_stream=_fold_source(fold_offset, n_stream_window),
+                vectors_negative=negative_vectors, bootstrap_n=n_init,
+                checkpoints=checkpoints, sweep="position", fold_offset=fold_offset,
             )
     for fold_offset in offsets:
         runner.submit(
             'stream_rebuild',
             output_csv=STREAMING_CSV,
             dim=dim, dataset=rep_key, k=k_fixed, seed=seed, tau_mid=tau_mid, policy="oracle", T=None,
-            vectors_stream=_fold_source(fold_offset, n_stream_ab), vectors_negative=negative_vectors,
-            checkpoints=checkpoints_ab, sweep="position", fold_offset=fold_offset,
+            vectors_stream=_fold_source(fold_offset, n_stream_window), vectors_negative=negative_vectors,
+            checkpoints=checkpoints, sweep="position", fold_offset=fold_offset,
         )
-
-    # --- panels (c)/(d): k sweep over the shared stream pool ---
-    for method in methods:
-        for k in k_values:
-            for fold_offset in offsets:
-                runner.submit(
-                    'stream_rebuild',
-                    output_csv=STREAMING_CSV,
-                    dim=dim, dataset=rep_key, k=k, seed=seed, tau_mid=tau_mid, policy="streaming", T=None,
-                    insertion_level=method, vectors_stream=_fold_source(fold_offset, n_stream_c),
-                    vectors_negative=negative_vectors,
-                    checkpoints=checkpoints_cd, sweep="k_sweep", fold_offset=fold_offset,
-                )
 
 
 def save_streaming(job_results: List[Tuple[str, Any]]) -> Tuple[pd.DataFrame, int]:
@@ -862,17 +864,22 @@ def generate_and_plot_all() -> None:
     inside runner.run() itself aborts the whole batch, but every job that
     did complete beforehand is still on disk."""
     runner = Runner(num_workers=MAX_WORKERS)
-
+    
+    try:
+        generate_streaming(runner)
+    except Exception:
+        logger.exception("An error occurred")
+    
+    '''    
     try:
         generate_system_tau(runner)
     except Exception:
         logger.exception("An error occurred")
-    
+
     try:
         generate_quantization(runner)
     except Exception:
         logger.exception("An error occurred")
-    '''
     try:
         generate_scaling(runner)
     except Exception:

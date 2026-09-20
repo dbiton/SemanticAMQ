@@ -8,7 +8,6 @@ class MinHeapInsert(InsertInterface):
     _MAX_NEIGHBORS = 50
     _COMPACTION_RATIO = 2
     _BATCH_SIZE = 2048
-    _COMPACT_THRESHOLD_MULTIPLIER = 4  # see _compact_if_needed
 
     def __init__(self):
         self._sphere_versions = np.zeros(0, dtype=np.int32)
@@ -128,25 +127,6 @@ class MinHeapInsert(InsertInterface):
             filter._num_spheres -= 2
 
             self.add_sphere(filter, new_center, new_radius)
-
-
-    def _compact_if_needed(self, filter: Filter) -> None:
-        """Lazy deletion (a version bump marks a heap entry stale) avoids an
-        O(n) removal per merge, but without a periodic sweep stale entries
-        accumulate unboundedly (add_sphere pushes up to _MAX_NEIGHBORS per
-        call, _merge_spheres pops one) -- a real unbounded-memory issue, not
-        just wasted heap space. Rebuild once past the live footprint."""
-        live_bound = max(
-            64, filter.max_spheres * self._MAX_NEIGHBORS * self._COMPACT_THRESHOLD_MULTIPLIER
-        )
-        if len(self._minimal_pairs) <= live_bound:
-            return
-        alive = [
-            entry for entry in self._minimal_pairs
-            if self._sphere_versions[entry[1]] == entry[2] and self._sphere_versions[entry[3]] == entry[4]
-        ]
-        heapq.heapify(alive)
-        self._minimal_pairs = alive
 
 
     def insert(self, filter: Filter, vectors: np.ndarray) -> None:

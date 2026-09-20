@@ -2,17 +2,18 @@
 (see runner._INSERT_STRATEGIES), one line per method throughout.
 
 Reads results/streaming.csv: one row per (method, checkpoint), tagged by
-`sweep` in {"position","k_sweep"} and `metric` in {"checkpoint",
-"static_reference"} (`method` is "static_rebuild" for the reference rows).
+`sweep` == "position" and `metric` in {"checkpoint", "static_reference"}
+(`method` is "static_rebuild" for the reference rows). No k sweep: the ball
+budget k is fixed for the whole run (see main.generate_streaming), so every
+panel is a function of stream position only.
 
-Six panels, all with a dashed static-rebuild reference except (c):
+Five panels, all with a dashed static-rebuild reference:
   (a) FPR vs. stream position at fixed k_fixed, median + IQR band over folds.
   (b) Geometric objective log10(J_tau) vs. the same x-axis.
-  (c) Insertion throughput (1 / amortized_cost_s) vs. ball budget k.
-  (d) Number of balls vs. stream position -- a validation check (expected
+  (c) Number of balls vs. stream position -- a validation check (expected
       flat/identical across methods), not a discriminating panel.
-  (e) Vectors inserted (solid) vs. ball count (dashed), twin y-axes.
-  (f) Filter size in bytes (solid) vs. ball count (dashed), twin y-axes."""
+  (d) Vectors inserted (solid) vs. ball count (dashed), twin y-axes.
+  (e) Filter size in bytes (solid) vs. ball count (dashed), twin y-axes."""
 
 from __future__ import annotations
 
@@ -67,11 +68,8 @@ class Config:
 def _synthesize_demo_data() -> pd.DataFrame:
     rng = np.random.default_rng(0)
     k_fixed = 32
-    k_values = [16, 32, 64, 128, 256, 512, 1024]
     n_stream_ab, F_ab = k_fixed * 1000, 4
-    n_stream_c, F_cd = 30_000, 4
     positions_ab = np.unique(np.round(np.logspace(np.log10(k_fixed + 1), np.log10(n_stream_ab), 12)).astype(int))
-    positions_cd = np.unique(np.round(np.linspace(n_stream_c // 20, n_stream_c, 20)).astype(int))
 
     # Rough ordering to make the demo figure legible: nearest worst FPR,
     # merge near the static-rebuild reference at far lower cost.
@@ -110,23 +108,6 @@ def _synthesize_demo_data() -> pd.DataFrame:
                     "metric": "static_reference", "sweep": "position",
                 })
 
-    offsets_cd = [36500 + f * 1000 for f in range(F_cd)]
-    for method in METHODS:
-        for k in k_values:
-            kf = k / 1024.0
-            for fold_offset in offsets_cd:
-                for pos in positions_cd:
-                    fpr = base_fpr[method] / (1.0 + 3.0 * kf) * rng.uniform(0.9, 1.1)
-                    rows.append({
-                        "dataset": "eli5", "method": method, "k": k, "seed": 0, "fold_offset": fold_offset,
-                        "position": int(pos), "fpr": float(fpr),
-                        "log10_j_tau": float(30.0 + 10.0 * kf), "n_balls": k,
-                        "memory_bytes": k * 1540,
-                        "cumulative_time_s": cost_scale[method] * k * pos * 1e-6,
-                        "amortized_cost_s": cost_scale[method] * k * 1e-6,
-                        "metric": "checkpoint", "sweep": "k_sweep",
-                    })
-
     return pd.DataFrame(rows)
 
 
@@ -137,9 +118,8 @@ def _validate_schema(df: pd.DataFrame) -> None:
     missing_methods = set(METHODS) - set(df.loc[df["metric"] == "checkpoint", "method"].unique())
     if missing_methods:
         raise ValueError(f"Missing method(s) {sorted(missing_methods)} among metric=='checkpoint' rows.")
-    missing_sweeps = {"position", "k_sweep"} - set(df["sweep"].unique())
-    if missing_sweeps:
-        raise ValueError(f"Missing sweep(s) {sorted(missing_sweeps)}.")
+    if "position" not in set(df["sweep"].unique()):
+        raise ValueError("Missing sweep 'position'.")
 
 
 def load_data() -> pd.DataFrame:
@@ -209,13 +189,10 @@ def panel_fpr_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     if not ref_agg.empty:
         ref_agg = ref_agg.sort_values("position")
         ax.plot(ref_agg["position"], ref_agg["median"], color="black", linestyle="--", linewidth=0.7, zorder=3)
-        ax.text(0.97, 0.95, "dashed: static rebuild", transform=ax.transAxes, ha="right", va="top", fontsize=5)
 
-    ax.set_xscale("log")
     _style_log_y(ax)
     ax.set_xlabel("Stream Position")
     ax.set_ylabel("FPR")
-    ax.text(0.03, 0.06, rf"$k = {cfg.k_fixed}$", transform=ax.transAxes, ha="left", va="bottom", fontsize=5.5)
     style_axes(ax)
 
     save_figure(fig, "streaming-fpr-vs-position.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
@@ -247,12 +224,9 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         ax.plot(ref_agg["position"], ref_agg["median"], color="black", linestyle="--", linewidth=0.7, zorder=3)
         ax.fill_between(ref_agg["position"], ref_agg["q25"], ref_agg["q75"], color="black",
                         alpha=0.15, linewidth=0, zorder=1)
-        ax.text(0.97, 0.95, "dashed: static rebuild", transform=ax.transAxes, ha="right", va="top", fontsize=5)
 
-    ax.set_xscale("log")
     ax.set_xlabel("Stream Position")
     ax.set_ylabel(r"$\log_{10} J_\tau(\mathcal{C})$")
-    ax.text(0.03, 0.06, rf"$k = {cfg.k_fixed}$", transform=ax.transAxes, ha="left", va="bottom", fontsize=5.5)
     style_axes(ax)
 
     save_figure(fig, "streaming-geometric-objective.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
@@ -285,12 +259,9 @@ def panel_n_balls_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     if not ref_agg.empty:
         ref_agg = ref_agg.sort_values("position")
         ax.plot(ref_agg["position"], ref_agg["median"], color="black", linestyle="--", linewidth=0.7, zorder=3)
-        ax.text(0.97, 0.95, "dashed: static rebuild", transform=ax.transAxes, ha="right", va="top", fontsize=5)
 
-    ax.set_xscale("log")
     ax.set_xlabel("Stream Position")
     ax.set_ylabel("Number of Balls")
-    ax.text(0.03, 0.06, rf"$k = {cfg.k_fixed}$", transform=ax.transAxes, ha="left", va="bottom", fontsize=5.5)
     style_axes(ax)
 
     save_figure(fig, "streaming-n-balls-vs-position.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
@@ -323,12 +294,10 @@ def panel_vectors_vs_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         ax2.plot(balls_sub["position"], balls_sub["median"], color=METHOD_COLORS[method],
                  linewidth=1.6, linestyle="--", zorder=3, alpha=0.8)
 
-    ax1.set_xscale("log")
     ax1.set_xlabel("Stream Position")
     ax1.set_ylabel("Vectors Inserted")
     ax2.set_ylabel("Number of Balls")
 
-    ax1.text(0.03, 0.94, rf"$k = {cfg.k_fixed}$", transform=ax1.transAxes, ha="left", va="top", fontsize=5.5)
     ax1.text(0.97, 0.06, "solid: vectors inserted -- dashed: ball count", transform=ax1.transAxes,
              ha="right", va="bottom", fontsize=5)
     style_axes(ax1)
@@ -337,39 +306,7 @@ def panel_vectors_vs_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return vectors_agg.merge(balls_agg, on=["method", "position"], suffixes=("_vectors", "_balls"))
 
 
-# Panel (c): insertion throughput vs. filter size (k)
-
-def panel_throughput_vs_k(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    sel = df[(df["sweep"] == "k_sweep") & (df["metric"] == "checkpoint")].copy()
-    last_pos = sel.groupby(["method", "k", "fold_offset"], dropna=False)["position"].transform("max")
-    final_rows = sel[sel["position"] == last_pos].copy()
-    final_rows["throughput"] = 1.0 / final_rows["amortized_cost_s"]
-    agg = _median_iqr(final_rows, ["method", "k"], "throughput")
-
-    apply_style(cfg.dpi)
-    fig, ax = plt.subplots()
-    for method in METHODS:
-        sub = agg[agg["method"] == method].sort_values("k")
-        if sub.empty:
-            continue
-        ax.plot(sub["k"], sub["median"], color=METHOD_COLORS[method], marker="o",
-               markersize=2.5, linewidth=0.8, zorder=2)
-        ax.fill_between(sub["k"], sub["q25"], sub["q75"], color=METHOD_COLORS[method],
-                        alpha=0.15, linewidth=0, zorder=1)
-
-    ax.set_xscale("log", base=2)
-    ax.xaxis.set_major_locator(LogLocator(base=2.0))
-    ax.xaxis.set_major_formatter(LogFormatterMathtext(base=2.0))
-    _style_log_y(ax)
-    ax.set_xlabel("Filter Size (k)")
-    ax.set_ylabel("Insertion Throughput (insertions/s)")
-    style_axes(ax)
-
-    save_figure(fig, "streaming-throughput-vs-k.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
-    return agg
-
-
-# Panel (d): filter size + ball count vs. stream position
+# Panel (e): filter size + ball count vs. stream position
 
 def panel_filter_size(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     """Filter total size (bytes, solid) vs. ball count (dashed) vs. stream
@@ -394,7 +331,6 @@ def panel_filter_size(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         ax2.plot(balls_sub["position"], balls_sub["median"], color=METHOD_COLORS[method],
                  linewidth=1.6, linestyle="--", zorder=3, alpha=0.8)
 
-    ax1.set_xscale("log")
     ax1.set_xlabel("Stream Position")
     ax1.set_ylabel("Filter Total Size (bytes)")
     ax2.set_ylabel("Number of Balls")
@@ -404,7 +340,6 @@ def panel_filter_size(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     y1_min, y1_max = ax1.get_ylim()
     ax2.set_ylim(y1_min / bytes_per_ball, y1_max / bytes_per_ball)
 
-    ax1.text(0.03, 0.94, rf"$k = {cfg.k_fixed}$", transform=ax1.transAxes, ha="left", va="top", fontsize=5.5)
     ax1.text(0.97, 0.06, "solid: size (bytes) -- dashed: ball count", transform=ax1.transAxes,
              ha="right", va="bottom", fontsize=5)
     style_axes(ax1)
@@ -456,7 +391,6 @@ def generate_streaming_figures(df: Optional[pd.DataFrame] = None, outdir: str = 
     panel_geometric_objective(df, cfg)
     panel_n_balls_vs_position(df, cfg)
     panel_vectors_vs_balls(df, cfg)
-    panel_throughput_vs_k(df, cfg)
     panel_filter_size(df, cfg)
     save_method_legend(cfg)
     print_summary(df, cfg)
@@ -485,11 +419,6 @@ def generate_streaming_figures(df: Optional[pd.DataFrame] = None, outdir: str = 
     \centering
     \includegraphics[width=\linewidth]{figures/streaming-vectors-vs-balls.png}
     \caption{Vectors inserted \& ball count vs. stream position}
-\end{subfigure}
-\begin{subfigure}[b]{0.24\linewidth}
-    \centering
-    \includegraphics[width=\linewidth]{figures/streaming-throughput-vs-k.png}
-    \caption{Insertion throughput vs. filter size}
 \end{subfigure}
 \begin{subfigure}[b]{0.24\linewidth}
     \centering

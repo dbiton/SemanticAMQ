@@ -1,7 +1,6 @@
-"""Scaling-evaluation figures: BallCoverFilter throughput vs filter size k,
-on one representative dataset (see main.py's _SCALING_DATASET). Query and
-insertion throughput each get one line per batch size (6); construction
-throughput gets one line per stream/indexed-set size (6).
+"""Scaling-evaluation figures: BallCoverFilter throughput vs batch size / stream size,
+on one representative dataset (see main.py's _SCALING_DATASET). Query, insertion,
+and construction throughput each get one line per filter size k.
 """
 
 from __future__ import annotations
@@ -24,10 +23,10 @@ OUTDIR = "plots/scaling/"
 DPI = 300
 EMIT_PDF = False
 
-# Okabe-Ito colorblind-safe palette, extended to 6 distinct lines (the
-# dataset trio elsewhere only needs 3; a single dataset here means every
-# color goes to a batch_size/stream_size line instead).
+# Okabe-Ito colorblind-safe palette, extended to 6 distinct lines
 LINE_COLORS = ["#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7", "#56B4E9"]
+# Distinct markers for each line
+LINE_MARKERS = ["o", "s", "D", "v", "^", "p"]
 
 _QUERY_COLUMNS = ["dataset", "k", "batch_size", "seed", "n_queries", "throughput_qps"]
 _INSERT_COLUMNS = ["dataset", "k", "batch_size", "seed", "n_inserted", "throughput_ips"]
@@ -83,35 +82,37 @@ def _aggregate(df: pd.DataFrame, group_cols: List[str], value_col: str) -> pd.Da
 
 def _throughput_panel(
     df: pd.DataFrame,
-    line_col: str,
+    x_col: str,
     value_col: str,
     ylabel: str,
-    legend_title: str,
+    xlabel: str,
     filename: str,
     cfg: Config,
 ) -> pd.DataFrame:
-    """Shared renderer for the three filter-size-on-x-axis, one-line-per-
-    line_col throughput panels -- only the grouping column (batch_size or n)
+    """Shared renderer for the three metric-on-x-axis, one-line-per-
+    filter-size (k) throughput panels -- only the x-axis column (batch_size or n)
     and the value column differ between query/insertion/construction."""
-    agg = _aggregate(df, ["k", line_col], value_col)
-    line_values = sorted(agg[line_col].unique())
+    agg = _aggregate(df, ["k", x_col], value_col)
+
+    line_values = sorted(agg["k"].unique())
     if len(line_values) > len(LINE_COLORS):
         raise ValueError(
-            f"{legend_title} sweep has {len(line_values)} distinct values; only "
+            f"Filter Size (k) sweep has {len(line_values)} distinct values; only "
             f"{len(LINE_COLORS)} line colors are defined in LINE_COLORS."
         )
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots()
-    for color, lv in zip(LINE_COLORS, line_values):
-        sub = agg[agg[line_col] == lv].sort_values("k")
+
+    for color, marker, lv in zip(LINE_COLORS, LINE_MARKERS, line_values):
+        sub = agg[agg["k"] == lv].sort_values(x_col)
         ax.plot(
-            sub["k"], sub["mean"], color=color, marker="o", markersize=2.5,
+            sub[x_col], sub["mean"], color=color, marker=marker, markersize=3.5,
             linewidth=0.8, zorder=2, label=str(int(lv)),
         )
         if (sub["ci95"] > 0).any():
             ax.errorbar(
-                sub["k"], sub["mean"], yerr=sub["ci95"], fmt="none", ecolor=color,
+                sub[x_col], sub["mean"], yerr=sub["ci95"], fmt="none", ecolor=color,
                 elinewidth=0.5, capsize=1.5, capthick=0.5, zorder=3,
             )
 
@@ -125,16 +126,39 @@ def _throughput_panel(
     ax.yaxis.set_minor_formatter(NullFormatter())
     ax.tick_params(axis="y", which="minor", length=1.2, width=0.4)
 
-    ax.set_xlabel("Filter Size (k)")
+    ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
-    ax.legend(title=legend_title, fontsize=5, title_fontsize=5.5, loc="best")
     ax.grid(axis="both", which="major", linewidth=0.35, alpha=0.4, zorder=0)
     ax.set_axisbelow(True)
+    
     for spine in ("left", "bottom"):
         ax.spines[spine].set_linewidth(0.5)
 
     save_figure(fig, filename, cfg.outdir, cfg.dpi, cfg.emit_pdf)
+    plt.close(fig)
     return agg
+
+
+def generate_legend_figure(line_values: List[float], cfg: Config) -> None:
+    """Generates a standalone horizontal legend for the filter sizes."""
+    apply_style(cfg.dpi)
+    fig, ax = plt.subplots(figsize=(8, 1))
+    ax.axis("off")  # Hide the axes to only render the legend
+
+    handles = []
+    labels = []
+    for color, marker, lv in zip(LINE_COLORS, LINE_MARKERS, line_values):
+        # Create dummy lines for the legend handles
+        handle, = ax.plot([], [], color=color, marker=marker, markersize=4.0,
+                          linewidth=1.2, label=str(int(lv)))
+        handles.append(handle)
+        labels.append(str(int(lv)))
+
+    ax.legend(handles, labels, loc="center", ncol=len(line_values),
+              title="Filter Size (k)", frameon=False, fontsize=8, title_fontsize=9)
+
+    save_figure(fig, "scaling-legend.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
+    plt.close(fig)
 
 
 def panel_query_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
@@ -180,12 +204,6 @@ def generate_scaling_figures(
     dpi: int = DPI,
     emit_pdf: bool = EMIT_PDF,
 ) -> None:
-    """
-    Library entry point: render the three scaling panels from in-memory
-    long-format DataFrames (one per throughput measurement), falling back to
-    load_{query,insert,construction}_data() for whichever is omitted so the
-    script still works standalone.
-    """
     if df_query is None:
         df_query = load_query_data()
     else:
@@ -200,9 +218,16 @@ def generate_scaling_figures(
         _validate_schema(df_construction, _CONSTRUCTION_COLUMNS, "construction")
 
     cfg = resolve_config(dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
+    
+    # Render individual panels without internal legends
     panel_query_throughput(df_query, cfg)
     panel_insert_throughput(df_insert, cfg)
     panel_construction_throughput(df_construction, cfg)
+
+    # Extract unique filter sizes and render the shared standalone legend
+    unique_k = sorted(df_query["k"].unique())
+    generate_legend_figure(unique_k, cfg)
+
     print_summary(df_query, df_insert, df_construction)
 
 

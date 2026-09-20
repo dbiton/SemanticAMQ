@@ -772,13 +772,22 @@ def stream_rebuild_worker(
     insertion_level: Optional[str] = None,
     sweep: Optional[str] = None,
     fold_offset: Optional[int] = None,
+    bootstrap_n: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Simulates one rebuild policy over vectors_stream, reporting FPR and
     amortized cost per checkpoint.
       "streaming": BallCoverFilter.insert() per arrival, never rebuilt.
       "periodic": like "streaming", rebuilt from scratch every T arrivals.
       "oracle": rebuilt from scratch at every checkpoint.
-    sweep/fold_offset are pass-through tag columns only."""
+    sweep/fold_offset are pass-through tag columns only.
+
+    bootstrap_n (streaming/periodic only) sizes the initial construct()
+    window independently of the ball budget k -- default min(k, n) reproduces
+    the old behavior, but that ties the bootstrap set 1:1 to the ball count,
+    which for k <= n gives GonzalesConstruct one input point per center and
+    hence zero-radius balls at position 0. Pass an explicit bootstrap_n
+    (e.g. an order of magnitude larger than k) to start from a filter with
+    real coverage instead."""
     stream_arr = _to_construct_array(vectors_stream)
     negative_arr = _to_construct_array(vectors_negative)
     n = len(stream_arr)
@@ -835,8 +844,9 @@ def stream_rebuild_worker(
     filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k),
                              insert_method=_INSERT_STRATEGIES[insertion_level]())
     # Bootstrap via one shared construct() (identical across insertion_level)
-    # so checkpoint k+1 onward compares each method's own decision rule.
-    bootstrap_n = min(k, n)
+    # so every checkpoint from bootstrap_n onward compares each method's own
+    # decision rule.
+    bootstrap_n = min(bootstrap_n if bootstrap_n is not None else k, n)
     t0 = time.perf_counter()
     filt.construct(stream_arr[:bootstrap_n])
     cumulative_time_s += time.perf_counter() - t0
