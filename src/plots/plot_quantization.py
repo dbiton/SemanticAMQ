@@ -41,17 +41,17 @@ EMIT_PDF = False
 # (stage="quantizing"), so a more compact code packs more balls into it.
 QUANTIZE_SWEEP = (
     Quantize.FP32, Quantize.FP16, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
-    Quantize.TQ3, Quantize.PQ4_R2, Quantize.PQ8_R2, Quantize.PQ4_R1,
-    # Quantize.RABITQ is deliberately left out: it is the one rung whose
-    # search() is not exact ADC, so its zero-false-negative property rests on
-    # a measured one-sided estimator rather than a proof -- see the CAVEAT on
-    # Quantize.RABITQ. Still constructible, just not swept.
+    Quantize.TQ3, Quantize.PQ4_R2, Quantize.PQ8_R2,
+    # The ladder stops at 2 b/dim: both 1 b/dim rungs (Quantize.PQ4_R1 and
+    # Quantize.RABITQ) are left out -- see runner.QUANTIZATION_SWEEP for why.
+    # Rows for either are dropped by aggregate()'s `stages` filter, so older
+    # results files that still carry them plot without complaint.
 )
 STAGES = [q.value for q in QUANTIZE_SWEEP]
 STAGE_LABELS = {
     # Labelled by rate so the ladder reads in bits/dim order on an axis.
-    Quantize.FP32.value: "fp32 (32b)",
-    Quantize.FP16.value: "fp16 (16b)",
+    Quantize.FP32.value: "FP32 (32b)",
+    Quantize.FP16.value: "FP16 (16b)",
     Quantize.SQ8.value: "SQ8 (8b)",
     Quantize.SQ6.value: "SQ6 (6b)",
     Quantize.SQ4.value: "SQ4 (4b)",
@@ -66,7 +66,8 @@ STAGE_LABELS = {
 # panels had before per-quantize breakdown existed.
 BASELINE_STAGE = Quantize.FP32.value
 
-# tab10 has 10 qualitative colors; 10 quantize variants use exactly all of them.
+# tab10 has 10 qualitative colors, enough for the swept variants with room to
+# spare; zip() stops at the shorter of the two, so re-adding a rung is safe.
 _STAGE_PALETTE = plt.get_cmap("tab10").colors
 STAGE_COLORS = dict(zip(STAGES, _STAGE_PALETTE))
 _STAGE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "p"]
@@ -406,13 +407,20 @@ def panel_n_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 # Panel (h): radius inflation due to quantization
 
 def panel_radius_inflation(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """Mean +/- stddev of each ball's radius inflation (the per-center
-    quantization reconstruction error BallCoverFilter._store_spheres adds
-    to preserve the no-false-negative guarantee -- see all_radius_inflation).
-    Unlike other panels' seed-CI error bars, mean/std here are collapsed
-    *across balls* within one job, so the error bars show ball-to-ball
-    spread, not seed variance. Quantize.FP32 has zero inflation by
-    construction, drawing as a flat reference line at 0."""
+    """Mean +/- stddev of what encoding cost each ball's radius: the stored
+    radius minus the one the unquantized cover measured, after
+    BallCoverFilter._tight_radii re-measures against the decoded centers
+    (see all_radius_inflation). Unlike other panels' seed-CI error bars,
+    mean/std here are collapsed *across balls* within one job, so the error
+    bars show ball-to-ball spread, not seed variance.
+
+    Values go *negative*, including for Quantize.FP32, and the zero line is
+    drawn to make that readable: _tight_radii's coverage pass drops any ball
+    whose members another ball already holds down to a smaller radius than
+    the construction measured, and on a lossless encoding there is no
+    reconstruction error to spend those savings on. A rung sitting below
+    zero is covering the same points in less volume than the raw cover, so
+    read this as encoding cost net of that saving, not as error alone."""
     mean_agg = aggregate(df, "radius_inflation_mean", cfg, use_tau=False)
     std_agg = aggregate(df, "radius_inflation_std", cfg, use_tau=False)
     std_agg = std_agg[["quantize", "k", "mean"]].rename(columns={"mean": "std"})
@@ -440,15 +448,12 @@ def panel_radius_inflation(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     ax.xaxis.set_major_locator(LogLocator(base=2.0))
     ax.xaxis.set_major_formatter(LogFormatterMathtext(base=2.0))
 
-    # Log y: inflation spans orders of magnitude across quantize variants.
-    # Quantize.FP32's identically-0 inflation has no representation on a log
-    # axis, so its line silently drops off rather than plotting at y=0.
-    ax.set_yscale("log")
-    ax.yaxis.set_major_locator(LogLocator(base=10.0))
-    ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10.0))
-    ax.yaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10)))
-    ax.yaxis.set_minor_formatter(NullFormatter())
-    ax.tick_params(axis="y", which="minor", length=1.2, width=0.4)
+    # Linear y, not log: since _tight_radii measures radii against the
+    # decoded centers instead of bounding them, this quantity is signed, and
+    # a log axis drops every non-positive point without saying so. The span
+    # is a small multiple either way now that no ball is charged a
+    # worst-case bound, so log buys nothing to offset that.
+    ax.axhline(0.0, color="black", linewidth=0.5, zorder=1)
 
     ax.set_xlabel("Memory Usage (MB)")
     ax.set_ylabel("Radius Inflation")

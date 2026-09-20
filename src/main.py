@@ -47,7 +47,7 @@ DATASET = 'ELI5'
 # evaluation: the ground-truth FPR/FNR ones (system_tau, quantization,
 # equal_memory, streaming) and the throughput-only sweeps (scaling,
 # query_performance), which used to read a separate STREAM_SIZE.
-WORKLOAD_NUM_VECTORS = 1_000
+WORKLOAD_NUM_VECTORS = 10_000
 
 # Registry name -> canonical dataset key, one source of truth via plot_common.
 DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}

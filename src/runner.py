@@ -371,11 +371,15 @@ def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, flo
 # stage="ball"): one "ball" cover to compare every real quantizer against.
 QUANTIZATION_SWEEP = (
     Quantize.FP32, Quantize.FP16, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
-    Quantize.TQ3, Quantize.PQ4_R2, Quantize.PQ8_R2, Quantize.PQ4_R1,
-    # Quantize.RABITQ is deliberately left out: it is the one rung whose
-    # search() is not exact ADC, so its zero-false-negative property rests on
-    # a measured one-sided estimator rather than a proof -- see the CAVEAT on
-    # Quantize.RABITQ. Still constructible, just not swept.
+    Quantize.TQ3, Quantize.PQ4_R2, Quantize.PQ8_R2,
+    # The ladder stops at 2 b/dim: both 1 b/dim rungs are left out.
+    # Quantize.PQ4_R1 halves PQ4_R2's subquantizer count at the same 4-bit
+    # width, so it buys its extra balls with reconstruction error that
+    # inflates every radius -- excluded as below the useful rate.
+    # Quantize.RABITQ is the one rung whose search() is not exact ADC, so its
+    # zero-false-negative property rests on a measured one-sided estimator
+    # rather than a proof -- see the CAVEAT on Quantize.RABITQ.
+    # Both stay constructible, just not swept.
 )
 
 

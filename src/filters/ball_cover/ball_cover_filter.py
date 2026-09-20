@@ -48,9 +48,9 @@ class Quantize(Enum):
     derived from dim by _pq_m_for(), so the rates hold at any dimension that
     admits them. The m values above are what dim=384 resolves to.
     """
-    FP32 = "fp32"
-    NONE = "fp32"     # back-compat alias: FP32 *is* the unquantized baseline
-    FP16 = "fp16"
+    FP32 = "FP32"
+    NONE = "FP32"     # back-compat alias: FP32 *is* the unquantized baseline
+    FP16 = "FP16"
     SQ8 = "SQ8"
     SQ6 = "SQ6"
     SQ4 = "SQ4"
@@ -134,6 +134,14 @@ class BallCoverFilter(Filter):
     # any real distance_threshold used in this project's sweeps.
     _COVERAGE_EPSILON = 1e-3
 
+    # How many of a construct vector's nearest balls _tight_radii tests when
+    # looking for one that already covers it. The pass only ever skips
+    # growing a ball when it positively finds a cover, so a vector held by
+    # some ball outside this shortlist is a missed saving, never a coverage
+    # hole -- which is what lets this stay a small constant instead of an
+    # all-pairs scan.
+    _COVERAGE_NEIGHBORS = 16
+
     def __init__(
         self,
         dim: int,
@@ -171,9 +179,12 @@ class BallCoverFilter(Filter):
         self._all_spheres = np.arange(self.max_spheres, dtype=np.int32)
         self._all_centers = None  # lazily rebuilt cache, not persistent state
         self._all_radiuses = np.empty((self.max_spheres,), dtype=np.float32)
-        # Per-ball reconstruction error (||center - decode(encode(center))||),
-        # 0 for Quantize.NONE: added onto each radius by _store_spheres, once,
-        # to preserve the no-false-negative guarantee under lossy encoding.
+        # Per-ball radius cost of encoding, written once by _store_spheres.
+        # After construct() that is the measured stored-minus-baseline delta,
+        # which goes negative on balls whose coverage pass saved more than
+        # their center's error cost; after an insert() it is the
+        # ||center - decode(encode(center))|| bound that path adds instead.
+        # 0 either way for Quantize.NONE.
         self._radius_inflation = np.zeros((self.max_spheres,), dtype=np.float32)
 
         self.insert_method.ensure_capacity(self.max_spheres)
@@ -197,7 +208,8 @@ class BallCoverFilter(Filter):
 
     @property
     def all_radius_inflation(self) -> np.ndarray:
-        """Per-ball radius inflation (0 for Quantize.NONE) -- see
+        """Per-ball radius cost of encoding (0 for Quantize.NONE, and
+        negative where the coverage pass more than paid for it) -- see
         _radius_inflation's docstring in __init__."""
         return self._radius_inflation[self.all_spheres]
 
@@ -478,6 +490,90 @@ class BallCoverFilter(Filter):
             )
         return index
 
+    def _tight_radii(
+        self,
+        vectors: np.ndarray,
+        centers: np.ndarray,
+        decoded: np.ndarray,
+        baseline_radii: np.ndarray,
+    ) -> np.ndarray:
+        """The smallest radii around the *decoded* centers that still cover
+        every construct vector -- the exact measurement the `radii + error`
+        bound in _store_spheres only approximates.
+
+        Two things make this tighter than that bound. First, the distance is
+        measured from where the ball actually sits after encoding, so a ball
+        pays for its center's error only in the direction of its own farthest
+        member, instead of paying the full ||c - decode(c)|| in every
+        direction. Second, a vector that some *other* ball already covers
+        doesn't force its own ball to grow at all -- with fixed centers,
+        covering every vector is all the no-false-negative guarantee needs,
+        and which ball does the covering is free.
+
+        Vectors are processed farthest-from-their-center first, so the balls
+        a vector might hide inside are grown before the vectors that could
+        hide there are tested. Radii only ever grow inside the loop, so a
+        vector found covered at one point stays covered at the end, which is
+        what makes the result a genuine cover rather than an ordering
+        artifact.
+
+        No ball is ever pushed past `baseline_radii + ||c - decode(c)||`, the
+        radius the bound would have given it. That cap is load-bearing, not a
+        formality: re-measuring lets a vector settle on a nearer *decoded*
+        ball than the one construction assigned it, and without the cap that
+        ball can be dragged past its own old radius -- covering points it has
+        no reason to, and trading a tighter cover globally for a worse one
+        right there. Every vector keeps its construction ball as a fallback,
+        which by the triangle inequality always sits inside that ball's cap,
+        so a legal home always exists and the cap can never deadlock.
+        """
+        n_centers = len(decoded)
+        radii = np.zeros(n_centers, dtype=np.float32)
+        if n_centers == 0 or len(vectors) == 0:
+            return radii
+
+        X = np.ascontiguousarray(vectors, dtype=np.float32)
+        decoded = np.ascontiguousarray(decoded, dtype=np.float32)
+        # Measured off `decoded` itself rather than _encoding_error(), so the
+        # cap is consistent with the very array the radii are measured from.
+        caps = np.asarray(baseline_radii, dtype=np.float32) + np.linalg.norm(
+            np.ascontiguousarray(centers, dtype=np.float32) - decoded, axis=1
+        ).astype(np.float32)
+
+        probe = faiss.IndexFlatL2(self.dim)
+        probe.add(decoded)
+        k = min(self._COVERAGE_NEIGHBORS, n_centers)
+        d2, labels = probe.search(X, k)
+        dist = np.sqrt(np.maximum(d2, 0.0))
+
+        # Each vector's construction ball, and how far it sits from that
+        # ball once encoded -- the fallback the cap argument rests on.
+        exact = faiss.IndexFlatL2(self.dim)
+        exact.add(np.ascontiguousarray(centers, dtype=np.float32))
+        _, home = exact.search(X, 1)
+        home = home.ravel()
+        home_dist = np.linalg.norm(X - decoded[home], axis=1).astype(np.float32)
+
+        nearest_d = dist[:, 0]
+        for i in np.argsort(-nearest_d, kind="stable"):
+            row_l = labels[i]
+            row_d = dist[i]
+            # Scalar fast path: the nearest ball, already grown by a farther
+            # member, covers the overwhelming majority.
+            if nearest_d[i] <= radii[row_l[0]]:
+                continue
+            if (row_d <= radii[row_l]).any() or home_dist[i] <= radii[home[i]]:
+                continue
+            # Nearest ball that can take it without breaching its own cap;
+            # the construction ball always can, so this always resolves.
+            for j, d in zip(row_l, row_d):
+                if d <= caps[j]:
+                    radii[j] = d
+                    break
+            else:
+                radii[home[i]] = home_dist[i]
+        return radii
+
     def _encoding_error(self, centers: np.ndarray) -> np.ndarray:
         """Per-center ||c - decode(encode(c))||, measured against the trained
         codebook -- never a probabilistic bound. sa_encode/sa_decode are used
@@ -489,19 +585,36 @@ class BallCoverFilter(Filter):
         decoded = coder.sa_decode(coder.sa_encode(centers))
         return np.linalg.norm(centers - decoded, axis=1).astype(np.float32)
 
-    def _store_spheres(self, sphere_indices: np.ndarray, centers: np.ndarray, radii: np.ndarray) -> None:
-        """Writes (center, radius) pairs into the already-trained index,
-        inflating each radius by that center's own encoding error.
+    def _store_spheres(
+        self,
+        sphere_indices: np.ndarray,
+        centers: np.ndarray,
+        radii: np.ndarray,
+        member_vectors: Optional[np.ndarray] = None,
+    ) -> None:
+        """Writes (center, radius) pairs into the already-trained index.
 
-        The inflation is applied exactly once, here, at the moment a center
-        is written -- which is the whole reason nothing rebuilds. A radius
-        only needs inflating when it was measured against a center that is
-        about to be replaced by its lossy encoding (construct()'s radii, and
-        any center an insert strategy relocates). Once stored, `all_centers`
-        hands back the *decoded* center, so every radius an insert strategy
-        derives from it is already correct with respect to what query()
-        scores against, and must not be inflated again. Re-inflating on each
-        touch is what made the old rebuild path grow radii without bound.
+        Two ways to land on a radius that query() can trust, both of which
+        have to account for the center being replaced by its lossy encoding:
+
+        `member_vectors` given (construct()) -- the vectors the balls have to
+        cover are in hand, so the radii are *measured* against the decoded
+        centers by _tight_radii and stored as-is. `radii` is then only the
+        pre-encoding baseline, used to record how much was actually paid.
+
+        `member_vectors` omitted (insert()) -- streaming, with no member set
+        to measure against, so each radius is inflated by its own center's
+        encoding error instead: the sound bound, just a looser one.
+
+        The inflation is applied exactly once, at the moment a center is
+        written -- which is the whole reason nothing rebuilds. A radius only
+        needs inflating when it was measured against a center that is about
+        to be replaced by its lossy encoding (any center an insert strategy
+        relocates). Once stored, `all_centers` hands back the *decoded*
+        center, so every radius an insert strategy derives from it is already
+        correct with respect to what query() scores against, and must not be
+        inflated again. Re-inflating on each touch is what made the old
+        rebuild path grow radii without bound.
         """
         sphere_indices = np.ascontiguousarray(sphere_indices, dtype=np.int64)
         if len(sphere_indices) == 0:
@@ -509,14 +622,30 @@ class BallCoverFilter(Filter):
         centers = np.ascontiguousarray(centers, dtype=np.float32)
         radii = np.asarray(radii, dtype=np.float32)
 
-        error = self._encoding_error(centers)
+        error = None if member_vectors is not None else self._encoding_error(centers)
         # add_with_ids appends rather than overwrites, so an id being
         # rewritten (a relocated/merged ball) has to be dropped first.
         if self.all_centers_index.ntotal > 0:
             self.all_centers_index.remove_ids(faiss.IDSelectorBatch(sphere_indices))
         self.all_centers_index.add_with_ids(centers, sphere_indices)
-        self._all_radiuses[sphere_indices] = self._fp16_ceil(radii + error)
-        self._radius_inflation[sphere_indices] = error
+
+        if error is not None:
+            self._all_radiuses[sphere_indices] = self._fp16_ceil(radii + error)
+            self._radius_inflation[sphere_indices] = error
+            return
+
+        # reconstruct_batch, not sa_decode(sa_encode(centers)): this reads the
+        # codes the index just stored, so the radii are measured against the
+        # exact vectors query() will score, with no assumption that add()
+        # and sa_encode() agree.
+        decoded = self.all_centers_index.reconstruct_batch(sphere_indices)
+        stored = self._fp16_ceil(self._tight_radii(member_vectors, centers, decoded, radii))
+        self._all_radiuses[sphere_indices] = stored
+        # What encoding actually cost, rather than the bound it would have
+        # been charged. Negative wherever the coverage pass more than paid
+        # for the center's error -- a real saving against the unquantized
+        # cover, not a bookkeeping artifact.
+        self._radius_inflation[sphere_indices] = stored - radii
 
     def _drop_spheres(self, sphere_indices: np.ndarray) -> None:
         """Evicts ids an insert strategy retired (merged away, absorbed) from
@@ -592,8 +721,11 @@ class BallCoverFilter(Filter):
         self._all_spheres[:] = np.arange(len(self._all_spheres), dtype=np.int32)
         self._num_spheres = n
         # construct_method measures radii against the true fp32 centers, so
-        # this is where those radii pick up their encoding error.
-        self._store_spheres(sphere_indices, centers, radii)
+        # this is where they are re-measured against the encoded ones. The
+        # vectors go along because construct() is the one caller that still
+        # has them: knowing what has to be covered is what buys the exact
+        # radius instead of a worst-case bound (see _store_spheres).
+        self._store_spheres(sphere_indices, centers, radii, member_vectors=vectors)
 
         return self._log_volume_bounds()
 
@@ -611,14 +743,21 @@ class BallCoverFilter(Filter):
         # float64 ||q - decode(c)|| to 2e-6 at dim=32 and 2e-5 at dim=384 --
         # float32 accumulation noise, well inside _COVERAGE_EPSILON.
         #
-        # That is what makes the single-sided inflation in _store_spheres
-        # both correct and tight:
-        #     d(q, c) <= d(q, decode(c)) + ||c - decode(c)||
-        # so d(q, c) <= tau implies d(q, decode(c)) <= tau + error_c, and
-        # only the center side of the triangle inequality is lossy. Adding a
-        # query-side term on top would be over-inflation, pure false
-        # positives for no gain. (For reference, if the query *were* encoded,
-        # SQ4 at dim=384 would need another ~2.7 on every radius.)
+        # That is what lets _store_spheres account for the encoding on the
+        # center side alone. Adding a query-side term on top would be
+        # over-inflation, pure false positives for no gain. (For reference,
+        # if the query *were* encoded, SQ4 at dim=384 would need another
+        # ~2.7 on every radius.)
+        #
+        # The guarantee this radius has to satisfy is just "every construct
+        # vector sits inside some ball, measured against the decoded
+        # centers": for a query within tau of a construct vector x, and the
+        # ball j that covers x,
+        #     d(q, decode(c_j)) <= d(q, x) + ||x - decode(c_j)|| <= tau + r_j
+        # so the surface test below accepts. _tight_radii establishes exactly
+        # that property by measurement; insert()'s error bound,
+        #     d(q, c) <= d(q, decode(c)) + ||c - decode(c)||,
+        # is the streaming way to reach the same place without the vectors.
         Q = np.ascontiguousarray(vectors, dtype=np.float32)
         # The raw ID-mapped index, not the unwrapped inner one -- the latter
         # returns labels keyed by insertion position, which stops matching
