@@ -390,7 +390,6 @@ def quantization_worker(
     quantize: Quantize,
     tau: float,
     seed: int,
-    construct_tau: float,
     vectors_construct: VectorInput,
     vectors_query: VectorInput,
     actual_results: List[bool],
@@ -410,8 +409,7 @@ def quantization_worker(
     more balls into the same budget -- a quantizer compact enough to
     saturate at n_construct balls before using the full budget (e.g. PQ)
     will show flat memory usage across the k sweep, which is real
-    information, not a plotting artifact. construct_tau is unused: Gonzalez
-    construction has no distance-threshold knob.
+    information, not a plotting artifact.
 
     FNR is asserted (raises on violation), never plotted. If construction
     itself raises (e.g. InsufficientMemoryError, too tight a budget for PQ's
@@ -516,7 +514,6 @@ def system_tau_worker(
     k: int,
     tau_values: List[float],
     seed: int,
-    construct_tau: float,
     vectors_construct: VectorInput,
     vectors_query: VectorInput,
     actual_results_by_tau: Dict[float, List[bool]],
@@ -600,7 +597,6 @@ def query_performance_worker(
     dataset: str,
     k: int,
     seed: int,
-    construct_tau: float,
     query_tau: float,
     vectors_construct: VectorInput,
     vectors_query: VectorInput,
@@ -658,15 +654,25 @@ def scaling_query_worker(
     n_query_vectors: int = 8192,
 ) -> Dict[str, Any]:
     """Measures batched-query throughput for a BallCoverFilter at filter
-    size k, querying in batches of `batch_size`. The query pool is cycled
-    up to n_query_vectors so every batch_size times the same total count."""
+    size k, querying in batches of `batch_size`. Every batch_size times the
+    same n_query_vectors, so the panel's lines are directly comparable.
+
+    tau_mid does not affect the measurement: query() scores every ball and
+    only then compares against the threshold, so the work is identical at
+    any tau. It is here because query() requires one, not as a variable."""
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
+    if len(query_arr) < n_query_vectors:
+        raise ValueError(
+            f"scaling_query_worker needs {n_query_vectors} query vectors but the holdout "
+            f"holds {len(query_arr)}. Widen the holdout in generate_scaling() (it is sized "
+            f"max(n_query_vectors, n_insert_vectors)) or lower n_query_vectors."
+        )
 
     filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
     filt.construct(construct_arr)
 
-    stream = query_arr[np.arange(n_query_vectors) % len(query_arr)]
+    stream = query_arr[:n_query_vectors]
 
     start = time.perf_counter()
     for i in range(0, len(stream), batch_size):
@@ -694,11 +700,17 @@ def scaling_insert_worker(
     `batch_size` after the initial construct()."""
     construct_arr = _to_construct_array(vectors_construct)
     insert_arr = _to_construct_array(vectors_insert)
+    if len(insert_arr) < n_insert_vectors:
+        raise ValueError(
+            f"scaling_insert_worker needs {n_insert_vectors} insert vectors but the holdout "
+            f"holds {len(insert_arr)}. Widen the holdout in generate_scaling() (it is sized "
+            f"max(n_query_vectors, n_insert_vectors)) or lower n_insert_vectors."
+        )
 
     filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
     filt.construct(construct_arr)
 
-    stream = insert_arr[np.arange(n_insert_vectors) % len(insert_arr)]
+    stream = insert_arr[:n_insert_vectors]
 
     start = time.perf_counter()
     for i in range(0, len(stream), batch_size):

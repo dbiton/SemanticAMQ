@@ -267,9 +267,6 @@ def generate_system_tau(runner: Runner) -> None:
     logger.info(f"Fixed tau sweep (shared across datasets): {tau_values}")
     logger.info(f"K-fold cross-validation: {k_folds} folds, non-wrapping contiguous 80/20 spans")
 
-    # tau is fixed up front, so construction-tightness is one global median.
-    construct_tau = float(np.median(tau_values))
-
     query_len = num_vectors // k_folds
     construct_len = num_vectors - query_len
 
@@ -323,7 +320,7 @@ def generate_system_tau(runner: Runner) -> None:
             'system_tau',
             output_csv=SYSTEM_TAU_CSV,
             dim=dim, dataset=DATASET_KEYS[dataset],
-            k=k, tau_values=tau_values, seed=fold, construct_tau=construct_tau,
+            k=k, tau_values=tau_values, seed=fold,
             vectors_construct=construct_source,
             vectors_query=query_source,
             actual_results_by_tau=actual_results_by_tau,
@@ -392,9 +389,6 @@ def generate_quantization(runner: Runner) -> None:
     tau = calculate_nn_distance_threshold(fold0_construct, duplicate_percentage)
     logger.info(f"Scaling tau to {tau} ({duplicate_percentage}-th percentile NN distance, fold 0)")
 
-    # Unused by quantization_worker: Gonzalez construction has no distance-threshold knob.
-    construct_tau = tau
-
     for fold, fold_start in enumerate(fold_starts):
         query_start, query_end = fold_start, fold_start + query_len
         construct_start, construct_end = query_end, query_end + construct_len
@@ -413,7 +407,7 @@ def generate_quantization(runner: Runner) -> None:
                     'quantization',
                     output_csv=QUANTIZATION_CSV,
                     dim=dim, dataset=dataset,
-                    k=k, quantize=quantize, tau=tau, seed=fold, construct_tau=construct_tau,
+                    k=k, quantize=quantize, tau=tau, seed=fold,
                     vectors_construct=construct_source, vectors_query=query_source,
                     actual_results=actual_results,
                 )
@@ -488,7 +482,7 @@ def generate_query_performance() -> pd.DataFrame:
                 runner.submit(
                     'query_performance',
                     dim=dim, dataset=DATASET_KEYS[dataset],
-                    k=k, seed=seed, construct_tau=query_tau, query_tau=query_tau,
+                    k=k, seed=seed, query_tau=query_tau,
                     vectors_construct=construct_source, vectors_query=query_source,
                     single_query_limit=single_query_limit,
                 )
@@ -510,8 +504,12 @@ def plot_query_performance(df: pd.DataFrame) -> None:
 
 
 # These panels compare across batch_size/stream_size, not datasets, so one
-# representative dataset suffices (Figure 5: "no measurable effect" per-dataset).
-_SCALING_DATASET = "MMLU"
+# representative dataset suffices (Figure 5: "no measurable effect"
+# per-dataset). MsMarco, matching generate_quantization: the 5 non-wrapping
+# folds below need ~1.8x the per-fold pool (180K rows at the Workloads
+# protocol's sizes), which rules out the smaller registry entries -- MMLU
+# holds 115,700, NaturalQuestions 91,535.
+_SCALING_DATASET = "MsMarco"
 
 
 def generate_scaling(runner: Runner) -> None:
@@ -521,24 +519,43 @@ def generate_scaling(runner: Runner) -> None:
     varies). Runs on a single dataset (_SCALING_DATASET); stream_sizes (the
     6 construction lines) derive from `stream_size` alone.
 
+    Sized to the paper's Workloads protocol (Section 5.1): 100K vectors per
+    fold, 80% construct / 20% query, so stream_size is the 80K construct set
+    and n_query_vectors the 20K holdout it is queried with. Both sweeps stay
+    at 6 values because plot_scaling draws one line per value and defines 6
+    line colors.
+
     K-fold cross-validation (Section 5.1): fold f's (construct, holdout)
     window starts f*fold_stride further into the dataset than fold 0's,
     non-wrapping via advancing_fold_starts, so each repeat measures
-    throughput against genuinely different data. Tagged via seed=fold for
-    plot_scaling's seed-based mean +/- 95% CI aggregation.
+    throughput against genuinely different data. With fold_stride equal to
+    the holdout width, the 5 query holdouts are disjoint -- which is what
+    makes them 5 samples rather than 5 views of one. Tagged via seed=fold
+    for plot_scaling's seed-based mean +/- 95% CI aggregation.
 
     Only submits 'scaling_query'/'scaling_insert'/'scaling_construction'
     jobs -- does not run `runner`. Each targets its own output_csv, so the
     Runner writes all three results/scaling_*.csv files incrementally."""
-    stream_size      = WORKLOAD_NUM_VECTORS
+    # 80% of the protocol's 100K per fold. Not WORKLOAD_NUM_VECTORS itself:
+    # that is the whole 100K, and using it here would make the construct set
+    # the full workload and push the pool (construct + holdout) past it.
+    stream_size      = 80_000
     dim              = 384
     n_steps          = 6
     k_values         = [16, 32, 64, 128, 256, 512]
+    # Powers of 4 from a single query up to 1024: spans three orders of
+    # magnitude in 6 lines, and the largest still cuts n_query_vectors into
+    # ~20 batches, so no line is timed from a handful of calls.
     batch_sizes      = [1, 4, 16, 64, 256, 1024]
+    # Throughput is threshold-independent here (query() scores every ball
+    # before comparing), so this only has to be a valid tau, not a tuned one.
     tau_mid          = 0.35
     k_folds          = 5
-    n_query_vectors  = 8192
-    n_insert_vectors = 8192
+    # The protocol's 20% query split. n_insert_vectors stays smaller: insert()
+    # mutates the cover, so its cost per vector grows with the ball count and
+    # a 20K stream would dominate the sweep's runtime for no extra resolution.
+    n_query_vectors  = 20_000
+    n_insert_vectors = 8_192
 
     if _SCALING_DATASET not in DATASET_KEYS:
         raise RuntimeError(f"_SCALING_DATASET={_SCALING_DATASET!r} must be one of {sorted(DATASET_KEYS)}")
@@ -552,23 +569,27 @@ def generate_scaling(runner: Runner) -> None:
     stream_sizes = sorted({max(1, stream_size // (2 ** i)) for i in range(n_steps)})
     max_stream = max(stream_sizes)
 
-    # Drop k_values/batch_sizes entries that no longer fit stream_size,
-    # rather than raising, so shrinking stream_size alone never requires
-    # hand-editing the sweep lists too.
-    def _below_stream(values: list[int], name: str) -> list[int]:
-        usable = sorted(v for v in values if v < max_stream)
+    # Drop sweep entries that no longer fit, rather than raising, so
+    # resizing the sweep never requires hand-editing the lists too. Each
+    # list is bounded by the thing it actually indexes: k is a ball count,
+    # so it is capped by the construct set (k >= n degenerates the cover
+    # into one zero-radius ball per point); batch_size is a slice of the
+    # query stream, so it is capped by that -- it has nothing to do with
+    # how many vectors the filter was built over.
+    def _bounded_by(values: list[int], limit: int, name: str, limit_name: str) -> list[int]:
+        usable = sorted(v for v in values if v < limit)
         dropped = sorted(set(values) - set(usable))
         if dropped:
-            logger.warning(f"Dropping {name} value(s) >= stream_size ({max_stream}): {dropped}")
+            logger.warning(f"Dropping {name} value(s) >= {limit_name} ({limit}): {dropped}")
         if not usable:
             raise RuntimeError(
-                f"No {name} value in {values} is below stream_size ({max_stream}). "
-                f"Raise stream_size or lower {name}."
+                f"No {name} value in {values} is below {limit_name} ({limit}). "
+                f"Raise {limit_name} or lower {name}."
             )
         return usable
 
-    k_values = _below_stream(k_values, "k_values")
-    batch_sizes = _below_stream(batch_sizes, "batch_sizes")
+    k_values = _bounded_by(k_values, max_stream, "k_values", "stream_size")
+    batch_sizes = _bounded_by(batch_sizes, n_query_vectors, "batch_sizes", "n_query_vectors")
 
     # Pool shape (largest stream size + a disjoint holdout); fold f's copy
     # starts fold_stride*f further into the dataset.
