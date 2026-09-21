@@ -47,12 +47,18 @@ logger = logging.getLogger(__name__)
 MAX_WORKERS = 8
 DATASET = 'ELI5'
 
-# Vectors/dataset for the paper's Workloads protocol (Section 5.1): "100K
-# queries per dataset, 80% construction / 20% queries". One knob for every
+# Vectors/dataset, split 80% construction / 20% queries. One knob for every
 # evaluation: the ground-truth FPR/FNR ones (system_tau, quantization,
-# equal_memory, streaming) and the throughput-only sweeps (scaling,
+# equal_memory, streaming, blocklist) and the throughput-only sweeps (scaling,
 # query_performance), which used to read a separate STREAM_SIZE.
-WORKLOAD_NUM_VECTORS = 10_000
+#
+# Capped well below the paper's nominal 100K by the blocklist workload, whose
+# reference set must come from duplicate clusters: CC-News holds only 31,696
+# usable vectors in clusters of >=3 at eps=0.4, so anything above ~36,018
+# drops that corpus and silently reduces the comparison to two. 2^15 leaves
+# ~10% headroom there; system_tau's non-wrapping folds need 1.8N = 58,982 rows
+# per dataset, which its shortest (HotpotQA, 97,852) clears comfortably.
+WORKLOAD_NUM_VECTORS = 2 ** 15  # 32,768
 
 # generate_blocklist() knobs. Cluster discovery scans the whole file on disk.
 # Multiplicity is a property of the pool, not of the corpus, so a partial pool
@@ -60,13 +66,15 @@ WORKLOAD_NUM_VECTORS = 10_000
 # members, which is why a 50k pool over 250k CC-News rows reported a median
 # cluster of 3 for a corpus whose syndication clusters are much larger.
 BLOCKLIST_POOL_SIZE = None  # None = use every row on disk (cluster DISCOVERY only)
-BLOCKLIST_STREAM_SIZE = 100_000
 BLOCKLIST_FOLDS = 5
-# The blocklist's query/reference split, mirroring generate_system_tau's 80/20:
-# there num_vectors is cut into a 20% query span and an 80% construct span, and
-# k = k_fraction * construct_len. Here the stream is that 20%, so the reference
-# set is stream_size * (1 - q) / q vectors and k = k_fraction * |B| -- the same
-# two knobs (stream size, k_fraction) mean the same things in both evaluations.
+# The blocklist's query/reference split of WORKLOAD_NUM_VECTORS, mirroring
+# generate_system_tau: one total size, cut into a q query part and a (1-q)
+# reference part, with k = k_fraction * |B|. The blocklist deliberately has no
+# size knob of its own -- WORKLOAD_NUM_VECTORS is already the single number
+# that sizes every evaluation, so the two knobs that matter (total size,
+# k_fraction) mean the same thing here as in system_tau:
+#
+#     stream (queries) = q * N          |B| (reference) = (1 - q) * N
 #
 # This is deliberately NOT the pool size. The pool is every row on disk because
 # cluster multiplicity is a property of the corpus and a partial pool
@@ -542,6 +550,16 @@ def _group_by_label(labels: np.ndarray, wanted: np.ndarray) -> Dict[int, np.ndar
     return {int(c): order[a:b] for c, a, b in zip(wanted, starts, stops)}
 
 
+def _selection_is_usable(selections: List[Dict[str, np.ndarray]]) -> bool:
+    """Every fold needs a reference set, something to find, and hard negatives
+    to be wrong about. Easy negatives may legitimately be absent (a corpus can
+    have no singletons), so they are not required."""
+    return bool(selections) and all(
+        len(sel["reference"]) and len(sel["positive"]) and len(sel["hard"])
+        for sel in selections
+    )
+
+
 def _fold_selections(dataset: str, labels: np.ndarray, dup_clusters: np.ndarray,
                      singletons: np.ndarray, members_by_cluster: Dict[int, np.ndarray],
                      n_folds: int, reference_target: int, n_pos: int, n_hard: int,
@@ -569,9 +587,17 @@ def _fold_selections(dataset: str, labels: np.ndarray, dup_clusters: np.ndarray,
         f"_folds{n_folds}{tag}_selection.npz")
     if os.path.exists(path):
         with np.load(path) as z:
+            cached = [{key: z[f"{f}_{key}"] for key in ("reference", "positive", "hard", "easy")}
+                      for f in range(n_folds)]
+        if _selection_is_usable(cached):
             logger.info(f"{dataset}: loaded cached fold selection from {path}")
-            return [{key: z[f"{f}_{key}"] for key in ("reference", "positive", "hard", "easy")}
-                    for f in range(n_folds)]
+            return cached
+        # A run whose sizing was infeasible used to write its empty splits here
+        # and every later run replayed them, skipping every fold while
+        # reporting nothing worse than "loaded cached fold selection". Drop it
+        # and rebuild rather than trusting the file's existence.
+        logger.warning(f"{dataset}: cached fold selection at {path} has empty splits; recomputing")
+        os.remove(path)
 
     def take(rng, pool_idx, n):
         pool_idx = np.asarray(pool_idx, dtype=np.int64)
@@ -607,6 +633,15 @@ def _fold_selections(dataset: str, labels: np.ndarray, dup_clusters: np.ndarray,
             "hard": take(rng, hard_pool, n_hard),
             "easy": take(rng, singletons, n_easy),
         })
+
+    if not _selection_is_usable(selections):
+        # Not cached on purpose: an unusable split is a sizing failure, and
+        # persisting it would make the failure sticky across runs.
+        logger.error(
+            f"{dataset}: fold selection is empty (reference/positive/hard); not caching. "
+            f"Reduce WORKLOAD_NUM_VECTORS or loosen eps/min_cluster."
+        )
+        return selections
 
     np.savez_compressed(path, **{f"{f}_{k}": v for f, sel in enumerate(selections)
                                  for k, v in sel.items()})
@@ -819,7 +854,7 @@ def generate_blocklist(runner: Runner) -> None:
     """
     dim              = 384
     pool_size        = BLOCKLIST_POOL_SIZE
-    stream_size      = BLOCKLIST_STREAM_SIZE
+    num_vectors      = WORKLOAD_NUM_VECTORS
     # 0.4 L2 on unit-normalised vectors = cosine 0.92, the conventional
     # paraphrase threshold. Inspected rather than assumed: same-cluster
     # WikiAnswers pairs at d~0.4 are true rewordings ("How many calories on 10
@@ -899,10 +934,29 @@ def generate_blocklist(runner: Runner) -> None:
             logger.warning(f"Skipping {name}: too few duplicate clusters at eps={eps} in a {pool_n}-vector pool")
             continue
 
+        stream_size = int(round(query_fraction * num_vectors))
+        reference_target = num_vectors - stream_size
         n_pos = int(frac_positive * stream_size)
         n_hard = int(frac_hard * stream_size)
         n_easy = stream_size - n_pos - n_hard
-        reference_target = int(round(stream_size * (1.0 - query_fraction) / query_fraction))
+
+        # Feasibility, checked up front rather than discovered fold by fold.
+        # A corpus that cannot fill |B| consumes every cluster trying, leaves
+        # none withheld, and so has no hard negatives -- every fold then aborts
+        # and the corpus vanishes from the results with only a per-fold
+        # warning. That is how CC-News silently disappeared from a 15-minute
+        # run at N=50,000: it holds 39,621 vectors in clusters of >=3, so 80%
+        # of them is 31,696 against a 40,000 target.
+        usable = int(0.8 * sizes[dup_clusters].sum())
+        if usable < reference_target + n_hard:
+            max_n = int((usable) / ((1.0 - query_fraction) + frac_hard * query_fraction))
+            logger.error(
+                f"Skipping {name}: needs {reference_target} reference + {n_hard} hard-negative "
+                f"vectors but only {usable} are available in clusters of >={min_cluster} "
+                f"at eps={eps}. Lower WORKLOAD_NUM_VECTORS to <= {max_n} for this corpus, "
+                f"or loosen eps/min_cluster."
+            )
+            continue
 
         # One argsort-based grouping, not a np.where scan per cluster: the
         # latter is O(clusters * n), which on WildChat is 33,545 x 1M = 3.4e10
