@@ -10,11 +10,12 @@ for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "
     os.environ.setdefault(_env_var, "1")
 
 import faiss
+import h5py
 import time
 import inspect
 import numpy as np
 import pandas as pd
-from scipy.cluster.hierarchy import DisjointSet
+from scipy.sparse import csr_matrix
 
 faiss.omp_set_num_threads(1)  # belt-and-suspenders alongside the env vars above
 
@@ -29,7 +30,7 @@ from plots.plot_system_tau import generate_system_tau_figures
 from plots.plot_system import generate_system_figures
 from plots.plot_blocklist import generate_blocklist_figures
 from plots.plot_common import DATASETS, DATASET_LABELS
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from filters.ball_cover.ball_cover_filter import BallCoverFilter
 from filters.dsh_filter import DSHFilter
 from filters.hnsw_filter import HNSWFilter
@@ -51,16 +52,35 @@ DATASET = 'ELI5'
 # evaluation: the ground-truth FPR/FNR ones (system_tau, quantization,
 # equal_memory, streaming) and the throughput-only sweeps (scaling,
 # query_performance), which used to read a separate STREAM_SIZE.
-WORKLOAD_NUM_VECTORS = 1_000
+WORKLOAD_NUM_VECTORS = 10_000
 
-# generate_blocklist() knobs. The pool is what cluster discovery scans; the
-# stream is the query count per fold. Multiplicity is measured on the pool, so
-# a small pool undercounts cluster sizes (a cluster of true size m yields only
-# ~m * pool/corpus members) -- raise the pool, not just the stream, when
-# clusters look smaller than expected.
-BLOCKLIST_POOL_SIZE = 50_000
-BLOCKLIST_STREAM_SIZE = 10_000
-BLOCKLIST_FOLDS = 3
+# generate_blocklist() knobs. Cluster discovery scans the whole file on disk.
+# Multiplicity is a property of the pool, not of the corpus, so a partial pool
+# undercounts it: a cluster of true size m yields only ~m * pool/corpus
+# members, which is why a 50k pool over 250k CC-News rows reported a median
+# cluster of 3 for a corpus whose syndication clusters are much larger.
+BLOCKLIST_POOL_SIZE = None  # None = use every row on disk (cluster DISCOVERY only)
+BLOCKLIST_STREAM_SIZE = 100_000
+BLOCKLIST_FOLDS = 5
+# The blocklist's query/reference split, mirroring generate_system_tau's 80/20:
+# there num_vectors is cut into a 20% query span and an 80% construct span, and
+# k = k_fraction * construct_len. Here the stream is that 20%, so the reference
+# set is stream_size * (1 - q) / q vectors and k = k_fraction * |B| -- the same
+# two knobs (stream size, k_fraction) mean the same things in both evaluations.
+#
+# This is deliberately NOT the pool size. The pool is every row on disk because
+# cluster multiplicity is a property of the corpus and a partial pool
+# undercounts it; |B| is a property of the WORKLOAD and has to be chosen. Left
+# coupled, a whole-file pool gave WildChat |B|=131,776 -- 13% of its corpus,
+# which is the symmetric regime this workload exists to avoid (measured: FPR
+# 0.016 at |B|=500, 0.051 at 2,000, 0.326 at 10,000) -- and made |B| differ 8x
+# between corpora purely because one file is bigger.
+BLOCKLIST_QUERY_FRACTION = 0.2
+
+# Cluster labels are a pure function of (dataset, pool size, eps, and the
+# config), so they are computed once and cached here rather than recomputed
+# every run -- the same pattern generate_system_tau uses for its ground truth.
+BLOCKLIST_CLUSTER_DIR = "results/blocklist_clusters"
 
 # Registry name -> canonical dataset key, one source of truth via plot_common.
 DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
@@ -498,49 +518,280 @@ BLOCKLIST_DATASETS = {
     # CC-News: cross-outlet wire syndication. Same-domain repeats are templated
     # boilerplate, not syndication, so they are dropped during discovery.
     "CCNews": ("ccnews", None),
-    # WikiAnswers: editor-labelled paraphrase sets. set_id gives ground truth
-    # that does not come from a distance threshold, breaking the circularity of
-    # defining "duplicate" with the same metric the filter thresholds.
-    "WikiAnswers": ("wikianswers", "set_id"),
+    # WikiAnswers: paraphrase questions. Clustered geometrically like the other
+    # two rather than by its set_id column, so all three corpora share one
+    # cluster definition and a difference between them is a difference in
+    # geometry, not in how their clusters were defined.
+    #
+    # The labels are still the better ground truth in one respect -- they do
+    # not come from the same metric the filter thresholds -- but they are loose
+    # enough that using them would not buy that: editors group "Why was the
+    # schlefan plan important to britain?" with "Why was the battle of britain
+    # important?", pairs at d~0.75 that are on-topic rather than duplicates.
+    # set_id stays in the metadata and is what eps=0.4 was calibrated against.
+    "WikiAnswers": ("wikianswers", None),
 }
 
 
-def _discover_clusters(vectors: np.ndarray, eps: float, kmax: int,
-                       exclude_same: Optional[np.ndarray] = None) -> np.ndarray:
-    """Cluster id per vector, from an eps-neighbourhood graph over each point's
-    kmax nearest neighbours, merged with union-find so a chain of near
-    duplicates becomes one cluster rather than many overlapping pairs.
+def _group_by_label(labels: np.ndarray, wanted: np.ndarray) -> Dict[int, np.ndarray]:
+    """{label: row indices} for the wanted labels, in one O(n log n) pass."""
+    order = np.argsort(labels, kind="stable")
+    sorted_labels = labels[order]
+    starts = np.searchsorted(sorted_labels, wanted, side="left")
+    stops = np.searchsorted(sorted_labels, wanted, side="right")
+    return {int(c): order[a:b] for c, a, b in zip(wanted, starts, stops)}
 
-    Used only for the corpora without labels. The ground truth it produces is
-    partly circular -- "duplicate" is defined by the same L2 metric the filter
-    thresholds -- which is exactly why WikiAnswers (labelled) is the anchor and
-    these two are the supporting corpora.
+
+def _fold_selections(dataset: str, labels: np.ndarray, dup_clusters: np.ndarray,
+                     singletons: np.ndarray, members_by_cluster: Dict[int, np.ndarray],
+                     n_folds: int, reference_target: int, n_pos: int, n_hard: int,
+                     n_easy: int, pool_n: int, eps: float, stream_size: int,
+                     query_fraction: float, xgroup: bool,
+                     cache_dir: str = BLOCKLIST_CLUSTER_DIR) -> List[Dict[str, np.ndarray]]:
+    """Per-fold reference/positive/hard/easy ROW INDICES, cached to disk.
+
+    Indices rather than vectors: they are the reproducible part, they are three
+    orders of magnitude smaller than the embeddings they select, and they let a
+    fold read only its own rows (see _read_rows) instead of holding the pool in
+    memory. Stored per (dataset, pool size, eps, stream size, query fraction,
+    folds), all of which are in the filename, so changing a knob misses the
+    cache rather than reusing a stale split.
+
+    Clusters are taken whole until the reference set reaches its target, so the
+    multiplicity that bounds compression survives the sizing; the clusters not
+    taken are withheld and supply the hard negatives.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    tag = "_xgroup" if xgroup else ""
+    path = os.path.join(
+        cache_dir,
+        f"{dataset}_{pool_n}_eps{eps:g}_stream{stream_size}_q{query_fraction:g}"
+        f"_folds{n_folds}{tag}_selection.npz")
+    if os.path.exists(path):
+        with np.load(path) as z:
+            logger.info(f"{dataset}: loaded cached fold selection from {path}")
+            return [{key: z[f"{f}_{key}"] for key in ("reference", "positive", "hard", "easy")}
+                    for f in range(n_folds)]
+
+    def take(rng, pool_idx, n):
+        pool_idx = np.asarray(pool_idx, dtype=np.int64)
+        if len(pool_idx) == 0 or n <= 0:
+            return pool_idx[:0]
+        return rng.choice(pool_idx, size=min(n, len(pool_idx)), replace=False)
+
+    selections = []
+    for fold in range(n_folds):
+        rng = np.random.default_rng(fold)
+        shuffled = rng.permutation(dup_clusters)
+
+        reference, positives, n_taken = [], [], 0
+        for c in shuffled:
+            if len(reference) >= reference_target:
+                break
+            members = members_by_cluster[int(c)].copy()
+            rng.shuffle(members)
+            cut = max(1, int(0.8 * len(members)))
+            reference.extend(members[:cut].tolist())
+            positives.extend(members[cut:].tolist())
+            n_taken += 1
+        # Trimmed to exactly the target so |B| matches across corpora and the
+        # three stay comparable at a given k_fraction.
+        reference = np.asarray(reference[:reference_target], dtype=np.int64)
+        hard_pool = np.concatenate(
+            [members_by_cluster[int(c)] for c in shuffled[n_taken:]]
+        ) if n_taken < len(shuffled) else np.empty(0, dtype=np.int64)
+
+        selections.append({
+            "reference": reference,
+            "positive": take(rng, positives, n_pos),
+            "hard": take(rng, hard_pool, n_hard),
+            "easy": take(rng, singletons, n_easy),
+        })
+
+    np.savez_compressed(path, **{f"{f}_{k}": v for f, sel in enumerate(selections)
+                                 for k, v in sel.items()})
+    logger.info(f"{dataset}: wrote fold selection to {path}")
+    return selections
+
+
+def _cluster_cache_path(dataset: str, n: int, eps: float, xgroup: bool,
+                        cache_dir: str = BLOCKLIST_CLUSTER_DIR) -> str:
+    tag = "_xgroup" if xgroup else ""
+    return os.path.join(cache_dir, f"{dataset}_{n}_eps{eps:g}_seedball{tag}.npy")
+
+
+def _cluster_cache_exists(dataset: str, n: int, eps: float, xgroup: bool) -> bool:
+    return os.path.exists(_cluster_cache_path(dataset, n, eps, xgroup))
+
+
+def _read_rows(dataset: str, idx: np.ndarray) -> np.ndarray:
+    """Just the requested rows of a dataset's embeddings, straight from HDF5.
+
+    h5py fancy indexing needs a sorted, unique selection, so the request is
+    sorted for the read and then mapped back to the caller's order.
+    """
+    order = np.argsort(idx, kind="stable")
+    sorted_idx = idx[order]
+    uniq, inverse = np.unique(sorted_idx, return_inverse=True)
+    with h5py.File(dataset_filenames[dataset], "r") as f:
+        block = f[HDF5_DATASET_KEY][uniq]
+    out = np.empty((len(idx), block.shape[1]), dtype=np.float32)
+    out[order] = block[inverse]
+    return np.ascontiguousarray(out)
+
+
+def _ivf_params(n: int) -> Tuple[int, int]:
+    """(nlist, nprobe) for a pool of n vectors.
+
+    nlist = 4*sqrt(n) is the usual faiss starting point, clamped so each cell
+    still holds enough points to train on. nprobe=8 was chosen by measurement:
+    on a 250k WildChat pool, edge recall at eps=0.25 was 0.9906 at nprobe 8, 16
+    and 32 alike, so probing harder buys nothing -- near duplicates are nearly
+    identical vectors and land in the same Voronoi cell. HNSW was measured too
+    and lost on both axes (0.865 recall at efSearch=64, 0.888 at 128, no
+    faster). The approximation is free in practice: on a 60k pool the resulting
+    partition was *identical* to one built from exact search (adjusted Rand
+    index 1.000000).
+    """
+    nlist = int(4 * np.sqrt(max(n, 1)))
+    nlist = max(1, min(nlist, max(1, n // 39), 65_536))
+    return nlist, min(8, nlist)
+
+
+def _eps_neighbors(vectors: np.ndarray, eps: float,
+                   exclude_same: Optional[np.ndarray] = None,
+                   chunk: int = 50_000) -> csr_matrix:
+    """Adjacency of every pair within eps, as a CSR matrix.
+
+    Uses range_search, not a top-k search: a fixed k silently caps how large a
+    cluster can be, which is not a tunable but a measurement error. At knn=64
+    every WildChat cluster came back as exactly 65 members, and at knn=256 as
+    exactly 257, at every eps -- the retrieval cap, not the corpus. WildChat's
+    99th-percentile neighbourhood at eps=0.4 is 405 and its largest is over
+    1400, so no fixed k is safe.
+
+    Chunked over queries because range_search output is unbounded; only the
+    surviving pairs are retained.
 
     exclude_same: optional per-vector group key (CC-News' publisher domain).
-    Edges within a group are dropped, so one site reposting its own boilerplate
-    does not manufacture a giant cluster that no filter should be credited for
-    finding.
+    Edges inside a group are dropped, so a site reposting its own boilerplate
+    does not form a cluster no filter should get credit for finding.
     """
     n = len(vectors)
-    index = faiss.IndexFlatL2(vectors.shape[1])
+    nlist, nprobe = _ivf_params(n)
+    quantizer = faiss.IndexFlatL2(vectors.shape[1])
+    index = faiss.IndexIVFFlat(quantizer, vectors.shape[1], nlist, faiss.METRIC_L2)
+    rng = np.random.default_rng(0)
+    train_n = min(n, 200_000)
+    index.train(np.ascontiguousarray(vectors if train_n == n else vectors[rng.choice(n, train_n, replace=False)]))
     index.add(vectors)
-    d2, nbr = index.search(vectors, min(kmax, n))
-    dist = np.sqrt(np.clip(d2, 0, None))
+    index.nprobe = nprobe
+    logger.info(f"  IVF nlist={nlist} nprobe={nprobe}, range search at eps={eps} over {n} vectors...")
 
-    ds = DisjointSet(list(range(n)))
-    for i in range(n):
-        for j, t in zip(nbr[i, 1:], dist[i, 1:]):
-            if t > eps:
-                break  # faiss returns ascending distance, so the rest are farther
-            if exclude_same is not None and exclude_same[i] == exclude_same[j]:
-                continue
-            ds.merge(i, int(j))
+    rows_out, cols_out = [], []
+    for start in range(0, n, chunk):
+        stop = min(start + chunk, n)
+        # faiss METRIC_L2 works in squared distance.
+        lims, _, nbr = index.range_search(vectors[start:stop], float(eps) ** 2)
+        # faiss returns lims as uint64; np.repeat refuses unsigned counts.
+        counts = np.diff(lims).astype(np.int64)
+        rows = np.repeat(np.arange(start, stop, dtype=np.int64), counts)
+        cols = nbr.astype(np.int64)
+        keep = cols != rows
+        if exclude_same is not None:
+            keep &= exclude_same[rows] != exclude_same[cols]
+        rows_out.append(rows[keep])
+        cols_out.append(cols[keep])
 
-    roots = {}
-    labels = np.empty(n, dtype=np.int64)
-    for i in range(n):
-        r = ds[i]
-        labels[i] = roots.setdefault(r, len(roots))
+    rows = np.concatenate(rows_out) if rows_out else np.empty(0, dtype=np.int64)
+    cols = np.concatenate(cols_out) if cols_out else np.empty(0, dtype=np.int64)
+    logger.info(f"  {len(rows)} edges within eps={eps}")
+    return csr_matrix((np.ones(len(rows), dtype=np.int8), (rows, cols)), shape=(n, n))
+
+
+def _discover_clusters(vectors: np.ndarray, eps: float,
+                       exclude_same: Optional[np.ndarray] = None) -> np.ndarray:
+    """Cluster id per vector, by greedy seed-ball covering: the highest-degree
+    unassigned point becomes a seed and claims every unassigned point within
+    eps of it.
+
+    Every cluster is therefore contained in one ball of radius eps -- which is
+    both what bounds it and what makes it the right unit here, since the filter
+    stores exactly one ball per cluster. Connected components was tried first
+    and is the wrong rule: it has no diameter bound, so chains of near
+    duplicates fuse unrelated content. On WildChat at 1M it produced a single
+    "cluster" of 57,749 vectors (5.8% of the corpus), and on WikiAnswers its
+    agreement with editor labels collapsed from 0.75 to 0.004 adjusted Rand
+    index over two steps of eps while its largest cluster went 185 -> 24,457.
+    Seed-ball degrades gracefully across the same range.
+
+    The seed relation is what carries the semantics: every member is within eps
+    of the seed, and the seed is what enters the blocklist, so a held-out
+    member is a genuine near-duplicate of a blocklisted item. Two members can
+    be up to 2*eps apart, but that pair is never the relation under test.
+    """
+    n = len(vectors)
+    adj = _eps_neighbors(vectors, eps, exclude_same=exclude_same)
+    indptr, indices = adj.indptr, adj.indices
+    degree = np.diff(indptr)
+
+    labels = np.full(n, -1, dtype=np.int64)
+    # Isolated points are their own cluster; assigning them in bulk keeps the
+    # Python loop below to the minority of points that actually have a
+    # neighbour (over half of WildChat has none at eps=0.4).
+    isolated = np.flatnonzero(degree == 0)
+    labels[isolated] = np.arange(len(isolated), dtype=np.int64)
+    next_label = len(isolated)
+
+    for seed in np.argsort(-degree, kind="stable"):
+        if degree[seed] == 0:
+            break  # sorted descending: everything from here on is isolated
+        if labels[seed] != -1:
+            continue
+        labels[seed] = next_label
+        nbrs = indices[indptr[seed]:indptr[seed + 1]]
+        labels[nbrs[labels[nbrs] == -1]] = next_label
+        next_label += 1
+    return labels
+
+
+def _cluster_labels(dataset: str, vectors: Optional[np.ndarray], eps: float,
+                    exclude_same: Optional[np.ndarray] = None,
+                    cache_dir: str = BLOCKLIST_CLUSTER_DIR,
+                    pool_n: Optional[int] = None) -> np.ndarray:
+    """Cluster labels for a pool, cached to disk by ordering index.
+
+    The saved array holds one label per row of the pool in dataset order, so
+    entry i names the cluster of the i-th vector on disk and any caller reading
+    the same prefix of the same file can reuse it. Labels depend only on
+    (dataset, pool size, eps, whether same-group edges were dropped), all of
+    which are in the filename, so changing a knob misses the cache rather than
+    silently reusing stale labels.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    n = pool_n if vectors is None else len(vectors)
+    path = _cluster_cache_path(dataset, n, eps, exclude_same is not None, cache_dir)
+    if os.path.exists(path):
+        logger.info(f"{dataset}: loaded cached cluster labels from {path}")
+        return np.load(path)
+
+    # Discovery runs in the main process, before any worker starts, so it can
+    # use every core. The module-level pinning to one thread exists to stop
+    # MAX_WORKERS processes each grabbing all cores; it does not apply here,
+    # and leaving it would cost roughly an order of magnitude.
+    prev_threads = faiss.omp_get_max_threads()
+    faiss.omp_set_num_threads(os.cpu_count() or prev_threads)
+    try:
+        if vectors is None:
+            raise ValueError(f"{dataset}: no cached labels and no vectors supplied to compute them")
+        t0 = time.perf_counter()
+        labels = _discover_clusters(vectors, eps, exclude_same=exclude_same)
+        logger.info(f"{dataset}: clustered {len(vectors)} vectors in {time.perf_counter() - t0:.1f}s")
+    finally:
+        faiss.omp_set_num_threads(prev_threads)
+
+    np.save(path, labels)
+    logger.info(f"{dataset}: wrote cluster labels to {path}")
     return labels
 
 
@@ -569,8 +820,16 @@ def generate_blocklist(runner: Runner) -> None:
     dim              = 384
     pool_size        = BLOCKLIST_POOL_SIZE
     stream_size      = BLOCKLIST_STREAM_SIZE
-    eps              = 0.25
-    kmax             = 64
+    # 0.4 L2 on unit-normalised vectors = cosine 0.92, the conventional
+    # paraphrase threshold. Inspected rather than assumed: same-cluster
+    # WikiAnswers pairs at d~0.4 are true rewordings ("How many calories on 10
+    # strawberries?" / "How many calories in some strawberries?"), while pairs
+    # at d~0.75 are merely on-topic ("Why was the schlefan plan important to
+    # britain?" / "Why was the battle of britain important?"). Agreement with
+    # WikiAnswers' editor labels actually peaks near 0.75, but those labels are
+    # loose -- they group topically related questions -- so fitting them would
+    # pull eps into the non-paraphrase range.
+    eps              = 0.4
     min_cluster      = 3
     k_fractions      = [0.02, 0.05, 0.1, 0.25, 0.5]
     target_recall    = 0.95
@@ -585,6 +844,7 @@ def generate_blocklist(runner: Runner) -> None:
     # thing varying between them is geometry.
     frac_positive    = 0.2
     frac_hard        = 0.4
+    query_fraction   = BLOCKLIST_QUERY_FRACTION
 
     for name, (plot_key, label_col) in BLOCKLIST_DATASETS.items():
         if not os.path.exists(dataset_filenames[name]):
@@ -592,8 +852,22 @@ def generate_blocklist(runner: Runner) -> None:
             continue
 
         total = len(VectorSource(name))
-        pool_n = min(pool_size, total)
-        pool = np.ascontiguousarray(VectorSource(name, 0, pool_n).to_array(), dtype=np.float32)
+        pool_n = total if pool_size is None else min(pool_size, total)
+
+        # The full pool is materialised only when clusters have to be
+        # discovered. Once labels are cached, a fold needs a few thousand rows
+        # out of the pool, so reading all of them back costs 1.5 GB and seconds
+        # per run on WildChat for nothing (see _read_rows).
+        # The pool is materialised only to DISCOVER clusters. It is not needed
+        # when a corpus carries its own labels (WikiAnswers' set_id) or when
+        # discovery already ran and cached them -- in both cases a fold reads
+        # just its own few thousand rows via _read_rows, instead of pulling
+        # 1.5 GB for WildChat to use ~50k of it.
+        needs_pool = label_col is None and not _cluster_cache_exists(
+            name, pool_n, eps, name == "CCNews")
+        pool = None
+        if needs_pool:
+            pool = np.ascontiguousarray(VectorSource(name, 0, pool_n).to_array(), dtype=np.float32)
 
         if label_col is not None:
             meta = load_meta(name, pool_n)
@@ -603,7 +877,7 @@ def generate_blocklist(runner: Runner) -> None:
                     "metadata persistence -- delete the .pkl and rebuild); "
                     "falling back to geometric cluster discovery"
                 )
-                labels = _discover_clusters(pool, eps, kmax)
+                labels = _cluster_labels(name, pool, eps, pool_n=pool_n)
             else:
                 labels = np.asarray(meta[label_col], dtype=np.int64)
         else:
@@ -611,7 +885,7 @@ def generate_blocklist(runner: Runner) -> None:
             if name == "CCNews":
                 dom = load_meta(name, pool_n).get("domain")
                 exclude = np.asarray(dom) if dom is not None else None
-            labels = _discover_clusters(pool, eps, kmax, exclude_same=exclude)
+            labels = _cluster_labels(name, pool, eps, exclude_same=exclude, pool_n=pool_n)
 
         sizes = np.bincount(labels)
         dup_clusters = np.where(sizes >= min_cluster)[0]
@@ -628,30 +902,30 @@ def generate_blocklist(runner: Runner) -> None:
         n_pos = int(frac_positive * stream_size)
         n_hard = int(frac_hard * stream_size)
         n_easy = stream_size - n_pos - n_hard
+        reference_target = int(round(stream_size * (1.0 - query_fraction) / query_fraction))
 
-        for fold in range(n_folds):
-            rng = np.random.default_rng(fold)
-            shuffled = rng.permutation(dup_clusters)
-            blocked, withheld = shuffled[: len(shuffled) // 2], shuffled[len(shuffled) // 2:]
+        # One argsort-based grouping, not a np.where scan per cluster: the
+        # latter is O(clusters * n), which on WildChat is 33,545 x 1M = 3.4e10
+        # comparisons just to find cluster memberships.
+        members_by_cluster = _group_by_label(labels, dup_clusters)
 
-            reference, positives = [], []
-            for c in blocked:
-                members = np.where(labels == c)[0]
-                rng.shuffle(members)
-                cut = max(1, int(0.8 * len(members)))
-                reference.extend(members[:cut].tolist())
-                positives.extend(members[cut:].tolist())
+        selections = _fold_selections(
+            name, labels, dup_clusters, singletons, members_by_cluster,
+            n_folds=n_folds, reference_target=reference_target,
+            n_pos=n_pos, n_hard=n_hard, n_easy=n_easy,
+            pool_n=pool_n, eps=eps, stream_size=stream_size,
+            query_fraction=query_fraction, xgroup=(name == "CCNews"),
+        )
 
-            hard_pool = np.where(np.isin(labels, withheld))[0]
-            if not reference or not positives or len(hard_pool) == 0:
+        for fold, sel in enumerate(selections):
+
+            if not len(sel["reference"]) or not len(sel["positive"]) or not len(sel["hard"]):
                 logger.warning(f"Skipping {name} fold {fold}: empty split")
                 continue
 
-            def take(pool_idx, n):
-                pool_idx = np.asarray(pool_idx)
-                if len(pool_idx) == 0 or n <= 0:
-                    return pool_idx[:0]
-                return rng.choice(pool_idx, size=min(n, len(pool_idx)), replace=False)
+            def rows(idx):
+                idx = np.asarray(idx, dtype=np.int64)
+                return pool[idx] if pool is not None else _read_rows(name, idx)
 
             runner.submit(
                 'blocklist',
@@ -659,11 +933,17 @@ def generate_blocklist(runner: Runner) -> None:
                 dim=dim, dataset=plot_key, seed=fold,
                 k_fractions=k_fractions, target_recall=target_recall,
                 tau_values=tau_values,
-                vectors_reference=pool[np.asarray(reference)],
-                vectors_positive=pool[take(positives, n_pos)],
-                vectors_hard_negative=pool[take(hard_pool, n_hard)],
-                vectors_easy_negative=pool[take(singletons, n_easy)],
+                vectors_reference=rows(sel["reference"]),
+                vectors_positive=rows(sel["positive"]),
+                vectors_hard_negative=rows(sel["hard"]),
+                vectors_easy_negative=rows(sel["easy"]),
             )
+            if fold == 0:
+                logger.info(
+                    f"{name}: |B|={len(sel['reference'])} (target {reference_target}), "
+                    f"stream={stream_size} ({len(sel['positive'])} pos / "
+                    f"{len(sel['hard'])} hard / {len(sel['easy'])} easy)"
+                )
 
 
 def save_blocklist(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
@@ -700,7 +980,7 @@ def generate_quantization(runner: Runner) -> None:
     num_vectors            = WORKLOAD_NUM_VECTORS
     dim                    = 384
     k_folds                = 5
-    k_fractions            = [0.01, 0.02, 0.04, 0.08, 0.16]
+    k_fractions            = [0.02, 0.04, 0.08, 0.16, 0.32]
     duplicate_percentage   = 5
 
     dataset = "MsMarco"  # Figure 3: "We evaluate on MS MARCO"
@@ -1204,7 +1484,7 @@ def generate_and_plot_all() -> None:
     runner = Runner(num_workers=MAX_WORKERS)
 
     try:
-        generate_quantization(runner)
+        generate_blocklist(runner)
     except Exception:
         logger.exception("An error occurred")
     
