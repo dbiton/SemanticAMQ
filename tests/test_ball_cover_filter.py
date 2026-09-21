@@ -4,6 +4,7 @@ sys.path.append(os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file
 import unittest
 import numpy as np
 from src.filters.ball_cover.ball_cover_filter import BallCoverFilter
+from src.hyperspheres_volume import estimate_hypersphere_volume
 
 DIM = 32
 R = 0.3  # semantic distance threshold used across most tests
@@ -199,18 +200,22 @@ class TestBallCoverConstruct(unittest.TestCase):
         f.construct(vecs)
         self.assertLess(len(f.all_centers), 50)
 
-    def test_construct_returns_log_volume_bounds(self):
+    def test_construct_returns_none(self):
+        """construct() no longer returns volume bounds -- they cost O(k^2) and
+        every caller discarded them. It now matches Filter.construct."""
         f = BallCoverFilter(dim=DIM, max_spheres=8)
-        low, high = f.construct(_rand(100))
+        self.assertIsNone(f.construct(_rand(100)))
+        self.assertIsNone(f.construct(np.empty((0, DIM), dtype=np.float32)))
+
+    def test_volume_bounds_computable_from_published_cover(self):
+        """The bounds a caller used to get back are still derivable from the
+        cover it can see, which is how runner obtains them now."""
+        f = BallCoverFilter(dim=DIM, max_spheres=8)
+        f.construct(_rand(100))
+        low, high = estimate_hypersphere_volume(f.all_centers, f.all_radiuses, return_log=True)
         self.assertTrue(np.isfinite(low))
         self.assertTrue(np.isfinite(high))
         self.assertLessEqual(low, high + 1e-9)
-
-    def test_construct_empty_returns_neg_inf_bounds(self):
-        f = BallCoverFilter(dim=DIM, max_spheres=5)
-        low, high = f.construct(np.empty((0, DIM), dtype=np.float32))
-        self.assertEqual(low, -np.inf)
-        self.assertEqual(high, -np.inf)
 
     def test_max_spheres_zero_builds_empty_filter(self):
         f = BallCoverFilter(dim=DIM, max_spheres=0)

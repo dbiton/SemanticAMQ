@@ -327,23 +327,56 @@ def equal_memory_worker(
 _LN10 = float(np.log(10.0))
 
 
+def _log_effective_radii(radii: np.ndarray, tau: float) -> np.ndarray:
+    """Natural log of each ball's tau-expanded radius, carried in log space --
+    -inf wherever that radius is not positive.
+
+    tau is not always positive: blocklist_worker solves its operating point as
+    a percentile of the query margins (distance-to-centre minus radius), and a
+    query strictly inside a ball has a negative margin, so the solved tau can
+    come out slightly negative -- a stricter "inside by a margin" threshold.
+    A ball whose radius that drives to zero or below covers nothing, and -inf
+    is the log-space statement of exactly that: logsumexp maps it back to a
+    zero contribution, so it drops out of the sum without ever being
+    materialised as a radius.
+
+    Kept in log space rather than clamping the radius to 0, because clamping
+    rewrites the geometry (the sum would be over a cover that does not exist)
+    to work around a representation limit. Taking the log first also avoids
+    both failure modes of the linear form: np.log of a negative radius is NaN
+    ("invalid value encountered in log"), and r**d silently returns a LARGE
+    POSITIVE number when d is even -- which would make a ball that covers
+    nothing the dominant term.
+    """
+    r = np.asarray(radii, dtype=np.float64) + float(tau)
+    logr = np.full(r.shape, -np.inf, dtype=np.float64)
+    # where= leaves the -inf in place for non-positive radii and never
+    # evaluates the log there, so no invalid-value warning is raised.
+    np.log(r, out=logr, where=r > 0.0)
+    return logr
+
+
 def _log10_J(radii: np.ndarray, dim: int, tau: float = 0.0) -> float:
     """log10 sum_i (r_i + tau)^d, safe for d in the hundreds where r^d over/underflows float64."""
-    r = np.asarray(radii, dtype=np.float64) + float(tau)
-    if r.size == 0:
+    logr = _log_effective_radii(radii, tau)
+    if logr.size == 0:
         return float('-inf')
-    with np.errstate(divide='ignore'):
-        logr = np.log(r)
     return float(logsumexp(dim * logr)) / _LN10
 
 
 def _J_tau(radii: np.ndarray, dim: int, tau: float = 0.0) -> float:
     """Linear J_tau(C) = sum_i (r_i + tau)^d; may overflow to +inf at d~384, r>~1 -- use _log10_J to plot."""
-    r = np.asarray(radii, dtype=np.float64) + float(tau)
-    if r.size == 0:
+    if len(radii) == 0:
+        return 0.0
+    # Derived from the log form rather than summed directly, so a ball with a
+    # non-positive tau-expanded radius contributes nothing instead of a large
+    # positive r**d (d is even). Still overflows to +inf at d~384, r>~1 --
+    # that is what _log10_J is for.
+    log10_j = _log10_J(radii, dim, tau)
+    if log10_j == float('-inf'):
         return 0.0
     with np.errstate(over='ignore'):
-        return float(np.sum(r ** dim))
+        return float(10.0 ** log10_j)
 
 
 def _tau_volume_bounds_log10(centers: np.ndarray, radii: np.ndarray, tau: float) -> Tuple[float, float]:
@@ -357,7 +390,11 @@ def _tau_volume_bounds_log10(centers: np.ndarray, radii: np.ndarray, tau: float)
     them by a hair."""
     if len(radii) == 0:
         return float('nan'), float('nan')
-    log_low, log_high = estimate_hypersphere_volume(centers, radii + tau, return_log=True)
+    # This estimator takes radii, not log-radii, so the degenerate case is
+    # expressed as a zero-radius ball -- which is the correct geometry for one
+    # that covers nothing, not a clamp working around a representation limit.
+    eff_radii = np.maximum(np.asarray(radii, dtype=np.float64) + float(tau), 0.0)
+    log_low, log_high = estimate_hypersphere_volume(centers, eff_radii, return_log=True)
     if np.isnan(log_low) or np.isinf(log_low):
         return float('nan'), float('nan')
     log_low /= _LN10
@@ -635,6 +672,148 @@ def system_worker(
     )
     for row, pct in zip(rows, redundancy_pcts):
         row["redundancy_pct"] = float(pct)
+    return rows
+
+
+def blocklist_worker(
+    dim: int,
+    dataset: str,
+    seed: int,
+    k_fractions: List[float],
+    target_recall: float,
+    tau_values: List[float],
+    vectors_reference: VectorInput,
+    vectors_positive: VectorInput,
+    vectors_hard_negative: VectorInput,
+    vectors_easy_negative: VectorInput,
+) -> List[Dict[str, Any]]:
+    """Asymmetric blocklist workload (main.generate_blocklist): a tight
+    reference set B, a broad query stream, positives that are held-out members
+    of B's own duplicate clusters.
+
+    Unlike system_tau_worker, tau is not swept over a grid -- it is solved per
+    row for `target_recall` on the positives, so every compression ratio is
+    compared at an equal-recall operating point and the interesting axis is
+    FPR. Sweeping tau instead would let a row buy a better FPR by quietly
+    giving up recall.
+
+    Negatives are split in two and never pooled. Hard negatives are members of
+    duplicate clusters that were NOT blocklisted: same tight local geometry as
+    B, so a filter that merely detects "is this vector in a dense region"
+    fails them and only one that localises B passes. Easy negatives are
+    singletons, i.e. background traffic. A pooled FPR would be dominated by
+    whichever class happened to be larger.
+    """
+    B = np.ascontiguousarray(_to_construct_array(vectors_reference), dtype=np.float32)
+    pos = np.ascontiguousarray(_to_construct_array(vectors_positive), dtype=np.float32)
+    hard = np.ascontiguousarray(_to_construct_array(vectors_hard_negative), dtype=np.float32)
+    easy = np.ascontiguousarray(_to_construct_array(vectors_easy_negative), dtype=np.float32)
+
+    # Exact nearest-reference distances: the workload's own geometry, reported
+    # so a row is interpretable without re-deriving it (delta vs d_hard).
+    bix = faiss.IndexFlatL2(dim)
+    bix.add(B)
+
+    def nn_dist(Q):
+        if len(Q) == 0:
+            return np.zeros(0, dtype=np.float32)
+        d2, _ = bix.search(Q, 1)
+        return np.sqrt(np.clip(d2[:, 0], 0, None))
+
+    d_pos_med = float(np.median(nn_dist(pos))) if len(pos) else float("nan")
+    d_hard_med = float(np.median(nn_dist(hard))) if len(hard) else float("nan")
+
+    n_queries = len(pos) + len(hard) + len(easy)
+    rows: List[Dict[str, Any]] = []
+
+    for kf in k_fractions:
+        k = min(max(1, round(kf * len(B))), len(B))
+        filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
+        filt.construct(B)
+        radii = filt.all_radiuses
+        centers = np.ascontiguousarray(filt.all_centers, dtype=np.float32)
+
+        cix = faiss.IndexFlatL2(dim)
+        cix.add(centers)
+
+        def margin(Q):
+            """Smallest (distance to a ball's centre - that ball's radius) over
+            every ball: the query is flagged iff this is <= tau. Searching all
+            balls rather than a top-m probe, since a query can sit nearest to
+            one centre while another, fatter ball is the one that covers it."""
+            if len(Q) == 0:
+                return np.zeros(0, dtype=np.float32)
+            D, I = cix.search(Q, len(radii))
+            return (np.sqrt(np.clip(D, 0, None)) - radii[I]).min(axis=1)
+
+        m_pos, m_hard, m_easy = margin(pos), margin(hard), margin(easy)
+        r_med = float(np.median(radii)) if len(radii) else 0.0
+
+        def row_at(tau: float, sweep: str) -> Dict[str, Any]:
+            """One measurement of the whole query stream at this tau. The
+            geometric objective and the volume bounds are recomputed per tau
+            because tau expands every ball (eff. radius r_i + tau), so they are
+            functions of tau at fixed k, not constants of the cover."""
+            recall = float(np.mean(m_pos <= tau)) if len(m_pos) else 0.0
+            fpr_hard = float(np.mean(m_hard <= tau)) if len(m_hard) else 0.0
+            fpr_easy = float(np.mean(m_easy <= tau)) if len(m_easy) else 0.0
+            # Pooled FPR over both negative classes, for the "FPR vs tau" view
+            # where the split into hard/easy is not the axis of interest.
+            n_neg = len(hard) + len(easy)
+            fpr = ((fpr_hard * len(hard)) + (fpr_easy * len(easy))) / n_neg if n_neg else 0.0
+
+            n_flagged = (recall * len(pos)) + (fpr_hard * len(hard)) + (fpr_easy * len(easy))
+            saved = 100.0 * (1.0 - n_flagged / max(n_queries, 1))
+
+            return {
+                "dataset": dataset, "seed": seed, "sweep": sweep,
+                "k": len(radii), "n_reference": len(B),
+                # k_fraction is the nominal knob and is identical across
+                # datasets and folds; `compression` is what it realised here,
+                # which is not (|B| differs per dataset and per fold, so k =
+                # round(kf*|B|) lands on a different ratio each time). Group
+                # and filter on k_fraction -- grouping on compression makes
+                # every fold its own singleton group, which silently drops the
+                # error bars and matches only one dataset when filtering.
+                "k_fraction": float(kf),
+                "compression": len(B) / max(len(radii), 1),
+                "r_med": r_med, "r_max": float(radii.max()) if len(radii) else 0.0,
+                "tau": tau, "recall": recall,
+                "fpr": fpr, "fpr_hard": fpr_hard, "fpr_easy": fpr_easy,
+                "n_positive": len(pos), "n_hard": len(hard), "n_easy": len(easy),
+                "n_queries": n_queries,
+                "accesses_saved_pct": saved,
+                # log10_J is a logsumexp over the balls, i.e. O(k). The
+                # overlap-aware union bound (_tau_volume_bounds_log10) is
+                # deliberately NOT reported here: it is ~O(k^2) -- 7s at
+                # k=2000, ~160s at k=9665 -- and this worker evaluates every
+                # tau in the sweep, so including it multiplied a job's cost by
+                # the length of the grid and dominated the entire evaluation.
+                # Use system_tau's volume-bounds panel for that view, where k
+                # is small and the grid short.
+                "j_tau": _J_tau(radii, dim, tau=tau),
+                "log10_j_tau": _log10_J(radii, dim, tau=tau),
+                "n_balls": len(radii),
+                "d_pos_med": d_pos_med, "d_hard_med": d_hard_med,
+                # The predictor: room left for a ball once the duplicate
+                # distance delta (d_pos_med) is paid for.
+                "margin_budget": d_hard_med - r_med,
+                "memory_bytes": filt.get_bytesize(),
+            }
+
+        # sweep="recall": the equal-recall operating point, one row per k --
+        # tau solved so every compression ratio is compared at the same recall
+        # and FPR is the only thing that moves.
+        tau_recall = float(np.percentile(m_pos, target_recall * 100.0)) if len(m_pos) else 0.0
+        rows.append(row_at(tau_recall, "recall"))
+
+        # sweep="tau": the same cover swept over a fixed, dataset-independent
+        # tau grid. Absolute tau is NOT comparable across corpora (that is the
+        # whole reason the blocklist workload solves for a target instead), so
+        # these rows are for reading one corpus's response curve, not for
+        # ranking corpora against each other at a given tau.
+        for t in tau_values:
+            rows.append(row_at(float(t), "tau"))
     return rows
 
 
@@ -928,6 +1107,7 @@ def stream_rebuild_worker(
 _WORKER_FNS: Dict[str, Any] = {
     'system_tau': system_tau_worker,
     'system': system_worker,
+    'blocklist': blocklist_worker,
     'quantization': quantization_worker,
     'query_performance': query_performance_worker,
     'equal_memory': equal_memory_worker,

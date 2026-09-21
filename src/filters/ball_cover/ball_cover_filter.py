@@ -795,13 +795,6 @@ class BallCoverFilter(Filter):
 
         return self.insert_method.remove(self, vectors)
 
-    def _log_volume_bounds(self) -> Tuple[float, float]:
-        if self._num_spheres == 0:
-            return -np.inf, -np.inf
-        current_centers = self.all_centers
-        self._all_centers = None
-        return estimate_hypersphere_volume(current_centers, self.all_radiuses, return_log=True)
-
     def get_bytesize(self) -> int:
         if not self._constructed:
             return 0

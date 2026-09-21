@@ -14,6 +14,7 @@ import time
 import inspect
 import numpy as np
 import pandas as pd
+from scipy.cluster.hierarchy import DisjointSet
 
 faiss.omp_set_num_threads(1)  # belt-and-suspenders alongside the env vars above
 
@@ -26,8 +27,9 @@ from plots.plot_scaling import generate_scaling_figures
 from plots.plot_streaming import generate_streaming_figures
 from plots.plot_system_tau import generate_system_tau_figures
 from plots.plot_system import generate_system_figures
+from plots.plot_blocklist import generate_blocklist_figures
 from plots.plot_common import DATASETS, DATASET_LABELS
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 from filters.ball_cover.ball_cover_filter import BallCoverFilter
 from filters.dsh_filter import DSHFilter
 from filters.hnsw_filter import HNSWFilter
@@ -35,7 +37,7 @@ from filters.ivf_filter import IVFFilter
 from filters.quantized_vector_filter import QuantizedVectorFilter
 from filters.mlp_filter import MLPFilter
 from util.dataset_paths import dataset_filenames
-from util.fetch_datasets import load_embeds
+from util.fetch_datasets import load_embeds, load_meta
 from vector_source import VectorSource
 
 configure_logging()
@@ -49,7 +51,16 @@ DATASET = 'ELI5'
 # evaluation: the ground-truth FPR/FNR ones (system_tau, quantization,
 # equal_memory, streaming) and the throughput-only sweeps (scaling,
 # query_performance), which used to read a separate STREAM_SIZE.
-WORKLOAD_NUM_VECTORS = 10_000
+WORKLOAD_NUM_VECTORS = 1_000
+
+# generate_blocklist() knobs. The pool is what cluster discovery scans; the
+# stream is the query count per fold. Multiplicity is measured on the pool, so
+# a small pool undercounts cluster sizes (a cluster of true size m yields only
+# ~m * pool/corpus members) -- raise the pool, not just the stream, when
+# clusters look smaller than expected.
+BLOCKLIST_POOL_SIZE = 50_000
+BLOCKLIST_STREAM_SIZE = 10_000
+BLOCKLIST_FOLDS = 3
 
 # Registry name -> canonical dataset key, one source of truth via plot_common.
 DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
@@ -471,6 +482,198 @@ def save_system(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
 
 def plot_system(df: pd.DataFrame) -> None:
     generate_system_figures(df)
+
+
+# generate_blocklist()'s corpora: deliberately NOT DATASET_KEYS. That list is
+# the 5-dataset symmetric sweep, which this workload replaces rather than
+# extends -- and these three were chosen for their duplicate-cluster geometry
+# (see BLOCKLIST_DATASETS' per-entry comments).
+BLOCKLIST_CSV = "results/blocklist.csv"
+BLOCKLIST_DATASETS = {
+    # registry name -> (plot key, label column in the HDF5 meta group or None)
+    # WildChat: clusters of repeated prompts, multiplicity up to 500+, but
+    # duplicates are mostly exact reposts. No labels -- clusters are discovered
+    # geometrically.
+    "WildChat": ("wildchat", None),
+    # CC-News: cross-outlet wire syndication. Same-domain repeats are templated
+    # boilerplate, not syndication, so they are dropped during discovery.
+    "CCNews": ("ccnews", None),
+    # WikiAnswers: editor-labelled paraphrase sets. set_id gives ground truth
+    # that does not come from a distance threshold, breaking the circularity of
+    # defining "duplicate" with the same metric the filter thresholds.
+    "WikiAnswers": ("wikianswers", "set_id"),
+}
+
+
+def _discover_clusters(vectors: np.ndarray, eps: float, kmax: int,
+                       exclude_same: Optional[np.ndarray] = None) -> np.ndarray:
+    """Cluster id per vector, from an eps-neighbourhood graph over each point's
+    kmax nearest neighbours, merged with union-find so a chain of near
+    duplicates becomes one cluster rather than many overlapping pairs.
+
+    Used only for the corpora without labels. The ground truth it produces is
+    partly circular -- "duplicate" is defined by the same L2 metric the filter
+    thresholds -- which is exactly why WikiAnswers (labelled) is the anchor and
+    these two are the supporting corpora.
+
+    exclude_same: optional per-vector group key (CC-News' publisher domain).
+    Edges within a group are dropped, so one site reposting its own boilerplate
+    does not manufacture a giant cluster that no filter should be credited for
+    finding.
+    """
+    n = len(vectors)
+    index = faiss.IndexFlatL2(vectors.shape[1])
+    index.add(vectors)
+    d2, nbr = index.search(vectors, min(kmax, n))
+    dist = np.sqrt(np.clip(d2, 0, None))
+
+    ds = DisjointSet(list(range(n)))
+    for i in range(n):
+        for j, t in zip(nbr[i, 1:], dist[i, 1:]):
+            if t > eps:
+                break  # faiss returns ascending distance, so the rest are farther
+            if exclude_same is not None and exclude_same[i] == exclude_same[j]:
+                continue
+            ds.merge(i, int(j))
+
+    roots = {}
+    labels = np.empty(n, dtype=np.int64)
+    for i in range(n):
+        r = ds[i]
+        labels[i] = roots.setdefault(r, len(roots))
+    return labels
+
+
+def generate_blocklist(runner: Runner) -> None:
+    """Asymmetric blocklist workload: a tight reference set B built from
+    duplicate clusters, queried by a stream of held-out cluster members
+    (positives), members of non-blocklisted clusters (hard negatives) and
+    singletons (easy negatives).
+
+    This is the workload the symmetric sweep (generate_system/_tau) cannot
+    measure. There, B is 80% of the same corpus the queries come from, so B is
+    as diffuse as the query stream, d(query -> B) is just the ambient distance
+    (~1.38 for these unit-normalised 384-d embeddings) and r + tau exceeds it
+    for any ball holding more than one point -- FPR pins at 1 regardless of
+    memory. Shrinking B to a set of tight clusters is what opens the budget.
+
+    Clusters are partitioned by cluster, not by vector: half are blocklisted
+    (80% of each into B, 20% held out as positives) and half are withheld
+    entirely to serve as hard negatives. Splitting by vector instead would
+    scatter every cluster across both roles and leave no hard negatives at all.
+
+    Only submits 'blocklist' jobs (output_csv=BLOCKLIST_CSV) -- does not run
+    `runner`. Cluster discovery runs eagerly here, since it needs the whole
+    pool in memory and is shared by every k_fraction of a dataset.
+    """
+    dim              = 384
+    pool_size        = BLOCKLIST_POOL_SIZE
+    stream_size      = BLOCKLIST_STREAM_SIZE
+    eps              = 0.25
+    kmax             = 64
+    min_cluster      = 3
+    k_fractions      = [0.02, 0.05, 0.1, 0.25, 0.5]
+    target_recall    = 0.95
+    # Shared absolute grid for the tau-swept panels. Stops at 0.4: measured on
+    # a 0..1.2 grid, every corpus was already pinned at FPR 1.000 and 0% saved
+    # by tau=0.3, so the bulk of that range carried no information. All the
+    # structure is in [0, 0.4], and 8 points resolve it while leaving just
+    # enough flat tail to show the saturation.
+    tau_values       = [float(t) for t in np.linspace(0.0, 0.4, 8)]
+    n_folds          = BLOCKLIST_FOLDS
+    # Query stream composition, held identical across corpora so the only
+    # thing varying between them is geometry.
+    frac_positive    = 0.2
+    frac_hard        = 0.4
+
+    for name, (plot_key, label_col) in BLOCKLIST_DATASETS.items():
+        if not os.path.exists(dataset_filenames[name]):
+            logger.warning(f"Skipping {name}: not found on disk")
+            continue
+
+        total = len(VectorSource(name))
+        pool_n = min(pool_size, total)
+        pool = np.ascontiguousarray(VectorSource(name, 0, pool_n).to_array(), dtype=np.float32)
+
+        if label_col is not None:
+            meta = load_meta(name, pool_n)
+            if label_col not in meta:
+                logger.warning(
+                    f"{name}: meta column {label_col!r} missing (dataset predates "
+                    "metadata persistence -- delete the .pkl and rebuild); "
+                    "falling back to geometric cluster discovery"
+                )
+                labels = _discover_clusters(pool, eps, kmax)
+            else:
+                labels = np.asarray(meta[label_col], dtype=np.int64)
+        else:
+            exclude = None
+            if name == "CCNews":
+                dom = load_meta(name, pool_n).get("domain")
+                exclude = np.asarray(dom) if dom is not None else None
+            labels = _discover_clusters(pool, eps, kmax, exclude_same=exclude)
+
+        sizes = np.bincount(labels)
+        dup_clusters = np.where(sizes >= min_cluster)[0]
+        singletons = np.where(np.isin(labels, np.where(sizes == 1)[0]))[0]
+        logger.info(
+            f"{name}: pool={pool_n} clusters>={min_cluster}: {len(dup_clusters)} "
+            f"(largest={sizes.max()}, median={np.median(sizes[dup_clusters]) if len(dup_clusters) else 0:.0f}), "
+            f"singletons={len(singletons)}"
+        )
+        if len(dup_clusters) < 2:
+            logger.warning(f"Skipping {name}: too few duplicate clusters at eps={eps} in a {pool_n}-vector pool")
+            continue
+
+        n_pos = int(frac_positive * stream_size)
+        n_hard = int(frac_hard * stream_size)
+        n_easy = stream_size - n_pos - n_hard
+
+        for fold in range(n_folds):
+            rng = np.random.default_rng(fold)
+            shuffled = rng.permutation(dup_clusters)
+            blocked, withheld = shuffled[: len(shuffled) // 2], shuffled[len(shuffled) // 2:]
+
+            reference, positives = [], []
+            for c in blocked:
+                members = np.where(labels == c)[0]
+                rng.shuffle(members)
+                cut = max(1, int(0.8 * len(members)))
+                reference.extend(members[:cut].tolist())
+                positives.extend(members[cut:].tolist())
+
+            hard_pool = np.where(np.isin(labels, withheld))[0]
+            if not reference or not positives or len(hard_pool) == 0:
+                logger.warning(f"Skipping {name} fold {fold}: empty split")
+                continue
+
+            def take(pool_idx, n):
+                pool_idx = np.asarray(pool_idx)
+                if len(pool_idx) == 0 or n <= 0:
+                    return pool_idx[:0]
+                return rng.choice(pool_idx, size=min(n, len(pool_idx)), replace=False)
+
+            runner.submit(
+                'blocklist',
+                output_csv=BLOCKLIST_CSV,
+                dim=dim, dataset=plot_key, seed=fold,
+                k_fractions=k_fractions, target_recall=target_recall,
+                tau_values=tau_values,
+                vectors_reference=pool[np.asarray(reference)],
+                vectors_positive=pool[take(positives, n_pos)],
+                vectors_hard_negative=pool[take(hard_pool, n_hard)],
+                vectors_easy_negative=pool[take(singletons, n_easy)],
+            )
+
+
+def save_blocklist(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
+    """Extracts this evaluation's rows from a shared Runner's combined run()
+    output (see generate_blocklist())."""
+    return pd.DataFrame(rows_for_mode(job_results, 'blocklist'))
+
+
+def plot_blocklist(df: pd.DataFrame) -> None:
+    generate_blocklist_figures(df)
 
 
 def generate_quantization(runner: Runner) -> None:
@@ -999,9 +1202,9 @@ def generate_and_plot_all() -> None:
     inside runner.run() itself aborts the whole batch, but every job that
     did complete beforehand is still on disk."""
     runner = Runner(num_workers=MAX_WORKERS)
-    
+
     try:
-        generate_system(runner)
+        generate_quantization(runner)
     except Exception:
         logger.exception("An error occurred")
     
@@ -1060,6 +1263,12 @@ def plot_all() -> None:
     try:
         df = pd.read_csv(SYSTEM_CSV)
         plot_system(df)
+    except Exception:
+        logger.exception("An error occurred")
+
+    try:
+        df = pd.read_csv(BLOCKLIST_CSV)
+        plot_blocklist(df)
     except Exception:
         logger.exception("An error occurred")
 

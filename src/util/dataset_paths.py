@@ -21,5 +21,7 @@ dataset_filenames = {
     "TriviaQA": "./datasets/embeds_triviaqa.pkl",
     "HotPotQA": "./datasets/embeds_hotpotqa.pkl",
     "peS2o": "./datasets/embeds_pes2o.pkl",
+    "CCNews": "./datasets/embeds_ccnews.pkl",
+    "WikiAnswers": "./datasets/embeds_wikianswers.pkl",
     # "synthetic_d16": "./datasets/synthetic_d16.h5",
 }
