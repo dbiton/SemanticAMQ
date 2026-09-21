@@ -47,7 +47,7 @@ DATASET = 'ELI5'
 # evaluation: the ground-truth FPR/FNR ones (system_tau, quantization,
 # equal_memory, streaming) and the throughput-only sweeps (scaling,
 # query_performance), which used to read a separate STREAM_SIZE.
-WORKLOAD_NUM_VECTORS = 4_000
+WORKLOAD_NUM_VECTORS = 100_000
 
 # Registry name -> canonical dataset key, one source of truth via plot_common.
 DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
@@ -542,7 +542,7 @@ def generate_scaling(runner: Runner) -> None:
     stream_size      = WORKLOAD_NUM_VECTORS * 70 // 100
     dim              = 384
     n_steps          = 6
-    k_values         = [16, 32, 64, 128, 256, 512]
+    k_percentages    = [1, 2, 4, 8, 16, 32]  # ball budget k, as a percentage of stream_size
     # Powers of 4 from a single query up to 1024: spans three orders of
     # magnitude in 6 lines, and the largest still cuts n_query_vectors into
     # ~20 batches, so no line is timed from a handful of calls.
@@ -568,6 +568,7 @@ def generate_scaling(runner: Runner) -> None:
 
     stream_sizes = sorted({max(1, stream_size // (2 ** i)) for i in range(n_steps)})
     max_stream = max(stream_sizes)
+    k_values = sorted({max(1, round(stream_size * p / 100)) for p in k_percentages})
 
     # Drop sweep entries that no longer fit, rather than raising, so
     # resizing the sweep never requires hand-editing the lists too. Each
@@ -866,7 +867,7 @@ def generate_and_plot_all() -> None:
     runner = Runner(num_workers=MAX_WORKERS)
     
     try:
-        generate_streaming(runner)
+        generate_scaling(runner)
     except Exception:
         logger.exception("An error occurred")
     
@@ -954,5 +955,5 @@ def plot_all() -> None:
 
 
 if __name__ == "__main__":
-    generate_and_plot_all()
-    # plot_all()  # alternative: re-render figures from an existing results/*.csv run
+    # generate_and_plot_all()
+    plot_all()  # alternative: re-render figures from an existing results/*.csv run

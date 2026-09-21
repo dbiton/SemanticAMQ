@@ -8,7 +8,7 @@ budget k is fixed for the whole run (see main.generate_streaming), so every
 panel is a function of stream position only.
 
 Five panels, all with a dashed static-rebuild reference:
-  (a) FPR vs. stream position at fixed k_fixed, median + IQR band over folds.
+  (a) FPR vs. stream position at fixed k_fixed, mean +/- 1 std over folds.
   (b) Geometric objective log10(J_tau) vs. the same x-axis.
   (c) Number of balls vs. stream position -- a validation check (expected
       flat/identical across methods), not a discriminating panel.
@@ -19,14 +19,14 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from typing import List, Optional
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 
-from plots.plot_common import apply_style, style_axes, save_figure
+from plots.plot_common import apply_style, style_axes, save_figure, mean_std
 
 INPUT_PATH = "results/streaming.csv"
 OUTDIR = "plots/streaming/"
@@ -156,24 +156,14 @@ def _style_log_y(ax: plt.Axes) -> None:
     ax.tick_params(axis="y", which="minor", length=1.2, width=0.4)
 
 
-def _median_iqr(df: pd.DataFrame, group_cols: List[str], value_col: str) -> pd.DataFrame:
-    """Median + IQR of value_col over the K-fold stream-offset sweep --
-    used instead of mean+-CI95 since a handful of folds makes single traces
-    cross meaninglessly at these FPR scales."""
-    agg = df.groupby(group_cols)[value_col].agg(
-        median="median", q25=lambda s: s.quantile(0.25), q75=lambda s: s.quantile(0.75), n="count",
-    ).reset_index()
-    return agg
-
-
 # Panel (a): FPR vs. stream position
 
 def panel_fpr_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)]
-    agg = _median_iqr(sel, ["method", "position"], "fpr")
+    agg = mean_std(sel, ["method", "position"], "fpr")
 
     ref = df[(df["sweep"] == "position") & (df["metric"] == "static_reference") & (df["k"] == cfg.k_fixed)]
-    ref_agg = _median_iqr(ref, ["position"], "fpr")
+    ref_agg = mean_std(ref, ["position"], "fpr")
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots()
@@ -181,14 +171,15 @@ def panel_fpr_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         sub = agg[agg["method"] == method].sort_values("position")
         if sub.empty:
             continue
-        ax.plot(sub["position"], sub["median"], color=METHOD_COLORS[method], marker="o",
+        ax.plot(sub["position"], sub["mean"], color=METHOD_COLORS[method], marker="o",
                markersize=2.5, linewidth=0.8, zorder=2)
-        ax.fill_between(sub["position"], sub["q25"], sub["q75"], color=METHOD_COLORS[method],
-                        alpha=0.15, linewidth=0, zorder=1)
+        if (sub["std"] > 0).any():
+            ax.errorbar(sub["position"], sub["mean"], yerr=sub["std"], fmt="none",
+                       ecolor=METHOD_COLORS[method], elinewidth=0.5, capsize=1.5, capthick=0.5, zorder=3)
 
     if not ref_agg.empty:
         ref_agg = ref_agg.sort_values("position")
-        ax.plot(ref_agg["position"], ref_agg["median"], color="black", linestyle="--", linewidth=0.7, zorder=3)
+        ax.plot(ref_agg["position"], ref_agg["mean"], color="black", linestyle="--", linewidth=0.7, zorder=3)
 
     _style_log_y(ax)
     ax.set_xlabel("Stream Position")
@@ -203,10 +194,10 @@ def panel_fpr_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)]
-    agg = _median_iqr(sel, ["method", "position"], "log10_j_tau")
+    agg = mean_std(sel, ["method", "position"], "log10_j_tau")
 
     ref = df[(df["sweep"] == "position") & (df["metric"] == "static_reference") & (df["k"] == cfg.k_fixed)]
-    ref_agg = _median_iqr(ref, ["position"], "log10_j_tau")
+    ref_agg = mean_std(ref, ["position"], "log10_j_tau")
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots()
@@ -214,16 +205,18 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         sub = agg[agg["method"] == method].sort_values("position")
         if sub.empty:
             continue
-        ax.plot(sub["position"], sub["median"], color=METHOD_COLORS[method], marker="o",
+        ax.plot(sub["position"], sub["mean"], color=METHOD_COLORS[method], marker="o",
                markersize=2.5, linewidth=0.8, zorder=2)
-        ax.fill_between(sub["position"], sub["q25"], sub["q75"], color=METHOD_COLORS[method],
-                        alpha=0.15, linewidth=0, zorder=1)
+        if (sub["std"] > 0).any():
+            ax.errorbar(sub["position"], sub["mean"], yerr=sub["std"], fmt="none",
+                       ecolor=METHOD_COLORS[method], elinewidth=0.5, capsize=1.5, capthick=0.5, zorder=3)
 
     if not ref_agg.empty:
         ref_agg = ref_agg.sort_values("position")
-        ax.plot(ref_agg["position"], ref_agg["median"], color="black", linestyle="--", linewidth=0.7, zorder=3)
-        ax.fill_between(ref_agg["position"], ref_agg["q25"], ref_agg["q75"], color="black",
-                        alpha=0.15, linewidth=0, zorder=1)
+        ax.plot(ref_agg["position"], ref_agg["mean"], color="black", linestyle="--", linewidth=0.7, zorder=3)
+        if (ref_agg["std"] > 0).any():
+            ax.errorbar(ref_agg["position"], ref_agg["mean"], yerr=ref_agg["std"], fmt="none",
+                       ecolor="black", elinewidth=0.5, capsize=1.5, capthick=0.5, zorder=3)
 
     ax.set_xlabel("Stream Position")
     ax.set_ylabel(r"$\log_{10} J_\tau(\mathcal{C})$")
@@ -240,10 +233,10 @@ def panel_n_balls_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     overlaid against memory size). Expected flat at k_fixed for all four
     methods -- a validation check, not a discriminating comparison."""
     sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)]
-    agg = _median_iqr(sel, ["method", "position"], "n_balls")
+    agg = mean_std(sel, ["method", "position"], "n_balls")
 
     ref = df[(df["sweep"] == "position") & (df["metric"] == "static_reference") & (df["k"] == cfg.k_fixed)]
-    ref_agg = _median_iqr(ref, ["position"], "n_balls")
+    ref_agg = mean_std(ref, ["position"], "n_balls")
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots()
@@ -251,14 +244,15 @@ def panel_n_balls_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         sub = agg[agg["method"] == method].sort_values("position")
         if sub.empty:
             continue
-        ax.plot(sub["position"], sub["median"], color=METHOD_COLORS[method], marker="o",
+        ax.plot(sub["position"], sub["mean"], color=METHOD_COLORS[method], marker="o",
                markersize=2.5, linewidth=0.8, zorder=2)
-        ax.fill_between(sub["position"], sub["q25"], sub["q75"], color=METHOD_COLORS[method],
-                        alpha=0.15, linewidth=0, zorder=1)
+        if (sub["std"] > 0).any():
+            ax.errorbar(sub["position"], sub["mean"], yerr=sub["std"], fmt="none",
+                       ecolor=METHOD_COLORS[method], elinewidth=0.5, capsize=1.5, capthick=0.5, zorder=3)
 
     if not ref_agg.empty:
         ref_agg = ref_agg.sort_values("position")
-        ax.plot(ref_agg["position"], ref_agg["median"], color="black", linestyle="--", linewidth=0.7, zorder=3)
+        ax.plot(ref_agg["position"], ref_agg["mean"], color="black", linestyle="--", linewidth=0.7, zorder=3)
 
     ax.set_xlabel("Stream Position")
     ax.set_ylabel("Number of Balls")
@@ -278,8 +272,8 @@ def panel_vectors_vs_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     the *contrast* with the flat dashed ball-count line, making the
     "unbounded input, bounded structure" claim visually explicit."""
     sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)]
-    vectors_agg = _median_iqr(sel, ["method", "position"], "position")
-    balls_agg = _median_iqr(sel, ["method", "position"], "n_balls")
+    vectors_agg = mean_std(sel, ["method", "position"], "position")
+    balls_agg = mean_std(sel, ["method", "position"], "n_balls")
 
     apply_style(cfg.dpi)
     fig, ax1 = plt.subplots()
@@ -289,9 +283,9 @@ def panel_vectors_vs_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         balls_sub = balls_agg[balls_agg["method"] == method].sort_values("position")
         if vectors_sub.empty:
             continue
-        ax1.plot(vectors_sub["position"], vectors_sub["median"], color=METHOD_COLORS[method],
+        ax1.plot(vectors_sub["position"], vectors_sub["mean"], color=METHOD_COLORS[method],
                  marker="o", markersize=2.5, linewidth=1.1, linestyle="-", zorder=2)
-        ax2.plot(balls_sub["position"], balls_sub["median"], color=METHOD_COLORS[method],
+        ax2.plot(balls_sub["position"], balls_sub["mean"], color=METHOD_COLORS[method],
                  linewidth=1.6, linestyle="--", zorder=3, alpha=0.8)
 
     ax1.set_xlabel("Stream Position")
@@ -314,8 +308,8 @@ def panel_filter_size(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     comparison. The right axis is scaled by the constant bytes_per_ball so
     the dashed line overlays the solid one exactly."""
     sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)]
-    size_agg = _median_iqr(sel, ["method", "position"], "memory_bytes")
-    balls_agg = _median_iqr(sel, ["method", "position"], "n_balls")
+    size_agg = mean_std(sel, ["method", "position"], "memory_bytes")
+    balls_agg = mean_std(sel, ["method", "position"], "n_balls")
     bytes_per_ball = float((sel["memory_bytes"] / sel["n_balls"]).median())
 
     apply_style(cfg.dpi)
@@ -326,9 +320,9 @@ def panel_filter_size(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         balls_sub = balls_agg[balls_agg["method"] == method].sort_values("position")
         if size_sub.empty:
             continue
-        ax1.plot(size_sub["position"], size_sub["median"], color=METHOD_COLORS[method],
+        ax1.plot(size_sub["position"], size_sub["mean"], color=METHOD_COLORS[method],
                  marker="o", markersize=2.5, linewidth=1.1, linestyle="-", zorder=2)
-        ax2.plot(balls_sub["position"], balls_sub["median"], color=METHOD_COLORS[method],
+        ax2.plot(balls_sub["position"], balls_sub["mean"], color=METHOD_COLORS[method],
                  linewidth=1.6, linestyle="--", zorder=3, alpha=0.8)
 
     ax1.set_xlabel("Stream Position")
