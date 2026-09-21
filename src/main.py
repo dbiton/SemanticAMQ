@@ -25,6 +25,7 @@ from plots.plot_equal_memory import generate_equal_memory_figures
 from plots.plot_scaling import generate_scaling_figures
 from plots.plot_streaming import generate_streaming_figures
 from plots.plot_system_tau import generate_system_tau_figures
+from plots.plot_system import generate_system_figures
 from plots.plot_common import DATASETS, DATASET_LABELS
 from typing import Any, List, Tuple
 from filters.ball_cover.ball_cover_filter import BallCoverFilter
@@ -47,7 +48,7 @@ DATASET = 'ELI5'
 # evaluation: the ground-truth FPR/FNR ones (system_tau, quantization,
 # equal_memory, streaming) and the throughput-only sweeps (scaling,
 # query_performance), which used to read a separate STREAM_SIZE.
-WORKLOAD_NUM_VECTORS = 100_000
+WORKLOAD_NUM_VECTORS = 10_000
 
 # Registry name -> canonical dataset key, one source of truth via plot_common.
 DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
@@ -56,6 +57,7 @@ DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
 # runner.submit(output_csv=...), each save_*'s df, and plot_all()'s reload.
 EQUAL_MEMORY_CSV = "results/equal_memory.csv"
 SYSTEM_TAU_CSV = "results/system_tau.csv"
+SYSTEM_CSV = "results/system.csv"
 QUANTIZATION_CSV = "results/quantization.csv"
 SCALING_QUERY_CSV = "results/scaling_query.csv"
 SCALING_INSERT_CSV = "results/scaling_insert.csv"
@@ -337,6 +339,137 @@ def save_system_tau(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
 
 def plot_system_tau(df: pd.DataFrame) -> None:
     generate_system_tau_figures(df)
+
+
+def generate_system(runner: Runner) -> None:
+    """Same end-to-end filtering benefit as generate_system_tau -- one
+    BallCoverFilter cover per (dataset, fold), queried at every tau without
+    rebuilding -- but tau is *solved for* a target redundancy percentage
+    instead of swept over a fixed, dataset-independent grid.
+
+    For each (dataset, fold), tau at target p is the p-th percentile of
+    that split's query->nearest-construct-vector distances, so exactly p%
+    of the query vectors sit within tau of some construct vector. Percentile
+    is the inverse-ECDF of that exact population, so the measured
+    redundancy rate lands on the target within a rounding hair -- unless the
+    distribution has a mass spike (exact-duplicate embeddings) wide enough
+    to straddle several targets, in which case they collapse onto the same
+    tau and share a measured rate.
+
+    That makes redundancy_pct -- not tau -- the shared x-axis across
+    datasets (see plot_system), which is the point: absolute L2 distances
+    aren't comparable between embedding sets, but "5% of queries are
+    redundant" is.
+
+    Reuses generate_system_tau's splits and its cached per-(dataset, fold)
+    nearest-neighbor distances (same ground_truth_dir, same cache keys), so
+    running both costs that brute-force pass only once.
+
+    Only submits 'system' jobs (output_csv=SYSTEM_CSV) -- does not run
+    `runner`. The ground-truth precomputation still runs eagerly, in its own
+    dedicated ProcessPoolExecutor."""
+    num_vectors      = WORKLOAD_NUM_VECTORS
+    dim              = 384
+    k_folds          = 5
+    k_fraction       = 0.1
+    min_redundancy_pct = 5.0
+    max_redundancy_pct = 20.0
+    count_steps        = 8
+    ground_truth_dir = "results/system_tau_ground_truth"
+
+    redundancy_pcts = [float(p) for p in np.linspace(min_redundancy_pct, max_redundancy_pct, count_steps)]
+
+    datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
+    missing = [d for d in DATASET_KEYS if d not in datasets]
+    if missing:
+        logger.warning(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
+    if set(datasets) != set(DATASET_KEYS):
+        raise RuntimeError(
+            f"generate_system needs all {len(DATASET_KEYS)} datasets "
+            f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
+        )
+
+    logger.info(f"Ball budget fixed as a fraction of the construct set: {k_fraction}")
+    logger.info(f"Target redundancy percentages (shared across datasets): {redundancy_pcts}")
+    logger.info(f"K-fold cross-validation: {k_folds} folds, non-wrapping contiguous 80/20 spans")
+
+    query_len = num_vectors // k_folds
+    construct_len = num_vectors - query_len
+
+    splits = []
+    for dataset in datasets:
+        total_rows = len(VectorSource(dataset))
+        fold_starts = advancing_fold_starts(total_rows, k_folds, query_len, num_vectors)
+        for fold, fold_start in enumerate(fold_starts):
+            query_start, query_end = fold_start, fold_start + query_len
+            construct_start, construct_end = query_end, query_end + construct_len
+            construct_source = VectorSource(dataset, construct_start, construct_end)
+            query_source = VectorSource(dataset, query_start, query_end)
+            splits.append((dataset, fold, construct_source, query_source))
+
+    os.makedirs(ground_truth_dir, exist_ok=True)
+    nn_dist_by_split = {}
+    to_compute = []
+    for dataset, fold, construct_source, query_source in splits:
+        cache_path = os.path.join(ground_truth_dir, f"{dataset}_{num_vectors}_{k_folds}fold_{fold}.npy")
+        if os.path.exists(cache_path):
+            nn_dist_by_split[(dataset, fold)] = np.load(cache_path)
+        else:
+            to_compute.append((dataset, fold, cache_path, construct_source, query_source))
+
+    if to_compute:
+        logger.info(f"Computing ground truth for {len(to_compute)} (dataset, fold) pair(s) not yet cached...")
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(system_tau_ground_truth_worker, dim, cs, qs): (dataset, fold, cache_path)
+                for dataset, fold, cache_path, cs, qs in to_compute
+            }
+            for future in as_completed(futures):
+                dataset, fold, cache_path = futures[future]
+                nn_dist = future.result()
+                np.save(cache_path, nn_dist)
+                nn_dist_by_split[(dataset, fold)] = nn_dist
+    else:
+        logger.info("All ground truth already cached on disk; skipping recomputation.")
+
+    for dataset, fold, construct_source, query_source in splits:
+        nn_dist = nn_dist_by_split[(dataset, fold)]
+
+        # tau solved per (dataset, fold) so that redundancy_pcts[i]% of this
+        # split's queries are within tau_values[i] of a construct vector.
+        tau_values = [float(np.percentile(nn_dist, p)) for p in redundancy_pcts]
+        logger.info(
+            f"{dataset} fold {fold}: tau per target % = "
+            + ", ".join(f"{p:.1f}%->{t:.4f}" for p, t in zip(redundancy_pcts, tau_values))
+        )
+        # Keyed by tau, so colliding targets share one entry -- the worker
+        # still emits one row per (tau, target) pair.
+        actual_results_by_tau = {t: (nn_dist <= t).tolist() for t in tau_values}
+
+        k = min(max(1, round(k_fraction * construct_len)), construct_len - 1)
+
+        runner.submit(
+            'system',
+            output_csv=SYSTEM_CSV,
+            dim=dim, dataset=DATASET_KEYS[dataset],
+            k=k, tau_values=tau_values, redundancy_pcts=redundancy_pcts,
+            seed=fold,
+            vectors_construct=construct_source,
+            vectors_query=query_source,
+            actual_results_by_tau=actual_results_by_tau,
+            )
+
+
+def save_system(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
+    """Extracts this evaluation's rows from a shared Runner's combined
+    run() output (see generate_system()). The Runner itself already wrote
+    results/system.csv incrementally, so this only rebuilds the DataFrame
+    for plot_system()."""
+    return pd.DataFrame(rows_for_mode(job_results, 'system'))
+
+
+def plot_system(df: pd.DataFrame) -> None:
+    generate_system_figures(df)
 
 
 def generate_quantization(runner: Runner) -> None:
@@ -867,13 +1000,18 @@ def generate_and_plot_all() -> None:
     runner = Runner(num_workers=MAX_WORKERS)
     
     try:
-        generate_scaling(runner)
+        generate_system(runner)
     except Exception:
         logger.exception("An error occurred")
     
     '''    
     try:
         generate_system_tau(runner)
+    except Exception:
+        logger.exception("An error occurred")
+
+    try:
+        generate_system(runner)
     except Exception:
         logger.exception("An error occurred")
 
@@ -919,6 +1057,12 @@ def plot_all() -> None:
         logger.exception("An error occurred")
 
     try:
+        df = pd.read_csv(SYSTEM_CSV)
+        plot_system(df)
+    except Exception:
+        logger.exception("An error occurred")
+
+    try:
         # keep_default_na=False: stage/config strings are read verbatim; pandas
         # would otherwise read back as NaN (see plot_quantization.py::load_data()).
         df = pd.read_csv(QUANTIZATION_CSV, keep_default_na=False)
@@ -955,5 +1099,5 @@ def plot_all() -> None:
 
 
 if __name__ == "__main__":
-    # generate_and_plot_all()
-    plot_all()  # alternative: re-render figures from an existing results/*.csv run
+    generate_and_plot_all()
+    # plot_all()  # alternative: re-render figures from an existing results/*.csv run
