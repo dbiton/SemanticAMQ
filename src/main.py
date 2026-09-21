@@ -27,7 +27,6 @@ from plots.plot_equal_memory import generate_equal_memory_figures
 from plots.plot_scaling import generate_scaling_figures
 from plots.plot_streaming import generate_streaming_figures
 from plots.plot_system_tau import generate_system_tau_figures
-from plots.plot_system import generate_system_figures
 from plots.plot_blocklist import generate_blocklist_figures
 from plots.plot_common import DATASETS, DATASET_LABELS
 from typing import Any, Dict, List, Optional, Tuple
@@ -58,7 +57,7 @@ DATASET = 'ELI5'
 # drops that corpus and silently reduces the comparison to two. 2^15 leaves
 # ~10% headroom there; system_tau's non-wrapping folds need 1.8N = 58,982 rows
 # per dataset, which its shortest (HotpotQA, 97,852) clears comfortably.
-WORKLOAD_NUM_VECTORS = 2 ** 15  # 32,768
+WORKLOAD_NUM_VECTORS = 2 ** 10  # 32,768
 
 # generate_blocklist() knobs. Cluster discovery scans the whole file on disk.
 # Multiplicity is a property of the pool, not of the corpus, so a partial pool
@@ -85,6 +84,19 @@ BLOCKLIST_FOLDS = 5
 # between corpora purely because one file is bigger.
 BLOCKLIST_QUERY_FRACTION = 0.2
 
+# 0.4 L2 on unit-normalised vectors = cosine 0.92, the conventional
+# paraphrase threshold. Inspected rather than assumed: same-cluster
+# WikiAnswers pairs at d~0.4 are true rewordings ("How many calories on 10
+# strawberries?" / "How many calories in some strawberries?"), while pairs
+# at d~0.75 are merely on-topic ("Why was the schlefan plan important to
+# britain?" / "Why was the battle of britain important?"). Agreement with
+# WikiAnswers' editor labels actually peaks near 0.75, but those labels are
+# loose -- they group topically related questions -- so fitting them would
+# pull eps into the non-paraphrase range.
+BLOCKLIST_EPS = 0.4
+BLOCKLIST_MIN_CLUSTER = 3
+
+
 # Cluster labels are a pure function of (dataset, pool size, eps, and the
 # config), so they are computed once and cached here rather than recomputed
 # every run -- the same pattern generate_system_tau uses for its ground truth.
@@ -97,8 +109,21 @@ DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
 # runner.submit(output_csv=...), each save_*'s df, and plot_all()'s reload.
 EQUAL_MEMORY_CSV = "results/equal_memory.csv"
 SYSTEM_TAU_CSV = "results/system_tau.csv"
-SYSTEM_CSV = "results/system.csv"
-QUANTIZATION_CSV = "results/quantization.csv"
+# generate_quantization runs once per blocklist corpus and keeps each run in
+# its own folder. Separate rather than one combined file because
+# plot_quantization asserts a single dataset: its panels already spend both
+# dimensions on memory and quantizer, leaving nowhere to put a dataset.
+QUANTIZATION_DIR = "results/quantization"
+QUANTIZATION_PLOT_DIR = "plots/quantization"
+
+
+def quantization_csv(dataset: str) -> str:
+    return os.path.join(QUANTIZATION_DIR, dataset, "quantization.csv")
+
+
+def quantization_plot_dir(dataset: str) -> str:
+    return os.path.join(QUANTIZATION_PLOT_DIR, dataset)
+
 SCALING_QUERY_CSV = "results/scaling_query.csv"
 SCALING_INSERT_CSV = "results/scaling_insert.csv"
 SCALING_CONSTRUCTION_CSV = "results/scaling_construction.csv"
@@ -379,137 +404,6 @@ def save_system_tau(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
 
 def plot_system_tau(df: pd.DataFrame) -> None:
     generate_system_tau_figures(df)
-
-
-def generate_system(runner: Runner) -> None:
-    """Same end-to-end filtering benefit as generate_system_tau -- one
-    BallCoverFilter cover per (dataset, fold), queried at every tau without
-    rebuilding -- but tau is *solved for* a target redundancy percentage
-    instead of swept over a fixed, dataset-independent grid.
-
-    For each (dataset, fold), tau at target p is the p-th percentile of
-    that split's query->nearest-construct-vector distances, so exactly p%
-    of the query vectors sit within tau of some construct vector. Percentile
-    is the inverse-ECDF of that exact population, so the measured
-    redundancy rate lands on the target within a rounding hair -- unless the
-    distribution has a mass spike (exact-duplicate embeddings) wide enough
-    to straddle several targets, in which case they collapse onto the same
-    tau and share a measured rate.
-
-    That makes redundancy_pct -- not tau -- the shared x-axis across
-    datasets (see plot_system), which is the point: absolute L2 distances
-    aren't comparable between embedding sets, but "5% of queries are
-    redundant" is.
-
-    Reuses generate_system_tau's splits and its cached per-(dataset, fold)
-    nearest-neighbor distances (same ground_truth_dir, same cache keys), so
-    running both costs that brute-force pass only once.
-
-    Only submits 'system' jobs (output_csv=SYSTEM_CSV) -- does not run
-    `runner`. The ground-truth precomputation still runs eagerly, in its own
-    dedicated ProcessPoolExecutor."""
-    num_vectors      = WORKLOAD_NUM_VECTORS
-    dim              = 384
-    k_folds          = 5
-    k_fraction       = 0.1
-    min_redundancy_pct = 5.0
-    max_redundancy_pct = 20.0
-    count_steps        = 8
-    ground_truth_dir = "results/system_tau_ground_truth"
-
-    redundancy_pcts = [float(p) for p in np.linspace(min_redundancy_pct, max_redundancy_pct, count_steps)]
-
-    datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
-    missing = [d for d in DATASET_KEYS if d not in datasets]
-    if missing:
-        logger.warning(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
-    if set(datasets) != set(DATASET_KEYS):
-        raise RuntimeError(
-            f"generate_system needs all {len(DATASET_KEYS)} datasets "
-            f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
-        )
-
-    logger.info(f"Ball budget fixed as a fraction of the construct set: {k_fraction}")
-    logger.info(f"Target redundancy percentages (shared across datasets): {redundancy_pcts}")
-    logger.info(f"K-fold cross-validation: {k_folds} folds, non-wrapping contiguous 80/20 spans")
-
-    query_len = num_vectors // k_folds
-    construct_len = num_vectors - query_len
-
-    splits = []
-    for dataset in datasets:
-        total_rows = len(VectorSource(dataset))
-        fold_starts = advancing_fold_starts(total_rows, k_folds, query_len, num_vectors)
-        for fold, fold_start in enumerate(fold_starts):
-            query_start, query_end = fold_start, fold_start + query_len
-            construct_start, construct_end = query_end, query_end + construct_len
-            construct_source = VectorSource(dataset, construct_start, construct_end)
-            query_source = VectorSource(dataset, query_start, query_end)
-            splits.append((dataset, fold, construct_source, query_source))
-
-    os.makedirs(ground_truth_dir, exist_ok=True)
-    nn_dist_by_split = {}
-    to_compute = []
-    for dataset, fold, construct_source, query_source in splits:
-        cache_path = os.path.join(ground_truth_dir, f"{dataset}_{num_vectors}_{k_folds}fold_{fold}.npy")
-        if os.path.exists(cache_path):
-            nn_dist_by_split[(dataset, fold)] = np.load(cache_path)
-        else:
-            to_compute.append((dataset, fold, cache_path, construct_source, query_source))
-
-    if to_compute:
-        logger.info(f"Computing ground truth for {len(to_compute)} (dataset, fold) pair(s) not yet cached...")
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(system_tau_ground_truth_worker, dim, cs, qs): (dataset, fold, cache_path)
-                for dataset, fold, cache_path, cs, qs in to_compute
-            }
-            for future in as_completed(futures):
-                dataset, fold, cache_path = futures[future]
-                nn_dist = future.result()
-                np.save(cache_path, nn_dist)
-                nn_dist_by_split[(dataset, fold)] = nn_dist
-    else:
-        logger.info("All ground truth already cached on disk; skipping recomputation.")
-
-    for dataset, fold, construct_source, query_source in splits:
-        nn_dist = nn_dist_by_split[(dataset, fold)]
-
-        # tau solved per (dataset, fold) so that redundancy_pcts[i]% of this
-        # split's queries are within tau_values[i] of a construct vector.
-        tau_values = [float(np.percentile(nn_dist, p)) for p in redundancy_pcts]
-        logger.info(
-            f"{dataset} fold {fold}: tau per target % = "
-            + ", ".join(f"{p:.1f}%->{t:.4f}" for p, t in zip(redundancy_pcts, tau_values))
-        )
-        # Keyed by tau, so colliding targets share one entry -- the worker
-        # still emits one row per (tau, target) pair.
-        actual_results_by_tau = {t: (nn_dist <= t).tolist() for t in tau_values}
-
-        k = min(max(1, round(k_fraction * construct_len)), construct_len - 1)
-
-        runner.submit(
-            'system',
-            output_csv=SYSTEM_CSV,
-            dim=dim, dataset=DATASET_KEYS[dataset],
-            k=k, tau_values=tau_values, redundancy_pcts=redundancy_pcts,
-            seed=fold,
-            vectors_construct=construct_source,
-            vectors_query=query_source,
-            actual_results_by_tau=actual_results_by_tau,
-            )
-
-
-def save_system(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
-    """Extracts this evaluation's rows from a shared Runner's combined
-    run() output (see generate_system()). The Runner itself already wrote
-    results/system.csv incrementally, so this only rebuilds the DataFrame
-    for plot_system()."""
-    return pd.DataFrame(rows_for_mode(job_results, 'system'))
-
-
-def plot_system(df: pd.DataFrame) -> None:
-    generate_system_figures(df)
 
 
 # generate_blocklist()'s corpora: deliberately NOT DATASET_KEYS. That list is
@@ -830,13 +724,176 @@ def _cluster_labels(dataset: str, vectors: Optional[np.ndarray], eps: float,
     return labels
 
 
+class BlocklistWorkload:
+    """One corpus's blocklist workload: cluster labels, the per-fold
+    reference/query index selection, and a reader for the rows it names.
+
+    Shared by generate_blocklist and generate_quantization so both evaluate on
+    the same construction and query sets. The two then differ only in what
+    they sweep -- ball budget versus quantizer -- which is the point: a
+    difference between their results is a difference in the swept variable,
+    not in the data underneath.
+    """
+
+    def __init__(self, name: str, plot_key: str, selections: List[Dict[str, np.ndarray]],
+                 pool: Optional[np.ndarray], stream_size: int, reference_target: int) -> None:
+        self.name = name
+        self.plot_key = plot_key
+        self.selections = selections
+        self._pool = pool
+        self.stream_size = stream_size
+        self.reference_target = reference_target
+
+    def rows(self, idx: np.ndarray) -> np.ndarray:
+        idx = np.asarray(idx, dtype=np.int64)
+        return self._pool[idx] if self._pool is not None else _read_rows(self.name, idx)
+
+    def query_vectors(self, sel: Dict[str, np.ndarray]) -> np.ndarray:
+        """A fold's queries as one array: positives, then hard negatives, then
+        easy negatives, in that order.
+
+        Ground truth is deliberately NOT returned with them. The two callers
+        need different definitions and the difference is load-bearing:
+        blocklist_worker judges against cluster membership, while
+        generate_quantization must judge against distance to the reference set
+        (see cluster_membership and its warning)."""
+        parts = [self.rows(sel[key]) for key in ("positive", "hard", "easy") if len(sel[key])]
+        return np.concatenate(parts) if parts else np.empty((0, 0), dtype=np.float32)
+
+    @staticmethod
+    def cluster_membership(sel: Dict[str, np.ndarray]) -> List[bool]:
+        """Label ground truth for query_vectors: positives are held-out members
+        of blocklisted clusters, everything else is not.
+
+        NOT usable with quantization_worker, which asserts a zero
+        false-negative invariant. That invariant holds only when "duplicate"
+        means "within tau of the reference set" -- the cover contains every
+        reference vector, so anything within tau of one is necessarily flagged.
+        A cluster member can sit FARTHER than tau from the reference set and be
+        missed legitimately, and since tau is solved for 95% recall, about 5%
+        of positives do exactly that. Passing this to quantization raised
+        "Zero-false-negative invariant violated" with fnr ~= 0.049."""
+        actual: List[bool] = []
+        for key in ("positive", "hard", "easy"):
+            actual.extend([key == "positive"] * len(sel[key]))
+        return actual
+
+    def recall_tau(self, sel: Dict[str, np.ndarray], target_recall: float) -> float:
+        """Smallest tau catching `target_recall` of this fold's positives by
+        exact distance to the reference set -- the operating point
+        blocklist_worker solves for, so both evaluations sit at comparable
+        thresholds."""
+        reference = np.ascontiguousarray(self.rows(sel["reference"]), dtype=np.float32)
+        positives = np.ascontiguousarray(self.rows(sel["positive"]), dtype=np.float32)
+        index = faiss.IndexFlatL2(reference.shape[1])
+        index.add(reference)
+        nn = np.sqrt(np.clip(index.search(positives, 1)[0][:, 0], 0, None))
+        return float(np.percentile(nn, target_recall * 100.0))
+
+
+def build_blocklist_workload(name: str, plot_key: str, label_col: Optional[str],
+                             num_vectors: int, n_folds: int) -> Optional[BlocklistWorkload]:
+    """Cluster a corpus and cut it into per-fold blocklist splits, or return
+    None (logging why) if it cannot supply the requested sizes."""
+    eps, min_cluster = BLOCKLIST_EPS, BLOCKLIST_MIN_CLUSTER
+    query_fraction, frac_positive, frac_hard = BLOCKLIST_QUERY_FRACTION, 0.2, 0.4
+
+    if not os.path.exists(dataset_filenames[name]):
+        logger.warning(f"Skipping {name}: not found on disk")
+        return None
+
+    total = len(VectorSource(name))
+    pool_n = total if BLOCKLIST_POOL_SIZE is None else min(BLOCKLIST_POOL_SIZE, total)
+
+    # The pool is materialised only to DISCOVER clusters: not needed when a
+    # corpus carries its own labels, nor once discovery has cached them.
+    needs_pool = label_col is None and not _cluster_cache_exists(
+        name, pool_n, eps, name == "CCNews")
+    pool = None
+    if needs_pool:
+        pool = np.ascontiguousarray(VectorSource(name, 0, pool_n).to_array(), dtype=np.float32)
+
+    if label_col is not None:
+        meta = load_meta(name, pool_n)
+        if label_col not in meta:
+            logger.warning(f"{name}: meta column {label_col!r} missing; using geometric discovery")
+            labels = _cluster_labels(name, pool, eps, pool_n=pool_n)
+        else:
+            labels = np.asarray(meta[label_col], dtype=np.int64)
+    else:
+        exclude = None
+        if name == "CCNews":
+            dom = load_meta(name, pool_n).get("domain")
+            exclude = np.asarray(dom) if dom is not None else None
+        labels = _cluster_labels(name, pool, eps, exclude_same=exclude, pool_n=pool_n)
+
+    sizes = np.bincount(labels)
+    dup_clusters = np.where(sizes >= min_cluster)[0]
+    singletons = np.where(np.isin(labels, np.where(sizes == 1)[0]))[0]
+    logger.info(
+        f"{name}: pool={pool_n} clusters>={min_cluster}: {len(dup_clusters)} "
+        f"(largest={sizes.max()}, median={np.median(sizes[dup_clusters]) if len(dup_clusters) else 0:.0f}), "
+        f"singletons={len(singletons)}")
+    if len(dup_clusters) < 2:
+        logger.warning(f"Skipping {name}: too few duplicate clusters at eps={eps}")
+        return None
+
+    stream_size = int(round(query_fraction * num_vectors))
+    reference_target = num_vectors - stream_size
+    n_pos = int(frac_positive * stream_size)
+    n_hard = int(frac_hard * stream_size)
+    n_easy = stream_size - n_pos - n_hard
+
+    # Feasibility up front, not fold by fold: a corpus that cannot fill |B|
+    # consumes every cluster trying, leaves none withheld, loses its hard
+    # negatives, and disappears from the results with only a per-fold warning.
+    usable = int(0.8 * sizes[dup_clusters].sum())
+    if usable < reference_target + n_hard:
+        max_n = int(usable / ((1.0 - query_fraction) + frac_hard * query_fraction))
+        logger.error(
+            f"Skipping {name}: needs {reference_target} reference + {n_hard} hard-negative "
+            f"vectors but only {usable} are available in clusters of >={min_cluster} at "
+            f"eps={eps}. Lower WORKLOAD_NUM_VECTORS to <= {max_n} for this corpus, or "
+            f"loosen eps/min_cluster.")
+        return None
+
+    members_by_cluster = _group_by_label(labels, dup_clusters)
+    selections = _fold_selections(
+        name, labels, dup_clusters, singletons, members_by_cluster,
+        n_folds=n_folds, reference_target=reference_target,
+        n_pos=n_pos, n_hard=n_hard, n_easy=n_easy,
+        pool_n=pool_n, eps=eps, stream_size=stream_size,
+        query_fraction=query_fraction, xgroup=(name == "CCNews"))
+    if not _selection_is_usable(selections):
+        logger.error(f"Skipping {name}: fold selection is empty")
+        return None
+
+    logger.info(
+        f"{name}: |B|={len(selections[0]['reference'])} (target {reference_target}), "
+        f"stream={stream_size} ({n_pos} pos / {n_hard} hard / {n_easy} easy)")
+    return BlocklistWorkload(name, plot_key, selections, pool, stream_size, reference_target)
+
+
+def blocklist_workloads(num_vectors: int, n_folds: int = BLOCKLIST_FOLDS,
+                        only: Optional[str] = None) -> List[BlocklistWorkload]:
+    """Every corpus's workload, or just the one `only` names."""
+    out = []
+    for name, (plot_key, label_col) in BLOCKLIST_DATASETS.items():
+        if only is not None and name != only:
+            continue
+        w = build_blocklist_workload(name, plot_key, label_col, num_vectors, n_folds)
+        if w is not None:
+            out.append(w)
+    return out
+
+
 def generate_blocklist(runner: Runner) -> None:
     """Asymmetric blocklist workload: a tight reference set B built from
     duplicate clusters, queried by a stream of held-out cluster members
     (positives), members of non-blocklisted clusters (hard negatives) and
     singletons (easy negatives).
 
-    This is the workload the symmetric sweep (generate_system/_tau) cannot
+    This is the workload the symmetric sweep (generate_system_tau) cannot
     measure. There, B is 80% of the same corpus the queries come from, so B is
     as diffuse as the query stream, d(query -> B) is just the ambient distance
     (~1.38 for these unit-normalised 384-d embeddings) and r + tau exceeds it
@@ -855,17 +912,6 @@ def generate_blocklist(runner: Runner) -> None:
     dim              = 384
     pool_size        = BLOCKLIST_POOL_SIZE
     num_vectors      = WORKLOAD_NUM_VECTORS
-    # 0.4 L2 on unit-normalised vectors = cosine 0.92, the conventional
-    # paraphrase threshold. Inspected rather than assumed: same-cluster
-    # WikiAnswers pairs at d~0.4 are true rewordings ("How many calories on 10
-    # strawberries?" / "How many calories in some strawberries?"), while pairs
-    # at d~0.75 are merely on-topic ("Why was the schlefan plan important to
-    # britain?" / "Why was the battle of britain important?"). Agreement with
-    # WikiAnswers' editor labels actually peaks near 0.75, but those labels are
-    # loose -- they group topically related questions -- so fitting them would
-    # pull eps into the non-paraphrase range.
-    eps              = 0.4
-    min_cluster      = 3
     k_fractions      = [0.02, 0.05, 0.1, 0.25, 0.5]
     target_recall    = 0.95
     # Shared absolute grid for the tau-swept panels. Stops at 0.4: measured on
@@ -875,129 +921,20 @@ def generate_blocklist(runner: Runner) -> None:
     # enough flat tail to show the saturation.
     tau_values       = [float(t) for t in np.linspace(0.0, 0.4, 8)]
     n_folds          = BLOCKLIST_FOLDS
-    # Query stream composition, held identical across corpora so the only
-    # thing varying between them is geometry.
-    frac_positive    = 0.2
-    frac_hard        = 0.4
-    query_fraction   = BLOCKLIST_QUERY_FRACTION
 
-    for name, (plot_key, label_col) in BLOCKLIST_DATASETS.items():
-        if not os.path.exists(dataset_filenames[name]):
-            logger.warning(f"Skipping {name}: not found on disk")
-            continue
-
-        total = len(VectorSource(name))
-        pool_n = total if pool_size is None else min(pool_size, total)
-
-        # The full pool is materialised only when clusters have to be
-        # discovered. Once labels are cached, a fold needs a few thousand rows
-        # out of the pool, so reading all of them back costs 1.5 GB and seconds
-        # per run on WildChat for nothing (see _read_rows).
-        # The pool is materialised only to DISCOVER clusters. It is not needed
-        # when a corpus carries its own labels (WikiAnswers' set_id) or when
-        # discovery already ran and cached them -- in both cases a fold reads
-        # just its own few thousand rows via _read_rows, instead of pulling
-        # 1.5 GB for WildChat to use ~50k of it.
-        needs_pool = label_col is None and not _cluster_cache_exists(
-            name, pool_n, eps, name == "CCNews")
-        pool = None
-        if needs_pool:
-            pool = np.ascontiguousarray(VectorSource(name, 0, pool_n).to_array(), dtype=np.float32)
-
-        if label_col is not None:
-            meta = load_meta(name, pool_n)
-            if label_col not in meta:
-                logger.warning(
-                    f"{name}: meta column {label_col!r} missing (dataset predates "
-                    "metadata persistence -- delete the .pkl and rebuild); "
-                    "falling back to geometric cluster discovery"
-                )
-                labels = _cluster_labels(name, pool, eps, pool_n=pool_n)
-            else:
-                labels = np.asarray(meta[label_col], dtype=np.int64)
-        else:
-            exclude = None
-            if name == "CCNews":
-                dom = load_meta(name, pool_n).get("domain")
-                exclude = np.asarray(dom) if dom is not None else None
-            labels = _cluster_labels(name, pool, eps, exclude_same=exclude, pool_n=pool_n)
-
-        sizes = np.bincount(labels)
-        dup_clusters = np.where(sizes >= min_cluster)[0]
-        singletons = np.where(np.isin(labels, np.where(sizes == 1)[0]))[0]
-        logger.info(
-            f"{name}: pool={pool_n} clusters>={min_cluster}: {len(dup_clusters)} "
-            f"(largest={sizes.max()}, median={np.median(sizes[dup_clusters]) if len(dup_clusters) else 0:.0f}), "
-            f"singletons={len(singletons)}"
-        )
-        if len(dup_clusters) < 2:
-            logger.warning(f"Skipping {name}: too few duplicate clusters at eps={eps} in a {pool_n}-vector pool")
-            continue
-
-        stream_size = int(round(query_fraction * num_vectors))
-        reference_target = num_vectors - stream_size
-        n_pos = int(frac_positive * stream_size)
-        n_hard = int(frac_hard * stream_size)
-        n_easy = stream_size - n_pos - n_hard
-
-        # Feasibility, checked up front rather than discovered fold by fold.
-        # A corpus that cannot fill |B| consumes every cluster trying, leaves
-        # none withheld, and so has no hard negatives -- every fold then aborts
-        # and the corpus vanishes from the results with only a per-fold
-        # warning. That is how CC-News silently disappeared from a 15-minute
-        # run at N=50,000: it holds 39,621 vectors in clusters of >=3, so 80%
-        # of them is 31,696 against a 40,000 target.
-        usable = int(0.8 * sizes[dup_clusters].sum())
-        if usable < reference_target + n_hard:
-            max_n = int((usable) / ((1.0 - query_fraction) + frac_hard * query_fraction))
-            logger.error(
-                f"Skipping {name}: needs {reference_target} reference + {n_hard} hard-negative "
-                f"vectors but only {usable} are available in clusters of >={min_cluster} "
-                f"at eps={eps}. Lower WORKLOAD_NUM_VECTORS to <= {max_n} for this corpus, "
-                f"or loosen eps/min_cluster."
-            )
-            continue
-
-        # One argsort-based grouping, not a np.where scan per cluster: the
-        # latter is O(clusters * n), which on WildChat is 33,545 x 1M = 3.4e10
-        # comparisons just to find cluster memberships.
-        members_by_cluster = _group_by_label(labels, dup_clusters)
-
-        selections = _fold_selections(
-            name, labels, dup_clusters, singletons, members_by_cluster,
-            n_folds=n_folds, reference_target=reference_target,
-            n_pos=n_pos, n_hard=n_hard, n_easy=n_easy,
-            pool_n=pool_n, eps=eps, stream_size=stream_size,
-            query_fraction=query_fraction, xgroup=(name == "CCNews"),
-        )
-
-        for fold, sel in enumerate(selections):
-
-            if not len(sel["reference"]) or not len(sel["positive"]) or not len(sel["hard"]):
-                logger.warning(f"Skipping {name} fold {fold}: empty split")
-                continue
-
-            def rows(idx):
-                idx = np.asarray(idx, dtype=np.int64)
-                return pool[idx] if pool is not None else _read_rows(name, idx)
-
+    for workload in blocklist_workloads(num_vectors, n_folds=n_folds):
+        for fold, sel in enumerate(workload.selections):
             runner.submit(
                 'blocklist',
                 output_csv=BLOCKLIST_CSV,
-                dim=dim, dataset=plot_key, seed=fold,
+                dim=dim, dataset=workload.plot_key, seed=fold,
                 k_fractions=k_fractions, target_recall=target_recall,
                 tau_values=tau_values,
-                vectors_reference=rows(sel["reference"]),
-                vectors_positive=rows(sel["positive"]),
-                vectors_hard_negative=rows(sel["hard"]),
-                vectors_easy_negative=rows(sel["easy"]),
+                vectors_reference=workload.rows(sel["reference"]),
+                vectors_positive=workload.rows(sel["positive"]),
+                vectors_hard_negative=workload.rows(sel["hard"]),
+                vectors_easy_negative=workload.rows(sel["easy"]),
             )
-            if fold == 0:
-                logger.info(
-                    f"{name}: |B|={len(sel['reference'])} (target {reference_target}), "
-                    f"stream={stream_size} ({len(sel['positive'])} pos / "
-                    f"{len(sel['hard'])} hard / {len(sel['easy'])} easy)"
-                )
 
 
 def save_blocklist(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
@@ -1011,89 +948,107 @@ def plot_blocklist(df: pd.DataFrame) -> None:
 
 
 def generate_quantization(runner: Runner) -> None:
-    """Generates per-quantize-variant construction data for BallCoverFilter
-    (QUANTIZATION_SWEEP) on a single dataset. Every candidate shares one
-    memory budget per k (derived from the unquantized cover's byte-per-ball
-    size), so a more compact quantizer packs more balls into the same
-    budget, letting plot_quantization.py use recorded memory usage as the
-    x-axis. k_values/tau_values derive from num_vectors/percentage_construct
-    rather than hardcoded absolutes, so those two knobs rescale the whole
-    sweep. Dataset and duplicate percentage follow the paper's Figure 3
-    caption ("MS MARCO, tau such that 5% are duplicates").
+    """Per-quantizer construction data for BallCoverFilter
+    (QUANTIZATION_SWEEP), on the same construction and query sets as
+    generate_blocklist.
 
-    K-fold cross-validation (Section 5.1): 5 non-wrapping folds via
-    advancing_fold_starts, tagged via seed=fold for plot_quantization's
-    seed-based mean +/- 95% CI aggregation. tau is a single value, calibrated
-    once from fold 0's construct set so every fold lands on the same
-    threshold; each fold's ground truth is still recomputed from its own
-    construct/query split. This sweep varies the quantizer, not the
-    threshold -- the tau sweep lives in generate_system_tau().
+    Every candidate shares one memory budget per k (derived from the
+    unquantized cover's byte-per-ball size), so a more compact quantizer packs
+    more balls into the same budget and plot_quantization.py can use recorded
+    memory usage as its x-axis.
 
-    Only submits 'quantization' jobs (output_csv=QUANTIZATION_CSV) -- does
-    not run `runner`."""
-    num_vectors            = WORKLOAD_NUM_VECTORS
-    dim                    = 384
-    k_folds                = 5
-    k_fractions            = [0.02, 0.04, 0.08, 0.16, 0.32]
-    duplicate_percentage   = 5
+    Reuses build_blocklist_workload rather than cutting its own contiguous
+    spans, so the only difference between this sweep and the blocklist one is
+    the variable being swept: the quantizer here, the ball budget there. tau is
+    a single value, solved once on fold 0 for the same target recall
+    blocklist_worker uses, so both evaluations sit at a comparable operating
+    point. Ground truth here is distance to the reference set, not the
+    blocklist workload's cluster membership: quantization_worker asserts a
+    zero false-negative invariant that only holds under the distance
+    definition (see BlocklistWorkload.cluster_membership).
 
-    dataset = "MsMarco"  # Figure 3: "We evaluate on MS MARCO"
+    Runs once per blocklist corpus, each into its own
+    results/quantization/<dataset>/ folder and its own figure folder.
+    Kept apart rather than pooled because plot_quantization asserts a single
+    dataset -- its panels put memory on the x-axis and one line per quantizer,
+    leaving no room for a dataset dimension -- and because tau is solved per
+    corpus, so a pooled file would also carry several thresholds.
 
-    query_len = num_vectors // k_folds
-    construct_len = num_vectors - query_len
-    total_rows = len(VectorSource(dataset))
-    fold_starts = advancing_fold_starts(total_rows, k_folds, query_len, num_vectors)
+    Only submits 'quantization' jobs -- does not run `runner`."""
+    num_vectors   = WORKLOAD_NUM_VECTORS
+    dim           = 384
+    n_folds       = BLOCKLIST_FOLDS
+    k_fractions   = [0.02, 0.04, 0.08, 0.16, 0.32]
+    target_recall = 0.95
 
-    k_values = sorted({max(1, round(construct_len * f)) for f in k_fractions})
-    k_values = [k for k in k_values if k < construct_len]
-    if not k_values:
+    workloads = blocklist_workloads(num_vectors, n_folds=n_folds)
+    if not workloads:
         raise RuntimeError(
-            f"No k_fraction in {k_fractions} produced a k below the construct set "
-            f"({construct_len} vectors). Raise num_vectors or lower k_fractions."
-        )
-    logger.info(f"Scaling k_values to {k_values} ({construct_len} vectors in the construct set)")
+            "generate_quantization: no usable workload for any corpus (see the errors "
+            "above -- most likely WORKLOAD_NUM_VECTORS is too large for their "
+            "duplicate clusters)")
 
-    # Calibrated from fold 0's construct span only, loaded as a real array
-    # just for this; job submissions below use lazy VectorSource instead.
-    fold0_construct_start = fold_starts[0] + query_len
-    fold0_construct = VectorSource(dataset, fold0_construct_start, fold0_construct_start + construct_len).to_array()
-    tau = calculate_nn_distance_threshold(fold0_construct, duplicate_percentage)
-    logger.info(f"Scaling tau to {tau} ({duplicate_percentage}-th percentile NN distance, fold 0)")
+    for workload in workloads:
+        reference_len = len(workload.selections[0]["reference"])
+        k_values = sorted({max(1, round(reference_len * f)) for f in k_fractions})
+        k_values = [k for k in k_values if k < reference_len]
+        if not k_values:
+            raise RuntimeError(
+                f"No k_fraction in {k_fractions} produced a k below the reference set "
+                f"of {workload.name} ({reference_len} vectors). Raise "
+                "WORKLOAD_NUM_VECTORS or lower k_fractions.")
 
-    for fold, fold_start in enumerate(fold_starts):
-        query_start, query_end = fold_start, fold_start + query_len
-        construct_start, construct_end = query_end, query_end + construct_len
+        # tau is solved per corpus, not shared: the distance at which a
+        # duplicate sits is a property of each embedding set (WildChat's
+        # reposts are near-exact, WikiAnswers' rewordings are not), so one
+        # absolute threshold would put the corpora at different recalls. It
+        # stays fixed across folds and quantizers within a corpus, because
+        # this sweep varies the quantizer, not the threshold.
+        tau = workload.recall_tau(workload.selections[0], target_recall)
+        logger.info(
+            f"{workload.name}: k_values={k_values} (|B|={reference_len}), "
+            f"tau={tau:.4f} ({target_recall:.0%} recall on fold 0 positives)")
 
-        logger.info(f"Computing ground truth for fold {fold} (tau={tau})...")
-        # Ground truth runs in this driver process (not a worker), so it
-        # needs real arrays, loaded once per fold here.
-        vectors_construct = VectorSource(dataset, construct_start, construct_end).to_array()
-        vectors_query = VectorSource(dataset, query_start, query_end).to_array()
-        actual_results = compute_static_actual_results(vectors_construct, vectors_query, tau)
-        construct_source = VectorSource(dataset, construct_start, construct_end)
-        query_source = VectorSource(dataset, query_start, query_end)
-        for k in k_values:
-            for quantize in QUANTIZATION_SWEEP:
-                runner.submit(
-                    'quantization',
-                    output_csv=QUANTIZATION_CSV,
-                    dim=dim, dataset=dataset,
-                    k=k, quantize=quantize, tau=tau, seed=fold,
-                    vectors_construct=construct_source, vectors_query=query_source,
-                    actual_results=actual_results,
-                )
+        output_csv = quantization_csv(workload.name)
+        os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+        for fold, sel in enumerate(workload.selections):
+            vectors_construct = workload.rows(sel["reference"])
+            vectors_query = workload.query_vectors(sel)
+            # Distance-based truth, not cluster membership: quantization_worker
+            # asserts zero false negatives, which only holds under this
+            # definition (see BlocklistWorkload.cluster_membership).
+            actual_results = compute_static_actual_results(
+                vectors_construct, vectors_query, tau)
+            for k in k_values:
+                for quantize in QUANTIZATION_SWEEP:
+                    runner.submit(
+                        'quantization',
+                        output_csv=output_csv,
+                        dim=dim, dataset=workload.name,
+                        k=k, quantize=quantize, tau=tau, seed=fold,
+                        vectors_construct=vectors_construct, vectors_query=vectors_query,
+                        actual_results=actual_results,
+                    )
 
 
 def save_quantization(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
-    """Extracts this evaluation's rows from a shared Runner's combined
-    run() output (see generate_quantization()). The Runner itself already
-    wrote results/quantization.csv incrementally (see generate_quantization()'s
-    output_csv=), so this only rebuilds the DataFrame for plot_quantization()."""
+    """Extracts this evaluation rows from a shared Runner combined run()
+    output (see generate_quantization()). The Runner already wrote one
+    results/quantization/<dataset>/quantization.csv per corpus, so this only
+    rebuilds the combined DataFrame; plot_quantization splits it again."""
     return pd.DataFrame(rows_for_mode(job_results, 'quantization'))
 
 
 def plot_quantization(df: pd.DataFrame) -> None:
-    generate_quantization_figures(df)
+    """One figure set per corpus, each in its own folder.
+
+    Split here rather than handed over whole because
+    generate_quantization_figures asserts a single dataset and a single tau,
+    and tau is solved per corpus (see generate_quantization)."""
+    for dataset in sorted(df["dataset"].unique()):
+        outdir = quantization_plot_dir(str(dataset))
+        logger.info(f"Plotting quantization for {dataset} -> {outdir}")
+        generate_quantization_figures(df[df["dataset"] == dataset], outdir=outdir)
 
 
 def generate_query_performance() -> pd.DataFrame:
@@ -1538,18 +1493,13 @@ def generate_and_plot_all() -> None:
     runner = Runner(num_workers=MAX_WORKERS)
 
     try:
-        generate_blocklist(runner)
+        generate_quantization(runner)
     except Exception:
         logger.exception("An error occurred")
     
     '''    
     try:
         generate_system_tau(runner)
-    except Exception:
-        logger.exception("An error occurred")
-
-    try:
-        generate_system(runner)
     except Exception:
         logger.exception("An error occurred")
 
@@ -1595,12 +1545,6 @@ def plot_all() -> None:
         logger.exception("An error occurred")
 
     try:
-        df = pd.read_csv(SYSTEM_CSV)
-        plot_system(df)
-    except Exception:
-        logger.exception("An error occurred")
-
-    try:
         df = pd.read_csv(BLOCKLIST_CSV)
         plot_blocklist(df)
     except Exception:
@@ -1609,8 +1553,15 @@ def plot_all() -> None:
     try:
         # keep_default_na=False: stage/config strings are read verbatim; pandas
         # would otherwise read back as NaN (see plot_quantization.py::load_data()).
-        df = pd.read_csv(QUANTIZATION_CSV, keep_default_na=False)
-        plot_quantization(df)
+        frames = []
+        for name in BLOCKLIST_DATASETS:
+            path = quantization_csv(name)
+            if os.path.exists(path):
+                # keep_default_na=False: stage/config strings are read verbatim;
+                # pandas would otherwise turn them into NaN.
+                frames.append(pd.read_csv(path, keep_default_na=False))
+        if frames:
+            plot_quantization(pd.concat(frames, ignore_index=True))
     except Exception:
         logger.exception("An error occurred")
 

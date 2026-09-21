@@ -635,46 +635,6 @@ def system_tau_worker(
     return rows
 
 
-def system_worker(
-    dim: int,
-    dataset: str,
-    k: int,
-    tau_values: List[float],
-    redundancy_pcts: List[float],
-    seed: int,
-    vectors_construct: VectorInput,
-    vectors_query: VectorInput,
-    actual_results_by_tau: Dict[float, List[bool]],
-) -> List[Dict[str, Any]]:
-    """Same measurement as system_tau_worker -- one cover per (dataset,
-    fold), swept over query-time tau -- but each tau here was solved for a
-    *target* redundancy percentage on this split's own query stream (see
-    main.generate_system), so tau differs per dataset/fold while the target
-    percentage is shared. Adds that target as `redundancy_pct`, which is
-    the shared x-axis plot_system plots against in place of tau.
-
-    tau_values and redundancy_pcts are parallel lists: tau_values[i] is the
-    threshold solved for redundancy_pcts[i]. Two nearby targets can collapse
-    onto the same tau (a mass spike of exact-duplicate embeddings), so the
-    two are zipped positionally against system_tau_worker's per-tau rows,
-    which come back one per tau_values entry in order -- a tau->pct dict
-    would silently drop one of the colliding targets."""
-    if len(tau_values) != len(redundancy_pcts):
-        raise ValueError(
-            f"tau_values ({len(tau_values)}) and redundancy_pcts "
-            f"({len(redundancy_pcts)}) must be parallel lists"
-        )
-
-    rows = system_tau_worker(
-        dim=dim, dataset=dataset, k=k, tau_values=tau_values, seed=seed,
-        vectors_construct=vectors_construct, vectors_query=vectors_query,
-        actual_results_by_tau=actual_results_by_tau,
-    )
-    for row, pct in zip(rows, redundancy_pcts):
-        row["redundancy_pct"] = float(pct)
-    return rows
-
-
 def blocklist_worker(
     dim: int,
     dataset: str,
@@ -1106,7 +1066,6 @@ def stream_rebuild_worker(
 
 _WORKER_FNS: Dict[str, Any] = {
     'system_tau': system_tau_worker,
-    'system': system_worker,
     'blocklist': blocklist_worker,
     'quantization': quantization_worker,
     'query_performance': query_performance_worker,

@@ -16,10 +16,10 @@ from datasets.combine import concatenate_datasets
 from scipy.cluster.hierarchy import DisjointSet
 from sklearn.preprocessing import normalize
 
-from util.dataset_paths import dataset_filenames  # load_embeds/load_meta both index this
+# from util.dataset_paths import dataset_filenames  # load_embeds/load_meta both index this
 
 embeds_dir = "datasets"
-MAX_STREAM_LENGTH = 250_000  # 1 million
+MAX_STREAM_LENGTH = 500_000
 models: Dict[str, SentenceTransformer] = {}
 
 def load_embeds(dataset_name: str, N: int):
