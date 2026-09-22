@@ -91,9 +91,9 @@ def _precision_recall_f1(predicted: Any, actual: Any) -> Tuple[float, float, flo
 
 
 _DIRECT_TAU_FILTERS = {
-    "FirstNFilter", "BallCoverFilter",
+    "FirstNFilter", "BallCoverFilter", "KDBoxFilter", "GonzalezBoxFilter", "GonzalezMEBFilter",
     "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", "DSHFilter", "HNSWFilter",
-    "IVFFilter", "QuantizedVectorFilter",
+    "IVFFilter", "QuantizedVectorFilter", "MLPFilter"
 }
 
 
@@ -139,19 +139,25 @@ class _BallCoverFilterEvalAdapter:
 
 def _instantiate_filter(filter_cls: Any, dim: int, memory_budget: int, distance_threshold: float = None, max_spheres: int = None,
                          insert_mem_percent: Optional[float] = 0.0, extra_kwargs: Optional[Dict[str, Any]] = None) -> Any:
-    extra_kwargs = extra_kwargs or {}
-    if filter_cls.__name__ in _DIRECT_TAU_FILTERS or 'max_spheres' in inspect.signature(filter_cls.__init__).parameters:
+    kwargs = {"dim": dim, "max_memory": memory_budget, **(extra_kwargs or {})}
+
+    if filter_cls.__name__ in _DIRECT_TAU_FILTERS:
+        kwargs.update(distance_threshold=distance_threshold)
+    
         if filter_cls is BallCoverFilter:
-            return _BallCoverFilterEvalAdapter(dim=dim, max_memory=memory_budget,distance_threshold=distance_threshold,
-                                                max_spheres=max_spheres, insert_mem_percent=insert_mem_percent, **extra_kwargs)
-        else:
-            return filter_cls(dim=dim, max_memory=memory_budget, distance_threshold=distance_threshold,
-                            max_spheres=max_spheres, **extra_kwargs)
+            kwargs.update(max_spheres=max_spheres, insert_mem_percent=insert_mem_percent)
+            return _BallCoverFilterEvalAdapter(**kwargs)
+
+        if "max_spheres" in inspect.signature(filter_cls.__init__).parameters:
+            kwargs.update(max_spheres=max_spheres)
+
+        return filter_cls(**kwargs)
     else:
         try:
-            return filter_cls(dim=dim, max_memory=memory_budget, **extra_kwargs)
+            return filter_cls(**kwargs)
         except TypeError:
-            return filter_cls(dim=dim, **extra_kwargs)
+            kwargs.pop("max_memory")
+            return filter_cls(**kwargs)
 
 
 def _f1_score(predicted: np.ndarray, actual: np.ndarray) -> float:
