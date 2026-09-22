@@ -36,7 +36,7 @@ from filters.hnsw_filter import HNSWFilter
 from filters.ivf_filter import IVFFilter
 from filters.quantized_vector_filter import QuantizedVectorFilter
 from filters.mlp_filter import MLPFilter
-from util.dataset_paths import dataset_filenames
+from util.dataset_paths import dataset_filenames, HDF5_DATASET_KEY
 from util.fetch_datasets import load_embeds, load_meta
 from vector_source import VectorSource
 
