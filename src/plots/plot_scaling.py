@@ -1,6 +1,8 @@
-"""Scaling-evaluation figures: BallCoverFilter throughput vs batch size / stream size,
-on one representative dataset (see main.py's _SCALING_DATASET). Query, insertion,
-and construction throughput each get one line per filter size k.
+"""Scaling-evaluation figures: BallCoverFilter throughput vs batch size / stream size.
+Rows come from every blocklist corpus/fold (see main.py's generate_scaling(), which
+reuses blocklist_workloads()) and are pooled per k/n value, since throughput is
+dataset-invariant here. Query, insertion, and construction throughput each get one
+line per filter size k.
 """
 
 from __future__ import annotations

@@ -107,7 +107,6 @@ DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
 
 # Output CSV path per evaluation, shared by each generate_*'s
 # runner.submit(output_csv=...), each save_*'s df, and plot_all()'s reload.
-EQUAL_MEMORY_CSV = "results/equal_memory.csv"
 SYSTEM_TAU_CSV = "results/system_tau.csv"
 # generate_quantization runs once per blocklist corpus and keeps each run in
 # its own folder. Separate rather than one combined file because
@@ -124,15 +123,40 @@ def quantization_csv(dataset: str) -> str:
 def quantization_plot_dir(dataset: str) -> str:
     return os.path.join(QUANTIZATION_PLOT_DIR, dataset)
 
-SCALING_QUERY_CSV = "results/scaling_query.csv"
-SCALING_INSERT_CSV = "results/scaling_insert.csv"
-SCALING_CONSTRUCTION_CSV = "results/scaling_construction.csv"
+# generate_scaling runs once per blocklist corpus and keeps each run in its
+# own folder, mirroring quantization_csv/QUANTIZATION_DIR above: throughput
+# is pooled across corpora for plotting, but keeping each corpus's raw rows
+# apart on disk makes a single corpus's run inspectable/rerunnable on its own.
+SCALING_DIR = "results/scaling"
+
+
+def scaling_query_csv(dataset: str) -> str:
+    return os.path.join(SCALING_DIR, dataset, "scaling_query.csv")
+
+
+def scaling_insert_csv(dataset: str) -> str:
+    return os.path.join(SCALING_DIR, dataset, "scaling_insert.csv")
+
+
+def scaling_construction_csv(dataset: str) -> str:
+    return os.path.join(SCALING_DIR, dataset, "scaling_construction.csv")
+
+
+# generate_equal_memory runs once per blocklist corpus and keeps each run in
+# its own folder, mirroring quantization_csv/QUANTIZATION_DIR above.
+EQUAL_MEMORY_DIR = "results/equal_memory"
+
+
+def equal_memory_csv(dataset: str) -> str:
+    return os.path.join(EQUAL_MEMORY_DIR, dataset, "equal_memory.csv")
+
+
 STREAMING_CSV = "results/streaming.csv"
 
 # generate_equal_memory()'s own comparison set: excludes DSBFFilter/
 # CoveringLSHFallbackFilter/LSBFFilter, which degenerate to ~100% duplicate
 # predictions at realistic construct-set sizes (still used elsewhere).
-equal_memory_filters = [BallCoverFilter, HNSWFilter, IVFFilter, DSHFilter, QuantizedVectorFilter]
+equal_memory_filters = [BallCoverFilter, HNSWFilter, IVFFilter, DSHFilter, QuantizedVectorFilter, MLPFilter]
 
 def calculate_nn_distance_threshold(
     construct_vectors: np.ndarray,
@@ -217,75 +241,102 @@ def compute_static_actual_results(
 
 
 def generate_equal_memory(runner: Runner) -> None:
-    """Equal-memory comparison across equal_memory_filters. Sweeps
+    """Equal-memory (SOTA) comparison across equal_memory_filters. Sweeps
     count_memory_steps budgets scaled off the construct set itself (one
     sphere per point, see bytes_per_sphere_at_1to1 below). For each budget,
-    every filter's best config is chosen on a
-    held-out calibration set (see runner.py::_build_calibrated_filter), then
-    FPR/FNR/latency/throughput are measured on a separate held-out query
-    set. Uses the paper's default single-dataset representative, MMLU
-    (Section 5.6 names no specific dataset).
+    every filter's best config is chosen on a held-out calibration set (see
+    runner.py::_build_calibrated_filter), then FPR/FNR/latency/throughput are
+    measured on a separate held-out query set.
 
-    Only submits 'equal_memory' jobs (output_csv=EQUAL_MEMORY_CSV) to the
-    given `runner` -- does not run it. The Runner writes
-    results/equal_memory.csv incrementally as each job completes."""
-    num_vectors               = WORKLOAD_NUM_VECTORS
-    dim                       = 384
-    percentage_construct      = 80
-    percentage_calibration    = 10
-    duplicate_percentage      = 5.0
-    count_memory_steps        = 10
+    Reuses blocklist_workloads() -- the same corpora, cluster-based fold
+    splits and reference set B as generate_blocklist/generate_quantization/
+    generate_scaling -- rather than its own single-dataset (MMLU) split, so
+    the SOTA baselines are compared on the same data the rest of the suite
+    evaluates. tau is solved once per corpus via recall_tau, exactly as
+    generate_quantization does, so every filter here is compared at the same
+    per-corpus operating point quantization_worker uses. Each fold's query
+    stream (see BlocklistWorkload.query_vectors) is split into a calibration
+    slice and a disjoint measurement slice, replacing the old flat
+    percentage_calibration split of one dataset.
 
-    dataset = "MMLU"  # paper's default single-dataset representative
-    vectors = load_embeds(dataset, num_vectors)[0]
-    num_construct   = num_vectors * percentage_construct // 100
-    num_calibration = num_vectors * percentage_calibration // 100
-    vectors_construct   = vectors[:num_construct]
-    vectors_calibration = vectors[num_construct:num_construct + num_calibration]
-    vectors_query       = vectors[num_construct + num_calibration:]
+    Runs over every blocklist corpus and fold; plot_equal_memory pools all of
+    them into one line per filter at each memory budget, so -- like
+    generate_scaling -- the budget grid is bounded by the *smallest* corpus's
+    reference set, keeping the same absolute budgets comparable, and thus
+    poolable, across corpora.
 
-    construct_source   = VectorSource(dataset, 0, num_construct)
-    calibration_source = VectorSource(dataset, num_construct, num_construct + num_calibration)
-    query_source        = VectorSource(dataset, num_construct + num_calibration, num_vectors)
+    Only submits 'equal_memory' jobs -- does not run `runner`. Each corpus
+    writes its own results/equal_memory/<dataset>/equal_memory.csv (see
+    equal_memory_csv()), mirroring quantization_csv/QUANTIZATION_DIR."""
+    num_vectors            = WORKLOAD_NUM_VECTORS
+    dim                    = 384
+    n_folds                = BLOCKLIST_FOLDS
+    target_recall          = 0.95
+    count_memory_steps     = 10
+    # Fraction of each fold's blocklist query stream spent calibrating each
+    # filter's config dial; the rest measures FPR/FNR/latency/throughput.
+    calibration_fraction   = 0.2
 
-    logger.info("Calculating distance threshold...")
-    # A nearest-neighbor threshold, not a random-pairwise percentile: at this
-    # construct-set size, a random-pairwise percentile is far more
-    # permissive than the nearest-neighbor test actually used, pushing the
-    # duplicate rate to ~100% and collapsing FPR/FNR to 0/0.
-    distance_threshold = calculate_nn_distance_threshold(vectors_construct, duplicate_percentage)
-    logger.info("Calculating calibration/query ground truth...")
-    actual_calibration = compute_static_actual_results(vectors_construct, vectors_calibration, distance_threshold)
-    actual_query       = compute_static_actual_results(vectors_construct, vectors_query, distance_threshold)
+    workloads = blocklist_workloads(num_vectors, n_folds=n_folds)
+    if not workloads:
+        raise RuntimeError(
+            "generate_equal_memory: no usable workload for any corpus (see the errors "
+            "above -- most likely WORKLOAD_NUM_VECTORS is too large for their "
+            "duplicate clusters)")
 
+    # Memory budgets are shared across corpora (plot_equal_memory pools every
+    # dataset's rows into one line per filter/budget), so -- like
+    # generate_scaling's k -- they are scaled off the smallest corpus's
+    # reference set rather than computed per corpus.
+    reference_len = min(len(w.selections[0]["reference"]) for w in workloads)
     # Scaled off the construct set itself: one sphere per point.
     bytes_per_sphere_at_1to1 = (dim + 1) * 4 * 4.0
-    max_memory_budget = int(num_construct * bytes_per_sphere_at_1to1)
+    max_memory_budget = int(reference_len * bytes_per_sphere_at_1to1)
     memory_budgets = np.linspace(0, max_memory_budget, count_memory_steps + 1, dtype=int)[1:]
 
-    for memory_budget in memory_budgets:
-        logger.info(f"Submitting jobs for memory_budget={memory_budget} bytes...")
-        for filter_cls in equal_memory_filters:
-            runner.submit(
-                'equal_memory',
-                output_csv=EQUAL_MEMORY_CSV,
-                filter_cls=filter_cls,
-                dim=dim, distance_threshold=distance_threshold,
-                memory_budget=memory_budget,
-                vectors_construct=construct_source, vectors_calibration=calibration_source,
-                vectors_query=query_source,
-                actual_calibration=actual_calibration, actual_query=actual_query,
-                dataset=dataset,
-            )
+    for workload in workloads:
+        # tau is solved once per corpus, not per fold -- the same operating
+        # point generate_quantization uses (see its docstring).
+        tau = workload.recall_tau(workload.selections[0], target_recall)
+        logger.info(f"{workload.name}: tau={tau:.4f} ({target_recall:.0%} recall on fold 0 positives)")
+
+        output_csv = equal_memory_csv(workload.name)
+        os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+        for fold, sel in enumerate(workload.selections):
+            vectors_construct = workload.rows(sel["reference"])
+            stream = workload.query_vectors(sel)
+            n_calibration = max(1, round(len(stream) * calibration_fraction))
+            vectors_calibration = stream[:n_calibration]
+            vectors_query = stream[n_calibration:]
+
+            actual_calibration = compute_static_actual_results(vectors_construct, vectors_calibration, tau)
+            actual_query = compute_static_actual_results(vectors_construct, vectors_query, tau)
+
+            for memory_budget in memory_budgets:
+                logger.info(
+                    f"{workload.name} fold {fold}: submitting jobs for "
+                    f"memory_budget={memory_budget} bytes...")
+                for filter_cls in equal_memory_filters:
+                    runner.submit(
+                        'equal_memory',
+                        output_csv=output_csv,
+                        filter_cls=filter_cls,
+                        dim=dim, distance_threshold=tau,
+                        memory_budget=int(memory_budget),
+                        vectors_construct=vectors_construct, vectors_calibration=vectors_calibration,
+                        vectors_query=vectors_query,
+                        actual_calibration=actual_calibration, actual_query=actual_query,
+                        dataset=workload.name,
+                    )
 
 
 def save_equal_memory(job_results: List[Tuple[str, Any]]) -> list:
     """Extracts this evaluation's rows from a shared Runner's combined
     run() output (see generate_equal_memory()). The Runner itself already
-    wrote results/equal_memory.csv incrementally, one row-batch per
-    completed job (see generate_equal_memory()'s output_csv=), so this no
-    longer writes the file -- it only recovers this evaluation's rows for
-    plot_equal_memory()."""
+    wrote one results/equal_memory/<dataset>/equal_memory.csv per corpus
+    incrementally, one row-batch per completed job (see
+    generate_equal_memory()'s output_csv=), so this no longer writes the
+    file -- it only recovers this evaluation's rows for plot_equal_memory()."""
     return rows_for_mode(job_results, 'equal_memory')
 
 
@@ -1129,139 +1180,131 @@ def plot_query_performance(df: pd.DataFrame) -> None:
     generate_query_performance_figures(df)
 
 
-# These panels compare across batch_size/stream_size, not datasets, so one
-# representative dataset suffices (Figure 5: "no measurable effect"
-# per-dataset). MsMarco, matching generate_quantization: the 5 non-wrapping
-# folds below need ~1.8x the per-fold pool (180K rows at the Workloads
-# protocol's sizes), which rules out the smaller registry entries -- MMLU
-# holds 115,700, NaturalQuestions 91,535.
-_SCALING_DATASET = "MsMarco"
-
-
 def generate_scaling(runner: Runner) -> None:
     """Measures three BallCoverFilter throughput surfaces against filter
     size k: query (k x batch_size grid), insertion (same grid, timing add()
     instead), and construction (k x n, where indexed-set size itself
-    varies). Runs on a single dataset (_SCALING_DATASET); stream_sizes (the
-    6 construction lines) derive from `stream_size` alone.
+    varies).
 
-    Sized to the paper's Workloads protocol (Section 5.1): 100K vectors per
-    fold, 80% construct / 20% query, so stream_size is the 80K construct set
-    and n_query_vectors the 20K holdout it is queried with. Both sweeps stay
-    at 6 values because plot_scaling draws one line per value and defines 6
-    line colors.
-
-    K-fold cross-validation (Section 5.1): fold f's (construct, holdout)
-    window starts f*fold_stride further into the dataset than fold 0's,
-    non-wrapping via advancing_fold_starts, so each repeat measures
-    throughput against genuinely different data. With fold_stride equal to
-    the holdout width, the 5 query holdouts are disjoint -- which is what
-    makes them 5 samples rather than 5 views of one. Tagged via seed=fold
-    for plot_scaling's seed-based mean +/- 95% CI aggregation.
+    Reuses blocklist_workloads() -- the same corpora, cluster-based fold
+    splits, reference set B and query stream as generate_blocklist and
+    generate_quantization -- rather than cutting its own contiguous window
+    over a separate dataset, so throughput is measured on the same data the
+    correctness sweeps evaluate. Runs over every blocklist corpus and fold;
+    plot_scaling pools all of them into one line per k (or n) value, which is
+    valid because throughput is dataset-invariant here (Figure 4: "different
+    datasets do not really matter") -- so k and the construction n's are
+    bounded by the *smallest* corpus's reference set, keeping the same
+    absolute values comparable, and thus poolable, across corpora. Both
+    sweeps stay at <=6 values because plot_scaling draws one line per value
+    and defines 6 line colors.
 
     Only submits 'scaling_query'/'scaling_insert'/'scaling_construction'
-    jobs -- does not run `runner`. Each targets its own output_csv, so the
-    Runner writes all three results/scaling_*.csv files incrementally."""
-    # 80% of the protocol's 100K per fold. Not WORKLOAD_NUM_VECTORS itself:
-    # that is the whole 100K, and using it here would make the construct set
-    # the full workload and push the pool (construct + holdout) past it.
-    stream_size      = WORKLOAD_NUM_VECTORS * 70 // 100
+    jobs -- does not run `runner`. Each corpus writes its own
+    results/scaling/<dataset>/scaling_{query,insert,construction}.csv (see
+    scaling_query_csv() et al.), mirroring quantization_csv/QUANTIZATION_DIR,
+    so the Runner writes all of them incrementally."""
+    num_vectors      = WORKLOAD_NUM_VECTORS
     dim              = 384
+    n_folds          = BLOCKLIST_FOLDS
     n_steps          = 6
-    k_percentages    = [1, 2, 4, 8, 16, 32]  # ball budget k, as a percentage of stream_size
+    # Ball budget k, as a fraction of a corpus's reference set |B| -- same
+    # unit generate_blocklist/generate_quantization sweep k_fractions in.
+    k_fractions      = [0.01, 0.02, 0.04, 0.08, 0.16, 0.32]
     # Powers of 4 from a single query up to 1024: spans three orders of
-    # magnitude in 6 lines, and the largest still cuts n_query_vectors into
-    # ~20 batches, so no line is timed from a handful of calls.
+    # magnitude in 6 lines.
     batch_sizes      = [1, 4, 16, 64, 256, 1024]
     # Throughput is threshold-independent here (query() scores every ball
     # before comparing), so this only has to be a valid tau, not a tuned one.
     tau_mid          = 0.35
-    k_folds          = 5
-    # The protocol's 20% query split. n_insert_vectors stays smaller: insert()
-    # mutates the cover, so its cost per vector grows with the ball count and
-    # a 20K stream would dominate the sweep's runtime for no extra resolution.
-    n_query_vectors  = WORKLOAD_NUM_VECTORS * 20 // 100
-    n_insert_vectors = WORKLOAD_NUM_VECTORS * 10 // 100
+    # Fractions of each fold's blocklist query stream (positives + hard +
+    # easy negatives -- see BlocklistWorkload.query_vectors) consumed by the
+    # query and insert sweeps. Both draw from the same stream since neither
+    # cares about overlap: only timing is measured, not correctness.
+    # insert_vector_fraction stays smaller: insert() mutates the cover, so
+    # its cost per vector grows with the ball count and a full stream would
+    # dominate the sweep's runtime for no extra resolution.
+    query_vector_fraction  = 1.0
+    insert_vector_fraction = 0.5
 
-    if _SCALING_DATASET not in DATASET_KEYS:
-        raise RuntimeError(f"_SCALING_DATASET={_SCALING_DATASET!r} must be one of {sorted(DATASET_KEYS)}")
-    dataset_key = _SCALING_DATASET
-    if not os.path.exists(dataset_filenames[dataset_key]):
+    workloads = blocklist_workloads(num_vectors, n_folds=n_folds)
+    if not workloads:
         raise RuntimeError(
-            f"generate_scaling needs {_SCALING_DATASET} on disk "
-            f"(looked for {dataset_filenames[dataset_key]})."
-        )
+            "generate_scaling: no usable workload for any corpus (see the errors "
+            "above -- most likely WORKLOAD_NUM_VECTORS is too large for their "
+            "duplicate clusters)")
 
-    stream_sizes = sorted({max(1, stream_size // (2 ** i)) for i in range(n_steps)})
-    max_stream = max(stream_sizes)
-    k_values = sorted({max(1, round(stream_size * p / 100)) for p in k_percentages})
+    # k and the construction n's are shared across corpora (plot_scaling
+    # pools every dataset's rows into one line per value), so both are
+    # bounded by the smallest corpus's reference set rather than computed
+    # per corpus.
+    reference_len = min(len(w.selections[0]["reference"]) for w in workloads)
+    k_values = sorted({max(1, round(reference_len * f)) for f in k_fractions})
+    k_values = [k for k in k_values if k < reference_len]
+    if not k_values:
+        raise RuntimeError(
+            f"No k_fraction in {k_fractions} produced a k below the smallest "
+            f"corpus's reference set ({reference_len} vectors). Raise "
+            "WORKLOAD_NUM_VECTORS or lower k_fractions.")
+    stream_sizes = sorted({max(1, reference_len // (2 ** i)) for i in range(n_steps)})
 
-    # Drop sweep entries that no longer fit, rather than raising, so
-    # resizing the sweep never requires hand-editing the lists too. Each
-    # list is bounded by the thing it actually indexes: k is a ball count,
-    # so it is capped by the construct set (k >= n degenerates the cover
-    # into one zero-radius ball per point); batch_size is a slice of the
-    # query stream, so it is capped by that -- it has nothing to do with
-    # how many vectors the filter was built over.
-    def _bounded_by(values: list[int], limit: int, name: str, limit_name: str) -> list[int]:
-        usable = sorted(v for v in values if v < limit)
-        dropped = sorted(set(values) - set(usable))
-        if dropped:
-            logger.warning(f"Dropping {name} value(s) >= {limit_name} ({limit}): {dropped}")
-        if not usable:
-            raise RuntimeError(
-                f"No {name} value in {values} is below {limit_name} ({limit}). "
-                f"Raise {limit_name} or lower {name}."
-            )
-        return usable
+    # workload.stream_size is a function of num_vectors alone (see
+    # build_blocklist_workload), so it is the same for every corpus.
+    stream_len = workloads[0].stream_size
+    n_query_vectors = max(1, round(stream_len * query_vector_fraction))
+    n_insert_vectors = max(1, round(stream_len * insert_vector_fraction))
 
-    k_values = _bounded_by(k_values, max_stream, "k_values", "stream_size")
-    batch_sizes = _bounded_by(batch_sizes, n_query_vectors, "batch_sizes", "n_query_vectors")
+    # Drop batch sizes that no longer fit, rather than raising, so resizing
+    # the sweep never requires hand-editing the lists too.
+    usable_batch_sizes = sorted(b for b in batch_sizes if b < min(n_query_vectors, n_insert_vectors))
+    dropped = sorted(set(batch_sizes) - set(usable_batch_sizes))
+    if dropped:
+        logger.warning(f"Dropping batch_size value(s) >= min(n_query_vectors, n_insert_vectors) "
+                        f"({min(n_query_vectors, n_insert_vectors)}): {dropped}")
+    if not usable_batch_sizes:
+        raise RuntimeError(
+            f"No batch_size in {batch_sizes} is below min(n_query_vectors={n_query_vectors}, "
+            f"n_insert_vectors={n_insert_vectors}). Raise WORKLOAD_NUM_VECTORS or lower "
+            "batch_sizes.")
 
-    # Pool shape (largest stream size + a disjoint holdout); fold f's copy
-    # starts fold_stride*f further into the dataset.
-    holdout_size = max(n_query_vectors, n_insert_vectors)
-    pool_needed = max_stream + holdout_size
-    total_rows = len(VectorSource(dataset_key))
-    fold_stride = pool_needed // k_folds
-    fold_starts = advancing_fold_starts(total_rows, k_folds, fold_stride, pool_needed)
+    for workload in workloads:
+        for fold, sel in enumerate(workload.selections):
+            vectors_construct = workload.rows(sel["reference"])
+            vectors_query = workload.query_vectors(sel)
+            if len(vectors_query) < max(n_query_vectors, n_insert_vectors):
+                raise RuntimeError(
+                    f"{workload.name} fold {fold}: query stream holds {len(vectors_query)} "
+                    f"vectors but needs {max(n_query_vectors, n_insert_vectors)}. Lower "
+                    "query_vector_fraction/insert_vector_fraction or BLOCKLIST_QUERY_FRACTION.")
 
-    def _source(start: int, stop: int) -> VectorSource:
-        return VectorSource(dataset_key, start, stop)
+            for k in k_values:
+                for batch_size in usable_batch_sizes:
+                    runner.submit(
+                        'scaling_query',
+                        output_csv=scaling_query_csv(workload.name),
+                        dim=dim, dataset=workload.name, k=k, batch_size=batch_size, seed=fold,
+                        tau_mid=tau_mid,
+                        vectors_construct=vectors_construct, vectors_query=vectors_query,
+                        n_query_vectors=n_query_vectors,
+                    )
+                    runner.submit(
+                        'scaling_insert',
+                        output_csv=scaling_insert_csv(workload.name),
+                        dim=dim, dataset=workload.name, k=k, batch_size=batch_size, seed=fold,
+                        vectors_construct=vectors_construct, vectors_insert=vectors_query,
+                        n_insert_vectors=n_insert_vectors,
+                    )
 
-    for k in k_values:
-        for batch_size in batch_sizes:
-            for fold, fold_start in enumerate(fold_starts):
-                construct_source = _source(fold_start, fold_start + max_stream)
-                holdout_source = _source(fold_start + max_stream, fold_start + max_stream + holdout_size)
-                runner.submit(
-                    'scaling_query',
-                    output_csv=SCALING_QUERY_CSV,
-                    dim=dim, dataset=_SCALING_DATASET, k=k, batch_size=batch_size, seed=fold,
-                    tau_mid=tau_mid,
-                    vectors_construct=construct_source, vectors_query=holdout_source,
-                    n_query_vectors=n_query_vectors,
-                )
-                runner.submit(
-                    'scaling_insert',
-                    output_csv=SCALING_INSERT_CSV,
-                    dim=dim, dataset=_SCALING_DATASET, k=k, batch_size=batch_size, seed=fold,
-                    vectors_construct=construct_source, vectors_insert=holdout_source,
-                    n_insert_vectors=n_insert_vectors,
-                )
-
-    for k in k_values:
-        for n in stream_sizes:
-            if k >= n:
-                continue
-            for fold, fold_start in enumerate(fold_starts):
-                construct_source_n = _source(fold_start, fold_start + n)
-                runner.submit(
-                    'scaling_construction',
-                    output_csv=SCALING_CONSTRUCTION_CSV,
-                    dim=dim, dataset=_SCALING_DATASET, k=k, n=n, seed=fold,
-                    vectors_construct=construct_source_n,
-                )
+            for k in k_values:
+                for n in stream_sizes:
+                    if k >= n or n > len(vectors_construct):
+                        continue
+                    runner.submit(
+                        'scaling_construction',
+                        output_csv=scaling_construction_csv(workload.name),
+                        dim=dim, dataset=workload.name, k=k, n=n, seed=fold,
+                        vectors_construct=vectors_construct,
+                    )
 
 
 def save_scaling(job_results: List[Tuple[str, Any]]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -1566,8 +1609,13 @@ def plot_all() -> None:
         logger.exception("An error occurred")
 
     try:
-        results = pd.read_csv(EQUAL_MEMORY_CSV).to_dict("records")
-        plot_equal_memory(results)
+        frames = []
+        for name in BLOCKLIST_DATASETS:
+            path = equal_memory_csv(name)
+            if os.path.exists(path):
+                frames.append(pd.read_csv(path))
+        if frames:
+            plot_equal_memory(pd.concat(frames, ignore_index=True).to_dict("records"))
     except Exception:
         logger.exception("An error occurred")
 
@@ -1578,10 +1626,15 @@ def plot_all() -> None:
         logger.exception("An error occurred")
 
     try:
-        df_query = pd.read_csv(SCALING_QUERY_CSV)
-        df_insert = pd.read_csv(SCALING_INSERT_CSV)
-        df_construction = pd.read_csv(SCALING_CONSTRUCTION_CSV)
-        plot_scaling(df_query, df_insert, df_construction)
+        def _concat_scaling(csv_fn):
+            frames = [pd.read_csv(csv_fn(name)) for name in BLOCKLIST_DATASETS if os.path.exists(csv_fn(name))]
+            return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+        df_query = _concat_scaling(scaling_query_csv)
+        df_insert = _concat_scaling(scaling_insert_csv)
+        df_construction = _concat_scaling(scaling_construction_csv)
+        if not (df_query.empty or df_insert.empty or df_construction.empty):
+            plot_scaling(df_query, df_insert, df_construction)
     except Exception:
         logger.exception("An error occurred")
 
