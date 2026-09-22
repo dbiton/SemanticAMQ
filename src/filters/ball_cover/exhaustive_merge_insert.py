@@ -12,19 +12,16 @@ class ExhaustiveMergeInsert(InsertInterface):
     NearestInsert/LeastInflationInsert's vectorized batch pass -- recomputes
     the full k x k merge-cost matrix on every insertion at capacity."""
 
+    def initialize_buffers(self, filter: Filter, spheres_indices: np.ndarray, centers: np.ndarray, radii: np.ndarray) -> None:
+        pass
+
+
     def ensure_capacity(self, required_cap: int) -> None:
         pass
 
 
     def reset_buffers(self, capacity: int) -> None:
         pass
-
-
-    def add_sphere(self, filter: Filter, center: np.ndarray, radius: float) -> None:
-        idx = filter._get_new_index()
-        filter._all_centers[idx] = center
-        filter._all_radiuses[idx] = radius
-        filter._num_spheres += 1
 
 
     @staticmethod
@@ -114,10 +111,8 @@ class ExhaustiveMergeInsert(InsertInterface):
 
                 n -= 1
 
-        filter._ensure_capacity(n)
-        filter._all_centers[:n] = c[:n].astype(np.float32)
-        filter._all_radiuses[:n] = r[:n].astype(np.float32)
-        filter._num_spheres = n
+        filter._num_spheres = 0
+        filter._add_spheres(c[:n].astype(np.float32), r[:n].astype(np.float32))
 
 
     def remove(self, filter: Filter, vectors: np.ndarray) -> List[bool]:

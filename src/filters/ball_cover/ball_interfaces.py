@@ -16,15 +16,15 @@ class ConstructInterface(ABC):
 
 class InsertInterface(ABC):
     @abstractmethod
+    def initialize_buffers(self, filter: 'Filter', spheres_indices: np.ndarray, centers: np.ndarray, radii: np.ndarray) -> None:
+        pass
+
+    @abstractmethod
     def ensure_capacity(self, required_cap: int) -> None:
         pass
 
     @abstractmethod
     def reset_buffers(self, capacity: int) -> None:
-        pass
-
-    @abstractmethod
-    def add_sphere(self, filter: 'Filter', center: np.ndarray, radius: float) -> None:
         pass
 
     @abstractmethod
@@ -37,8 +37,4 @@ class InsertInterface(ABC):
 
     @abstractmethod
     def get_bytesize(self, filter: 'Filter') -> int:
-        """Takes the owning filter so an implementation can report bytes
-        proportional to actual usage (e.g. filter._num_spheres), not
-        pre-allocated capacity -- a compact quantizer's byte budget can imply
-        far more balls than the construct set will ever fill."""
         pass

@@ -35,17 +35,14 @@ class DoublingInsert(InsertInterface):
             )
         self.growth_budget_fraction = growth_budget_fraction
 
+    def initialize_buffers(self, filter: Filter, spheres_indices: np.ndarray, centers: np.ndarray, radii: np.ndarray) -> None:
+        pass
+
     def ensure_capacity(self, required_cap: int) -> None:
         pass
 
     def reset_buffers(self, capacity: int) -> None:
         pass
-
-    def add_sphere(self, filter: Filter, center: np.ndarray, radius: float) -> None:
-        idx = filter._get_new_index()
-        filter._all_centers[idx] = center
-        filter._all_radiuses[idx] = radius
-        filter._num_spheres += 1
 
     @staticmethod
     def _gonzalez_select_with_uncertainty(
@@ -126,7 +123,7 @@ class DoublingInsert(InsertInterface):
 
         filter._num_spheres = 0
         for center, radius in zip(new_centers, new_radii):
-            self.add_sphere(filter, center, radius)
+            filter._add_spheres(center[None, :], radius)
         # No index work here: BallCoverFilter.insert() encodes whatever
         # centers this left in _all_centers and retires the ids it dropped.
 
@@ -150,7 +147,7 @@ class DoublingInsert(InsertInterface):
         X = X[~is_already_covered]
 
         for vec in X:
-            self.add_sphere(filter, vec, 0.0)
+            filter._add_spheres(vec[None, :], 0.0)
 
         if filter._num_spheres >= self._rebuild_threshold(filter):
             self._rebuild(filter)

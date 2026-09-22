@@ -8,9 +8,11 @@ from hyperspheres_volume import estimate_hypersphere_volume
 from filters.filter import Filter, InsufficientMemoryError
 from filters.ball_cover.ball_interfaces import ConstructInterface, InsertInterface
 from filters.ball_cover.gonzales_construct import GonzalesConstruct
+from filters.ball_cover.min_heap_insert import MinHeapInsert
 from filters.ball_cover.nearest_insert import NearestInsert
 from filters.ball_cover.least_inflation_insert import LeastInflationInsert
 from filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
+from filters.ball_cover.doubling_insert import DoublingInsert
 
 
 class Quantize(Enum):
@@ -145,8 +147,8 @@ class BallCoverFilter(Filter):
     def __init__(
         self,
         dim: int,
-        construct_method: Optional[ConstructInterface] = None,
-        insert_method: Optional[InsertInterface] = None,
+        construct_method: Optional[ConstructInterface] = GonzalesConstruct(),
+        insert_method: Optional[InsertInterface] = NearestInsert(),
         quantize: Quantize = Quantize.NONE,
         max_memory: Optional[int] = None,
         max_spheres: Optional[int] = None,
@@ -154,21 +156,9 @@ class BallCoverFilter(Filter):
     ) -> None:
         super().__init__(dim, max_memory=max_memory)
         self.quantize = quantize
-        # Constructed fresh here, not as parameter defaults: a mutable default
-        # argument is evaluated once at def-time and shared by every call that
-        # doesn't override it. Both defaults are stateless (harmless to
-        # share), but strategies with real per-filter state (e.g.
-        # MinHeapInsert's _sphere_versions/_minimal_pairs) must not be shared
-        # this way if passed explicitly across filters in the same process.
-        self.construct_method = construct_method if construct_method is not None else GonzalesConstruct()
-        self.insert_method = insert_method if insert_method is not None else NearestInsert()
+        self.construct_method = construct_method
+        self.insert_method = insert_method
         self.insert_memory_percent = insert_memory_percent
-        # The codebook is fitted once, by construct(), and never retrained:
-        # insert() encodes new centers with whatever construct() fit.
-        # Retraining would re-encode every stored center under a new codebook
-        # while their radii still carry the old codebook's inflation -- and
-        # the unquantized centers needed to recompute that inflation no
-        # longer exist.
         self.all_centers_index = self._make_faiss_index(self.quantize)
         self.max_spheres = (max_spheres if max_spheres is not None 
                     else self._calculate_max_spheres(self.max_memory))
@@ -177,17 +167,12 @@ class BallCoverFilter(Filter):
 
         self._num_spheres = 0
         self._all_spheres = np.arange(self.max_spheres, dtype=np.int32)
-        self._all_centers = None  # lazily rebuilt cache, not persistent state
+        self._all_centers = None # lazily rebuilt cache, not persistent state
         self._all_radiuses = np.empty((self.max_spheres,), dtype=np.float32)
-        # Per-ball radius cost of encoding, written once by _store_spheres.
-        # After construct() that is the measured stored-minus-baseline delta,
-        # which goes negative on balls whose coverage pass saved more than
-        # their center's error cost; after an insert() it is the
-        # ||center - decode(encode(center))|| bound that path adds instead.
-        # 0 either way for Quantize.NONE.
         self._radius_inflation = np.zeros((self.max_spheres,), dtype=np.float32)
 
-        self.insert_method.ensure_capacity(self.max_spheres)
+        if self.insert_method:
+            self.insert_method.ensure_capacity(self.max_spheres)
 
     @property
     def all_spheres(self) -> np.ndarray:
@@ -237,26 +222,35 @@ class BallCoverFilter(Filter):
         new_inflation[:current_cap] = self._radius_inflation
         self._radius_inflation = new_inflation
 
-        self.insert_method.ensure_capacity(new_cap)
-
-    def _get_new_index(self) -> int:
-        if self._num_spheres == len(self._all_radiuses):
-            self._ensure_capacity(len(self._all_radiuses) * 2)
-        return self._all_spheres[self._num_spheres]
+        if self.insert_method:
+            self.insert_method.ensure_capacity(new_cap)
 
     def _reset_buffers(self, capacity: int) -> None:
         self._ensure_capacity(capacity)
         self._num_spheres = 0
         self._all_centers = None
-        # Back to an untrained index: construct() has to run again to refit
-        # the codebook before any sphere can be stored.
+        self._all_radiuses[:] = 0.0
+        self._radius_inflation[:] = 0.0
         self.all_centers_index = self._make_faiss_index(self.quantize)
         self._constructed = False
-        self.insert_method.reset_buffers(capacity)
+
+        if self.insert_method:
+            self.insert_method.reset_buffers(capacity)
+
+    def _add_spheres(self, centers: np.ndarray, radii: np.ndarray) -> np.ndarray:
+        num_new_spheres = len(centers)
+        if num_new_spheres == 0:
+            return np.empty(0, dtype=np.int32)
+
+        self._ensure_capacity(self._num_spheres + num_new_spheres)
+        new_sphere_indices = self._all_spheres[self._num_spheres : self._num_spheres + num_new_spheres]
+        self._all_centers[new_sphere_indices] = centers
+        self._all_radiuses[new_sphere_indices] = radii
+        self._num_spheres += num_new_spheres
+        return new_sphere_indices
 
     def _calculate_max_spheres(self, max_memory: Optional[int]) -> int:
         if max_memory is None:
-            # When unconstrained, fallback to standard integer bounds to avoid crash
             return sys.maxsize
         usable = max(0, max_memory - self._codebook_bytes())
         return max(1, usable // self.bytes_per_ball())
@@ -657,76 +651,38 @@ class BallCoverFilter(Filter):
         self._radius_inflation[sphere_indices] = 0.0
 
     def construct(self, vectors: np.ndarray) -> Tuple[float, float]:
-        """Builds directly from construct_method's output, independent of
-        insert_method: routing through insert_method.add_sphere() here was
-        redundant (its result was immediately overwritten below) and, for
-        strategies with per-ball bookkeeping (e.g. MinHeapInsert's
-        merge-candidate heap), unintentionally seeded that state from
-        construction -- a cost only the streaming policy needs, paid by every
-        one-shot construct-then-query use of this filter.
+        """Builds the filter in bulk from construct_method's output via _add_spheres().
+
+        If no insert_method is provided, the index acts as a static filter. Otherwise,
+        construct() delegates state setup to insert_method.initialize_buffers(...)
+        to seed bookkeeping (e.g., MinHeapInsert) in a vectorized pass for streaming.
 
         This is also the only place the quantizer is ever trained (see
         _train_quantizer), and it is re-runnable: calling it again on a
         filter that has already been constructed and inserted into is what
         runner's "periodic" streaming policy does, so it fully resets the id
-        pool, the per-ball inflation and the insert strategy's bookkeeping."""
+        pool, the per-ball inflation, and the insert strategy's bookkeeping."""
         centers, radii = self.construct_method.construct_filter(self, vectors)
         centers = np.ascontiguousarray(centers, dtype=np.float32)
         radii = np.asarray(radii, dtype=np.float32)
         n = len(centers)
+        self._reset_buffers(n)
+        _ = self.all_centers
 
-        # Build and validate the new index FIRST, while the filter is still
-        # untouched. _train_quantizer raises on a budget too tight for the
-        # codebook or a center count below its k-means floor, and construct()
-        # is called mid-stream by runner's "periodic" policy -- so failing
-        # after resetting _num_spheres would leave a filter that still
-        # reports _constructed but answers False to everything, i.e. silent
-        # false negatives on a filter that used to be correct. Nothing below
-        # this line is allowed to raise.
-        index = self._make_faiss_index(self.quantize) if n == 0 else self._train_quantizer(centers)
-
-        self._ensure_capacity(max(n, 1))
-        self._num_spheres = 0
-        self._all_centers = None
-        self._radius_inflation[:] = 0.0
-        # Clear the strategy's per-ball bookkeeping. construct() re-derives
-        # the whole ball set and reassigns every id, so anything keyed by
-        # sphere id is stale afterwards. MinHeapInsert is the one that bites:
-        # its merge heap keeps (i, j, version) tuples, and construct() does
-        # not bump the versions, so a stale pair validates and pops ids that
-        # are no longer active -- which then desynchronises _all_spheres from
-        # _num_spheres ("could not broadcast (302,) into (301,)"). Reachable
-        # from runner's "periodic" streaming policy. Note this *clears*
-        # state; it deliberately still does not *seed* any (see above).
-        self.insert_method.reset_buffers(len(self._all_radiuses))
-        self.all_centers_index = index
+        self.all_centers_index = self._make_faiss_index(self.quantize) if n == 0 else self._train_quantizer(centers)
         self._constructed = True
 
         if n == 0:
-            # Keep the configured encoding's (untrained) index rather than
-            # swapping in a flat one: bytes_per_ball() is read off this, so a
-            # flat stand-in would price a PQ4_R2 ball at 1538 bytes instead
-            # of 98. insert() refuses on an untrained codebook.
             return self._log_volume_bounds()
 
-        sphere_indices = np.arange(n, dtype=np.int64)
-        # Reset the WHOLE id pool, not just the first n. _all_spheres is a
-        # permutation of the id space (merging strategies reorder it in
-        # place); writing arange(n) over only the front leaves the ids it
-        # displaced still sitting in the tail, so the array stops being
-        # injective. _get_new_index() hands out _all_spheres[_num_spheres],
-        # which would then be an id that is already live -- the next inserted
-        # ball would land on an occupied slot and add_with_ids would put a
-        # duplicate id in the index.
-        self._all_spheres[:] = np.arange(len(self._all_spheres), dtype=np.int32)
-        self._num_spheres = n
-        # construct_method measures radii against the true fp32 centers, so
-        # this is where they are re-measured against the encoded ones. The
-        # vectors go along because construct() is the one caller that still
-        # has them: knowing what has to be covered is what buys the exact
-        # radius instead of a worst-case bound (see _store_spheres).
+        sphere_indices = self._add_spheres(centers, radii)
         self._store_spheres(sphere_indices, centers, radii, member_vectors=vectors)
 
+        # initialize insert method buffers if given
+        if self.insert_method:
+            self.insert_method.initialize_buffers(self, sphere_indices, centers, radii)
+
+        self._all_centers = None
         return self._log_volume_bounds()
 
     def query(self, vectors: np.ndarray, distance_threshold: float) -> list[bool]:
@@ -736,39 +692,9 @@ class BallCoverFilter(Filter):
         if self._num_spheres == 0 or len(vectors) == 0:
             return [False] * len(vectors)
 
-        # Q goes in raw and is never encoded: both IndexPQ (search_type
-        # ST_PQ, pinned in _make_faiss_index) and IndexScalarQuantizer score
-        # with asymmetric distance computation, comparing the float32 query
-        # against the *decoded* stored codes. Verified to match an exact
-        # float64 ||q - decode(c)|| to 2e-6 at dim=32 and 2e-5 at dim=384 --
-        # float32 accumulation noise, well inside _COVERAGE_EPSILON.
-        #
-        # That is what lets _store_spheres account for the encoding on the
-        # center side alone. Adding a query-side term on top would be
-        # over-inflation, pure false positives for no gain. (For reference,
-        # if the query *were* encoded, SQ4 at dim=384 would need another
-        # ~2.7 on every radius.)
-        #
-        # The guarantee this radius has to satisfy is just "every construct
-        # vector sits inside some ball, measured against the decoded
-        # centers": for a query within tau of a construct vector x, and the
-        # ball j that covers x,
-        #     d(q, decode(c_j)) <= d(q, x) + ||x - decode(c_j)|| <= tau + r_j
-        # so the surface test below accepts. _tight_radii establishes exactly
-        # that property by measurement; insert()'s error bound,
-        #     d(q, c) <= d(q, decode(c)) + ||c - decode(c)||,
-        # is the streaming way to reach the same place without the vectors.
         Q = np.ascontiguousarray(vectors, dtype=np.float32)
-        # The raw ID-mapped index, not the unwrapped inner one -- the latter
-        # returns labels keyed by insertion position, which stops matching
-        # sphere ID after a merge reassigns some, silently indexing
-        # self._all_radiuses[labels] by the wrong sphere.
         d2, labels = self.all_centers_index.search(Q, self._num_spheres)
-        # faiss pads short result rows with label -1. That should not happen
-        # here (k == _num_spheres == ntotal), but -1 indexes the *tail* of
-        # _all_radiuses -- uninitialised capacity, not an error -- so any
-        # future drift between ntotal and _num_spheres would silently compare
-        # against a garbage radius. Mask instead.
+
         missing = labels < 0
         surface = np.sqrt(np.maximum(d2, 0.0)) - self._all_radiuses[np.where(missing, 0, labels)]
         if missing.any():
@@ -800,6 +726,13 @@ class BallCoverFilter(Filter):
                 "BallCoverFilter.insert() has no codebook to encode with: construct() produced "
                 "zero balls, so the quantizer was never fitted. Call construct() on a non-empty "
                 "vector set first."
+            )
+
+        if not self.insert_method:
+            raise ValueError(
+                "BallCoverFilter.insert() requires an insertion strategy: insert_method is None. "
+                "Provide an InsertInterface implementation (e.g., NearestInsert, MinHeapInsert) "
+                "when instantiating BallCoverFilter to enable streaming insertions."
             )
 
         if len(vectors) == 0:
@@ -848,6 +781,18 @@ class BallCoverFilter(Filter):
         self.insert(vectors)
 
     def remove(self, vectors: np.ndarray) -> List[bool]:
+        if not self._constructed:
+            raise ValueError(
+                "BallCoverFilter.insert() requires a constructed filter -- call construct() first."
+            )
+
+        if not self.insert_method:
+            raise ValueError(
+                "BallCoverFilter.insert() requires an insertion strategy: insert_method is None. "
+                "Provide an InsertInterface implementation (e.g., NearestInsert, MinHeapInsert) "
+                "when instantiating BallCoverFilter to enable streaming insertions."
+            )
+
         return self.insert_method.remove(self, vectors)
 
     def _log_volume_bounds(self) -> Tuple[float, float]:

@@ -12,19 +12,16 @@ class NearestInsert(InsertInterface):
     ball may need no growth while the nearest one is a tight singleton about
     to blow up by dist**d (see LeastInflationInsert)."""
 
+    def initialize_buffers(self, filter: Filter, spheres_indices: np.ndarray, centers: np.ndarray, radii: np.ndarray) -> None:
+        pass
+
+
     def ensure_capacity(self, required_cap: int) -> None:
         pass
 
 
     def reset_buffers(self, capacity: int) -> None:
         pass
-
-
-    def add_sphere(self, filter: Filter, center: np.ndarray, radius: float) -> None:
-        idx = filter._get_new_index()
-        filter._all_centers[idx] = center
-        filter._all_radiuses[idx] = radius
-        filter._num_spheres += 1
 
 
     @staticmethod
