@@ -3,8 +3,7 @@ import faiss
 import sys
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Tuple, Optional
-from hyperspheres_volume import estimate_hypersphere_volume
+from typing import List, Optional
 from filters.filter import Filter, InsufficientMemoryError
 from filters.ball_cover.ball_interfaces import ConstructInterface, InsertInterface
 from filters.ball_cover.gonzales_construct import GonzalesConstruct
@@ -650,7 +649,7 @@ class BallCoverFilter(Filter):
         self.all_centers_index.remove_ids(faiss.IDSelectorBatch(sphere_indices))
         self._radius_inflation[sphere_indices] = 0.0
 
-    def construct(self, vectors: np.ndarray) -> Tuple[float, float]:
+    def construct(self, vectors: np.ndarray) -> None:
         """Builds the filter in bulk from construct_method's output via _add_spheres().
 
         If no insert_method is provided, the index acts as a static filter. Otherwise,
@@ -661,7 +660,15 @@ class BallCoverFilter(Filter):
         _train_quantizer), and it is re-runnable: calling it again on a
         filter that has already been constructed and inserted into is what
         runner's "periodic" streaming policy does, so it fully resets the id
-        pool, the per-ball inflation, and the insert strategy's bookkeeping."""
+        pool, the per-ball inflation, and the insert strategy's bookkeeping.
+
+        Returns nothing. This used to return estimate_hypersphere_volume's
+        overlap-aware bounds on the cover's volume, which made every caller
+        pay for them whether or not it read them -- and almost none did. That
+        measurement now belongs to whoever wants it: runner's
+        _tau_volume_bounds_log10 computes the same bounds from all_centers and
+        all_radiuses, at any tau, and is called only by the worker whose
+        figure needs them."""
         centers, radii = self.construct_method.construct_filter(self, vectors)
         centers = np.ascontiguousarray(centers, dtype=np.float32)
         radii = np.asarray(radii, dtype=np.float32)
@@ -673,7 +680,7 @@ class BallCoverFilter(Filter):
         self._constructed = True
 
         if n == 0:
-            return self._log_volume_bounds()
+            return
 
         sphere_indices = self._add_spheres(centers, radii)
         self._store_spheres(sphere_indices, centers, radii, member_vectors=vectors)
@@ -683,7 +690,6 @@ class BallCoverFilter(Filter):
             self.insert_method.initialize_buffers(self, sphere_indices, centers, radii)
 
         self._all_centers = None
-        return self._log_volume_bounds()
 
     def query(self, vectors: np.ndarray, distance_threshold: float) -> list[bool]:
         if not self._constructed:

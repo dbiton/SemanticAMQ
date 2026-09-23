@@ -28,6 +28,7 @@ from plots.plot_scaling import generate_scaling_figures
 from plots.plot_streaming import generate_streaming_figures
 from plots.plot_system_tau import generate_system_tau_figures
 from plots.plot_blocklist import generate_blocklist_figures
+from plots.plot_budget import generate_budget_figures
 from plots.plot_common import DATASETS, DATASET_LABELS
 from typing import Any, Dict, List, Optional, Tuple
 from filters.ball_cover.ball_cover_filter import BallCoverFilter
@@ -462,6 +463,11 @@ def plot_system_tau(df: pd.DataFrame) -> None:
 # extends -- and these three were chosen for their duplicate-cluster geometry
 # (see BLOCKLIST_DATASETS' per-entry comments).
 BLOCKLIST_CSV = "results/blocklist.csv"
+# generate_budget's rows: the same workload and the same worker, swept over the
+# ball budget at a fixed tau. Its own file rather than a `sweep` value inside
+# BLOCKLIST_CSV, since blocklist_worker already spends that column
+# ("recall"/"tau") on its internal split.
+BUDGET_CSV = "results/budget.csv"
 BLOCKLIST_DATASETS = {
     # registry name -> (plot key, label column in the HDF5 meta group or None)
     # WildChat: clusters of repeated prompts, multiplicity up to 500+, but
@@ -996,6 +1002,71 @@ def save_blocklist(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
 
 def plot_blocklist(df: pd.DataFrame) -> None:
     generate_blocklist_figures(df)
+
+
+def generate_budget(runner: Runner) -> None:
+    """The blocklist workload read along its other axis: the ball budget k is
+    the swept variable and tau is held at one fixed value, where
+    generate_blocklist instead solves tau per budget for a target recall.
+
+    Holding tau fixed is what makes recall a measurement here rather than a
+    constant, so both recall and FPR move with the budget and the sweep shows
+    where paying for more balls stops buying either. The band is deliberately
+    narrow (5%-20% of |B|): below it the cover is too coarse to localise B at
+    a fixed threshold, and above it the budget approaches saturation, where
+    each ball stands in for so few reference vectors that there is nothing
+    left to compress.
+
+    tau is one absolute value across every corpus, which
+    generate_blocklist's docstring warns is NOT comparable between them --
+    that is the point of solving for a target recall there. Read these panels
+    as one corpus's response to its budget, not as a ranking of corpora.
+
+    Reuses blocklist_workloads() and runner.blocklist_worker itself (mode
+    'budget', registered against the same function): identical construction
+    and query sets to generate_blocklist, so a difference between the two
+    evaluations is a difference in the swept variable alone.
+
+    Only submits 'budget' jobs (output_csv=BUDGET_CSV) -- does not run
+    `runner`."""
+    dim             = 384
+    num_vectors     = WORKLOAD_NUM_VECTORS
+    n_folds         = BLOCKLIST_FOLDS
+    k_percentages   = [5, 10, 15, 20]  # ball budget k, as a percentage of |B|
+    tau             = 0.2
+    # Only shapes blocklist_worker's sweep="recall" rows, which this
+    # evaluation does not plot (plot_budget reads the fixed-tau rows). Left at
+    # generate_blocklist's value so the two files' recall rows stay
+    # comparable if anyone does read them.
+    target_recall   = 0.95
+
+    k_fractions = [p / 100.0 for p in k_percentages]
+
+    for workload in blocklist_workloads(num_vectors, n_folds=n_folds):
+        for fold, sel in enumerate(workload.selections):
+            runner.submit(
+                'budget',
+                output_csv=BUDGET_CSV,
+                dim=dim, dataset=workload.plot_key, seed=fold,
+                k_fractions=k_fractions, target_recall=target_recall,
+                tau_values=[tau],
+                vectors_reference=workload.rows(sel["reference"]),
+                vectors_positive=workload.rows(sel["positive"]),
+                vectors_hard_negative=workload.rows(sel["hard"]),
+                vectors_easy_negative=workload.rows(sel["easy"]),
+            )
+
+
+def save_budget(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
+    """Extracts this evaluation's rows from a shared Runner's combined run()
+    output (see generate_budget()). Tagged mode 'budget' rather than
+    'blocklist' so the two evaluations' rows split cleanly, even though both
+    come from runner.blocklist_worker."""
+    return pd.DataFrame(rows_for_mode(job_results, 'budget'))
+
+
+def plot_budget(df: pd.DataFrame) -> None:
+    generate_budget_figures(df)
 
 
 def generate_quantization(runner: Runner) -> None:
@@ -1539,8 +1610,13 @@ def generate_and_plot_all() -> None:
         generate_quantization(runner)
     except Exception:
         logger.exception("An error occurred")
-    
-    '''    
+
+    try:
+        generate_budget(runner)
+    except Exception:
+        logger.exception("An error occurred")
+
+    '''
     try:
         generate_system_tau(runner)
     except Exception:
@@ -1590,6 +1666,12 @@ def plot_all() -> None:
     try:
         df = pd.read_csv(BLOCKLIST_CSV)
         plot_blocklist(df)
+    except Exception:
+        logger.exception("An error occurred")
+
+    try:
+        df = pd.read_csv(BUDGET_CSV)
+        plot_budget(df)
     except Exception:
         logger.exception("An error occurred")
 

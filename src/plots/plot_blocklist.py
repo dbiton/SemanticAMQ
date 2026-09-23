@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -83,7 +83,9 @@ class Config:
     outdir: str
 
 
-def _validate_schema(df: pd.DataFrame) -> None:
+def validate_schema(df: pd.DataFrame) -> None:
+    """Shared with plot_budget: both render rows from runner.blocklist_worker,
+    so both require the same columns."""
     missing = [c for c in _REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"Input missing columns: {missing}. Present: {sorted(df.columns)}")
@@ -93,7 +95,7 @@ def load_data() -> pd.DataFrame:
     if not os.path.exists(INPUT_PATH):
         raise FileNotFoundError(f"Input file not found: {INPUT_PATH!r}")
     df = pd.read_csv(INPUT_PATH)
-    _validate_schema(df)
+    validate_schema(df)
     return df
 
 
@@ -122,26 +124,37 @@ def save_blocklist_legend(outdir: str, dpi: int, emit_pdf: bool = False,
     save_figure(fig, filename, outdir, dpi, emit_pdf, transparent=True)
 
 
-def _line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg: Config,
-                bounded_unit: bool = False, logx: bool = True) -> pd.DataFrame:
-    """One line per corpus against compression, averaged over folds with
-    +/- 1 std error bars (same convention as plot_system_tau). Restricted to
-    the equal-recall rows: the tau-sweep rows repeat every compression at 13
-    taus, and pooling them would average a response curve into the operating
-    point."""
-    agg = mean_std(df[df["sweep"] == SWEEP_RECALL], ["dataset", "k_fraction"], value_col)
-    agg["compression"] = 1.0 / agg["k_fraction"]
+def line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg: Config,
+               bounded_unit: bool = False, logx: bool = True,
+               sweep: str = SWEEP_RECALL,
+               x_from: Callable[[pd.Series], pd.Series] = lambda kf: 1.0 / kf,
+               xlabel: str = r"Compression $|B|/k$",
+               annotation: Optional[str] = None) -> pd.DataFrame:
+    """One line per corpus against a function of the ball budget, averaged over
+    folds with +/- 1 std error bars (same convention as plot_system_tau).
+
+    Restricted to one `sweep` at a time: the worker emits both an equal-recall
+    row per budget and a row per budget per fixed tau, and pooling them would
+    average a response curve into an operating point.
+
+    Always groups on k_fraction -- the nominal knob, identical across datasets
+    and folds -- and only then maps it onto the x-axis via `x_from`, so a
+    caller can plot against compression (|B|/k, the default) or against the
+    budget itself (see plot_budget) without grouping on a realised quantity
+    that differs per dataset and per fold."""
+    agg = mean_std(df[df["sweep"] == sweep], ["dataset", "k_fraction"], value_col)
+    agg["x"] = x_from(agg["k_fraction"])
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots()
     for dataset in BLOCKLIST_DATASETS:
-        sub = agg[agg["dataset"] == dataset].sort_values("compression")
+        sub = agg[agg["dataset"] == dataset].sort_values("x")
         if sub.empty:
             continue
-        ax.plot(sub["compression"], sub["mean"], color=BLOCKLIST_COLORS[dataset],
+        ax.plot(sub["x"], sub["mean"], color=BLOCKLIST_COLORS[dataset],
                 marker=BLOCKLIST_MARKERS[dataset], markersize=2.5, linewidth=0.8, zorder=2)
         if (sub["std"] > 0).any():
-            ax.errorbar(sub["compression"], sub["mean"], yerr=sub["std"], fmt="none",
+            ax.errorbar(sub["x"], sub["mean"], yerr=sub["std"], fmt="none",
                         ecolor=BLOCKLIST_COLORS[dataset], elinewidth=0.5, capsize=1.5,
                         capthick=0.5, zorder=3)
 
@@ -149,8 +162,11 @@ def _line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cf
         ax.set_ylim(-0.05, 1.05)
     if logx:
         ax.set_xscale("log")
-    ax.set_xlabel(r"Compression $|B|/k$")
+    ax.set_xlabel(xlabel)
     ax.set_ylabel(wrap_label(ylabel))
+    if annotation:
+        ax.text(0.97, 0.06, annotation, transform=ax.transAxes,
+                ha="right", va="bottom", fontsize=5)
     style_axes(ax)
     fig.subplots_adjust(left=0.26, right=0.97, top=0.95, bottom=0.24)
     save_figure(fig, filename, cfg.outdir, cfg.dpi, cfg.emit_pdf, tight=False)
@@ -158,18 +174,18 @@ def _line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cf
 
 
 def panel_fpr_hard(df, cfg):
-    return _line_panel(df, "fpr_hard", "FPR (hard negatives)", "blocklist-fpr-hard.png",
-                       cfg, bounded_unit=True)
+    return line_panel(df, "fpr_hard", "FPR (hard negatives)", "blocklist-fpr-hard.png",
+                      cfg, bounded_unit=True)
 
 
 def panel_fpr_easy(df, cfg):
-    return _line_panel(df, "fpr_easy", "FPR (easy negatives)", "blocklist-fpr-easy.png",
-                       cfg, bounded_unit=True)
+    return line_panel(df, "fpr_easy", "FPR (easy negatives)", "blocklist-fpr-easy.png",
+                      cfg, bounded_unit=True)
 
 
 def panel_saved(df, cfg):
-    return _line_panel(df, "accesses_saved_pct", "Index Accesses Saved (%)",
-                       "blocklist-accesses-saved.png", cfg)
+    return line_panel(df, "accesses_saved_pct", "Index Accesses Saved (%)",
+                      "blocklist-accesses-saved.png", cfg)
 
 
 def panel_margin_budget(df, cfg):
@@ -349,7 +365,7 @@ def generate_blocklist_figures(df: Optional[pd.DataFrame] = None, outdir: str = 
     if df is None:
         df = load_data()
     else:
-        _validate_schema(df)
+        validate_schema(df)
     cfg = Config(dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
 
     # compression axis, at the equal-recall operating point

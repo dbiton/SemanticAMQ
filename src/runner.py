@@ -91,7 +91,7 @@ def _precision_recall_f1(predicted: Any, actual: Any) -> Tuple[float, float, flo
 
 
 _DIRECT_TAU_FILTERS = {
-    "FirstNFilter", "BallCoverFilter", "KDBoxFilter", "GonzalezBoxFilter", "GonzalezMEBFilter",
+    "FirstNFilter", "BallCoverFilter", "KDBoxFilter", "GonzalezBoxFilter",
     "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", "DSHFilter", "HNSWFilter",
     "IVFFilter", "QuantizedVectorFilter", "MLPFilter"
 }
@@ -382,12 +382,18 @@ def _J_tau(radii: np.ndarray, dim: int, tau: float = 0.0) -> float:
 def _tau_volume_bounds_log10(centers: np.ndarray, radii: np.ndarray, tau: float) -> Tuple[float, float]:
     """Log10 (lower, upper) bounds on the volume actually covered by the
     tau-expanded balls (radius + tau), via estimate_hypersphere_volume's
-    overlap-aware union bound -- the same estimator BallCoverFilter.construct()
-    uses for its own (tau=0) volume bounds, just re-run at each tau since
-    _log10_J's naive sum-of-volumes proxy ignores overlap entirely. High is
-    floored at low the same way _fpvr_bounds floored its log-ratio at 0:
-    floating-point error in the lens/Bonferroni terms can otherwise invert
-    them by a hair."""
+    overlap-aware union bound -- unlike _log10_J's naive sum-of-volumes proxy,
+    which ignores overlap entirely. High is floored at low the same way
+    _fpvr_bounds floored its log-ratio at 0: floating-point error in the
+    lens/Bonferroni terms can otherwise invert them by a hair.
+
+    This is the only home of that estimate. BallCoverFilter.construct() used
+    to run it eagerly at tau=0 and return the bounds, so every construct() in
+    the suite paid for an O(k^2) union bound that almost no caller read;
+    callers that want it now ask for it here, from all_centers/all_radiuses,
+    at whatever tau they are reporting (pass tau=0.0 for the cover's own
+    volume). Only system_tau_worker does -- see blocklist_worker for a worker
+    that deliberately skips it on cost grounds."""
     if len(radii) == 0:
         return float('nan'), float('nan')
     # This estimator takes radii, not log-radii, so the degenerate case is
@@ -1067,6 +1073,11 @@ def stream_rebuild_worker(
 _WORKER_FNS: Dict[str, Any] = {
     'system_tau': system_tau_worker,
     'blocklist': blocklist_worker,
+    # Same worker, second mode: generate_budget runs the identical blocklist
+    # measurement but sweeps the ball budget at a fixed tau instead of solving
+    # tau per budget (see main.generate_budget). A distinct mode tag only so
+    # rows_for_mode can split the two evaluations' rows back apart.
+    'budget': blocklist_worker,
     'quantization': quantization_worker,
     'query_performance': query_performance_worker,
     'equal_memory': equal_memory_worker,
