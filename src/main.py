@@ -58,7 +58,7 @@ DATASET = 'ELI5'
 # drops that corpus and silently reduces the comparison to two. 2^15 leaves
 # ~10% headroom there; system_tau's non-wrapping folds need 1.8N = 58,982 rows
 # per dataset, which its shortest (HotpotQA, 97,852) clears comfortably.
-WORKLOAD_NUM_VECTORS = 2 ** 10  # 32,768
+WORKLOAD_NUM_VECTORS = 2 ** 16  # 32,768
 
 # generate_blocklist() knobs. Cluster discovery scans the whole file on disk.
 # Multiplicity is a property of the pool, not of the corpus, so a partial pool
@@ -1027,12 +1027,19 @@ def generate_budget(runner: Runner) -> None:
     and query sets to generate_blocklist, so a difference between the two
     evaluations is a difference in the swept variable alone.
 
+    Also the one blocklist-workload sweep that can afford
+    runner._tau_volume_bounds_log10's overlap-aware volume bounds
+    (volume_bounds=True below): they cost ~O(k^2) per row, which a tau grid
+    multiplies out of reach, but a single fixed tau pays it once per budget.
+    That makes the covered volume readable against the budget here, rather
+    than only through log10_j_tau's overlap-blind sum.
+
     Only submits 'budget' jobs (output_csv=BUDGET_CSV) -- does not run
     `runner`."""
     dim             = 384
     num_vectors     = WORKLOAD_NUM_VECTORS
     n_folds         = BLOCKLIST_FOLDS
-    k_percentages   = [5, 10, 15, 20]  # ball budget k, as a percentage of |B|
+    k_percentages   = [5, 7.5, 10, 12.5, 15, 17.5, 20]  # ball budget k, as a percentage of |B|
     tau             = 0.2
     # Only shapes blocklist_worker's sweep="recall" rows, which this
     # evaluation does not plot (plot_budget reads the fixed-tau rows). Left at
@@ -1050,6 +1057,11 @@ def generate_budget(runner: Runner) -> None:
                 dim=dim, dataset=workload.plot_key, seed=fold,
                 k_fractions=k_fractions, target_recall=target_recall,
                 tau_values=[tau],
+                # Affordable here and nowhere else in this workload: the bound
+                # is ~O(k^2) per row, and a single tau means one run per
+                # budget rather than one per (budget, tau) as in
+                # generate_blocklist's grid.
+                volume_bounds=True,
                 vectors_reference=workload.rows(sel["reference"]),
                 vectors_positive=workload.rows(sel["positive"]),
                 vectors_hard_negative=workload.rows(sel["hard"]),

@@ -652,6 +652,7 @@ def blocklist_worker(
     vectors_positive: VectorInput,
     vectors_hard_negative: VectorInput,
     vectors_easy_negative: VectorInput,
+    volume_bounds: bool = False,
 ) -> List[Dict[str, Any]]:
     """Asymmetric blocklist workload (main.generate_blocklist): a tight
     reference set B, a broad query stream, positives that are held-out members
@@ -669,6 +670,14 @@ def blocklist_worker(
     fails them and only one that localises B passes. Easy negatives are
     singletons, i.e. background traffic. A pooled FPR would be dominated by
     whichever class happened to be larger.
+
+    volume_bounds adds the overlap-aware log10_vol_low/log10_vol_high columns
+    (_tau_volume_bounds_log10) to the tau-sweep rows. Off by default because
+    that bound is ~O(k^2) -- ~160s at k=9665 -- and generate_blocklist sweeps
+    a whole tau grid per k, which multiplies that cost by the length of the
+    grid and dominates the run. generate_budget passes a single tau, so it
+    pays it once per k and turns this on; see the log10_j_tau comment in
+    row_at for the cheap sum-of-volumes proxy that is always reported.
     """
     B = np.ascontiguousarray(_to_construct_array(vectors_reference), dtype=np.float32)
     pos = np.ascontiguousarray(_to_construct_array(vectors_positive), dtype=np.float32)
@@ -731,6 +740,14 @@ def blocklist_worker(
             n_flagged = (recall * len(pos)) + (fpr_hard * len(hard)) + (fpr_easy * len(easy))
             saved = 100.0 * (1.0 - n_flagged / max(n_queries, 1))
 
+            # Only for the fixed-tau rows, and only when asked: this is the
+            # ~O(k^2) bound (see the docstring). The sweep="recall" row solves
+            # its own tau and so would need its own second run of it, which no
+            # figure reads -- NaN there is "not measured", not "zero volume".
+            vol_low, vol_high = float('nan'), float('nan')
+            if volume_bounds and sweep == "tau":
+                vol_low, vol_high = _tau_volume_bounds_log10(centers, radii, tau)
+
             return {
                 "dataset": dataset, "seed": seed, "sweep": sweep,
                 "k": len(radii), "n_reference": len(B),
@@ -749,16 +766,15 @@ def blocklist_worker(
                 "n_positive": len(pos), "n_hard": len(hard), "n_easy": len(easy),
                 "n_queries": n_queries,
                 "accesses_saved_pct": saved,
-                # log10_J is a logsumexp over the balls, i.e. O(k). The
-                # overlap-aware union bound (_tau_volume_bounds_log10) is
-                # deliberately NOT reported here: it is ~O(k^2) -- 7s at
-                # k=2000, ~160s at k=9665 -- and this worker evaluates every
-                # tau in the sweep, so including it multiplied a job's cost by
-                # the length of the grid and dominated the entire evaluation.
-                # Use system_tau's volume-bounds panel for that view, where k
-                # is small and the grid short.
+                # log10_J is a logsumexp over the balls, i.e. O(k), so it is
+                # always reported -- but it sums each ball's volume
+                # independently and double-counts overlap. The overlap-aware
+                # union bound below is the tighter number, and is opt-in
+                # because it is ~O(k^2) (see volume_bounds in the docstring).
                 "j_tau": _J_tau(radii, dim, tau=tau),
                 "log10_j_tau": _log10_J(radii, dim, tau=tau),
+                "log10_vol_low": vol_low,
+                "log10_vol_high": vol_high,
                 "n_balls": len(radii),
                 "d_pos_med": d_pos_med, "d_hard_med": d_hard_med,
                 # The predictor: room left for a ball once the duplicate

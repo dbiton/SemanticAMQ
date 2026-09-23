@@ -36,16 +36,20 @@ from typing import Optional
 
 import pandas as pd
 
+import matplotlib.pyplot as plt
+
 from plots.plot_blocklist import (
+    BLOCKLIST_COLORS,
     BLOCKLIST_DATASETS,
     BLOCKLIST_LABELS,
+    BLOCKLIST_MARKERS,
     SWEEP_TAU,
     Config,
     line_panel,
     save_blocklist_legend,
     validate_schema,
 )
-from plots.plot_common import mean_std
+from plots.plot_common import apply_style, mean_std, save_figure, style_axes, wrap_label
 
 INPUT_PATH = "results/budget.csv"
 OUTDIR = "plots/budget/"
@@ -55,6 +59,21 @@ EMIT_PDF = False
 # k as a percentage of |B| rather than plot_blocklist's compression |B|/k.
 _XLABEL = r"Ball budget $k$ (% of $|B|$)"
 
+# On top of the columns plot_blocklist requires: generate_budget is the one
+# blocklist-workload sweep that can afford these (see its docstring), so unlike
+# results/blocklist.csv they are always present here.
+_VOLUME_COLUMNS = ["log10_vol_low", "log10_vol_high"]
+
+
+def _validate_volume_schema(df: pd.DataFrame) -> None:
+    missing = [c for c in _VOLUME_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Input missing columns: {missing}. These come from blocklist_worker's "
+            "volume_bounds=True, which generate_budget always passes -- a file without "
+            "them predates that, so rerun generate_budget."
+        )
+
 
 def load_data() -> pd.DataFrame:
     if not os.path.exists(INPUT_PATH):
@@ -63,6 +82,7 @@ def load_data() -> pd.DataFrame:
         )
     df = pd.read_csv(INPUT_PATH)
     validate_schema(df)
+    _validate_volume_schema(df)
     return df
 
 
@@ -120,10 +140,59 @@ def panel_geometric_objective(df, cfg, tau):
                          "budget-geometric-objective.png", cfg, tau)
 
 
+def panel_volume_bounds(df: pd.DataFrame, cfg: Config, tau: float) -> pd.DataFrame:
+    """Lower/upper bounds (one shaded band per corpus) on the volume actually
+    covered by the tau-expanded cover, against the budget that bought it --
+    see runner._tau_volume_bounds_log10's overlap-aware union bound. Tighter
+    than panel_geometric_objective's log10_j_tau, which sums each ball's
+    volume independently and so double-counts every overlap; the gap between
+    the two panels is what that double-counting costs.
+
+    Rendered as a band rather than through line_panel because there are two
+    series per corpus, and the interesting quantity is the region between
+    them, not either bound alone."""
+    sel = df[df["sweep"] == SWEEP_TAU]
+    agg_low = mean_std(sel, ["dataset", "k_fraction"], "log10_vol_low")[
+        ["dataset", "k_fraction", "mean"]].rename(columns={"mean": "low"})
+    agg_high = mean_std(sel, ["dataset", "k_fraction"], "log10_vol_high")[
+        ["dataset", "k_fraction", "mean"]].rename(columns={"mean": "high"})
+    agg = agg_low.merge(agg_high, on=["dataset", "k_fraction"])
+    agg["x"] = 100.0 * agg["k_fraction"]
+
+    apply_style(cfg.dpi)
+    fig, ax = plt.subplots()
+    for dataset in BLOCKLIST_DATASETS:
+        sub = agg[agg["dataset"] == dataset].sort_values("x")
+        if sub.empty:
+            continue
+        ax.plot(sub["x"], sub["low"], color=BLOCKLIST_COLORS[dataset],
+                marker=BLOCKLIST_MARKERS[dataset], markersize=2.0, linewidth=0.6,
+                linestyle="--", zorder=2)
+        ax.plot(sub["x"], sub["high"], color=BLOCKLIST_COLORS[dataset],
+                marker=BLOCKLIST_MARKERS[dataset], markersize=2.0, linewidth=0.6,
+                linestyle="-", zorder=2)
+        ax.fill_between(sub["x"], sub["low"], sub["high"], color=BLOCKLIST_COLORS[dataset],
+                        alpha=0.15, linewidth=0, zorder=1)
+
+    ax.set_xlabel(_XLABEL)
+    ax.set_ylabel(wrap_label(r"$\log_{10}$ Volume Bounds"))
+    # Just the tau, as the sibling panels carry: the y-label already says
+    # these are bounds and the shaded band shows which is which, so
+    # plot_system_tau's longer "dashed: lower -- solid: upper" only crowds a
+    # panel this size.
+    ax.text(0.97, 0.06, rf"at $\tau$ = {tau:g}", transform=ax.transAxes,
+            ha="right", va="bottom", fontsize=5)
+    style_axes(ax)
+    fig.subplots_adjust(left=0.26, right=0.97, top=0.95, bottom=0.24)
+    save_figure(fig, "budget-volume-bounds.png", cfg.outdir, cfg.dpi, cfg.emit_pdf, tight=False)
+    return agg
+
+
 def print_summary(df: pd.DataFrame, tau: float) -> None:
     sel = df[df["sweep"] == SWEEP_TAU]
     print(f"\n--- Ball-budget sweep (tau fixed at {tau:g}) ---")
-    cols = ("recall", "fpr_hard", "fpr_easy", "accesses_saved_pct", "r_med", "log10_j_tau")
+    cols = ("recall", "fpr_hard", "fpr_easy", "accesses_saved_pct", "r_med", "log10_j_tau",
+            "log10_vol_low", "log10_vol_high")
     aggs = {c: mean_std(sel, ["dataset", "k_fraction"], c) for c in cols}
     for dataset in BLOCKLIST_DATASETS:
         sub = sel[sel["dataset"] == dataset]
@@ -138,7 +207,8 @@ def print_summary(df: pd.DataFrame, tau: float) -> None:
                 return float(row["mean"].iloc[0]) if len(row) else float("nan")
             print(f"  k={100.0*kf:>5.1f}%  r_med={_m('r_med'):.3f} recall={_m('recall'):.3f} "
                   f"FPR_hard={_m('fpr_hard'):.3f} FPR_easy={_m('fpr_easy'):.3f} "
-                  f"saved={_m('accesses_saved_pct'):5.1f}% log10_J={_m('log10_j_tau'):.2f}")
+                  f"saved={_m('accesses_saved_pct'):5.1f}% log10_J={_m('log10_j_tau'):.2f} "
+                  f"vol=[{_m('log10_vol_low'):.2f}, {_m('log10_vol_high'):.2f}]")
     print()
 
 
@@ -148,6 +218,7 @@ def generate_budget_figures(df: Optional[pd.DataFrame] = None, outdir: str = OUT
         df = load_data()
     else:
         validate_schema(df)
+        _validate_volume_schema(df)
     cfg = Config(dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
     tau = fixed_tau(df)
 
@@ -156,6 +227,7 @@ def generate_budget_figures(df: Optional[pd.DataFrame] = None, outdir: str = OUT
     panel_fpr_easy(df, cfg, tau)
     panel_saved(df, cfg, tau)
     panel_geometric_objective(df, cfg, tau)
+    panel_volume_bounds(df, cfg, tau)
 
     # Same three corpora and the same palette as the blocklist figures, so the
     # two evaluations' panels read as one set.
