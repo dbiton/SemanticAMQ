@@ -116,10 +116,9 @@ class MinHeapInsert(InsertInterface):
             contained_indices = (center_distances + current_radiuses) <= radius
             if np.any(contained_indices):
                 contained_spheres = current_spheres[contained_indices]
-                current_spheres = current_spheres[~contained_indices]
-                filter._all_spheres[:filter._num_spheres] = np.concatenate([current_spheres, contained_spheres])
-                filter._num_spheres -= len(contained_spheres)
+                filter._remove_spheres(contained_spheres)
                 self._sphere_versions[contained_spheres] += 1
+                current_spheres = current_spheres[~contained_indices]
                 current_radiuses = current_radiuses[~contained_indices]
                 center_distances = center_distances[~contained_indices]
 
@@ -161,10 +160,8 @@ class MinHeapInsert(InsertInterface):
 
             new_radius = float(self._compute_merged_radius(filter.dim, radius_i, radius_j, distance_ij)[0])
 
-            current_spheres = filter.all_spheres[(filter.all_spheres != i) & (filter.all_spheres != j)]
-            filter._all_spheres[:filter._num_spheres] = np.concatenate([current_spheres, [i, j]])
+            filter._remove_spheres(np.array([i, j]))
             self._sphere_versions[[i, j]] += 1
-            filter._num_spheres -= 2
 
             self.add_sphere(filter, new_center, new_radius)
 
