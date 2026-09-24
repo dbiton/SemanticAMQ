@@ -12,6 +12,7 @@ from filters.ball_cover.nearest_insert import NearestInsert
 from filters.ball_cover.least_inflation_insert import LeastInflationInsert
 from filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
 from filters.ball_cover.doubling_insert import DoublingInsert
+from filters.ball_cover.pooled_insert import PooledInsert
 
 
 class Quantize(Enum):
@@ -182,7 +183,7 @@ class BallCoverFilter(Filter):
         self,
         dim: int,
         construct_method: Optional[ConstructInterface] = GonzalesConstruct(),
-        insert_method: Optional[InsertInterface] = NearestInsert(),
+        insert_method: Optional[InsertInterface] = MinHeapInsert(),
         quantize: Quantize = Quantize.NONE,
         max_memory: Optional[int] = None,
         max_spheres: Optional[int] = None,

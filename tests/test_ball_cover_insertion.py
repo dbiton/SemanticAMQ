@@ -13,6 +13,7 @@ from src.filters.ball_cover.nearest_insert import NearestInsert
 from src.filters.ball_cover.least_inflation_insert import LeastInflationInsert
 from src.filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
 from src.filters.ball_cover.doubling_insert import DoublingInsert
+from src.filters.ball_cover.pooled_insert import PooledInsert
 
 DIM = 8
 
@@ -23,6 +24,7 @@ def get_insertion_strategies():
         'least_inflation': LeastInflationInsert(),
         'exhaustive_merge': ExhaustiveMergeInsert(),
         'doubling': DoublingInsert(),
+        'pooled': PooledInsert()
     }
 
 
