@@ -30,9 +30,6 @@ class LeastInflationInsert(InsertInterface):
 
     @staticmethod
     def _exhaustive_search(centers: np.ndarray, queries: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Via a throwaway faiss index, not a raw (m, k, d) numpy broadcast
-        -- the latter materializes a full dense tensor (~150GB at
-        20000x5000x384) where this holds only the (m, k) result."""
         dim = centers.shape[1]
         index = faiss.IndexFlatL2(dim)
         index.add(centers)
@@ -43,6 +40,7 @@ class LeastInflationInsert(InsertInterface):
     def insert(self, filter: Filter, vectors: np.ndarray) -> None:
         dim = filter.dim
         X = np.ascontiguousarray(vectors, dtype=np.float32)
+        active_indices = filter.all_spheres
         centers = filter.all_centers
         radii = filter.all_radiuses
 
@@ -65,7 +63,7 @@ class LeastInflationInsert(InsertInterface):
         new_radii = radii.copy()
         np.maximum.at(new_radii, ball, dist[row, col].astype(np.float32))
 
-        filter._all_radiuses[:filter._num_spheres] = new_radii
+        filter._all_radiuses[active_indices] = new_radii
 
 
     def remove(self, filter: Filter, vectors: np.ndarray) -> List[bool]:
