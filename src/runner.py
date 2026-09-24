@@ -33,6 +33,7 @@ from filters.ball_cover.least_inflation_insert import LeastInflationInsert
 from filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
 from filters.ball_cover.min_heap_insert import MinHeapInsert
 from filters.ball_cover.doubling_insert import DoublingInsert
+from filters.ball_cover.pooled_insert import PooledInsert
 from hyperspheres_volume import estimate_hypersphere_volume
 from vector_source import VectorSource
 
@@ -48,6 +49,7 @@ _INSERT_STRATEGIES = {
     "merge": ExhaustiveMergeInsert,
     "min_heap": MinHeapInsert,
     "doubling": DoublingInsert,
+    "pooled": PooledInsert,
 }
 
 VectorInput = Union[np.ndarray, VectorSource]
