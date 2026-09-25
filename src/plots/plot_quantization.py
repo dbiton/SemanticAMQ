@@ -108,6 +108,8 @@ _REQUIRED_COLUMNS = [
     "log10_J",
     "log10_J_tau",
     "fpr",
+    "fpr_hard",
+    "fpr_easy",
     "fnr",
     "stage_time_s",
     "cum_time_s",
@@ -333,6 +335,28 @@ def panel_fpr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     # can't represent 0). y-min pinned to 0, top auto-scales.
     return _line_panel(
         df, "fpr", "FPR", "quantization-false-positive-rate.png", cfg,
+        use_tau=True, y_bounds=(0, None),
+    )
+
+
+# Panel (c-hard)/(c-easy): the same pooled FPR split by query class, the same
+# distinction plot_blocklist reports separately for the reason its own
+# comment gives -- a pooled rate is dominated by whichever class the corpus
+# happens to have more of. fpr_hard is held-out members of duplicate clusters
+# NOT in the reference set (same tight local geometry as B, so this is what
+# actually tests whether the cover localises B rather than just density);
+# fpr_easy is singletons, i.e. undiscriminating background traffic.
+
+def panel_fpr_hard(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    return _line_panel(
+        df, "fpr_hard", "FPR (hard negatives)", "quantization-false-positive-rate-hard.png", cfg,
+        use_tau=True, y_bounds=(0, None),
+    )
+
+
+def panel_fpr_easy(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    return _line_panel(
+        df, "fpr_easy", "FPR (easy negatives)", "quantization-false-positive-rate-easy.png", cfg,
         use_tau=True, y_bounds=(0, None),
     )
 
@@ -570,7 +594,7 @@ def generate_quantization_figures(
     dpi: int = DPI,
     emit_pdf: bool = EMIT_PDF,
 ) -> None:
-    """Library entry point: renders the seven paper panels + one diagnostic
+    """Library entry point: renders the nine paper panels + one diagnostic
     FNR panel (+ legend) from an in-memory DataFrame, or from `load_data()`
     (reads INPUT_PATH) if `df` is omitted. panel_fnr is excluded from the
     LaTeX subfigure snippet printed below, since it's a sanity check, not
@@ -585,6 +609,8 @@ def generate_quantization_figures(
     panel_geometric_objective(df, cfg)
     panel_threshold_objective(df, cfg)
     panel_fpr(df, cfg)
+    panel_fpr_hard(df, cfg)
+    panel_fpr_easy(df, cfg)
     panel_construction_time(df, cfg)
     panel_query_throughput(df, cfg)
     panel_index_accesses_saved(df, cfg)

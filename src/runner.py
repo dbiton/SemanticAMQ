@@ -442,6 +442,8 @@ def quantization_worker(
     vectors_construct: VectorInput,
     vectors_query: VectorInput,
     actual_results: List[bool],
+    n_hard: int,
+    n_easy: int,
 ) -> List[Dict[str, Any]]:
     """Builds one BallCoverFilter cover per (dataset, k, seed, quantize) and
     evaluates it at a single tau. Returns one row, tagged
@@ -452,6 +454,18 @@ def quantization_worker(
     of queries are duplicates), so the tau-dependent columns (fpr,
     log10_J_tau, index_accesses_saved_pct) are unambiguous without the plots
     having to pick one tau out of several.
+
+    n_hard/n_easy split fpr into fpr_hard/fpr_easy, the same distinction
+    blocklist_worker reports: vectors_query is [positives, hard negatives,
+    easy negatives] in that order (see BlocklistWorkload.query_vectors), so
+    the last n_hard+n_easy entries are hard then easy negatives and the rest
+    are positives. Unlike blocklist_worker, ground truth here is
+    distance-to-tau (compute_static_actual_results), not cluster membership,
+    so a hard/easy-negative row is not unconditionally a true negative the
+    way it is there -- fpr_hard/fpr_easy go through the same confusion-rate
+    helper as the pooled fpr rather than a plain mean, so the rare row where
+    a "hard negative" is within tau by the distance definition is still
+    counted correctly.
 
     max_memory is derived from k using Quantize.FP32's byte-per-ball size and
     held fixed across every quantize candidate, so a more compact code packs
@@ -473,6 +487,9 @@ def quantization_worker(
         )
 
     actual = np.asarray(actual_results, dtype=bool)
+    if n_hard + n_easy > n_q:
+        raise ValueError(f"n_hard+n_easy ({n_hard + n_easy}) exceeds n_queries ({n_q})")
+    n_pos = n_q - n_hard - n_easy
     stage = "ball" if quantize == Quantize.FP32 else "quantizing"
 
     rows: List[Dict[str, Any]] = []
@@ -514,11 +531,17 @@ def quantization_worker(
     n_index_accesses = int(predicted_arr.sum())
 
     rates = _confusion_rates(predicted, actual)
+    # Same [positives, hard, easy] layout as blocklist_worker's query stream
+    # (see BlocklistWorkload.query_vectors) -- hard then easy negatives are
+    # the trailing n_hard+n_easy entries.
+    hard_rates = _confusion_rates(predicted_arr[n_pos:n_pos + n_hard], actual[n_pos:n_pos + n_hard])
+    easy_rates = _confusion_rates(predicted_arr[n_pos + n_hard:], actual[n_pos + n_hard:])
     rows.append({
         "dataset": dataset, "k": k, "quantize": quantize.value, "stage": stage, "tau": tau,
         "log10_J": log10_J,
         "log10_J_tau": _log10_J(radii, dim, tau=tau),
         "fpr": rates["fpr"], "fnr": rates["fnr"],
+        "fpr_hard": hard_rates["fpr"], "fpr_easy": easy_rates["fpr"],
         "stage_time_s": stage_time, "cum_time_s": stage_time,
         "query_throughput_qps": n_q / max(query_time, 1e-9),
         "n_queries": n_q,

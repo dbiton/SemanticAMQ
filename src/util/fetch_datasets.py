@@ -20,7 +20,7 @@ from sklearn.preprocessing import normalize
 from util.dataset_paths import dataset_filenames  # load_embeds/load_meta both index this
 
 embeds_dir = "datasets"
-MAX_STREAM_LENGTH = 500_000
+MAX_STREAM_LENGTH = 750_000
 models: Dict[str, SentenceTransformer] = {}
 
 def load_embeds(dataset_name: str, N: int):
@@ -535,6 +535,20 @@ if __name__ == "__main__":
     os.makedirs(embeds_dir, exist_ok=True)
 
     try:
+        print("generating CC-News...")
+        texts, meta = build_ccnews()
+        pack_and_dump(os.path.join(embeds_dir, "embeds_ccnews.pkl"), texts, meta)
+    except Exception as e:
+        print(f"Failed to generate CC-News: {e}")
+
+    try:
+        print("generating ChatGPT-paraphrases...")
+        texts, meta = build_chatgpt_paraphrases()
+        pack_and_dump(os.path.join(embeds_dir, "embeds_chatgpt_paraphrases.pkl"), texts, meta)
+    except Exception as e:
+        print(f"Failed to generate ChatGPT-paraphrases: {e}")
+
+    try:
         print("generating StackOverflow...")
         texts, meta = build_stackoverflow()
         pack_and_dump(os.path.join(embeds_dir, "embeds_stackoverflow.pkl"), texts, meta)
@@ -547,13 +561,6 @@ if __name__ == "__main__":
         pack_and_dump(os.path.join(embeds_dir, "embeds_quora_qp.pkl"), texts, meta)
     except Exception as e:
         print(f"Failed to generate Quora Question Pairs: {e}")
-
-    try:
-        print("generating ChatGPT-paraphrases...")
-        texts, meta = build_chatgpt_paraphrases()
-        pack_and_dump(os.path.join(embeds_dir, "embeds_chatgpt_paraphrases.pkl"), texts, meta)
-    except Exception as e:
-        print(f"Failed to generate ChatGPT-paraphrases: {e}")
 
     try:
         print("generating WildChat...")
@@ -610,13 +617,6 @@ if __name__ == "__main__":
         pack_and_dump(os.path.join(embeds_dir, "embeds_pes2o.pkl"), texts, meta)
     except Exception as e:
         print(f"Failed to generate peS2o: {e}")
-
-    try:
-        print("generating CC-News...")
-        texts, meta = build_ccnews()
-        pack_and_dump(os.path.join(embeds_dir, "embeds_ccnews.pkl"), texts, meta)
-    except Exception as e:
-        print(f"Failed to generate CC-News: {e}")
 
     try:
         print("generating WikiAnswers...")

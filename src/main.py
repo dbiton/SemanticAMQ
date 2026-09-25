@@ -58,7 +58,7 @@ DATASET = 'ELI5'
 # drops that corpus and silently reduces the comparison to two. 2^15 leaves
 # ~10% headroom there; system_tau's non-wrapping folds need 1.8N = 58,982 rows
 # per dataset, which its shortest (HotpotQA, 97,852) clears comfortably.
-WORKLOAD_NUM_VECTORS = 2 ** 16  # 32,768
+WORKLOAD_NUM_VECTORS = 100_000
 
 # generate_blocklist() knobs. Cluster discovery scans the whole file on disk.
 # Multiplicity is a property of the pool, not of the corpus, so a partial pool
@@ -1128,6 +1128,12 @@ def generate_quantization(runner: Runner) -> None:
     zero false-negative invariant that only holds under the distance
     definition (see BlocklistWorkload.cluster_membership).
 
+    Also passes n_hard/n_easy so quantization_worker can split fpr into
+    fpr_hard/fpr_easy the same way blocklist_worker does, from the same
+    [positives, hard, easy] query-stream layout (see
+    BlocklistWorkload.query_vectors) -- the pooled fpr column is unchanged,
+    this only adds the breakdown alongside it.
+
     Runs once per blocklist corpus, each into its own
     results/quantization/<dataset>/ folder and its own figure folder.
     Kept apart rather than pooled because plot_quantization asserts a single
@@ -1189,6 +1195,7 @@ def generate_quantization(runner: Runner) -> None:
                         k=k, quantize=quantize, tau=tau, seed=fold,
                         vectors_construct=vectors_construct, vectors_query=vectors_query,
                         actual_results=actual_results,
+                        n_hard=len(sel["hard"]), n_easy=len(sel["easy"]),
                     )
 
 
@@ -1668,13 +1675,11 @@ def generate_and_plot_all() -> None:
         generate_quantization(runner)
     except Exception:
         logger.exception("An error occurred")
-
     try:
         generate_budget(runner)
     except Exception:
         logger.exception("An error occurred")
 
-    '''
     try:
         generate_system_tau(runner)
     except Exception:
@@ -1688,6 +1693,7 @@ def generate_and_plot_all() -> None:
         generate_scaling(runner)
     except Exception:
         logger.exception("An error occurred")
+    '''
     try:
         generate_streaming(runner)
     except Exception:
