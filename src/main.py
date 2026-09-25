@@ -152,7 +152,16 @@ def equal_memory_csv(dataset: str) -> str:
     return os.path.join(EQUAL_MEMORY_DIR, dataset, "equal_memory.csv")
 
 
-STREAMING_CSV = "results/streaming.csv"
+# generate_streaming runs once per blocklist corpus and keeps each run in its
+# own folder, mirroring quantization_csv/QUANTIZATION_DIR above; plot_streaming
+# pools every dataset's rows the same way plot_scaling does (see its
+# docstring: "this figure is single-dataset" refers to color channel reuse
+# for method, not to a restriction on how many datasets feed it).
+STREAMING_DIR = "results/streaming"
+
+
+def streaming_csv(dataset: str) -> str:
+    return os.path.join(STREAMING_DIR, dataset, "streaming.csv")
 
 # generate_equal_memory()'s own comparison set: excludes DSBFFilter/
 # CoveringLSHFallbackFilter/LSBFFilter, which degenerate to ~100% duplicate
@@ -460,8 +469,9 @@ def plot_system_tau(df: pd.DataFrame) -> None:
 
 # generate_blocklist()'s corpora: deliberately NOT DATASET_KEYS. That list is
 # the 5-dataset symmetric sweep, which this workload replaces rather than
-# extends -- and these three were chosen for their duplicate-cluster geometry
-# (see BLOCKLIST_DATASETS' per-entry comments).
+# extends -- and these five were chosen for their duplicate-cluster geometry
+# (see BLOCKLIST_DATASETS' per-entry comments), verified by running eps=0.4
+# seed-ball discovery on each before adding it, not assumed from the label.
 BLOCKLIST_CSV = "results/blocklist.csv"
 # generate_budget's rows: the same workload and the same worker, swept over the
 # ball budget at a fixed tau. Its own file rather than a `sweep` value inside
@@ -489,6 +499,23 @@ BLOCKLIST_DATASETS = {
     # important?", pairs at d~0.75 that are on-topic rather than duplicates.
     # set_id stays in the metadata and is what eps=0.4 was calibrated against.
     "WikiAnswers": ("wikianswers", None),
+    # Quora: is_duplicate question pairs. Its set_id column exists (see
+    # build_quora) but the on-disk file predates _write_meta, so load_meta
+    # returns {} for it -- geometric discovery is the only option available
+    # without a full re-embed, and it doesn't need the label anyway: eps=0.4
+    # alone found 48,111 clusters>=3 here (median 4, ~259k usable vectors),
+    # the same shared cluster definition every other entry here uses.
+    "Quora": ("quora", None),
+    # ChatGPT-paraphrases: a source text plus 5 LLM-generated paraphrases,
+    # one cluster of 6 by construction (see build_chatgpt_paraphrases).
+    # Considered and rejected first: TaPaCo and StackExchange's official
+    # duplicate-question pairs, both community "same topic" labels that
+    # turned out geometrically sparse once actually clustered (~10-26k
+    # usable vectors from a comparable sample) -- "duplicate" there does not
+    # imply nearby embeddings the way a paraphrase does. eps=0.4 on this
+    # corpus instead recovered a median cluster size of 5 out of the native
+    # 6, ~166k usable vectors from a 360k-row sample alone.
+    "ChatGPTParaphrases": ("chatgpt_paraphrases", None),
 }
 
 
@@ -1407,10 +1434,6 @@ def plot_scaling(df_query: pd.DataFrame, df_insert: pd.DataFrame, df_constructio
     generate_scaling_figures(df_query, df_insert, df_construction)
 
 
-# Panels (b)/(c)/(d) collapse to one representative dataset (Figure 4: "different datasets do not really matter").
-_STREAMING_REPRESENTATIVE_DATASET = "MMLU"
-
-
 def _build_streaming_negative_set(
     dataset: str, stream_vectors: np.ndarray, candidate_pool: np.ndarray, tau_mid: float, n_negative: int,
 ) -> np.ndarray:
@@ -1454,45 +1477,51 @@ def generate_streaming(runner: Runner) -> None:
     1 - init_percent_stream - insert_percent_stream of num_vectors, past
     every fold's window, is held out as the source of verified-negative
     queries. Each of k_folds=5 folds gets its own stream window, starting
-    fold_stride further into the representative dataset than fold 0's --
-    non-wrapping via advancing_fold_starts, so folds see genuinely different
-    data rather than the same pool reordered. The dataset needs enough
-    vectors on disk for both the folds' windows and the query span, or this
-    raises.
+    fold_stride further into the dataset than fold 0's -- non-wrapping via
+    advancing_fold_starts, so folds see genuinely different data rather than
+    the same pool reordered. A dataset needs enough vectors on disk for both
+    the folds' windows and the query span, or this raises.
+
+    Runs once per blocklist corpus (WildChat, CCNews, WikiAnswers), each to
+    its own results/streaming/<dataset>/streaming.csv (see streaming_csv()),
+    mirroring quantization_csv/QUANTIZATION_DIR -- rather than one
+    hardcoded representative dataset outside that trio, so this evaluation
+    draws from the same corpora as generate_blocklist/generate_quantization/
+    generate_scaling/generate_equal_memory/generate_budget. Unlike those,
+    it does not reuse blocklist_workloads(): streaming needs an ordered,
+    contiguous span of one corpus to simulate positions in time, not a
+    cluster-based reference/query split, so it draws directly from
+    VectorSource the same way it always did, just once per corpus instead of
+    once for a single hardcoded one. k_fixed and the checkpoint positions are
+    pure functions of num_vectors, not of any corpus's geometry, so unlike
+    generate_scaling's k or generate_equal_memory's memory_budgets neither
+    needs bounding by the smallest corpus -- they are identical across
+    corpora already, which is what makes plot_streaming's pooling (see its
+    module docstring) meaningful here.
 
     FNR=0 is asserted per checkpoint inside stream_rebuild_worker (raises,
     not recorded) -- a correctness requirement, not a plotted quantity.
 
-    Only submits 'stream_rebuild' jobs (output_csv=STREAMING_CSV) -- does
-    not run `runner`."""
+    Only submits 'stream_rebuild' jobs -- does not run `runner`."""
     num_vectors = WORKLOAD_NUM_VECTORS
     dim = 384
     methods = ["nearest", "least_inflation", "merge", "min_heap"]
     n_negative = 500
-    duplicate_percentage = 10.0  # calibrates tau_mid; see calculate_nn_distance_threshold
+    # Calibrates tau_mid; see calculate_nn_distance_threshold. Raised from the
+    # 10.0 the old single-dataset (MMLU) run used: WildChat's stream window is
+    # so duplicate-dense that ~12% of vectors have an exact-duplicate nearest
+    # neighbor (distance 0), so a 10th-percentile calibration lands tau_mid on
+    # exactly 0.0 and stream_rebuild_worker's zero-FNR invariant then fails on
+    # ordinary floating-point round-off at the tau=0 boundary. 20.0 clears
+    # that zero-distance mass on every blocklist corpus with real headroom
+    # (measured >= ~0.11 on all three) while still calibrating each corpus's
+    # own duplicate rate rather than fixing one absolute threshold.
+    duplicate_percentage = 20.0
     k_folds = 5  # "we do this 5 times" (Section 5.1)
     seed = 0  # fixed; fold_offset supplies the stream-order variance instead
     k_percent_stream = 0.1  # ball budget k, as a fraction of num_vectors
     init_percent_stream = 0.4  # bootstrap/construct window, as a fraction of num_vectors
     insert_percent_stream = 0.4  # vectors streamed via insert() after bootstrap, as a fraction of num_vectors
-
-    datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
-    missing = [d for d in DATASET_KEYS if d not in datasets]
-    if missing:
-        logger.warning(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
-    if set(datasets) != set(DATASET_KEYS):
-        raise RuntimeError(
-            f"generate_streaming needs all {len(DATASET_KEYS)} datasets "
-            f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
-        )
-    if _STREAMING_REPRESENTATIVE_DATASET not in datasets:
-        raise RuntimeError(
-            f"generate_streaming's representative dataset {_STREAMING_REPRESENTATIVE_DATASET!r} "
-            "is not on disk."
-        )
-
-    rep_dataset = _STREAMING_REPRESENTATIVE_DATASET
-    rep_key = DATASET_KEYS[rep_dataset]
 
     k_fixed = max(16, round(k_percent_stream * num_vectors))
 
@@ -1518,70 +1547,87 @@ def generate_streaming(runner: Runner) -> None:
     negative_pool_start = offsets[-1] + n_stream_window
     negative_pool_end = negative_pool_start + negative_pool_size
 
-    total_rows = len(VectorSource(rep_dataset))
-    if total_rows < negative_pool_end:
-        raise RuntimeError(
-            f"{rep_dataset}: has only {total_rows} vectors on disk; generate_streaming's "
-            f"non-wrapping {k_folds}-fold sweep at num_vectors={num_vectors} needs at least "
-            f"{negative_pool_end} (room for {k_folds} stream windows of {n_stream_window} "
-            f"vectors each, advancing by {fold_stride}, plus a {negative_pool_size}-vector "
-            "negative-candidate pool past the last one). Raise the dataset's available "
-            "vectors, or lower num_vectors."
-        )
-
-    # The driver needs real arrays only for calibrating tau_mid and building
-    # the negative set (one-time, not per-job) -- everything else stays
-    # lazy. `full_span` covers every fold's window, not just fold 0's.
-    full_span = VectorSource(rep_dataset, 0, negative_pool_start).to_array()
-    negative_candidate_pool = VectorSource(rep_dataset, negative_pool_start, negative_pool_end).to_array()
-    if len(negative_candidate_pool) < n_negative:
-        raise RuntimeError(
-            f"{rep_dataset}: held-out negative-candidate pool has only "
-            f"{len(negative_candidate_pool)} vectors (needed >= {n_negative}). "
-            "Raise num_vectors or lower n_negative."
-        )
-
-    # Calibrated from fold 0's window (full_span's first n_stream_window vectors).
-    logger.info(f"{rep_dataset}: calibrating tau_mid against the stream window...")
-    tau_mid = calculate_nn_distance_threshold(full_span[:n_stream_window], duplicate_percentage)
-    logger.info(f"tau_mid={tau_mid:.4f}")
-
-    logger.info(f"{rep_dataset}: building fixed streaming negative set from the held-out span...")
-    negative_vectors = _build_streaming_negative_set(
-        rep_dataset, full_span, negative_candidate_pool, tau_mid, n_negative,
-    )
-
     # Bootstrap (construct()) covers positions [0, n_init); the position
     # sweep only checkpoints the subsequent insert-only span, since nothing
-    # streams in before n_init.
+    # streams in before n_init. Dataset-independent, computed once.
     checkpoints = sorted(set(
         int(round(x)) for x in np.logspace(np.log10(n_init + 1), np.log10(n_stream_window), num=12)
     ))
 
-    def _fold_source(fold_offset: int, length: int) -> VectorSource:
-        return VectorSource(rep_dataset, fold_offset, fold_offset + length)
+    any_usable = False
+    for name in BLOCKLIST_DATASETS:
+        if not os.path.exists(dataset_filenames[name]):
+            logger.warning(f"Skipping {name}: not found on disk")
+            continue
+        any_usable = True
 
-    # Each row is self-describing (method/sweep/metric/fold_offset), so no
-    # positional reconstruction is needed despite Runner's completion-order results.
+        total_rows = len(VectorSource(name))
+        if total_rows < negative_pool_end:
+            raise RuntimeError(
+                f"{name}: has only {total_rows} vectors on disk; generate_streaming's "
+                f"non-wrapping {k_folds}-fold sweep at num_vectors={num_vectors} needs at least "
+                f"{negative_pool_end} (room for {k_folds} stream windows of {n_stream_window} "
+                f"vectors each, advancing by {fold_stride}, plus a {negative_pool_size}-vector "
+                "negative-candidate pool past the last one). Raise the dataset's available "
+                "vectors, or lower num_vectors."
+            )
 
-    # --- panels (a)/(b): position sweep at fixed k_fixed, decoupled bootstrap/insert windows ---
-    for method in methods:
+        # The driver needs real arrays only for calibrating tau_mid and
+        # building the negative set (one-time per corpus, not per job) --
+        # everything else stays lazy. `full_span` covers every fold's
+        # window, not just fold 0's.
+        full_span = VectorSource(name, 0, negative_pool_start).to_array()
+        negative_candidate_pool = VectorSource(name, negative_pool_start, negative_pool_end).to_array()
+        if len(negative_candidate_pool) < n_negative:
+            raise RuntimeError(
+                f"{name}: held-out negative-candidate pool has only "
+                f"{len(negative_candidate_pool)} vectors (needed >= {n_negative}). "
+                "Raise num_vectors or lower n_negative."
+            )
+
+        # Calibrated from fold 0's window (full_span's first n_stream_window vectors).
+        logger.info(f"{name}: calibrating tau_mid against the stream window...")
+        tau_mid = calculate_nn_distance_threshold(full_span[:n_stream_window], duplicate_percentage)
+        logger.info(f"{name}: tau_mid={tau_mid:.4f}")
+
+        logger.info(f"{name}: building fixed streaming negative set from the held-out span...")
+        negative_vectors = _build_streaming_negative_set(
+            name, full_span, negative_candidate_pool, tau_mid, n_negative,
+        )
+
+        def _fold_source(fold_offset: int, length: int, name: str = name) -> VectorSource:
+            return VectorSource(name, fold_offset, fold_offset + length)
+
+        output_csv = streaming_csv(name)
+
+        # Each row is self-describing (dataset/method/sweep/metric/fold_offset),
+        # so no positional reconstruction is needed despite Runner's
+        # completion-order results.
+
+        # --- panels (a)/(b): position sweep at fixed k_fixed, decoupled bootstrap/insert windows ---
+        for method in methods:
+            for fold_offset in offsets:
+                runner.submit(
+                    'stream_rebuild',
+                    output_csv=output_csv,
+                    dim=dim, dataset=name, k=k_fixed, seed=seed, tau_mid=tau_mid, policy="streaming", T=None,
+                    insertion_level=method, vectors_stream=_fold_source(fold_offset, n_stream_window),
+                    vectors_negative=negative_vectors, bootstrap_n=n_init,
+                    checkpoints=checkpoints, sweep="position", fold_offset=fold_offset,
+                )
         for fold_offset in offsets:
             runner.submit(
                 'stream_rebuild',
-                output_csv=STREAMING_CSV,
-                dim=dim, dataset=rep_key, k=k_fixed, seed=seed, tau_mid=tau_mid, policy="streaming", T=None,
-                insertion_level=method, vectors_stream=_fold_source(fold_offset, n_stream_window),
-                vectors_negative=negative_vectors, bootstrap_n=n_init,
+                output_csv=output_csv,
+                dim=dim, dataset=name, k=k_fixed, seed=seed, tau_mid=tau_mid, policy="oracle", T=None,
+                vectors_stream=_fold_source(fold_offset, n_stream_window), vectors_negative=negative_vectors,
                 checkpoints=checkpoints, sweep="position", fold_offset=fold_offset,
             )
-    for fold_offset in offsets:
-        runner.submit(
-            'stream_rebuild',
-            output_csv=STREAMING_CSV,
-            dim=dim, dataset=rep_key, k=k_fixed, seed=seed, tau_mid=tau_mid, policy="oracle", T=None,
-            vectors_stream=_fold_source(fold_offset, n_stream_window), vectors_negative=negative_vectors,
-            checkpoints=checkpoints, sweep="position", fold_offset=fold_offset,
+
+    if not any_usable:
+        raise RuntimeError(
+            "generate_streaming: none of the blocklist corpora "
+            f"({', '.join(BLOCKLIST_DATASETS)}) were found on disk."
         )
 
 
@@ -1733,9 +1779,12 @@ def plot_all() -> None:
         logger.exception("An error occurred")
 
     try:
-        df = pd.read_csv(STREAMING_CSV)
-        k_fixed = int(df.loc[df["sweep"] == "position", "k"].iloc[0])
-        plot_streaming(df, k_fixed=k_fixed)
+        frames = [pd.read_csv(streaming_csv(name)) for name in BLOCKLIST_DATASETS
+                 if os.path.exists(streaming_csv(name))]
+        if frames:
+            df = pd.concat(frames, ignore_index=True)
+            k_fixed = int(df.loc[df["sweep"] == "position", "k"].iloc[0])
+            plot_streaming(df, k_fixed=k_fixed)
     except Exception:
         logger.exception("An error occurred")
 

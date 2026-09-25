@@ -1,3 +1,4 @@
+import ast
 import os
 import h5py
 
@@ -427,6 +428,61 @@ def build_ccnews() -> Tuple[List[str], Dict[str, List[Any]]]:
     return texts, meta
 
 
+def build_chatgpt_paraphrases() -> Tuple[List[str], Dict[str, List[Any]]]:
+    """ChatGPT-generated paraphrase clusters (humarin/chatgpt-paraphrases):
+    each source text (from SQuAD 2.0 or CNN/DailyMail, one row per source)
+    ships with 5 LLM-generated paraphrases, so a source plus its 5
+    paraphrases is one cluster of 6 by construction.
+
+    Excludes the dataset's "quora" source split (also present as raw Quora
+    questions, ~59% of the source texts) -- BLOCKLIST_DATASETS already has a
+    separate Quora corpus, and re-adding its questions here as LLM
+    rewrites would make the two corpora's clusters overlap in content
+    rather than add an independent one.
+
+    Added as a synthetic-paraphrase counterpart to WikiAnswers' editor-labelled
+    rephrasings, after WikiAnswers-scale community datasets (TaPaCo,
+    StackExchange's official duplicate-question pairs) turned out too sparse
+    once actually clustered: their "duplicate" label means "same underlying
+    topic," which does not imply nearby embeddings, and eps=0.4 seed-ball
+    discovery on a 360k-row sample recovered only ~10-25k usable vectors from
+    either. The same check on this corpus recovered a median cluster size of
+    5 out of the native 6 (largest discovered cluster 18, where a few
+    different sources' paraphrases happened to land within eps of each
+    other) and ~166k usable vectors from that same sample size -- an LLM
+    paraphrase is built to preserve meaning while varying wording, which is
+    much closer to WikiAnswers/Quora's rephrasings than to a "same problem"
+    moderation label.
+
+    `set_id` is written to metadata for the same reason as WikiAnswers', but
+    -- like WikiAnswers -- generate_blocklist clusters geometrically rather
+    than from this label, so every blocklist corpus shares one cluster
+    definition.
+
+    Capped at MAX_STREAM_LENGTH total rows (source texts + paraphrases), same
+    as build_wikianswers().
+    """
+    print(f"Loading ChatGPT-paraphrases (up to {MAX_STREAM_LENGTH} rows, excluding quora sources)...")
+    ds = load_dataset("humarin/chatgpt-paraphrases")["train"]
+    ds = ds.filter(lambda ex: ex["source"] != "quora")
+
+    texts, set_id = [], []
+    for i, ex in enumerate(ds):
+        paraphrases = ex["paraphrases"]
+        if isinstance(paraphrases, str):
+            paraphrases = ast.literal_eval(paraphrases)
+        texts.append(ex["text"])
+        set_id.append(i)
+        for p in paraphrases:
+            texts.append(p)
+            set_id.append(i)
+        if len(texts) >= MAX_STREAM_LENGTH:
+            break
+
+    meta = {"set_id": set_id}
+    return texts, meta
+
+
 def build_wikianswers() -> Tuple[List[str], Dict[str, List[Any]]]:
     """WikiAnswers paraphrase clusters, via the Parquet-native
     embedding-data/WikiAnswers mirror. Each row is a `set` of user-submitted
@@ -491,6 +547,13 @@ if __name__ == "__main__":
         pack_and_dump(os.path.join(embeds_dir, "embeds_quora_qp.pkl"), texts, meta)
     except Exception as e:
         print(f"Failed to generate Quora Question Pairs: {e}")
+
+    try:
+        print("generating ChatGPT-paraphrases...")
+        texts, meta = build_chatgpt_paraphrases()
+        pack_and_dump(os.path.join(embeds_dir, "embeds_chatgpt_paraphrases.pkl"), texts, meta)
+    except Exception as e:
+        print(f"Failed to generate ChatGPT-paraphrases: {e}")
 
     try:
         print("generating WildChat...")

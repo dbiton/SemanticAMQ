@@ -23,5 +23,6 @@ dataset_filenames = {
     "peS2o": "./datasets/embeds_pes2o.pkl",
     "CCNews": "./datasets/embeds_ccnews.pkl",
     "WikiAnswers": "./datasets/embeds_wikianswers.pkl",
+    "ChatGPTParaphrases": "./datasets/embeds_chatgpt_paraphrases.pkl",
     # "synthetic_d16": "./datasets/synthetic_d16.h5",
 }

@@ -56,10 +56,21 @@ EMIT_PDF = False
 # Self-contained styling: these corpora are deliberately not in
 # plot_common.DATASETS (that list is the 5-dataset sweep subset, and
 # every other plot module validates against it).
-BLOCKLIST_DATASETS = ["wildchat", "ccnews", "wikianswers"]
-BLOCKLIST_LABELS = {"wildchat": "WildChat", "ccnews": "CC-News", "wikianswers": "WikiAnswers"}
-BLOCKLIST_COLORS = {"wildchat": "#4C72B0", "ccnews": "#DD8452", "wikianswers": "#55A868"}
-BLOCKLIST_MARKERS = {"wildchat": "o", "ccnews": "s", "wikianswers": "^"}
+BLOCKLIST_DATASETS = ["wildchat", "ccnews", "wikianswers", "quora", "chatgpt_paraphrases"]
+BLOCKLIST_LABELS = {
+    "wildchat": "WildChat", "ccnews": "CC-News", "wikianswers": "WikiAnswers",
+    "quora": "Quora", "chatgpt_paraphrases": "ChatGPT-Paraphrases",
+}
+# Seaborn "deep" palette, extended by two more of its own entries so the two
+# new corpora stay in the same family rather than introducing a new one.
+BLOCKLIST_COLORS = {
+    "wildchat": "#4C72B0", "ccnews": "#DD8452", "wikianswers": "#55A868",
+    "quora": "#C44E52", "chatgpt_paraphrases": "#8172B2",
+}
+BLOCKLIST_MARKERS = {
+    "wildchat": "o", "ccnews": "s", "wikianswers": "^",
+    "quora": "D", "chatgpt_paraphrases": "v",
+}
 
 _REQUIRED_COLUMNS = [
     "dataset", "seed", "sweep", "k", "k_fraction", "n_reference", "compression", "r_med",
