@@ -1,8 +1,8 @@
 """Blocklist-workload figures (see main.generate_blocklist).
 
-The x-axis is the compression ratio |B|/k -- how many reference vectors each
+The x-axis is the compression ratio |X|/k -- how many reference vectors each
 stored ball stands in for. The claim under test is that compression is bounded
-by the duplicate-cluster multiplicity m: one ball per cluster means |B|/k <= m,
+by the duplicate-cluster multiplicity m: one ball per cluster means |X|/k <= m,
 so a corpus of pairs caps at 2x however much memory you spend, while a corpus
 with clusters of 50 keeps working out to 50x.
 
@@ -130,7 +130,7 @@ def save_blocklist_legend(outdir: str, dpi: int, emit_pdf: bool = False,
     ]
     labels = [BLOCKLIST_LABELS[d] for d in BLOCKLIST_DATASETS]
     fig.legend(handles, labels, loc="center", ncol=len(BLOCKLIST_DATASETS),
-               frameon=False, fontsize=7)
+               frameon=False, fontsize=8.4)
     fig.patch.set_alpha(0.0)
     save_figure(fig, filename, outdir, dpi, emit_pdf, transparent=True)
 
@@ -139,7 +139,7 @@ def line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg
                bounded_unit: bool = False, logx: bool = True,
                sweep: str = SWEEP_RECALL,
                x_from: Callable[[pd.Series], pd.Series] = lambda kf: 1.0 / kf,
-               xlabel: str = r"Compression $|B|/k$",
+               xlabel: str = r"Compression $|X|/k$",
                annotation: Optional[str] = None) -> pd.DataFrame:
     """One line per corpus against a function of the ball budget, averaged over
     folds with +/- 1 std error bars (same convention as plot_system_tau).
@@ -150,7 +150,7 @@ def line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg
 
     Always groups on k_fraction -- the nominal knob, identical across datasets
     and folds -- and only then maps it onto the x-axis via `x_from`, so a
-    caller can plot against compression (|B|/k, the default) or against the
+    caller can plot against compression (|X|/k, the default) or against the
     budget itself (see plot_budget) without grouping on a realised quantity
     that differs per dataset and per fold."""
     agg = mean_std(df[df["sweep"] == sweep], ["dataset", "k_fraction"], value_col)
@@ -177,7 +177,7 @@ def line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg
     ax.set_ylabel(wrap_label(ylabel))
     if annotation:
         ax.text(0.97, 0.06, annotation, transform=ax.transAxes,
-                ha="right", va="bottom", fontsize=5)
+                ha="right", va="bottom", fontsize=6.0)
     style_axes(ax)
     fig.subplots_adjust(left=0.26, right=0.97, top=0.95, bottom=0.24)
     save_figure(fig, filename, cfg.outdir, cfg.dpi, cfg.emit_pdf, tight=False)
@@ -195,7 +195,7 @@ def panel_fpr_easy(df, cfg):
 
 
 def panel_saved(df, cfg):
-    return line_panel(df, "accesses_saved_pct", "Index Accesses Saved (%)",
+    return line_panel(df, "accesses_saved_pct", "Accesses Saved (%)",
                       "blocklist-accesses-saved.png", cfg)
 
 
@@ -222,10 +222,10 @@ def panel_margin_budget(df, cfg):
                        linestyle="--", linewidth=0.5, alpha=0.7, zorder=1)
 
     ax.set_xscale("log")
-    ax.set_xlabel(r"Compression $|B|/k$")
+    ax.set_xlabel(r"Compression $|X|/k$")
     ax.set_ylabel(wrap_label(r"Margin budget $d_{hard} - r$"))
     ax.text(0.97, 0.06, r"dashed: that corpus's $\delta$", transform=ax.transAxes,
-            ha="right", va="bottom", fontsize=5)
+            ha="right", va="bottom", fontsize=6.0)
     style_axes(ax)
     fig.subplots_adjust(left=0.26, right=0.97, top=0.95, bottom=0.24)
     save_figure(fig, "blocklist-margin-budget.png", cfg.outdir, cfg.dpi, cfg.emit_pdf, tight=False)
@@ -287,8 +287,8 @@ def _tau_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg
         ax.set_ylim(-0.05, 1.05)
     ax.set_xlabel(r"$\tau$")
     ax.set_ylabel(wrap_label(ylabel))
-    ax.text(0.97, 0.06, rf"at {1.0/k_fraction:.0f}x compression -- dotted: $\delta$",
-            transform=ax.transAxes, ha="right", va="bottom", fontsize=5)
+    ax.text(0.97, 0.06, r"dotted: $\delta$",
+            transform=ax.transAxes, ha="right", va="bottom", fontsize=6.0)
     style_axes(ax)
     if not horizontal_grid:
         # style_axes grids both axes for the whole project; drop just the
@@ -322,7 +322,7 @@ def panel_geometric_objective_vs_tau(df, cfg, k_fraction):
 def panel_saved_vs_tau(df, cfg, k_fraction):
     """Percentage of queries that never reach the backing index, as tau grows.
     Falls monotonically: a larger tau flags more of the stream."""
-    return _tau_panel(df, "accesses_saved_pct", "Index Accesses Saved (%)",
+    return _tau_panel(df, "accesses_saved_pct", "Accesses Saved (%)",
                       "blocklist-accesses-saved-vs-tau.png", cfg, k_fraction,
                       horizontal_grid=False)
 
@@ -337,7 +337,7 @@ def print_summary(df: pd.DataFrame) -> None:
         if sub.empty:
             continue
         n_ref = int(sub["n_reference"].iloc[0])
-        print(f"\n{BLOCKLIST_LABELS[dataset]} (|B|={n_ref}, delta={sub['d_pos_med'].mean():.3f}, "
+        print(f"\n{BLOCKLIST_LABELS[dataset]} (|X|={n_ref}, delta={sub['d_pos_med'].mean():.3f}, "
               f"d_hard={sub['d_hard_med'].mean():.3f})")
         for kf in sorted(sub["k_fraction"].unique()):
             def _m(c):

@@ -273,7 +273,7 @@ def save_legend(cfg: Config) -> None:
     fig.legend(
         handles, labels,
         loc="center", ncol=len(cfg.configs),
-        frameon=False, fontsize=7,
+        frameon=False, fontsize=8.4,
     )
     fig.patch.set_alpha(0.0)
 

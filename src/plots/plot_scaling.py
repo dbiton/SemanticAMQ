@@ -157,7 +157,7 @@ def generate_legend_figure(line_values: List[float], cfg: Config) -> None:
         labels.append(str(int(lv)))
 
     ax.legend(handles, labels, loc="center", ncol=len(line_values),
-              title="Filter Size (k)", frameon=False, fontsize=8, title_fontsize=9)
+              title="Filter Size (k)", frameon=False, fontsize=9.6, title_fontsize=10.8)
 
     save_figure(fig, "scaling-legend.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
     plt.close(fig)

@@ -318,7 +318,7 @@ def panel_threshold_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     def annotate(ax: plt.Axes) -> None:
         ax.text(
             0.97, 0.95, rf"$\tau = {cfg.tau:g}$",
-            transform=ax.transAxes, ha="right", va="top", fontsize=5.5,
+            transform=ax.transAxes, ha="right", va="top", fontsize=6.6,
         )
 
     return _line_panel(
@@ -406,7 +406,7 @@ def panel_index_accesses_saved(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             # Top-left, not top-right like panel (b): this curve rises with
             # memory, so the right half is where the lines are.
             0.03, 0.95, rf"$\tau = {cfg.tau:g}$",
-            transform=ax.transAxes, ha="left", va="top", fontsize=5.5,
+            transform=ax.transAxes, ha="left", va="top", fontsize=6.6,
         )
 
     return _line_panel(
@@ -526,7 +526,7 @@ def save_legend(df: pd.DataFrame, cfg: Config) -> None:
     fig.legend(
         handles, labels,
         loc="center", ncol=min(5, len(stages)),
-        frameon=False, fontsize=7,
+        frameon=False, fontsize=8.4,
     )
     fig.patch.set_alpha(0.0)
 

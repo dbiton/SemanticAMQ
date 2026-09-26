@@ -7,8 +7,8 @@ an outcome rather than a held constant. That makes this the "what does a fixed
 operating threshold buy as you pay for more balls" view: recall and FPR both
 move, and the question is where the budget stops buying either.
 
-The x-axis is k as a percentage of the reference set |B| -- the budget itself,
-not plot_blocklist's derived compression |B|/k, since the sweep is a narrow
+The x-axis is k as a percentage of the reference set |X| -- the budget itself,
+not plot_blocklist's derived compression |X|/k, since the sweep is a narrow
 linear band (5%-20%) where a reciprocal log axis would compress the whole
 range into one corner.
 
@@ -56,8 +56,8 @@ OUTDIR = "plots/budget/"
 DPI = 300
 EMIT_PDF = False
 
-# k as a percentage of |B| rather than plot_blocklist's compression |B|/k.
-_XLABEL = r"Ball budget $k$ (% of $|B|$)"
+# k as a percentage of |X| rather than plot_blocklist's compression |X|/k.
+_XLABEL = r"Ball budget $k$ (% of $|X|$)"
 
 # On top of the columns plot_blocklist requires: generate_budget is the one
 # blocklist-workload sweep that can afford these (see its docstring), so unlike
@@ -104,43 +104,42 @@ def fixed_tau(df: pd.DataFrame) -> float:
 
 
 def _budget_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str,
-                  cfg: Config, tau: float, bounded_unit: bool = False) -> pd.DataFrame:
+                  cfg: Config, bounded_unit: bool = False) -> pd.DataFrame:
     """plot_blocklist's shared renderer, pointed at the fixed-tau rows and at a
-    budget x-axis: linear, in percent of |B|."""
+    budget x-axis: linear, in percent of |X|."""
     return line_panel(
         df, value_col, ylabel, filename, cfg,
         bounded_unit=bounded_unit, logx=False,
         sweep=SWEEP_TAU, x_from=lambda kf: 100.0 * kf, xlabel=_XLABEL,
-        annotation=rf"at $\tau$ = {tau:g}",
     )
 
 
-def panel_recall(df, cfg, tau):
-    return _budget_panel(df, "recall", "Recall", "budget-recall.png", cfg, tau,
+def panel_recall(df, cfg):
+    return _budget_panel(df, "recall", "Recall", "budget-recall.png", cfg,
                          bounded_unit=True)
 
 
-def panel_fpr_hard(df, cfg, tau):
+def panel_fpr_hard(df, cfg):
     return _budget_panel(df, "fpr_hard", "FPR (hard negatives)", "budget-fpr-hard.png",
-                         cfg, tau, bounded_unit=True)
+                         cfg, bounded_unit=True)
 
 
-def panel_fpr_easy(df, cfg, tau):
+def panel_fpr_easy(df, cfg):
     return _budget_panel(df, "fpr_easy", "FPR (easy negatives)", "budget-fpr-easy.png",
-                         cfg, tau, bounded_unit=True)
+                         cfg, bounded_unit=True)
 
 
-def panel_saved(df, cfg, tau):
-    return _budget_panel(df, "accesses_saved_pct", "Index Accesses Saved (%)",
-                         "budget-accesses-saved.png", cfg, tau)
+def panel_saved(df, cfg):
+    return _budget_panel(df, "accesses_saved_pct", "Accesses Saved (%)",
+                         "budget-accesses-saved.png", cfg)
 
 
-def panel_geometric_objective(df, cfg, tau):
+def panel_geometric_objective(df, cfg):
     return _budget_panel(df, "log10_j_tau", r"$\log_{10} J_\tau(\mathcal{C})$",
-                         "budget-geometric-objective.png", cfg, tau)
+                         "budget-geometric-objective.png", cfg)
 
 
-def panel_volume_bounds(df: pd.DataFrame, cfg: Config, tau: float) -> pd.DataFrame:
+def panel_volume_bounds(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     """Lower/upper bounds (one shaded band per corpus) on the volume actually
     covered by the tau-expanded cover, against the budget that bought it --
     see runner._tau_volume_bounds_log10's overlap-aware union bound. Tighter
@@ -176,12 +175,6 @@ def panel_volume_bounds(df: pd.DataFrame, cfg: Config, tau: float) -> pd.DataFra
 
     ax.set_xlabel(_XLABEL)
     ax.set_ylabel(wrap_label(r"$\log_{10}$ Volume Bounds"))
-    # Just the tau, as the sibling panels carry: the y-label already says
-    # these are bounds and the shaded band shows which is which, so
-    # plot_system_tau's longer "dashed: lower -- solid: upper" only crowds a
-    # panel this size.
-    ax.text(0.97, 0.06, rf"at $\tau$ = {tau:g}", transform=ax.transAxes,
-            ha="right", va="bottom", fontsize=5)
     style_axes(ax)
     fig.subplots_adjust(left=0.26, right=0.97, top=0.95, bottom=0.24)
     save_figure(fig, "budget-volume-bounds.png", cfg.outdir, cfg.dpi, cfg.emit_pdf, tight=False)
@@ -199,7 +192,7 @@ def print_summary(df: pd.DataFrame, tau: float) -> None:
         if sub.empty:
             continue
         n_ref = int(sub["n_reference"].iloc[0])
-        print(f"\n{BLOCKLIST_LABELS[dataset]} (|B|={n_ref}, delta={sub['d_pos_med'].mean():.3f}, "
+        print(f"\n{BLOCKLIST_LABELS[dataset]} (|X|={n_ref}, delta={sub['d_pos_med'].mean():.3f}, "
               f"d_hard={sub['d_hard_med'].mean():.3f})")
         for kf in sorted(sub["k_fraction"].unique()):
             def _m(c):
@@ -222,12 +215,12 @@ def generate_budget_figures(df: Optional[pd.DataFrame] = None, outdir: str = OUT
     cfg = Config(dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
     tau = fixed_tau(df)
 
-    panel_recall(df, cfg, tau)
-    panel_fpr_hard(df, cfg, tau)
-    panel_fpr_easy(df, cfg, tau)
-    panel_saved(df, cfg, tau)
-    panel_geometric_objective(df, cfg, tau)
-    panel_volume_bounds(df, cfg, tau)
+    panel_recall(df, cfg)
+    panel_fpr_hard(df, cfg)
+    panel_fpr_easy(df, cfg)
+    panel_saved(df, cfg)
+    panel_geometric_objective(df, cfg)
+    panel_volume_bounds(df, cfg)
 
     # Same three corpora and the same palette as the blocklist figures, so the
     # two evaluations' panels read as one set.

@@ -33,16 +33,21 @@ DATASET_MARKERS = {"eli5": "o", "mmlu": "s", "wildchat": "^", "msmarco": "D", "h
 
 def apply_style(dpi: int = 300) -> None:
     plt.rcParams.update({
-        "figure.figsize": (1.70, 1.50),
+        # Scaled by the same 1.2x as the font sizes below, so the ratio of
+        # text to canvas is unchanged -- keeps every fixed, non-tight
+        # subplots_adjust() margin elsewhere (tuned for the old ratio, and
+        # relied on to align panels placed side by side) still fitting
+        # without touching each one individually.
+        "figure.figsize": (1.70 * 1.2, 1.50 * 1.2),
         "figure.dpi": dpi,
         "savefig.dpi": dpi,
         "font.family": "serif",
         "font.serif": ["Linux Libertine O", "Libertine", "DejaVu Serif"],
         "mathtext.fontset": "stix",
-        "axes.labelsize": 7,
-        "xtick.labelsize": 6,
-        "ytick.labelsize": 6,
-        "axes.titlesize": 7,
+        "axes.labelsize": 8.4,
+        "xtick.labelsize": 7.2,
+        "ytick.labelsize": 7.2,
+        "axes.titlesize": 8.4,
         "axes.spines.top": False,
         "axes.spines.right": False,
         "axes.linewidth": 0.5,
@@ -55,8 +60,8 @@ def apply_style(dpi: int = 300) -> None:
         "xtick.minor.size": 0,
         "ytick.minor.size": 0,
         "legend.frameon": False,
-        "legend.fontsize": 7,
-        "legend.title_fontsize": 7,
+        "legend.fontsize": 8.4,
+        "legend.title_fontsize": 8.4,
     })
 
 
@@ -125,6 +130,6 @@ def save_dataset_legend(outdir: str, dpi: int, emit_pdf: bool = False, filename:
         for d in DATASETS
     ]
     labels = [DATASET_LABELS[d] for d in DATASETS]
-    fig.legend(handles, labels, loc="center", ncol=len(DATASETS), frameon=False, fontsize=7)
+    fig.legend(handles, labels, loc="center", ncol=len(DATASETS), frameon=False, fontsize=8.4)
     fig.patch.set_alpha(0.0)
     save_figure(fig, filename, outdir, dpi, emit_pdf, transparent=True)
