@@ -989,14 +989,21 @@ def generate_blocklist(runner: Runner) -> None:
     entirely to serve as hard negatives. Splitting by vector instead would
     scatter every cluster across both roles and leave no hard negatives at all.
 
+    A single fixed ball budget (k_fractions is one value, not a sweep) --
+    varying the budget is generate_budget's job now, at its own fixed tau.
+    This evaluation is the complementary view: fix k, sweep tau, and read
+    how FPR/recall/accesses-saved respond at that one representative budget.
+    k_fraction=0.1 sits in the middle of generate_budget's own 5%-20% range,
+    so the two evaluations are anchored at a comparable operating point.
+
     Only submits 'blocklist' jobs (output_csv=BLOCKLIST_CSV) -- does not run
     `runner`. Cluster discovery runs eagerly here, since it needs the whole
-    pool in memory and is shared by every k_fraction of a dataset.
+    pool in memory.
     """
     dim              = 384
     pool_size        = BLOCKLIST_POOL_SIZE
     num_vectors      = WORKLOAD_NUM_VECTORS
-    k_fractions      = [0.02, 0.05, 0.1, 0.25, 0.5]
+    k_fractions      = [0.1]  # fixed ball budget; see docstring
     target_recall    = 0.95
     # Shared absolute grid for the tau-swept panels. Stops at 0.4: measured on
     # a 0..1.2 grid, every corpus was already pinned at FPR 1.000 and 0% saved

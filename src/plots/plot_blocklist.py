@@ -1,39 +1,28 @@
 """Blocklist-workload figures (see main.generate_blocklist).
 
-The x-axis is the compression ratio |X|/k -- how many reference vectors each
-stored ball stands in for. The claim under test is that compression is bounded
-by the duplicate-cluster multiplicity m: one ball per cluster means |X|/k <= m,
-so a corpus of pairs caps at 2x however much memory you spend, while a corpus
-with clusters of 50 keeps working out to 50x.
+Ball budget k is fixed (one representative value, see generate_blocklist's
+docstring) -- varying the budget is generate_budget's job, at its own fixed
+tau. This module's whole figure set is the complementary view: tau swept at
+that one fixed budget.
 
 Panels:
-  (a) FPR on HARD negatives -- members of duplicate clusters that were NOT
-      blocklisted. Same local geometry as B (tight, high-multiplicity), so
-      only a filter that actually localises B rejects them. This is the
+  (a) FPR vs tau, pooled over both negative classes.
+  (b) FPR on HARD negatives vs tau -- members of duplicate clusters that were
+      NOT blocklisted. Same local geometry as B (tight, high-multiplicity),
+      so only a filter that actually localises B rejects them. This is the
       headline number.
-  (b) FPR on EASY negatives -- singletons, i.e. background traffic.
-  (c) Index accesses saved over the unfiltered baseline.
-  (d) Margin budget d(hard negative -> B) - r_med against compression. The
-      predictor: the filter discriminates while this stays comfortably above
-      the duplicate distance delta, and collapses once it does not.
-
-On those four, recall is held fixed (tau solved per row), so every point is an
-equal-recall operating point and they read as a clean FPR comparison.
-
-Four more sweep tau at a single ball budget instead:
-  (e) FPR vs tau, pooled over both negative classes.
-  (f) FPR on hard negatives vs tau.
-  (g) Geometric objective log10 J_tau(C) = log10 sum_i (r_i + tau)^d vs tau --
+  (c) FPR on EASY negatives vs tau -- singletons, i.e. background traffic.
+  (d) Geometric objective log10 J_tau(C) = log10 sum_i (r_i + tau)^d vs tau --
       the overlap-blind sum of ball volumes once every ball is expanded by tau.
-  (h) Index accesses saved vs tau.
+  (e) Index accesses saved vs tau.
 
-All eight share one legend, written separately as blocklist-legend.png so
+All five share one legend, written separately as blocklist-legend.png so
 the panels can be placed side by side without repeating it.
 
 Absolute tau is not comparable between corpora -- the distance at which a
-duplicate sits is a property of each embedding set, which is why the headline
-workload solves tau for a target rather than fixing it. Read (e)-(h) as one
-corpus's response curve; the dotted vertical marks that corpus's own delta.
+duplicate sits is a property of each embedding set. Read each panel as one
+corpus's response curve; the dotted vertical marks that corpus's own delta
+(d_pos_med, the median true-duplicate distance).
 """
 
 from __future__ import annotations
@@ -75,14 +64,15 @@ BLOCKLIST_MARKERS = {
 _REQUIRED_COLUMNS = [
     "dataset", "seed", "sweep", "k", "k_fraction", "n_reference", "compression", "r_med",
     "tau", "recall", "fpr", "fpr_hard", "fpr_easy", "accesses_saved_pct",
-    "log10_j_tau", "d_hard_med", "d_pos_med", "margin_budget",
+    "log10_j_tau", "d_hard_med", "d_pos_med",
 ]
 
 # Rows carry two sweeps (see runner.blocklist_worker): "recall" is the
-# equal-recall operating point, one row per compression, which the
-# compression-axis panels use; "tau" is the same cover swept over a fixed tau
-# grid, which the tau-axis panels use. Mixing them would average an operating
-# point into a response curve.
+# equal-recall operating point blocklist_worker still emits per k (shared
+# with generate_budget's mode='budget' calls) but this module no longer
+# plots -- compression is generate_budget's job now. "tau" is the same cover
+# swept over a fixed tau grid at the one fixed k generate_blocklist submits,
+# which every panel here reads.
 SWEEP_RECALL = "recall"
 SWEEP_TAU = "tau"
 
@@ -184,58 +174,12 @@ def line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg
     return agg
 
 
-def panel_fpr_hard(df, cfg):
-    return line_panel(df, "fpr_hard", "FPR (hard negatives)", "blocklist-fpr-hard.png",
-                      cfg, bounded_unit=True)
-
-
-def panel_fpr_easy(df, cfg):
-    return line_panel(df, "fpr_easy", "FPR (easy negatives)", "blocklist-fpr-easy.png",
-                      cfg, bounded_unit=True)
-
-
-def panel_saved(df, cfg):
-    return line_panel(df, "accesses_saved_pct", "Accesses Saved (%)",
-                      "blocklist-accesses-saved.png", cfg)
-
-
-def panel_margin_budget(df, cfg):
-    """d(hard negative -> B) - r_med. The filter works while this stays above
-    the duplicate distance delta (plotted as each corpus's dashed d_pos line)."""
-    sel = df[df["sweep"] == SWEEP_RECALL]
-    agg = mean_std(sel, ["dataset", "k_fraction"], "margin_budget")
-    agg["compression"] = 1.0 / agg["k_fraction"]
-    delta = mean_std(sel, ["dataset", "k_fraction"], "d_pos_med")
-    delta["compression"] = 1.0 / delta["k_fraction"]
-
-    apply_style(cfg.dpi)
-    fig, ax = plt.subplots()
-    for dataset in BLOCKLIST_DATASETS:
-        sub = agg[agg["dataset"] == dataset].sort_values("compression")
-        dsub = delta[delta["dataset"] == dataset].sort_values("compression")
-        if sub.empty:
-            continue
-        ax.plot(sub["compression"], sub["mean"], color=BLOCKLIST_COLORS[dataset],
-                marker=BLOCKLIST_MARKERS[dataset], markersize=2.5, linewidth=0.8, zorder=2)
-        if not dsub.empty:
-            ax.axhline(float(dsub["mean"].mean()), color=BLOCKLIST_COLORS[dataset],
-                       linestyle="--", linewidth=0.5, alpha=0.7, zorder=1)
-
-    ax.set_xscale("log")
-    ax.set_xlabel(r"Compression $|X|/k$")
-    ax.set_ylabel(wrap_label(r"Margin budget $d_{hard} - r$"))
-    ax.text(0.97, 0.06, r"dashed: that corpus's $\delta$", transform=ax.transAxes,
-            ha="right", va="bottom", fontsize=6.0)
-    style_axes(ax)
-    fig.subplots_adjust(left=0.26, right=0.97, top=0.95, bottom=0.24)
-    save_figure(fig, "blocklist-margin-budget.png", cfg.outdir, cfg.dpi, cfg.emit_pdf, tight=False)
-    return agg
-
-
 def resolve_tau_kfraction(df: pd.DataFrame, k_fraction: Optional[float] = None) -> float:
-    """Which ball budget the tau-axis panels render, as the nominal
-    k_fraction. Defaults to the median available, the same "pick one
-    representative value" pattern plot_system_tau uses for k.
+    """Which ball budget every panel renders, as the nominal k_fraction.
+    generate_blocklist now submits one fixed k_fraction, so this trivially
+    resolves to that single value; the median-of-available fallback (the
+    same "pick one representative value" pattern plot_system_tau uses for k)
+    only matters for older multi-k data or an explicit override.
 
     Selects on k_fraction rather than the realised compression because the
     latter differs per dataset and per fold, so filtering on a single
@@ -311,6 +255,11 @@ def panel_fpr_hard_vs_tau(df, cfg, k_fraction):
                       "blocklist-fpr-hard-vs-tau.png", cfg, k_fraction, bounded_unit=True)
 
 
+def panel_fpr_easy_vs_tau(df, cfg, k_fraction):
+    return _tau_panel(df, "fpr_easy", "FPR (easy negatives)",
+                      "blocklist-fpr-easy-vs-tau.png", cfg, k_fraction, bounded_unit=True)
+
+
 def panel_geometric_objective_vs_tau(df, cfg, k_fraction):
     """Threshold-expanded geometric objective log10 J_tau(C) = log10 sum_i
     (r_i + tau)^d -- the overlap-blind sum of the cover's ball volumes once
@@ -327,32 +276,10 @@ def panel_saved_vs_tau(df, cfg, k_fraction):
                       horizontal_grid=False)
 
 
-def print_summary(df: pd.DataFrame) -> None:
-    print("\n--- Blocklist workload summary (equal-recall operating points) ---")
-    rec = df[df["sweep"] == SWEEP_RECALL]
-    cols = ("recall", "fpr_hard", "fpr_easy", "accesses_saved_pct", "r_med", "margin_budget")
-    aggs = {c: mean_std(rec, ["dataset", "k_fraction"], c) for c in cols}
-    for dataset in BLOCKLIST_DATASETS:
-        sub = rec[rec["dataset"] == dataset]
-        if sub.empty:
-            continue
-        n_ref = int(sub["n_reference"].iloc[0])
-        print(f"\n{BLOCKLIST_LABELS[dataset]} (|X|={n_ref}, delta={sub['d_pos_med'].mean():.3f}, "
-              f"d_hard={sub['d_hard_med'].mean():.3f})")
-        for kf in sorted(sub["k_fraction"].unique()):
-            def _m(c):
-                row = aggs[c][(aggs[c]["dataset"] == dataset) & (aggs[c]["k_fraction"] == kf)]
-                return float(row["mean"].iloc[0]) if len(row) else float("nan")
-            print(f"  {1.0/kf:>5.0f}x  r_med={_m('r_med'):.3f} budget={_m('margin_budget'):+.3f} "
-                  f"recall={_m('recall'):.3f} FPR_hard={_m('fpr_hard'):.3f} "
-                  f"FPR_easy={_m('fpr_easy'):.3f} saved={_m('accesses_saved_pct'):.1f}%")
-    print()
-
-
-def print_tau_summary(df: pd.DataFrame, k_fraction: float) -> None:
+def print_summary(df: pd.DataFrame, k_fraction: float) -> None:
     sel = df[(df["sweep"] == SWEEP_TAU) & (np.isclose(df["k_fraction"], k_fraction))]
-    print(f"--- tau sweep (at {1.0/k_fraction:.0f}x compression) ---")
-    cols = ("fpr", "fpr_hard", "recall", "accesses_saved_pct", "log10_j_tau")
+    print(f"\n--- Blocklist workload summary (tau sweep at k={k_fraction:g}) ---")
+    cols = ("fpr", "fpr_hard", "fpr_easy", "recall", "accesses_saved_pct", "log10_j_tau")
     aggs = {c: mean_std(sel, ["dataset", "tau"], c) for c in cols}
     for dataset in BLOCKLIST_DATASETS:
         sub = sel[sel["dataset"] == dataset]
@@ -365,8 +292,8 @@ def print_tau_summary(df: pd.DataFrame, k_fraction: float) -> None:
                 row = aggs[c][(aggs[c]["dataset"] == dataset) & (aggs[c]["tau"] == tau)]
                 return float(row["mean"].iloc[0]) if len(row) else float("nan")
             print(f"  tau={tau:.2f}  FPR={_m('fpr'):.3f} FPR_hard={_m('fpr_hard'):.3f} "
-                  f"recall={_m('recall'):.3f} saved={_m('accesses_saved_pct'):5.1f}% "
-                  f"log10_J={_m('log10_j_tau'):.2f}")
+                  f"FPR_easy={_m('fpr_easy'):.3f} recall={_m('recall'):.3f} "
+                  f"saved={_m('accesses_saved_pct'):5.1f}% log10_J={_m('log10_j_tau'):.2f}")
     print()
 
 
@@ -379,23 +306,16 @@ def generate_blocklist_figures(df: Optional[pd.DataFrame] = None, outdir: str = 
         validate_schema(df)
     cfg = Config(dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
 
-    # compression axis, at the equal-recall operating point
-    panel_fpr_hard(df, cfg)
-    panel_fpr_easy(df, cfg)
-    panel_saved(df, cfg)
-    panel_margin_budget(df, cfg)
-
-    # tau axis, at one representative compression
     kf = resolve_tau_kfraction(df, k_fraction)
     panel_fpr_vs_tau(df, cfg, kf)
     panel_fpr_hard_vs_tau(df, cfg, kf)
+    panel_fpr_easy_vs_tau(df, cfg, kf)
     panel_geometric_objective_vs_tau(df, cfg, kf)
     panel_saved_vs_tau(df, cfg, kf)
 
     save_blocklist_legend(cfg.outdir, cfg.dpi, cfg.emit_pdf)
 
-    print_summary(df)
-    print_tau_summary(df, kf)
+    print_summary(df, kf)
 
 
 def main() -> None:

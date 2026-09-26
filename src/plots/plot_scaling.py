@@ -165,22 +165,22 @@ def generate_legend_figure(line_values: List[float], cfg: Config) -> None:
 
 def panel_query_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _throughput_panel(
-        df, "batch_size", "throughput_qps", "Query Throughput (queries/s)",
+        df, "batch_size", "throughput_qps", "Query OPS",
         "Batch size", "scaling-query-throughput.png", cfg,
     )
 
 
 def panel_insert_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _throughput_panel(
-        df, "batch_size", "throughput_ips", "Insertion Throughput (vectors/s)",
+        df, "batch_size", "throughput_ips", "Insertion OPS",
         "Batch size", "scaling-insertion-throughput.png", cfg,
     )
 
 
 def panel_construction_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _throughput_panel(
-        df, "n", "throughput_vps", "Construction Throughput (vectors/s)",
-        "Stream size (n)", "scaling-construction-throughput.png", cfg,
+        df, "n", "throughput_vps", "Construction OPS",
+        r"Initialization size ($|X|$)", "scaling-construction-throughput.png", cfg,
     )
 
 

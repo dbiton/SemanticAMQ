@@ -800,9 +800,6 @@ def blocklist_worker(
                 "log10_vol_high": vol_high,
                 "n_balls": len(radii),
                 "d_pos_med": d_pos_med, "d_hard_med": d_hard_med,
-                # The predictor: room left for a ball once the duplicate
-                # distance delta (d_pos_med) is paid for.
-                "margin_budget": d_hard_med - r_med,
                 "memory_bytes": filt.get_bytesize(),
             }
 
