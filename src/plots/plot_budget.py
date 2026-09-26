@@ -176,6 +176,7 @@ def panel_volume_bounds(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     ax.set_xlabel(_XLABEL)
     ax.set_ylabel(wrap_label(r"$\log_{10}$ Volume Bounds"))
     style_axes(ax)
+    ax.grid(visible=False, axis="y")  # no horizontal gridlines
     fig.subplots_adjust(left=0.26, right=0.97, top=0.95, bottom=0.24)
     save_figure(fig, "budget-volume-bounds.png", cfg.outdir, cfg.dpi, cfg.emit_pdf, tight=False)
     return agg

@@ -21,8 +21,7 @@ the panels can be placed side by side without repeating it.
 
 Absolute tau is not comparable between corpora -- the distance at which a
 duplicate sits is a property of each embedding set. Read each panel as one
-corpus's response curve; the dotted vertical marks that corpus's own delta
-(d_pos_med, the median true-duplicate distance).
+corpus's own response curve.
 """
 
 from __future__ import annotations
@@ -128,8 +127,7 @@ def line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg
                bounded_unit: bool = False, logx: bool = True,
                sweep: str = SWEEP_TAU,
                x_from: Callable[[pd.Series], pd.Series] = lambda kf: 1.0 / kf,
-               xlabel: str = r"Compression $|X|/k$",
-               annotation: Optional[str] = None) -> pd.DataFrame:
+               xlabel: str = r"Compression $|X|/k$") -> pd.DataFrame:
     """One line per corpus against a function of the ball budget, averaged over
     folds with +/- 1 std error bars (same convention as plot_system_tau).
 
@@ -160,10 +158,8 @@ def line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg
         ax.set_xscale("log")
     ax.set_xlabel(xlabel)
     ax.set_ylabel(wrap_label(ylabel))
-    if annotation:
-        ax.text(0.97, 0.06, annotation, transform=ax.transAxes,
-                ha="right", va="bottom", fontsize=6.0)
     style_axes(ax)
+    ax.grid(visible=False, axis="y")  # no horizontal gridlines
     fig.subplots_adjust(left=0.26, right=0.97, top=0.95, bottom=0.24)
     save_figure(fig, filename, cfg.outdir, cfg.dpi, cfg.emit_pdf, tight=False)
     return agg
@@ -191,16 +187,13 @@ def resolve_tau_kfraction(df: pd.DataFrame, k_fraction: Optional[float] = None) 
 
 
 def _tau_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg: Config,
-               k_fraction: float, bounded_unit: bool = False,
-               horizontal_grid: bool = True) -> pd.DataFrame:
+               k_fraction: float, bounded_unit: bool = False) -> pd.DataFrame:
     """One line per corpus against tau, at a single compression ratio.
 
     Absolute tau is not comparable across corpora -- the distance at which a
     duplicate sits differs per embedding set, which is exactly why the
     headline workload solves tau for a target instead of fixing it. These
-    panels are for reading one corpus's response curve; the vertical dashed
-    line marks that corpus's own duplicate distance delta, i.e. the smallest
-    tau at which its true positives start being caught.
+    panels are for reading one corpus's own response curve.
     """
     sel = df[(df["sweep"] == SWEEP_TAU) & (np.isclose(df["k_fraction"], k_fraction))]
     agg = mean_std(sel, ["dataset", "tau"], value_col)
@@ -217,23 +210,13 @@ def _tau_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg
             ax.errorbar(sub["tau"], sub["mean"], yerr=sub["std"], fmt="none",
                         ecolor=BLOCKLIST_COLORS[dataset], elinewidth=0.5, capsize=1.5,
                         capthick=0.5, zorder=3)
-        d_pos = sel[sel["dataset"] == dataset]["d_pos_med"]
-        if len(d_pos):
-            ax.axvline(float(d_pos.mean()), color=BLOCKLIST_COLORS[dataset],
-                       linestyle=":", linewidth=0.5, alpha=0.8, zorder=1)
 
     if bounded_unit:
         ax.set_ylim(-0.05, 1.05)
     ax.set_xlabel(r"$\tau$")
     ax.set_ylabel(wrap_label(ylabel))
-    ax.text(0.97, 0.06, r"dotted: $\delta$",
-            transform=ax.transAxes, ha="right", va="bottom", fontsize=6.0)
     style_axes(ax)
-    if not horizontal_grid:
-        # style_axes grids both axes for the whole project; drop just the
-        # y-axis (horizontal) lines here. Overridden after the shared call
-        # rather than by editing style_axes, which every other figure uses.
-        ax.grid(visible=False, axis="y")
+    ax.grid(visible=False, axis="y")  # no horizontal gridlines
     fig.subplots_adjust(left=0.26, right=0.97, top=0.95, bottom=0.24)
     save_figure(fig, filename, cfg.outdir, cfg.dpi, cfg.emit_pdf, tight=False)
     return agg
@@ -267,8 +250,7 @@ def panel_saved_vs_tau(df, cfg, k_fraction):
     """Percentage of queries that never reach the backing index, as tau grows.
     Falls monotonically: a larger tau flags more of the stream."""
     return _tau_panel(df, "accesses_saved_pct", "Accesses Saved (%)",
-                      "blocklist-accesses-saved-vs-tau.png", cfg, k_fraction,
-                      horizontal_grid=False)
+                      "blocklist-accesses-saved-vs-tau.png", cfg, k_fraction)
 
 
 def print_summary(df: pd.DataFrame, k_fraction: float) -> None:

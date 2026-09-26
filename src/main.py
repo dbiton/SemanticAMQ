@@ -1801,5 +1801,5 @@ def plot_all() -> None:
 
 
 if __name__ == "__main__":
-    generate_and_plot_all()
-    # plot_all()  # alternative: re-render figures from an existing results/*.csv run
+    # generate_and_plot_all()
+    plot_all()  # alternative: re-render figures from an existing results/*.csv run
