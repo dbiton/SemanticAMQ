@@ -28,12 +28,13 @@ class Quantize(Enum):
          2   PQ4_R2   PQ, 4-bit subquantizers (m=192)    96   24 KB
          2   PQ8_R2   PQ, 8-bit subquantizers (m=96)     96   384 KB
          1   PQ4_R1   PQ, 4-bit subquantizers (m=96)     48   24 KB
+         1   PQ8_R1   PQ, 8-bit subquantizers (m=48)     48   384 KB
          1   RABITQ   rotation + RaBitQ                  56   seed only
 
     Every ball also stores its radius as fp16, so a ball costs center + 2
     bytes -- see bytes_per_ball().
 
-    CAVEAT on RABITQ: the other nine rows are exact ADC, so search() returns
+    CAVEAT on RABITQ: the other ten rows are exact ADC, so search() returns
     ||q - decode(c)|| and the one-sided inflation in _store_spheres is a
     proof. RaBitQ instead scores through its own estimator, which is not tied
     to sa_decode's output: measured against exact distances over 3.6M
@@ -59,6 +60,7 @@ class Quantize(Enum):
     PQ4_R2 = "PQ4@2"
     PQ8_R2 = "PQ8@2"
     PQ4_R1 = "PQ4@1"
+    PQ8_R1 = "PQ8@1"
     RABITQ = "RaBitQ"
 
 
@@ -114,6 +116,7 @@ _ENCODINGS = {
     Quantize.PQ4_R2: _Encoding(rate=2, kind="pq", nbits=4),
     Quantize.PQ8_R2: _Encoding(rate=2, kind="pq", nbits=8),
     Quantize.PQ4_R1: _Encoding(rate=1, kind="pq", nbits=4),
+    Quantize.PQ8_R1: _Encoding(rate=1, kind="pq", nbits=8),
     Quantize.RABITQ: _Encoding(rate=1, kind="rabitq", rotate=True),
 }
 

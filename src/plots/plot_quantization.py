@@ -42,10 +42,15 @@ EMIT_PDF = False
 QUANTIZE_SWEEP = (
     Quantize.FP32, Quantize.FP16, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
     Quantize.TQ3, Quantize.PQ4_R2, Quantize.PQ8_R2,
-    # The ladder stops at 2 b/dim: both 1 b/dim rungs (Quantize.PQ4_R1 and
-    # Quantize.RABITQ) are left out -- see runner.QUANTIZATION_SWEEP for why.
-    # Rows for either are dropped by aggregate()'s `stages` filter, so older
-    # results files that still carry them plot without complaint.
+    # Down to 1 b/dim via the same two-subquantizer-width pairing the 2 b/dim
+    # rung already has -- see runner.QUANTIZATION_SWEEP. Quantize.RABITQ is
+    # deliberately excluded (its zero-false-negative property is an
+    # empirical bound, not a proof, unlike every other rung). A results file
+    # from before PQ4_R1/PQ8_R1 were swept simply has no rows for them;
+    # every panel already tolerates an absent stage by not drawing/counting
+    # it -- and one that still carries old RABITQ rows plots without
+    # complaint too, since STAGES no longer includes it.
+    Quantize.PQ4_R1, Quantize.PQ8_R1,
 )
 STAGES = [q.value for q in QUANTIZE_SWEEP]
 STAGE_LABELS = {
@@ -59,6 +64,7 @@ STAGE_LABELS = {
     Quantize.PQ4_R2.value: "PQ4 (2b)",
     Quantize.PQ8_R2.value: "PQ8 (2b)",
     Quantize.PQ4_R1.value: "PQ4 (1b)",
+    Quantize.PQ8_R1.value: "PQ8 (1b)",
     Quantize.RABITQ.value: "RaBitQ (1b)",
 }
 # Reference stage for the two relative-objective panels: the raw/unquantized
@@ -594,7 +600,7 @@ def generate_quantization_figures(
     dpi: int = DPI,
     emit_pdf: bool = EMIT_PDF,
 ) -> None:
-    """Library entry point: renders the nine paper panels + one diagnostic
+    """Library entry point: renders the ten paper panels + one diagnostic
     FNR panel (+ legend) from an in-memory DataFrame, or from `load_data()`
     (reads INPUT_PATH) if `df` is omitted. panel_fnr is excluded from the
     LaTeX subfigure snippet printed below, since it's a sanity check, not
@@ -640,6 +646,16 @@ def generate_quantization_figures(
     \centering
     \includegraphics[width=\linewidth]{figures/quantization-false-positive-rate.png}
     \caption{False positive rate}
+\end{subfigure}
+\begin{subfigure}[b]{0.24\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/quantization-false-positive-rate-hard.png}
+    \caption{FPR, hard negatives}
+\end{subfigure}
+\begin{subfigure}[b]{0.24\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/quantization-false-positive-rate-easy.png}
+    \caption{FPR, easy negatives}
 \end{subfigure}
 \begin{subfigure}[b]{0.24\linewidth}
     \centering

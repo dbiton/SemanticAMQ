@@ -421,14 +421,21 @@ def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, flo
 QUANTIZATION_SWEEP = (
     Quantize.FP32, Quantize.FP16, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
     Quantize.TQ3, Quantize.PQ4_R2, Quantize.PQ8_R2,
-    # The ladder stops at 2 b/dim: both 1 b/dim rungs are left out.
-    # Quantize.PQ4_R1 halves PQ4_R2's subquantizer count at the same 4-bit
-    # width, so it buys its extra balls with reconstruction error that
-    # inflates every radius -- excluded as below the useful rate.
-    # Quantize.RABITQ is the one rung whose search() is not exact ADC, so its
-    # zero-false-negative property rests on a measured one-sided estimator
-    # rather than a proof -- see the CAVEAT on Quantize.RABITQ.
-    # Both stay constructible, just not swept.
+    # Down to 1 b/dim via two subquantizer-width options, the same pairing
+    # the 2 b/dim rung already has (PQ4_R2 vs PQ8_R2): PQ4_R1 packs more,
+    # coarser subquantizers; PQ8_R1 packs fewer, finer ones, at the same
+    # rate and the same 48-byte center cost (see the Quantize docstring's
+    # table). Both are exact ADC, so their zero-false-negative property is a
+    # proof like the rest of the ladder's.
+    #
+    # Quantize.RABITQ is deliberately NOT swept here: unlike every other rung,
+    # its search() is not exact ADC -- it scores through its own estimator,
+    # so its zero-false-negative property rests on a measured one-sided
+    # bound (3.6M (query, center) pairs, always under-estimated) rather than
+    # a proof. Safe in every measurement taken so far, but a materially
+    # weaker guarantee than the other ten rungs; see the CAVEAT on
+    # Quantize.RABITQ. Stays constructible, just not swept by default.
+    Quantize.PQ4_R1, Quantize.PQ8_R1,
 )
 
 

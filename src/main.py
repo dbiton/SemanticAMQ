@@ -1319,9 +1319,11 @@ def generate_scaling(runner: Runner) -> None:
     valid because throughput is dataset-invariant here (Figure 4: "different
     datasets do not really matter") -- so k and the construction n's are
     bounded by the *smallest* corpus's reference set, keeping the same
-    absolute values comparable, and thus poolable, across corpora. Both
-    sweeps stay at <=6 values because plot_scaling draws one line per value
-    and defines 6 line colors.
+    absolute values comparable, and thus poolable, across corpora. k itself
+    is a fixed absolute ladder (2^11..2^16, one power of two per line color)
+    rather than a fraction of the reference set, since "Filter Size (k)" is
+    plotted and compared as an absolute count. Both sweeps stay at <=6 values
+    because plot_scaling draws one line per value and defines 6 line colors.
 
     Only submits 'scaling_query'/'scaling_insert'/'scaling_construction'
     jobs -- does not run `runner`. Each corpus writes its own
@@ -1332,9 +1334,10 @@ def generate_scaling(runner: Runner) -> None:
     dim              = 384
     n_folds          = BLOCKLIST_FOLDS
     n_steps          = 6
-    # Ball budget k, as a fraction of a corpus's reference set |B| -- same
-    # unit generate_blocklist/generate_quantization sweep k_fractions in.
-    k_fractions      = [0.01, 0.02, 0.04, 0.08, 0.16, 0.32]
+    # Ball budget k, as absolute filter sizes (plot_scaling's "Filter Size (k)"
+    # legend) rather than a fraction of a corpus's reference set: 2^11..2^16,
+    # one power of two per line color (LINE_COLORS has exactly 6 entries).
+    k_values_nominal = [2 ** i for i in range(11, 17)]
     # Powers of 4 from a single query up to 1024: spans three orders of
     # magnitude in 6 lines.
     batch_sizes      = [1, 4, 16, 64, 256, 1024]
@@ -1363,13 +1366,12 @@ def generate_scaling(runner: Runner) -> None:
     # bounded by the smallest corpus's reference set rather than computed
     # per corpus.
     reference_len = min(len(w.selections[0]["reference"]) for w in workloads)
-    k_values = sorted({max(1, round(reference_len * f)) for f in k_fractions})
-    k_values = [k for k in k_values if k < reference_len]
+    k_values = [k for k in k_values_nominal if k < reference_len]
     if not k_values:
         raise RuntimeError(
-            f"No k_fraction in {k_fractions} produced a k below the smallest "
-            f"corpus's reference set ({reference_len} vectors). Raise "
-            "WORKLOAD_NUM_VECTORS or lower k_fractions.")
+            f"No k in {k_values_nominal} is below the smallest corpus's reference "
+            f"set ({reference_len} vectors). Raise WORKLOAD_NUM_VECTORS or lower "
+            "k_values_nominal.")
     stream_sizes = sorted({max(1, reference_len // (2 ** i)) for i in range(n_steps)})
 
     # workload.stream_size is a function of num_vectors alone (see
@@ -1682,10 +1684,12 @@ def generate_and_plot_all() -> None:
         generate_quantization(runner)
     except Exception:
         logger.exception("An error occurred")
+    '''
     try:
-        generate_budget(runner)
+        generate_quantization(runner)
     except Exception:
         logger.exception("An error occurred")
+
 
     try:
         generate_system_tau(runner)
@@ -1700,6 +1704,7 @@ def generate_and_plot_all() -> None:
         generate_scaling(runner)
     except Exception:
         logger.exception("An error occurred")
+    '''
     '''
     try:
         generate_streaming(runner)
@@ -1803,5 +1808,5 @@ def plot_all() -> None:
 
 
 if __name__ == "__main__":
-    # generate_and_plot_all()
-    plot_all()  # alternative: re-render figures from an existing results/*.csv run
+    generate_and_plot_all()
+    # plot_all()  # alternative: re-render figures from an existing results/*.csv run
