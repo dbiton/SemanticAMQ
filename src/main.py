@@ -336,6 +336,38 @@ def stratified_calibration_split(
             labels[calibration_idx].tolist(), labels[measurement_idx].tolist())
 
 
+def compute_dynamic_actual_results(
+    vectors: np.ndarray, 
+    distance_threshold: float,
+) -> list[bool]:
+    """
+    Online ground-truth: the first vector is unique; each subsequent vector is a
+    duplicate if it falls within `distance_threshold` of any previously accepted
+    unique vector, otherwise it joins the reference set.
+    """
+    vectors = np.ascontiguousarray(vectors, dtype=np.float32)
+
+    actual = [False]
+    thresh_sq = distance_threshold ** 2
+
+    index = faiss.IndexFlatL2(vectors.shape[1])
+    index.add(vectors[0:1])
+
+    for i in range(1, len(vectors)):
+        v = vectors[i:i+1]
+
+        # find the single nearest accepted vector
+        nn_sq_dist, _ = index.search(v, 1)
+
+        # check if the closest vector is within the threshold
+        is_dup = bool(nn_sq_dist[0, 0] <= thresh_sq)
+        actual.append(is_dup)
+        if not is_dup:
+            index.add(v)
+
+    return actual
+
+
 def generate_equal_memory(runner: Runner) -> None:
     """Equal-memory (SOTA) comparison across equal_memory_filters. Sweeps
     count_memory_steps budgets from 10% to 100% of raw storage (storing the
@@ -1564,7 +1596,7 @@ def _build_streaming_negative_set(
     if len(negatives) < n_negative:
         raise RuntimeError(
             f"{dataset}: only found {len(negatives)} true negatives against the full stream "
-            f"(needed {n_negative}); shrink n_negative, raise tau_mid, or grow the candidate pool."
+            f"(needed {n_negative}); shrink n_negative, lower tau_mid, or grow the candidate pool."
         )
     return negatives[:n_negative]
 
@@ -1574,8 +1606,9 @@ def generate_streaming(runner: Runner) -> None:
     BallCoverFilter's 4 insertion strategies via stream_rebuild_worker's
     policy="streaming". Produces the streaming figure's panels: (a) FPR vs.
     position + a static-rebuild reference, (b) threshold-expanded objective
-    inflation vs. position -- no k sweep: the ball budget k stays fixed for
-    the whole run, and only the stream position varies.
+    inflation vs. position -- no k sweep: the ball budget k stays fixed for the
+    whole run, and only the stream position varies; (c) insertion throughput
+    vs. filter size k.
 
     The ball budget k, the bootstrap (construct) window, and the subsequent
     insert-only window are each sized as their own fraction of num_vectors:
@@ -1595,11 +1628,10 @@ def generate_streaming(runner: Runner) -> None:
     construction share (default 0.4 + 0.4 = 0.8) and the remaining
     1 - init_percent_stream - insert_percent_stream of num_vectors, past
     every fold's window, is held out as the source of verified-negative
-    queries. Each of k_folds=5 folds gets its own stream window, starting
-    fold_stride further into the dataset than fold 0's -- non-wrapping via
-    advancing_fold_starts, so folds see genuinely different data rather than
-    the same pool reordered. A dataset needs enough vectors on disk for both
-    the folds' windows and the query span, or this raises.
+    queries. Each of k_folds=5 folds gets its own non-overlapping stream window,
+    so folds see genuinely different data rather than the same pool reordered.
+    The dataset needs enough vectors on disk for all folds' windows and the
+    query span, or this raises.
 
     Runs once per blocklist corpus (WildChat, CCNews, WikiAnswers), each to
     its own results/streaming/<dataset>/streaming.csv (see streaming_csv()),
@@ -1624,7 +1656,7 @@ def generate_streaming(runner: Runner) -> None:
     Only submits 'stream_rebuild' jobs -- does not run `runner`."""
     num_vectors = WORKLOAD_NUM_VECTORS
     dim = 384
-    methods = ["nearest", "least_inflation", "merge", "min_heap"]
+    methods = ["nearest", "least_inflation", "pooled", "merge", "min_heap"]
     n_negative = 500
     # Calibrates tau_mid; see calculate_nn_distance_threshold. Raised from the
     # 10.0 the old single-dataset (MMLU) run used: WildChat's stream window is
@@ -1638,31 +1670,26 @@ def generate_streaming(runner: Runner) -> None:
     duplicate_percentage = 20.0
     k_folds = 5  # "we do this 5 times" (Section 5.1)
     seed = 0  # fixed; fold_offset supplies the stream-order variance instead
-    k_percent_stream = 0.1  # ball budget k, as a fraction of num_vectors
-    init_percent_stream = 0.4  # bootstrap/construct window, as a fraction of num_vectors
-    insert_percent_stream = 0.4  # vectors streamed via insert() after bootstrap, as a fraction of num_vectors
+    k_percent_stream = 0.10  # ball budget k, as a fraction of num_vectors
+    init_percent_stream = 0.40  # bootstrap/construct window, as a fraction of num_vectors
+    insert_percent_stream = 0.40  # vectors streamed via insert() after bootstrap, as a fraction of num_vectors
+    negative_pool_percent = 0.20  # held out past all folds for negative query pool
 
-    k_fixed = max(16, round(k_percent_stream * num_vectors))
+    k_target = max(16, round(k_percent_stream * num_vectors))
+    k_fixed = int(2 ** round(np.log2(k_target)))
 
     n_init = max(1, round(init_percent_stream * num_vectors))
     n_insert = max(1, round(insert_percent_stream * num_vectors))
     n_stream_window = n_init + n_insert
-    if n_stream_window > num_vectors:
-        raise RuntimeError(
-            f"init_percent_stream={init_percent_stream} + insert_percent_stream="
-            f"{insert_percent_stream} needs {n_stream_window} vectors per fold, but "
-            f"num_vectors is only {num_vectors}. Lower either percentage or raise num_vectors."
-        )
+    negative_pool_size = max(n_negative, round(negative_pool_percent * num_vectors))
 
-    # construct()+insert() consume n_stream_window vectors per fold; the
-    # remainder of num_vectors, past every fold's window, is held out as the
-    # source of verified-negative queries.
-    fold_stride = n_stream_window // k_folds
+    total_stream_size = k_folds * n_stream_window
+    negative_pool_start = total_stream_size
+    negative_pool_end = negative_pool_start + negative_pool_size
+
+    # Each fold uses separate non-overlapping stream window, the negative pool starts after the last fold.
+    fold_stride = n_stream_window
     offsets = [f * fold_stride for f in range(k_folds)]
-    negative_pool_size = num_vectors - n_stream_window
-
-    # Placed past every fold's window (all contained in [0, offsets[-1] +
-    # n_stream_window)) so it can never overlap any fold's stream.
     negative_pool_start = offsets[-1] + n_stream_window
     negative_pool_end = negative_pool_start + negative_pool_size
 
@@ -1743,6 +1770,21 @@ def generate_streaming(runner: Runner) -> None:
                 checkpoints=checkpoints, sweep="position", fold_offset=fold_offset,
             )
 
+        # --- panel (c): filter size (k) sweep for insertion throughput ---
+        max_p = max(4, int(round(np.log2(k_fixed))))
+        k_sweep_values = [2**p for p in range(4, max_p + 1)]
+        for method in methods:
+            for k_val in k_sweep_values:
+                for fold_offset in offsets:
+                    runner.submit(
+                        'stream_rebuild',
+                        output_csv=output_csv,
+                        dim=dim, dataset=name, k=k_val, seed=seed, tau_mid=tau_mid, policy="streaming", T=None,
+                        insertion_level=method, vectors_stream=_fold_source(fold_offset, n_stream_window),
+                        vectors_negative=negative_vectors, bootstrap_n=n_init,
+                        checkpoints=checkpoints, sweep="k", fold_offset=fold_offset,
+                    )
+
     if not any_usable:
         raise RuntimeError(
             "generate_streaming: none of the blocklist corpora "
@@ -1750,12 +1792,21 @@ def generate_streaming(runner: Runner) -> None:
         )
 
 
-def save_streaming(job_results: List[Tuple[str, Any]]) -> Tuple[pd.DataFrame, int]:
+def save_streaming(job_results: List[Tuple[str, Any]], default_k: int = 16) -> Tuple[pd.DataFrame, int]:
     """Rebuilds this evaluation's DataFrame from a shared Runner's run()
     output, plus k_fixed (the smallest k among 'position'-sweep rows,
     matching plot_all()'s own derivation)."""
-    df = pd.DataFrame(rows_for_mode(job_results, 'stream_rebuild'))
-    k_fixed = int(df.loc[df["sweep"] == "position", "k"].iloc[0])
+    df = pd.DataFrame(rows_for_mode(job_results, "stream_rebuild"))
+    if df.empty or "k" not in df.columns:
+        return df, default_k
+
+    if "sweep" in df.columns:
+        pos_k = df.loc[df["sweep"] == "position", "k"].dropna()
+        if not pos_k.empty:
+            return df, int(pos_k.min())
+
+    all_k = df["k"].dropna()
+    k_fixed = int(all_k.min()) if not all_k.empty else default_k
     return df, k_fixed
 
 
