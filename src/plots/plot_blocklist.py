@@ -127,7 +127,8 @@ def line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg
                bounded_unit: bool = False, logx: bool = True,
                sweep: str = SWEEP_TAU,
                x_from: Callable[[pd.Series], pd.Series] = lambda kf: 1.0 / kf,
-               xlabel: str = r"Compression $|X|/k$") -> pd.DataFrame:
+               xlabel: str = r"Compression $|X|/k$",
+               x_override: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """One line per corpus against a function of the ball budget, averaged over
     folds with +/- 1 std error bars (same convention as plot_system_tau).
 
@@ -135,9 +136,18 @@ def line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg
     and folds -- and only then maps it onto the x-axis via `x_from`, so a
     caller can plot against compression (|X|/k, the default) or against the
     budget itself (see plot_budget) without grouping on a realised quantity
-    that differs per dataset and per fold."""
+    that differs per dataset and per fold.
+
+    `x_override`, if given, is a (dataset, k_fraction, x) frame merged in
+    instead of computing x from k_fraction via `x_from` -- for an x that
+    depends on some other aggregated column (e.g. realised memory usage as a
+    percentage of raw vector storage; see plot_budget's raw-storage panels),
+    where the caller has to aggregate that column itself before merging."""
     agg = mean_std(df[df["sweep"] == sweep], ["dataset", "k_fraction"], value_col)
-    agg["x"] = x_from(agg["k_fraction"])
+    if x_override is not None:
+        agg = agg.merge(x_override, on=["dataset", "k_fraction"], how="left")
+    else:
+        agg["x"] = x_from(agg["k_fraction"])
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots()

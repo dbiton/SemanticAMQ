@@ -27,6 +27,10 @@ OUTDIR = "plots/equal_memory/"
 DPI = 400
 EMIT_PDF = False
 
+# Embedding dimensionality: fixed at 384 across every blocklist-workload
+# evaluation (see main.generate_equal_memory's own dim=384).
+_EMBEDDING_DIM = 384
+
 # Display overrides for recognized filter names; anything else falls back to
 # the palettes below (see _derive_style_maps).
 _KNOWN_LABELS = {
@@ -158,20 +162,41 @@ def load_data() -> pd.DataFrame:
 
 # Aggregation
 
-def aggregate(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
+def aggregate(df: pd.DataFrame, value_col: str, dim: int = _EMBEDDING_DIM) -> pd.DataFrame:
     """Mean + 95% CI of `value_col` over any repeated runs, per (filter,
-    memory budget); a single run per (filter, budget) gives ci95=0."""
+    memory budget); a single run per (filter, budget) gives ci95=0.
+
+    Also derives "Memory Budget (% of Raw)" when the input has a "Construct
+    Size" column: datasets pooled into this sweep do NOT all share the same
+    reference-set size (main.generate_equal_memory scales the *budget* grid
+    off the smallest corpus, but bigger corpora still get their own, bigger
+    construct set at every budget -- see equal_memory_worker), so unlike the
+    budget axis itself, "raw storage" has no single dataset-independent
+    value. Averaging Construct Size within each (filter, budget) group before
+    dividing -- the same "aggregate, then combine" pattern
+    plot_quantization.aggregate() and plot_budget._raw_storage_pct_x() use
+    for their own memory columns -- means every dataset actually pooled into
+    that point contributes its own real size, rather than one dataset's
+    (or an algebraically reconstructed, and generally wrong, blend of all of
+    them) being applied to every row."""
     work = df.copy()
     work["filter"] = work["Config"].str.split(" + ", regex=False).str[0]
     work["Memory Budget (MB)"] = work["Memory Budget"] / (1024 * 1024)
 
-    grouped = work.groupby(["filter", "Memory Budget (MB)"])[value_col]
-    agg = grouped.agg(mean="mean", sem="sem", n="count").reset_index()
+    grouped = work.groupby(["filter", "Memory Budget (MB)"])
+    agg = grouped[value_col].agg(mean="mean", sem="sem", n="count").reset_index()
     agg["ci95"] = np.where(agg["n"] > 1, 1.96 * agg["sem"].fillna(0.0), 0.0)
+
+    if "Construct Size" in work.columns:
+        construct_size = grouped["Construct Size"].mean().reset_index(name="Construct Size")
+        agg = agg.merge(construct_size, on=["filter", "Memory Budget (MB)"])
+        raw_bytes = agg["Construct Size"] * dim * 4
+        agg["Memory Budget (% of Raw)"] = 100.0 * (agg["Memory Budget (MB)"] * 1024 * 1024) / raw_bytes
     return agg
 
 
-# Line panels: x = memory budget, one line per filter config
+# Line panels: x = memory budget (or, in the "_raw_pct" panels, that budget
+# as a percentage of raw vector storage), one line per filter config
 
 def _line_panel(
     df: pd.DataFrame,
@@ -181,6 +206,8 @@ def _line_panel(
     cfg: Config,
     log_y: bool = False,
     y_bounds: Optional[tuple] = None,
+    x_col: str = "Memory Budget (MB)",
+    xlabel: str = "Memory Budget (MB)",
 ) -> pd.DataFrame:
     agg = aggregate(df, value_col)
 
@@ -188,12 +215,12 @@ def _line_panel(
     fig, ax = plt.subplots()
 
     for name in cfg.configs:
-        sub = agg[agg["filter"] == name].sort_values("Memory Budget (MB)")
+        sub = agg[agg["filter"] == name].sort_values(x_col)
         if sub.empty:
             continue
         has_ci = (sub["ci95"] > 0).any()
         ax.plot(
-            sub["Memory Budget (MB)"], sub["mean"],
+            sub[x_col], sub["mean"],
             color=cfg.colors[name],
             marker=cfg.markers[name], markersize=2.5,
             linewidth=0.8,
@@ -201,7 +228,7 @@ def _line_panel(
         )
         if has_ci:
             ax.errorbar(
-                sub["Memory Budget (MB)"], sub["mean"], yerr=sub["ci95"],
+                sub[x_col], sub["mean"], yerr=sub["ci95"],
                 fmt="none", ecolor=cfg.colors[name],
                 elinewidth=0.5, capsize=1.5, capthick=0.5,
                 zorder=3,
@@ -221,7 +248,7 @@ def _line_panel(
     elif y_bounds is not None:
         ax.set_ylim(*y_bounds)
 
-    ax.set_xlabel("Memory Budget (MB)")
+    ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.grid(axis="both", which="major", linewidth=0.35, alpha=0.4, zorder=0)
     ax.set_axisbelow(True)
@@ -236,8 +263,20 @@ def panel_fpr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _line_panel(df, "FPR", "False Positive Rate", "equal-memory-fpr.png", cfg, y_bounds=(-0.05, 1.05))
 
 
+def panel_fpr_raw_pct(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    return _line_panel(df, "FPR", "False Positive Rate", "equal-memory-fpr-raw-pct.png", cfg,
+                       y_bounds=(-0.05, 1.05), x_col="Memory Budget (% of Raw)",
+                       xlabel="Memory Budget (% of Raw)")
+
+
 def panel_fnr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _line_panel(df, "FNR", "False Negative Rate", "equal-memory-fnr.png", cfg, y_bounds=(-0.05, 1.05))
+
+
+def panel_fnr_raw_pct(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    return _line_panel(df, "FNR", "False Negative Rate", "equal-memory-fnr-raw-pct.png", cfg,
+                       y_bounds=(-0.05, 1.05), x_col="Memory Budget (% of Raw)",
+                       xlabel="Memory Budget (% of Raw)")
 
 
 def panel_latency(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
@@ -247,9 +286,22 @@ def panel_latency(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _line_panel(df, "Latency (ms)", "Construction Latency (ms)", "equal-memory-latency.png", cfg, log_y=True)
 
 
+def panel_latency_raw_pct(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    return _line_panel(df, "Latency (ms)", "Construction Latency (ms)",
+                       "equal-memory-latency-raw-pct.png", cfg, log_y=True,
+                       x_col="Memory Budget (% of Raw)", xlabel="Memory Budget (% of Raw)")
+
+
 def panel_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _line_panel(
         df, "Throughput (qps)", "Throughput (queries/s)", "equal-memory-throughput.png", cfg, log_y=True
+    )
+
+
+def panel_throughput_raw_pct(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    return _line_panel(
+        df, "Throughput (qps)", "Throughput (queries/s)", "equal-memory-throughput-raw-pct.png", cfg,
+        log_y=True, x_col="Memory Budget (% of Raw)", xlabel="Memory Budget (% of Raw)",
     )
 
 
@@ -367,6 +419,23 @@ def generate_equal_memory_figures(
     panel_fnr(df, cfg)
     panel_latency(df, cfg)
     panel_throughput(df, cfg)
+
+    # Same four panels again, against memory budget as a percentage of raw
+    # (uncompressed float32) vector storage instead of absolute MB -- needs
+    # the "Construct Size" column (see equal_memory_worker), absent from
+    # results files predating it.
+    if "Construct Size" in df.columns:
+        panel_fpr_raw_pct(df, cfg)
+        panel_fnr_raw_pct(df, cfg)
+        panel_latency_raw_pct(df, cfg)
+        panel_throughput_raw_pct(df, cfg)
+    else:
+        print(
+            "Note: input has no 'Construct Size' column, so the raw-storage-percentage "
+            "panels were skipped. Rerun generate_equal_memory() (main.py) with a current "
+            "runner.py to get them."
+        )
+
     save_legend(cfg)
 
     print_summary(df, cfg)

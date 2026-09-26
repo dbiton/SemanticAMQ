@@ -318,6 +318,7 @@ def equal_memory_worker(
             'FPR': float('nan'), 'FNR': float('nan'),
             'Latency (ms)': float('nan'), 'Throughput (qps)': float('nan'),
             'Infeasible': True,
+            'Construct Size': len(construct_arr),
         }
 
     predicted: List[bool] = []
@@ -357,6 +358,13 @@ def equal_memory_worker(
         'Latency (ms)': construction_time * 1000,
         'Throughput (qps)': n_q / max(elapsed, 1e-9),
         'Infeasible': False,
+        # This corpus/fold's construct-set size, so plot_equal_memory can
+        # express Memory Budget/Usage as a percentage of storing this set
+        # raw (Construct Size * dim float32s) -- per row, since datasets
+        # pooled into this sweep don't all share the same reference-set
+        # size (see main.generate_equal_memory's min-over-corpora budget
+        # scaling), unlike the shared budget grid itself.
+        'Construct Size': len(construct_arr),
     }
 
 
@@ -367,11 +375,9 @@ def _log_effective_radii(radii: np.ndarray, tau: float) -> np.ndarray:
     """Natural log of each ball's tau-expanded radius, carried in log space --
     -inf wherever that radius is not positive.
 
-    tau is not always positive: callers like main.BlocklistWorkload.recall_tau
-    solve an operating point as a percentile of query margins (distance-to-
-    centre minus radius), and a query strictly inside a ball has a negative
-    margin, so the solved tau can come out slightly negative -- a stricter
-    "inside by a margin" threshold.
+    tau is not guaranteed positive by every caller -- a negative tau is a
+    stricter "inside by a margin" threshold (a query must sit strictly inside
+    a ball's radius, not just within it).
     A ball whose radius that drives to zero or below covers nothing, and -inf
     is the log-space statement of exactly that: logsumexp maps it back to a
     zero contribution, so it drops out of the sum without ever being
@@ -605,6 +611,13 @@ def quantization_worker(
         "n_balls": filt._num_spheres, "memory_bytes": memory_bytes, "seed": seed,
         "radius_inflation_mean": radius_inflation_mean,
         "radius_inflation_std": radius_inflation_std,
+        # Size of the set every ball cover in this row is built over -- fixed
+        # per (dataset, seed), not swept, but recorded per row (rather than
+        # left for a caller to look up separately) so plot_quantization can
+        # express memory_bytes as a percentage of storing this set raw
+        # (n_construct * dim float32s) without needing its own copy of the
+        # corpus.
+        "n_construct": len(construct_arr),
     })
 
     bad = [r for r in rows if r["fnr"] != 0]

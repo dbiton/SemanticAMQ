@@ -59,10 +59,24 @@ EMIT_PDF = False
 # k as a percentage of |X| rather than plot_blocklist's compression |X|/k.
 _XLABEL = r"Ball budget $k$ (% of $|X|$)"
 
+# Embedding dimensionality: fixed at 384 across every blocklist-workload
+# evaluation (see generate_budget/generate_blocklist's own dim=384), needed
+# here only to convert bytes into "as a fraction of storing every reference
+# vector raw" -- the naive float32 baseline the ball cover is compressing
+# against.
+_EMBEDDING_DIM = 384
+_XLABEL_RAW_PCT = "Memory Usage (% of Raw)"
+
 # On top of the columns plot_blocklist requires: generate_budget is the one
 # blocklist-workload sweep that can afford these (see its docstring), so unlike
 # results/blocklist.csv they are always present here.
 _VOLUME_COLUMNS = ["log10_vol_low", "log10_vol_high"]
+
+# memory_bytes/n_reference come from the same shared core (runner's
+# _blocklist_cover_rows) that supplies every other required column, so in
+# practice they're always present -- validated separately anyway, since the
+# raw-storage panels are the only thing here that reads them.
+_RAW_STORAGE_COLUMNS = ["memory_bytes", "n_reference"]
 
 
 def _validate_volume_schema(df: pd.DataFrame) -> None:
@@ -75,6 +89,15 @@ def _validate_volume_schema(df: pd.DataFrame) -> None:
         )
 
 
+def _validate_raw_storage_schema(df: pd.DataFrame) -> None:
+    missing = [c for c in _RAW_STORAGE_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Input missing columns: {missing}, needed for the raw-storage-percentage "
+            "panels. Rerun generate_budget with a current runner.py."
+        )
+
+
 def load_data() -> pd.DataFrame:
     if not os.path.exists(INPUT_PATH):
         raise FileNotFoundError(
@@ -83,6 +106,7 @@ def load_data() -> pd.DataFrame:
     df = pd.read_csv(INPUT_PATH)
     validate_schema(df)
     _validate_volume_schema(df)
+    _validate_raw_storage_schema(df)
     return df
 
 
@@ -114,9 +138,47 @@ def _budget_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str,
     )
 
 
+def _raw_storage_pct_x(df: pd.DataFrame, dim: int = _EMBEDDING_DIM) -> pd.DataFrame:
+    """(dataset, k_fraction, x) frame for line_panel's `x_override`: x is the
+    realised memory usage as a percentage of storing every reference vector
+    raw (n_reference * dim float32 values), at each (dataset, k_fraction).
+
+    memory_bytes and n_reference are both averaged per group first (the same
+    "aggregate, then combine" pattern plot_quantization.aggregate() uses for
+    its memory axis) rather than computing the ratio per row and averaging
+    that: n_reference is already constant within a (dataset, k_fraction)
+    group, so this only matters for memory_bytes, but doing it this way once
+    means a future column that does vary per fold is handled correctly too."""
+    sel = df[df["sweep"] == SWEEP_TAU]
+    grouped = sel.groupby(["dataset", "k_fraction"])
+    mem = grouped["memory_bytes"].mean()
+    n_ref = grouped["n_reference"].mean()
+    x = 100.0 * mem / (n_ref * dim * 4)
+    return x.reset_index(name="x")
+
+
+def _budget_panel_raw_pct(df: pd.DataFrame, value_col: str, ylabel: str, filename: str,
+                          cfg: Config, bounded_unit: bool = False) -> pd.DataFrame:
+    """Same panel as _budget_panel, but against realised memory usage as a
+    percentage of raw (uncompressed float32) vector storage instead of ball
+    budget k -- the two axes agree in shape only up to how compact this
+    filter's per-ball encoding is relative to a raw vector."""
+    return line_panel(
+        df, value_col, ylabel, filename, cfg,
+        bounded_unit=bounded_unit, logx=False,
+        sweep=SWEEP_TAU, xlabel=_XLABEL_RAW_PCT,
+        x_override=_raw_storage_pct_x(df),
+    )
+
+
 def panel_recall(df, cfg):
     return _budget_panel(df, "recall", "Recall", "budget-recall.png", cfg,
                          bounded_unit=True)
+
+
+def panel_recall_raw_pct(df, cfg):
+    return _budget_panel_raw_pct(df, "recall", "Recall", "budget-recall-raw-pct.png", cfg,
+                                 bounded_unit=True)
 
 
 def panel_fpr_hard(df, cfg):
@@ -124,9 +186,19 @@ def panel_fpr_hard(df, cfg):
                          cfg, bounded_unit=True)
 
 
+def panel_fpr_hard_raw_pct(df, cfg):
+    return _budget_panel_raw_pct(df, "fpr_hard", "FPR (hard negatives)",
+                                 "budget-fpr-hard-raw-pct.png", cfg, bounded_unit=True)
+
+
 def panel_fpr_easy(df, cfg):
     return _budget_panel(df, "fpr_easy", "FPR (easy negatives)", "budget-fpr-easy.png",
                          cfg, bounded_unit=True)
+
+
+def panel_fpr_easy_raw_pct(df, cfg):
+    return _budget_panel_raw_pct(df, "fpr_easy", "FPR (easy negatives)",
+                                 "budget-fpr-easy-raw-pct.png", cfg, bounded_unit=True)
 
 
 def panel_saved(df, cfg):
@@ -134,12 +206,23 @@ def panel_saved(df, cfg):
                          "budget-accesses-saved.png", cfg)
 
 
+def panel_saved_raw_pct(df, cfg):
+    return _budget_panel_raw_pct(df, "accesses_saved_pct", "Accesses Saved (%)",
+                                 "budget-accesses-saved-raw-pct.png", cfg)
+
+
 def panel_geometric_objective(df, cfg):
     return _budget_panel(df, "log10_j_tau", r"$\log_{10} J_\tau(\mathcal{C})$",
                          "budget-geometric-objective.png", cfg)
 
 
-def panel_volume_bounds(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+def panel_geometric_objective_raw_pct(df, cfg):
+    return _budget_panel_raw_pct(df, "log10_j_tau", r"$\log_{10} J_\tau(\mathcal{C})$",
+                                 "budget-geometric-objective-raw-pct.png", cfg)
+
+
+def _volume_bounds_panel(df: pd.DataFrame, cfg: Config, filename: str, xlabel: str,
+                         x_override: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """Lower/upper bounds (one shaded band per corpus) on the volume actually
     covered by the tau-expanded cover, against the budget that bought it --
     see runner._tau_volume_bounds_log10's overlap-aware union bound. Tighter
@@ -149,14 +232,20 @@ def panel_volume_bounds(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     Rendered as a band rather than through line_panel because there are two
     series per corpus, and the interesting quantity is the region between
-    them, not either bound alone."""
+    them, not either bound alone. `x_override` mirrors line_panel's own
+    parameter of the same name (see there) -- a (dataset, k_fraction, x)
+    frame merged in for the raw-storage-percentage variant instead of
+    computing x from k_fraction directly."""
     sel = df[df["sweep"] == SWEEP_TAU]
     agg_low = mean_std(sel, ["dataset", "k_fraction"], "log10_vol_low")[
         ["dataset", "k_fraction", "mean"]].rename(columns={"mean": "low"})
     agg_high = mean_std(sel, ["dataset", "k_fraction"], "log10_vol_high")[
         ["dataset", "k_fraction", "mean"]].rename(columns={"mean": "high"})
     agg = agg_low.merge(agg_high, on=["dataset", "k_fraction"])
-    agg["x"] = 100.0 * agg["k_fraction"]
+    if x_override is not None:
+        agg = agg.merge(x_override, on=["dataset", "k_fraction"], how="left")
+    else:
+        agg["x"] = 100.0 * agg["k_fraction"]
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots()
@@ -173,13 +262,22 @@ def panel_volume_bounds(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         ax.fill_between(sub["x"], sub["low"], sub["high"], color=BLOCKLIST_COLORS[dataset],
                         alpha=0.15, linewidth=0, zorder=1)
 
-    ax.set_xlabel(_XLABEL)
+    ax.set_xlabel(xlabel)
     ax.set_ylabel(wrap_label(r"$\log_{10}$ Volume Bounds"))
     style_axes(ax)
     ax.grid(visible=False, axis="y")  # no horizontal gridlines
     fig.subplots_adjust(left=0.26, right=0.97, top=0.95, bottom=0.24)
-    save_figure(fig, "budget-volume-bounds.png", cfg.outdir, cfg.dpi, cfg.emit_pdf, tight=False)
+    save_figure(fig, filename, cfg.outdir, cfg.dpi, cfg.emit_pdf, tight=False)
     return agg
+
+
+def panel_volume_bounds(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    return _volume_bounds_panel(df, cfg, "budget-volume-bounds.png", _XLABEL)
+
+
+def panel_volume_bounds_raw_pct(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    return _volume_bounds_panel(df, cfg, "budget-volume-bounds-raw-pct.png",
+                                _XLABEL_RAW_PCT, x_override=_raw_storage_pct_x(df))
 
 
 def print_summary(df: pd.DataFrame, tau: float) -> None:
@@ -213,6 +311,7 @@ def generate_budget_figures(df: Optional[pd.DataFrame] = None, outdir: str = OUT
     else:
         validate_schema(df)
         _validate_volume_schema(df)
+        _validate_raw_storage_schema(df)
     cfg = Config(dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
     tau = fixed_tau(df)
 
@@ -222,6 +321,16 @@ def generate_budget_figures(df: Optional[pd.DataFrame] = None, outdir: str = OUT
     panel_saved(df, cfg)
     panel_geometric_objective(df, cfg)
     panel_volume_bounds(df, cfg)
+
+    # Same five panels again, against realised memory usage as a percentage
+    # of raw (uncompressed float32) vector storage instead of ball budget k
+    # -- see _raw_storage_pct_x.
+    panel_recall_raw_pct(df, cfg)
+    panel_fpr_hard_raw_pct(df, cfg)
+    panel_fpr_easy_raw_pct(df, cfg)
+    panel_saved_raw_pct(df, cfg)
+    panel_geometric_objective_raw_pct(df, cfg)
+    panel_volume_bounds_raw_pct(df, cfg)
 
     # Same three corpora and the same palette as the blocklist figures, so the
     # two evaluations' panels read as one set.

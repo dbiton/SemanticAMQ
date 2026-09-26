@@ -262,9 +262,9 @@ def generate_equal_memory(runner: Runner) -> None:
     splits and reference set B as generate_blocklist/generate_quantization/
     generate_scaling -- rather than its own single-dataset (MMLU) split, so
     the SOTA baselines are compared on the same data the rest of the suite
-    evaluates. tau is solved once per corpus via recall_tau, exactly as
-    generate_quantization does, so every filter here is compared at the same
-    per-corpus operating point quantization_worker uses. Each fold's query
+    evaluates. tau is one fixed absolute value, the same one generate_budget
+    and generate_quantization use, so every filter here is compared at the
+    same operating point quantization_worker uses. Each fold's query
     stream (see BlocklistWorkload.query_vectors) is split into a calibration
     slice and a disjoint measurement slice, replacing the old flat
     percentage_calibration split of one dataset.
@@ -281,7 +281,7 @@ def generate_equal_memory(runner: Runner) -> None:
     num_vectors            = WORKLOAD_NUM_VECTORS
     dim                    = 384
     n_folds                = BLOCKLIST_FOLDS
-    target_recall          = 0.95
+    tau                    = 0.1
     count_memory_steps     = 10
     # Fraction of each fold's blocklist query stream spent calibrating each
     # filter's config dial; the rest measures FPR/FNR/latency/throughput.
@@ -305,11 +305,6 @@ def generate_equal_memory(runner: Runner) -> None:
     memory_budgets = np.linspace(0, max_memory_budget, count_memory_steps + 1, dtype=int)[1:]
 
     for workload in workloads:
-        # tau is solved once per corpus, not per fold -- the same operating
-        # point generate_quantization uses (see its docstring).
-        tau = workload.recall_tau(workload.selections[0], target_recall)
-        logger.info(f"{workload.name}: tau={tau:.4f} ({target_recall:.0%} recall on fold 0 positives)")
-
         output_csv = equal_memory_csv(workload.name)
         os.makedirs(os.path.dirname(output_csv), exist_ok=True)
         for fold, sel in enumerate(workload.selections):
@@ -855,26 +850,13 @@ class BlocklistWorkload:
         means "within tau of the reference set" -- the cover contains every
         reference vector, so anything within tau of one is necessarily flagged.
         A cluster member can sit FARTHER than tau from the reference set and be
-        missed legitimately, and since tau is solved for 95% recall, about 5%
-        of positives do exactly that. Passing this to quantization raised
-        "Zero-false-negative invariant violated" with fnr ~= 0.049."""
+        missed legitimately, so a false negative rate above zero here means
+        tau is too tight for this corpus's own duplicate geometry, not a bug
+        in the cover itself."""
         actual: List[bool] = []
         for key in ("positive", "hard", "easy"):
             actual.extend([key == "positive"] * len(sel[key]))
         return actual
-
-    def recall_tau(self, sel: Dict[str, np.ndarray], target_recall: float) -> float:
-        """Smallest tau catching `target_recall` of this fold's positives by
-        exact distance to the reference set -- the same operating point
-        generate_quantization and generate_equal_memory solve for, so those
-        evaluations sit at a comparable threshold to the blocklist workload's
-        own target_recall (see generate_blocklist)."""
-        reference = np.ascontiguousarray(self.rows(sel["reference"]), dtype=np.float32)
-        positives = np.ascontiguousarray(self.rows(sel["positive"]), dtype=np.float32)
-        index = faiss.IndexFlatL2(reference.shape[1])
-        index.add(reference)
-        nn = np.sqrt(np.clip(index.search(positives, 1)[0][:, 0], 0, None))
-        return float(np.percentile(nn, target_recall * 100.0))
 
 
 def build_blocklist_workload(name: str, plot_key: str, label_col: Optional[str],
@@ -1074,7 +1056,7 @@ def generate_budget(runner: Runner) -> None:
     num_vectors     = WORKLOAD_NUM_VECTORS
     n_folds         = BLOCKLIST_FOLDS
     k_percentages   = [5, 7.5, 10, 12.5, 15, 17.5, 20]  # ball budget k, as a percentage of |B|
-    tau             = 0.2
+    tau             = 0.1
 
     k_fractions = [p / 100.0 for p in k_percentages]
 
@@ -1117,9 +1099,9 @@ def generate_quantization(runner: Runner) -> None:
     Reuses build_blocklist_workload rather than cutting its own contiguous
     spans, so the only difference between this sweep and the blocklist one is
     the variable being swept: the quantizer here, the ball budget there. tau is
-    a single value, solved once on fold 0 for the same target_recall
-    generate_blocklist uses, so both evaluations sit at a comparable operating
-    point. Ground truth here is distance to the reference set, not the
+    a single fixed absolute value, the same one generate_budget and
+    generate_equal_memory use, so both evaluations sit at a comparable
+    operating point. Ground truth here is distance to the reference set, not the
     blocklist workload's cluster membership: quantization_worker asserts a
     zero false-negative invariant that only holds under the distance
     definition (see BlocklistWorkload.cluster_membership).
@@ -1134,8 +1116,7 @@ def generate_quantization(runner: Runner) -> None:
     results/quantization/<dataset>/ folder and its own figure folder.
     Kept apart rather than pooled because plot_quantization asserts a single
     dataset -- its panels put memory on the x-axis and one line per quantizer,
-    leaving no room for a dataset dimension -- and because tau is solved per
-    corpus, so a pooled file would also carry several thresholds.
+    leaving no room for a dataset dimension.
 
     Only submits 'quantization' jobs -- does not run `runner`."""
     num_vectors      = WORKLOAD_NUM_VECTORS
@@ -1147,7 +1128,7 @@ def generate_quantization(runner: Runner) -> None:
     # "k" meaning the same absolute ball count across every evaluation that
     # reports it.
     k_values_nominal = [2 ** i for i in range(11, 17)]
-    target_recall    = 0.95
+    tau              = 0.1
 
     workloads = blocklist_workloads(num_vectors, n_folds=n_folds)
     if not workloads:
@@ -1165,16 +1146,7 @@ def generate_quantization(runner: Runner) -> None:
                 f"{workload.name} ({reference_len} vectors). Raise "
                 "WORKLOAD_NUM_VECTORS or lower k_values_nominal.")
 
-        # tau is solved per corpus, not shared: the distance at which a
-        # duplicate sits is a property of each embedding set (WildChat's
-        # reposts are near-exact, WikiAnswers' rewordings are not), so one
-        # absolute threshold would put the corpora at different recalls. It
-        # stays fixed across folds and quantizers within a corpus, because
-        # this sweep varies the quantizer, not the threshold.
-        tau = workload.recall_tau(workload.selections[0], target_recall)
-        logger.info(
-            f"{workload.name}: k_values={k_values} (|B|={reference_len}), "
-            f"tau={tau:.4f} ({target_recall:.0%} recall on fold 0 positives)")
+        logger.info(f"{workload.name}: k_values={k_values} (|B|={reference_len}), tau={tau:.4f}")
 
         output_csv = quantization_csv(workload.name)
         os.makedirs(os.path.dirname(output_csv), exist_ok=True)
