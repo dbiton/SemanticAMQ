@@ -93,9 +93,8 @@ def _precision_recall_f1(predicted: Any, actual: Any) -> Tuple[float, float, flo
 
 
 _DIRECT_TAU_FILTERS = {
-    "FirstNFilter", "BallCoverFilter", "KDBoxFilter", "GonzalezBoxFilter", "GonzalezMEBFilter",
-    "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", "DSHFilter", "HNSWFilter",
-    "IVFFilter", "QuantizedVectorFilter", "MLPFilter"
+    "FirstNFilter", "BallCoverFilter", "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", 
+    "DSHFilter", "HNSWFilter", "IVFFilter", "QuantizedVectorFilter", "MLPFilter"
 }
 
 
@@ -451,10 +450,6 @@ def quantization_worker(
     radii = filt.all_radiuses
     log10_J = _log10_J(radii, dim)
 
-    radius_inflation = filt.all_radius_inflation
-    radius_inflation_mean = float(np.mean(radius_inflation)) if len(radius_inflation) else 0.0
-    radius_inflation_std = float(np.std(radius_inflation)) if len(radius_inflation) else 0.0
-
     memory_bytes = filt.get_bytesize()
 
     q0 = time.perf_counter()
@@ -484,9 +479,7 @@ def quantization_worker(
         "n_index_accesses": n_index_accesses,
         "index_accesses_saved": n_q - n_index_accesses,
         "index_accesses_saved_pct": (1.0 - n_index_accesses / max(n_q, 1)) * 100.0,
-        "n_balls": filt._num_spheres, "memory_bytes": memory_bytes, "seed": seed,
-        "radius_inflation_mean": radius_inflation_mean,
-        "radius_inflation_std": radius_inflation_std,
+        "n_balls": filt._num_spheres, "memory_bytes": memory_bytes, "seed": seed
     })
 
     bad = [r for r in rows if r["fnr"] != 0]
@@ -839,8 +832,9 @@ def stream_rebuild_worker(
     stream_arr = _to_construct_array(vectors_stream)
     negative_arr = _to_construct_array(vectors_negative)
     n = len(stream_arr)
-    checkpoint_set = sorted(set(c for c in checkpoints if 0 < c <= n))
     metric, method = _rebuild_policy_tags(policy, insertion_level)
+    # we reserve 20% memory pool for pooled insertion, other methods construct at 100% capacity
+    insert_memory_percent = 20.0 if insertion_level == "pooled" else 0.0
 
     rows: List[Dict[str, Any]] = []
     cumulative_time_s = 0.0
@@ -861,6 +855,7 @@ def stream_rebuild_worker(
             )
 
     if policy == "oracle":
+        checkpoint_set = sorted(set(c for c in checkpoints if 0 < c <= n))
         for c in checkpoint_set:
             filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
             t0 = time.perf_counter()
@@ -890,11 +885,12 @@ def stream_rebuild_worker(
         )
     rebuild_every = T if (policy == "periodic" and T is not None) else None
     filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k),
-                             insert_method=_INSERT_STRATEGIES[insertion_level]())
+            insert_method=_INSERT_STRATEGIES[insertion_level](), insert_memory_percent=insert_memory_percent)
     # Bootstrap via one shared construct() (identical across insertion_level)
     # so every checkpoint from bootstrap_n onward compares each method's own
     # decision rule.
     bootstrap_n = min(bootstrap_n if bootstrap_n is not None else k, n)
+    checkpoint_set = sorted(set(c for c in checkpoints if bootstrap_n < c <= n))
     t0 = time.perf_counter()
     filt.construct(stream_arr[:bootstrap_n])
     cumulative_time_s += time.perf_counter() - t0
