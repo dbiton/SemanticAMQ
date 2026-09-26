@@ -69,9 +69,9 @@ def _validate_volume_schema(df: pd.DataFrame) -> None:
     missing = [c for c in _VOLUME_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(
-            f"Input missing columns: {missing}. These come from blocklist_worker's "
-            "volume_bounds=True, which generate_budget always passes -- a file without "
-            "them predates that, so rerun generate_budget."
+            f"Input missing columns: {missing}. These come from runner.budget_worker, "
+            "which always requests volume bounds -- a file without them predates that, "
+            "so rerun generate_budget."
         )
 
 

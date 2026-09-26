@@ -26,6 +26,7 @@ from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 
 from logging_config import configure_logging
 from filters.filter import InsufficientMemoryError
+from filters.dsh_filter import DSHFilter
 from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize
 from filters.quantized_vector_filter import QuantizedVectorFilter
 from filters.ball_cover.nearest_insert import NearestInsert
@@ -186,8 +187,25 @@ _POST_CONSTRUCTION_CONFIG_DIALS = {
 }
 
 # Filters whose configuration changes memory layout at construction time: one build per candidate.
+# A value may be a static list of kwargs (LSBFFilter) or a callable
+# (dim, distance_threshold) -> list of kwargs, for a dial whose candidates
+# depend on the sweep's own parameters (DSHFilter's z grid).
 _CONSTRUCTION_TIME_CONFIG_DIALS = {
     "LSBFFilter": [{"verify": True}, {"verify": False}],
+    # DSHFilter bakes z into every inserted point's hash codes, so unlike
+    # IVFFilter.nprobe/HNSWFilter.ef_search it cannot be tuned post-hoc on a
+    # single built instance -- it needs one build per candidate, exactly
+    # like LSBFFilter.verify above. Without this, z came only from a
+    # synthetic uniform-sphere model (see DSHFilter's module docstring),
+    # while IVF/HNSW's dials were already selected by F1 on real calibration
+    # data -- an asymmetry that understated DSH's achievable accuracy on
+    # real, non-uniform embeddings. z_grid() reuses the same bounded
+    # candidate range that synthetic model would have searched, so this
+    # changes *how* the best candidate in that range is chosen, not the
+    # range itself.
+    "DSHFilter": lambda dim, distance_threshold: [
+        {"z": float(z)} for z in DSHFilter.z_grid(distance_threshold)
+    ],
 }
 
 
@@ -209,23 +227,41 @@ def _build_calibrated_filter(
     construction_time = 0.0
 
     if name in _CONSTRUCTION_TIME_CONFIG_DIALS:
+        dial = _CONSTRUCTION_TIME_CONFIG_DIALS[name]
+        candidates = dial(dim, distance_threshold) if callable(dial) else dial
         best_f1, best_instance = -1.0, None
-        for kwargs in _CONSTRUCTION_TIME_CONFIG_DIALS[name]:
+        last_error: Optional[Exception] = None
+        for kwargs in candidates:
             # Via _instantiate_filter's own dispatch, not a hardcoded
             # direct-tau call, so a dial-registry filter not in
             # _DIRECT_TAU_FILTERS still gets built correctly.
-            candidate = _instantiate_filter(
-                filter_cls, dim, memory_budget, distance_threshold, extra_kwargs=kwargs
-            )
-            t0 = time.perf_counter()
-            candidate.construct(construct_arr)
-            construction_time += time.perf_counter() - t0
+            try:
+                candidate = _instantiate_filter(
+                    filter_cls, dim, memory_budget, distance_threshold, extra_kwargs=kwargs
+                )
+                t0 = time.perf_counter()
+                candidate.construct(construct_arr)
+                construction_time += time.perf_counter() - t0
+            except (InsufficientMemoryError, RuntimeError) as e:
+                # A dial value can be infeasible at this budget (DSH's z
+                # shifts num_tables, so its memory footprint moves with the
+                # grid) or fail DSH's own calibration_min_gap guard -- either
+                # way that is one bad candidate, not a reason to fail the
+                # whole sweep row as long as some other candidate works.
+                last_error = e
+                continue
             f1 = (
                 _f1_score(np.asarray(candidate.query(calib_arr), dtype=bool), calib_actual)
                 if len(calib_arr) > 0 else 0.0
             )
             if f1 > best_f1:
                 best_f1, best_instance = f1, candidate
+        if best_instance is None:
+            raise InsufficientMemoryError(
+                f"No candidate for {name} in its construction-time config dial fit "
+                f"max_memory={memory_budget} bytes / passed its calibration guard "
+                f"(last error: {last_error})."
+            )
         return best_instance, construction_time
 
     filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold)
@@ -331,10 +367,11 @@ def _log_effective_radii(radii: np.ndarray, tau: float) -> np.ndarray:
     """Natural log of each ball's tau-expanded radius, carried in log space --
     -inf wherever that radius is not positive.
 
-    tau is not always positive: blocklist_worker solves its operating point as
-    a percentile of the query margins (distance-to-centre minus radius), and a
-    query strictly inside a ball has a negative margin, so the solved tau can
-    come out slightly negative -- a stricter "inside by a margin" threshold.
+    tau is not always positive: callers like main.BlocklistWorkload.recall_tau
+    solve an operating point as a percentile of query margins (distance-to-
+    centre minus radius), and a query strictly inside a ball has a negative
+    margin, so the solved tau can come out slightly negative -- a stricter
+    "inside by a margin" threshold.
     A ball whose radius that drives to zero or below covers nothing, and -inf
     is the log-space statement of exactly that: logsumexp maps it back to a
     zero contribution, so it drops out of the sum without ever being
@@ -392,8 +429,8 @@ def _tau_volume_bounds_log10(centers: np.ndarray, radii: np.ndarray, tau: float)
     the suite paid for an O(k^2) union bound that almost no caller read;
     callers that want it now ask for it here, from all_centers/all_radiuses,
     at whatever tau they are reporting (pass tau=0.0 for the cover's own
-    volume). Only system_tau_worker does -- see blocklist_worker for a worker
-    that deliberately skips it on cost grounds."""
+    volume). Only system_tau_worker does -- see blocklist_tau_worker for a
+    worker that deliberately skips it on cost grounds."""
     if len(radii) == 0:
         return float('nan'), float('nan')
     # This estimator takes radii, not log-radii, so the degenerate case is
@@ -436,6 +473,15 @@ QUANTIZATION_SWEEP = (
     # weaker guarantee than the other ten rungs; see the CAVEAT on
     # Quantize.RABITQ. Stays constructible, just not swept by default.
     Quantize.PQ4_R1, Quantize.PQ8_R1,
+    # The rest of faiss's TurboQuant family alongside TQ3 (TQ1/TQ2/TQ4/TQ5/
+    # TQ8 -- see the Quantize docstring). Evaluation-only: swept here so
+    # results/quantization.csv carries their rows, but deliberately left out
+    # of plot_quantization.QUANTIZE_SWEEP (a separate, hand-kept list, not
+    # imported from here -- see that file's comment) so no figure changes
+    # until they've actually been looked at. All exact ADC like the rest of
+    # the scalar-quantizer rungs, so this doesn't touch the zero-false-
+    # negative guarantee.
+    Quantize.TQ1, Quantize.TQ2, Quantize.TQ4, Quantize.TQ5, Quantize.TQ8,
 )
 
 
@@ -463,11 +509,12 @@ def quantization_worker(
     having to pick one tau out of several.
 
     n_hard/n_easy split fpr into fpr_hard/fpr_easy, the same distinction
-    blocklist_worker reports: vectors_query is [positives, hard negatives,
-    easy negatives] in that order (see BlocklistWorkload.query_vectors), so
-    the last n_hard+n_easy entries are hard then easy negatives and the rest
-    are positives. Unlike blocklist_worker, ground truth here is
-    distance-to-tau (compute_static_actual_results), not cluster membership,
+    blocklist_tau_worker/budget_worker report: vectors_query is [positives,
+    hard negatives, easy negatives] in that order (see
+    BlocklistWorkload.query_vectors), so the last n_hard+n_easy entries are
+    hard then easy negatives and the rest are positives. Unlike
+    blocklist_tau_worker/budget_worker, ground truth here is distance-to-tau
+    (compute_static_actual_results), not cluster membership,
     so a hard/easy-negative row is not unconditionally a true negative the
     way it is there -- fpr_hard/fpr_easy go through the same confusion-rate
     helper as the pooled fpr rather than a plain mean, so the rare row where
@@ -538,7 +585,7 @@ def quantization_worker(
     n_index_accesses = int(predicted_arr.sum())
 
     rates = _confusion_rates(predicted, actual)
-    # Same [positives, hard, easy] layout as blocklist_worker's query stream
+    # Same [positives, hard, easy] layout as blocklist_tau_worker/budget_worker's query stream
     # (see BlocklistWorkload.query_vectors) -- hard then easy negatives are
     # the trailing n_hard+n_easy entries.
     hard_rates = _confusion_rates(predicted_arr[n_pos:n_pos + n_hard], actual[n_pos:n_pos + n_hard])
@@ -671,28 +718,22 @@ def system_tau_worker(
     return rows
 
 
-def blocklist_worker(
+def _blocklist_cover_rows(
     dim: int,
     dataset: str,
     seed: int,
     k_fractions: List[float],
-    target_recall: float,
     tau_values: List[float],
     vectors_reference: VectorInput,
     vectors_positive: VectorInput,
     vectors_hard_negative: VectorInput,
     vectors_easy_negative: VectorInput,
-    volume_bounds: bool = False,
+    volume_bounds: bool,
 ) -> List[Dict[str, Any]]:
-    """Asymmetric blocklist workload (main.generate_blocklist): a tight
-    reference set B, a broad query stream, positives that are held-out members
-    of B's own duplicate clusters.
-
-    Unlike system_tau_worker, tau is not swept over a grid -- it is solved per
-    row for `target_recall` on the positives, so every compression ratio is
-    compared at an equal-recall operating point and the interesting axis is
-    FPR. Sweeping tau instead would let a row buy a better FPR by quietly
-    giving up recall.
+    """Shared core of blocklist_tau_worker and budget_worker: build a
+    BallCoverFilter per k in k_fractions and emit one sweep="tau" row per
+    (k, tau) pair. Both callers read only these rows -- see each one's own
+    docstring for which axis it treats as fixed and which it sweeps.
 
     Negatives are split in two and never pooled. Hard negatives are members of
     duplicate clusters that were NOT blocklisted: same tight local geometry as
@@ -702,12 +743,12 @@ def blocklist_worker(
     whichever class happened to be larger.
 
     volume_bounds adds the overlap-aware log10_vol_low/log10_vol_high columns
-    (_tau_volume_bounds_log10) to the tau-sweep rows. Off by default because
-    that bound is ~O(k^2) -- ~160s at k=9665 -- and generate_blocklist sweeps
-    a whole tau grid per k, which multiplies that cost by the length of the
-    grid and dominates the run. generate_budget passes a single tau, so it
-    pays it once per k and turns this on; see the log10_j_tau comment in
-    row_at for the cheap sum-of-volumes proxy that is always reported.
+    (_tau_volume_bounds_log10). Off by default because that bound is ~O(k^2)
+    -- ~160s at k=9665 -- and blocklist_tau_worker sweeps a whole tau grid per
+    k, which multiplies that cost by the length of the grid and dominates the
+    run. budget_worker passes a single tau, so it pays it once per k and turns
+    this on; see the log10_j_tau comment below for the cheap sum-of-volumes
+    proxy that is always reported.
     """
     B = np.ascontiguousarray(_to_construct_array(vectors_reference), dtype=np.float32)
     pos = np.ascontiguousarray(_to_construct_array(vectors_positive), dtype=np.float32)
@@ -754,11 +795,12 @@ def blocklist_worker(
         m_pos, m_hard, m_easy = margin(pos), margin(hard), margin(easy)
         r_med = float(np.median(radii)) if len(radii) else 0.0
 
-        def row_at(tau: float, sweep: str) -> Dict[str, Any]:
-            """One measurement of the whole query stream at this tau. The
-            geometric objective and the volume bounds are recomputed per tau
-            because tau expands every ball (eff. radius r_i + tau), so they are
-            functions of tau at fixed k, not constants of the cover."""
+        for tau in tau_values:
+            tau = float(tau)
+            # Recomputed per tau because tau expands every ball (eff. radius
+            # r_i + tau), so both the geometric objective and the volume
+            # bounds are functions of tau at fixed k, not constants of the
+            # cover.
             recall = float(np.mean(m_pos <= tau)) if len(m_pos) else 0.0
             fpr_hard = float(np.mean(m_hard <= tau)) if len(m_hard) else 0.0
             fpr_easy = float(np.mean(m_easy <= tau)) if len(m_easy) else 0.0
@@ -770,16 +812,12 @@ def blocklist_worker(
             n_flagged = (recall * len(pos)) + (fpr_hard * len(hard)) + (fpr_easy * len(easy))
             saved = 100.0 * (1.0 - n_flagged / max(n_queries, 1))
 
-            # Only for the fixed-tau rows, and only when asked: this is the
-            # ~O(k^2) bound (see the docstring). The sweep="recall" row solves
-            # its own tau and so would need its own second run of it, which no
-            # figure reads -- NaN there is "not measured", not "zero volume".
             vol_low, vol_high = float('nan'), float('nan')
-            if volume_bounds and sweep == "tau":
+            if volume_bounds:
                 vol_low, vol_high = _tau_volume_bounds_log10(centers, radii, tau)
 
-            return {
-                "dataset": dataset, "seed": seed, "sweep": sweep,
+            rows.append({
+                "dataset": dataset, "seed": seed, "sweep": "tau",
                 "k": len(radii), "n_reference": len(B),
                 # k_fraction is the nominal knob and is identical across
                 # datasets and folds; `compression` is what it realised here,
@@ -799,7 +837,7 @@ def blocklist_worker(
                 # log10_J is a logsumexp over the balls, i.e. O(k), so it is
                 # always reported -- but it sums each ball's volume
                 # independently and double-counts overlap. The overlap-aware
-                # union bound below is the tighter number, and is opt-in
+                # union bound above is the tighter number, and is opt-in
                 # because it is ~O(k^2) (see volume_bounds in the docstring).
                 "j_tau": _J_tau(radii, dim, tau=tau),
                 "log10_j_tau": _log10_J(radii, dim, tau=tau),
@@ -808,22 +846,62 @@ def blocklist_worker(
                 "n_balls": len(radii),
                 "d_pos_med": d_pos_med, "d_hard_med": d_hard_med,
                 "memory_bytes": filt.get_bytesize(),
-            }
-
-        # sweep="recall": the equal-recall operating point, one row per k --
-        # tau solved so every compression ratio is compared at the same recall
-        # and FPR is the only thing that moves.
-        tau_recall = float(np.percentile(m_pos, target_recall * 100.0)) if len(m_pos) else 0.0
-        rows.append(row_at(tau_recall, "recall"))
-
-        # sweep="tau": the same cover swept over a fixed, dataset-independent
-        # tau grid. Absolute tau is NOT comparable across corpora (that is the
-        # whole reason the blocklist workload solves for a target instead), so
-        # these rows are for reading one corpus's response curve, not for
-        # ranking corpora against each other at a given tau.
-        for t in tau_values:
-            rows.append(row_at(float(t), "tau"))
+            })
     return rows
+
+
+def blocklist_tau_worker(
+    dim: int,
+    dataset: str,
+    seed: int,
+    k_fraction: float,
+    tau_values: List[float],
+    vectors_reference: VectorInput,
+    vectors_positive: VectorInput,
+    vectors_hard_negative: VectorInput,
+    vectors_easy_negative: VectorInput,
+) -> List[Dict[str, Any]]:
+    """Asymmetric blocklist workload (main.generate_blocklist): a tight
+    reference set B, a broad query stream, positives that are held-out members
+    of B's own duplicate clusters.
+
+    Ball budget k is fixed (a single k_fraction, not a sweep -- varying it is
+    budget_worker's job); tau is swept over tau_values so FPR/recall/accesses
+    are read as one corpus's response curve at that one budget.
+    """
+    return _blocklist_cover_rows(
+        dim, dataset, seed, [k_fraction], tau_values,
+        vectors_reference, vectors_positive, vectors_hard_negative, vectors_easy_negative,
+        volume_bounds=False,
+    )
+
+
+def budget_worker(
+    dim: int,
+    dataset: str,
+    seed: int,
+    k_fractions: List[float],
+    tau: float,
+    vectors_reference: VectorInput,
+    vectors_positive: VectorInput,
+    vectors_hard_negative: VectorInput,
+    vectors_easy_negative: VectorInput,
+) -> List[Dict[str, Any]]:
+    """The same asymmetric blocklist workload as blocklist_tau_worker
+    (main.generate_budget), read along the other axis: tau is fixed at a
+    single value and the ball budget k is swept over k_fractions, so recall
+    becomes a measurement instead of a fixed operating point.
+
+    Always requests the overlap-aware volume bounds: this is the one
+    blocklist-workload sweep that can afford them (~O(k^2) per row, paid once
+    per budget rather than once per (budget, tau) as blocklist_tau_worker's
+    grid would multiply it out to).
+    """
+    return _blocklist_cover_rows(
+        dim, dataset, seed, k_fractions, [tau],
+        vectors_reference, vectors_positive, vectors_hard_negative, vectors_easy_negative,
+        volume_bounds=True,
+    )
 
 
 def query_performance_worker(
@@ -1115,12 +1193,12 @@ def stream_rebuild_worker(
 
 _WORKER_FNS: Dict[str, Any] = {
     'system_tau': system_tau_worker,
-    'blocklist': blocklist_worker,
-    # Same worker, second mode: generate_budget runs the identical blocklist
-    # measurement but sweeps the ball budget at a fixed tau instead of solving
-    # tau per budget (see main.generate_budget). A distinct mode tag only so
-    # rows_for_mode can split the two evaluations' rows back apart.
-    'budget': blocklist_worker,
+    'blocklist': blocklist_tau_worker,
+    # Same underlying cover-and-margin core (_blocklist_cover_rows), second
+    # worker: generate_budget runs the identical blocklist measurement but
+    # sweeps the ball budget at a fixed tau instead of sweeping tau at a fixed
+    # budget (see main.generate_budget).
+    'budget': budget_worker,
     'quantization': quantization_worker,
     'query_performance': query_performance_worker,
     'equal_memory': equal_memory_worker,

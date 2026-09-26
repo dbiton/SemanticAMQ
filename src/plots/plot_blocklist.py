@@ -67,13 +67,11 @@ _REQUIRED_COLUMNS = [
     "log10_j_tau", "d_hard_med", "d_pos_med",
 ]
 
-# Rows carry two sweeps (see runner.blocklist_worker): "recall" is the
-# equal-recall operating point blocklist_worker still emits per k (shared
-# with generate_budget's mode='budget' calls) but this module no longer
-# plots -- compression is generate_budget's job now. "tau" is the same cover
-# swept over a fixed tau grid at the one fixed k generate_blocklist submits,
-# which every panel here reads.
-SWEEP_RECALL = "recall"
+# runner.blocklist_tau_worker (mode 'blocklist') only emits sweep="tau" rows:
+# the same cover swept over a fixed tau grid at the one fixed k
+# generate_blocklist submits, which every panel here reads. SWEEP_TAU is kept
+# as a named constant (rather than every reader hardcoding "tau") since it's
+# shared with plot_budget, whose rows come from runner.budget_worker instead.
 SWEEP_TAU = "tau"
 
 
@@ -85,8 +83,9 @@ class Config:
 
 
 def validate_schema(df: pd.DataFrame) -> None:
-    """Shared with plot_budget: both render rows from runner.blocklist_worker,
-    so both require the same columns."""
+    """Shared with plot_budget: both render sweep="tau" rows from the same
+    runner._blocklist_cover_rows core (blocklist_tau_worker/budget_worker
+    respectively), so both require the same columns."""
     missing = [c for c in _REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"Input missing columns: {missing}. Present: {sorted(df.columns)}")
@@ -127,16 +126,12 @@ def save_blocklist_legend(outdir: str, dpi: int, emit_pdf: bool = False,
 
 def line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg: Config,
                bounded_unit: bool = False, logx: bool = True,
-               sweep: str = SWEEP_RECALL,
+               sweep: str = SWEEP_TAU,
                x_from: Callable[[pd.Series], pd.Series] = lambda kf: 1.0 / kf,
                xlabel: str = r"Compression $|X|/k$",
                annotation: Optional[str] = None) -> pd.DataFrame:
     """One line per corpus against a function of the ball budget, averaged over
     folds with +/- 1 std error bars (same convention as plot_system_tau).
-
-    Restricted to one `sweep` at a time: the worker emits both an equal-recall
-    row per budget and a row per budget per fixed tau, and pooling them would
-    average a response curve into an operating point.
 
     Always groups on k_fraction -- the nominal knob, identical across datasets
     and folds -- and only then maps it onto the x-axis via `x_from`, so a

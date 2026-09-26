@@ -473,10 +473,11 @@ def plot_system_tau(df: pd.DataFrame) -> None:
 # (see BLOCKLIST_DATASETS' per-entry comments), verified by running eps=0.4
 # seed-ball discovery on each before adding it, not assumed from the label.
 BLOCKLIST_CSV = "results/blocklist.csv"
-# generate_budget's rows: the same workload and the same worker, swept over the
-# ball budget at a fixed tau. Its own file rather than a `sweep` value inside
-# BLOCKLIST_CSV, since blocklist_worker already spends that column
-# ("recall"/"tau") on its internal split.
+# generate_budget's rows: the same workload, swept over the ball budget at a
+# fixed tau via runner.budget_worker rather than runner.blocklist_tau_worker.
+# Its own file rather than reusing BLOCKLIST_CSV, since the two evaluations
+# sweep different variables and mixing them would need a second grouping
+# column on top of `sweep`.
 BUDGET_CSV = "results/budget.csv"
 BLOCKLIST_DATASETS = {
     # registry name -> (plot key, label column in the HDF5 meta group or None)
@@ -838,7 +839,7 @@ class BlocklistWorkload:
 
         Ground truth is deliberately NOT returned with them. The two callers
         need different definitions and the difference is load-bearing:
-        blocklist_worker judges against cluster membership, while
+        blocklist_tau_worker/budget_worker judge against cluster membership, while
         generate_quantization must judge against distance to the reference set
         (see cluster_membership and its warning)."""
         parts = [self.rows(sel[key]) for key in ("positive", "hard", "easy") if len(sel[key])]
@@ -864,9 +865,10 @@ class BlocklistWorkload:
 
     def recall_tau(self, sel: Dict[str, np.ndarray], target_recall: float) -> float:
         """Smallest tau catching `target_recall` of this fold's positives by
-        exact distance to the reference set -- the operating point
-        blocklist_worker solves for, so both evaluations sit at comparable
-        thresholds."""
+        exact distance to the reference set -- the same operating point
+        generate_quantization and generate_equal_memory solve for, so those
+        evaluations sit at a comparable threshold to the blocklist workload's
+        own target_recall (see generate_blocklist)."""
         reference = np.ascontiguousarray(self.rows(sel["reference"]), dtype=np.float32)
         positives = np.ascontiguousarray(self.rows(sel["positive"]), dtype=np.float32)
         index = faiss.IndexFlatL2(reference.shape[1])
@@ -989,8 +991,8 @@ def generate_blocklist(runner: Runner) -> None:
     entirely to serve as hard negatives. Splitting by vector instead would
     scatter every cluster across both roles and leave no hard negatives at all.
 
-    A single fixed ball budget (k_fractions is one value, not a sweep) --
-    varying the budget is generate_budget's job now, at its own fixed tau.
+    A single fixed ball budget (k_fraction, not a sweep) -- varying the
+    budget is generate_budget's job now, at its own fixed tau.
     This evaluation is the complementary view: fix k, sweep tau, and read
     how FPR/recall/accesses-saved respond at that one representative budget.
     k_fraction=0.1 sits in the middle of generate_budget's own 5%-20% range,
@@ -1003,8 +1005,7 @@ def generate_blocklist(runner: Runner) -> None:
     dim              = 384
     pool_size        = BLOCKLIST_POOL_SIZE
     num_vectors      = WORKLOAD_NUM_VECTORS
-    k_fractions      = [0.1]  # fixed ball budget; see docstring
-    target_recall    = 0.95
+    k_fraction       = 0.1  # fixed ball budget; see docstring
     # Shared absolute grid for the tau-swept panels. Stops at 0.4: measured on
     # a 0..1.2 grid, every corpus was already pinned at FPR 1.000 and 0% saved
     # by tau=0.3, so the bulk of that range carried no information. All the
@@ -1019,8 +1020,7 @@ def generate_blocklist(runner: Runner) -> None:
                 'blocklist',
                 output_csv=BLOCKLIST_CSV,
                 dim=dim, dataset=workload.plot_key, seed=fold,
-                k_fractions=k_fractions, target_recall=target_recall,
-                tau_values=tau_values,
+                k_fraction=k_fraction, tau_values=tau_values,
                 vectors_reference=workload.rows(sel["reference"]),
                 vectors_positive=workload.rows(sel["positive"]),
                 vectors_hard_negative=workload.rows(sel["hard"]),
@@ -1041,7 +1041,7 @@ def plot_blocklist(df: pd.DataFrame) -> None:
 def generate_budget(runner: Runner) -> None:
     """The blocklist workload read along its other axis: the ball budget k is
     the swept variable and tau is held at one fixed value, where
-    generate_blocklist instead solves tau per budget for a target recall.
+    generate_blocklist instead sweeps tau at one fixed budget.
 
     Holding tau fixed is what makes recall a measurement here rather than a
     constant, so both recall and FPR move with the budget and the sweep shows
@@ -1051,22 +1051,22 @@ def generate_budget(runner: Runner) -> None:
     each ball stands in for so few reference vectors that there is nothing
     left to compress.
 
-    tau is one absolute value across every corpus, which
-    generate_blocklist's docstring warns is NOT comparable between them --
-    that is the point of solving for a target recall there. Read these panels
-    as one corpus's response to its budget, not as a ranking of corpora.
+    tau is one absolute value across every corpus, which is NOT comparable
+    between them -- the distance a duplicate sits at is a property of each
+    embedding set. Read these panels as one corpus's response to its budget,
+    not as a ranking of corpora.
 
-    Reuses blocklist_workloads() and runner.blocklist_worker itself (mode
-    'budget', registered against the same function): identical construction
-    and query sets to generate_blocklist, so a difference between the two
-    evaluations is a difference in the swept variable alone.
+    Reuses blocklist_workloads() and runner.budget_worker (mode 'budget'):
+    identical construction and query sets to generate_blocklist (which uses
+    runner.blocklist_tau_worker, mode 'blocklist'), so a difference between
+    the two evaluations is a difference in the swept variable alone -- both
+    share the cover-and-margin core in runner._blocklist_cover_rows.
 
-    Also the one blocklist-workload sweep that can afford
-    runner._tau_volume_bounds_log10's overlap-aware volume bounds
-    (volume_bounds=True below): they cost ~O(k^2) per row, which a tau grid
-    multiplies out of reach, but a single fixed tau pays it once per budget.
-    That makes the covered volume readable against the budget here, rather
-    than only through log10_j_tau's overlap-blind sum.
+    Always requests runner._tau_volume_bounds_log10's overlap-aware volume
+    bounds: they cost ~O(k^2) per row, which a tau grid multiplies out of
+    reach, but a single fixed tau pays it once per budget. That makes the
+    covered volume readable against the budget here, rather than only through
+    log10_j_tau's overlap-blind sum.
 
     Only submits 'budget' jobs (output_csv=BUDGET_CSV) -- does not run
     `runner`."""
@@ -1075,11 +1075,6 @@ def generate_budget(runner: Runner) -> None:
     n_folds         = BLOCKLIST_FOLDS
     k_percentages   = [5, 7.5, 10, 12.5, 15, 17.5, 20]  # ball budget k, as a percentage of |B|
     tau             = 0.2
-    # Only shapes blocklist_worker's sweep="recall" rows, which this
-    # evaluation does not plot (plot_budget reads the fixed-tau rows). Left at
-    # generate_blocklist's value so the two files' recall rows stay
-    # comparable if anyone does read them.
-    target_recall   = 0.95
 
     k_fractions = [p / 100.0 for p in k_percentages]
 
@@ -1089,13 +1084,7 @@ def generate_budget(runner: Runner) -> None:
                 'budget',
                 output_csv=BUDGET_CSV,
                 dim=dim, dataset=workload.plot_key, seed=fold,
-                k_fractions=k_fractions, target_recall=target_recall,
-                tau_values=[tau],
-                # Affordable here and nowhere else in this workload: the bound
-                # is ~O(k^2) per row, and a single tau means one run per
-                # budget rather than one per (budget, tau) as in
-                # generate_blocklist's grid.
-                volume_bounds=True,
+                k_fractions=k_fractions, tau=tau,
                 vectors_reference=workload.rows(sel["reference"]),
                 vectors_positive=workload.rows(sel["positive"]),
                 vectors_hard_negative=workload.rows(sel["hard"]),
@@ -1105,9 +1094,9 @@ def generate_budget(runner: Runner) -> None:
 
 def save_budget(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
     """Extracts this evaluation's rows from a shared Runner's combined run()
-    output (see generate_budget()). Tagged mode 'budget' rather than
-    'blocklist' so the two evaluations' rows split cleanly, even though both
-    come from runner.blocklist_worker."""
+    output (see generate_budget()). Tagged mode 'budget' (runner.budget_worker)
+    rather than 'blocklist' (runner.blocklist_tau_worker) so the two
+    evaluations' rows split cleanly."""
     return pd.DataFrame(rows_for_mode(job_results, 'budget'))
 
 
@@ -1128,16 +1117,16 @@ def generate_quantization(runner: Runner) -> None:
     Reuses build_blocklist_workload rather than cutting its own contiguous
     spans, so the only difference between this sweep and the blocklist one is
     the variable being swept: the quantizer here, the ball budget there. tau is
-    a single value, solved once on fold 0 for the same target recall
-    blocklist_worker uses, so both evaluations sit at a comparable operating
+    a single value, solved once on fold 0 for the same target_recall
+    generate_blocklist uses, so both evaluations sit at a comparable operating
     point. Ground truth here is distance to the reference set, not the
     blocklist workload's cluster membership: quantization_worker asserts a
     zero false-negative invariant that only holds under the distance
     definition (see BlocklistWorkload.cluster_membership).
 
     Also passes n_hard/n_easy so quantization_worker can split fpr into
-    fpr_hard/fpr_easy the same way blocklist_worker does, from the same
-    [positives, hard, easy] query-stream layout (see
+    fpr_hard/fpr_easy the same way blocklist_tau_worker/budget_worker do,
+    from the same [positives, hard, easy] query-stream layout (see
     BlocklistWorkload.query_vectors) -- the pooled fpr column is unchanged,
     this only adds the breakdown alongside it.
 
@@ -1149,11 +1138,16 @@ def generate_quantization(runner: Runner) -> None:
     corpus, so a pooled file would also carry several thresholds.
 
     Only submits 'quantization' jobs -- does not run `runner`."""
-    num_vectors   = WORKLOAD_NUM_VECTORS
-    dim           = 384
-    n_folds       = BLOCKLIST_FOLDS
-    k_fractions   = [0.02, 0.04, 0.08, 0.16, 0.32]
-    target_recall = 0.95
+    num_vectors      = WORKLOAD_NUM_VECTORS
+    dim              = 384
+    n_folds          = BLOCKLIST_FOLDS
+    # Absolute filter sizes, same 2^11..2^16 ladder generate_scaling uses --
+    # no cross-corpus pooling constraint forces these to be shared (each
+    # corpus gets its own figure set here), but the same fixed ladder keeps
+    # "k" meaning the same absolute ball count across every evaluation that
+    # reports it.
+    k_values_nominal = [2 ** i for i in range(11, 17)]
+    target_recall    = 0.95
 
     workloads = blocklist_workloads(num_vectors, n_folds=n_folds)
     if not workloads:
@@ -1164,13 +1158,12 @@ def generate_quantization(runner: Runner) -> None:
 
     for workload in workloads:
         reference_len = len(workload.selections[0]["reference"])
-        k_values = sorted({max(1, round(reference_len * f)) for f in k_fractions})
-        k_values = [k for k in k_values if k < reference_len]
+        k_values = [k for k in k_values_nominal if k < reference_len]
         if not k_values:
             raise RuntimeError(
-                f"No k_fraction in {k_fractions} produced a k below the reference set "
-                f"of {workload.name} ({reference_len} vectors). Raise "
-                "WORKLOAD_NUM_VECTORS or lower k_fractions.")
+                f"No k in {k_values_nominal} is below the reference set of "
+                f"{workload.name} ({reference_len} vectors). Raise "
+                "WORKLOAD_NUM_VECTORS or lower k_values_nominal.")
 
         # tau is solved per corpus, not shared: the distance at which a
         # duplicate sits is a property of each embedding set (WildChat's
