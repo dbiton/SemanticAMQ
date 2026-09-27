@@ -7,7 +7,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter, NullLocator
+from matplotlib.ticker import LogFormatterMathtext, LogLocator, MaxNLocator, NullFormatter, NullLocator
 
 from plots.plot_common import apply_style, style_axes, save_figure, mean_std
 
@@ -19,6 +19,7 @@ EMIT_PDF = False
 DEMO = False
 
 METHODS = ["nearest", "least_inflation", "pooled", "merge", "min_heap"]
+
 METHOD_LABELS = {
     "nearest": "Nearest-center absorb",
     "least_inflation": "Least-inflation absorb",
@@ -45,8 +46,8 @@ METHOD_MARKERS = {
 
 _REQUIRED_COLUMNS = [
     "dataset", "method", "k", "seed", "fold_offset", "position",
-    "fpr", "log10_j_tau", "n_balls", "memory_bytes", "cumulative_time_s", "amortized_cost_s",
-    "metric", "sweep",
+    "fpr", "log10_j_tau", "n_balls", "memory_bytes", "cumulative_time_s",
+    "amortized_cost_s", "metric", "sweep",
 ]
 
 
@@ -78,14 +79,14 @@ def _synthesize_demo_data() -> pd.DataFrame:
                 fpr = base_fpr[method] * (0.3 + 0.7 * x) * rng.uniform(0.9, 1.1)
                 log10_j = 40.0 + 8.0 * x + rng.normal(0, 0.2)
                 rows.append({
-                    "dataset": "eli5", "method": method, "k": k_fixed, "seed": 0, "fold_offset": fold_offset,
-                    "position": int(pos),
-                    "fpr": float(fpr), "log10_j_tau": float(log10_j), "n_balls": k_fixed,
-                    "memory_bytes": k_fixed * 1540,
+                    "dataset": "eli5", "method": method, "k": k_fixed, "seed": 0,
+                    "fold_offset": fold_offset, "position": int(pos), "fpr": float(fpr),
+                    "log10_j_tau": float(log10_j), "n_balls": k_fixed, "memory_bytes": k_fixed * 1540,
                     "cumulative_time_s": cost_scale[method] * pos * 1e-5,
                     "amortized_cost_s": cost_scale[method] * 1e-5,
                     "metric": "checkpoint", "sweep": "position",
                 })
+
         for fold_offset in offsets:
             for pos in positions_ab:
                 x = pos / n_stream_ab
@@ -93,8 +94,8 @@ def _synthesize_demo_data() -> pd.DataFrame:
                     "dataset": "eli5", "method": "static_rebuild", "k": k_fixed, "seed": 0,
                     "fold_offset": fold_offset, "position": int(pos),
                     "fpr": float(base_fpr["static_rebuild"] * (0.3 + 0.7 * x) * rng.uniform(0.9, 1.1)),
-                    "log10_j_tau": float(38.0 + 6.0 * x + rng.normal(0, 0.2)), "n_balls": k_fixed,
-                    "memory_bytes": k_fixed * 1540,
+                    "log10_j_tau": float(38.0 + 6.0 * x + rng.normal(0, 0.2)),
+                    "n_balls": k_fixed, "memory_bytes": k_fixed * 1540,
                     "cumulative_time_s": cost_scale["static_rebuild"] * pos * 1e-5,
                     "amortized_cost_s": cost_scale["static_rebuild"] * 1e-5,
                     "metric": "static_reference", "sweep": "position",
@@ -107,12 +108,10 @@ def _synthesize_demo_data() -> pd.DataFrame:
             for k_val in [16, 32, 64, 128]:
                 cost = cost_scale[method] * (1.0 + 0.005 * k_val) * 1e-5 * rng.uniform(0.95, 1.05)
                 rows.append({
-                    "dataset": "eli5", "method": method, "k": k_val, "seed": 0, "fold_offset": fold_offset,
-                    "position": 3050,
-                    "fpr": 0.02, "log10_j_tau": 40.0, "n_balls": k_val,
-                    "memory_bytes": k_val * 1540,
-                    "cumulative_time_s": cost * 3000,
-                    "amortized_cost_s": cost,
+                    "dataset": "eli5", "method": method, "k": k_val, "seed": 0,
+                    "fold_offset": fold_offset, "position": 3050, "fpr": 0.02,
+                    "log10_j_tau": 40.0, "n_balls": k_val, "memory_bytes": k_val * 1540,
+                    "cumulative_time_s": cost * 3000, "amortized_cost_s": cost,
                     "metric": "checkpoint", "sweep": "k",
                 })
 
@@ -153,15 +152,6 @@ def resolve_config(df: pd.DataFrame, k_fixed: Optional[int] = K_FIXED,
 
 # Styling helpers matching main paper specifications
 
-def _style_log_y(ax: plt.Axes) -> None:
-    ax.set_yscale("log")
-    ax.yaxis.set_major_locator(LogLocator(base=10.0))
-    ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10.0))
-    ax.yaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10)))
-    ax.yaxis.set_minor_formatter(NullFormatter())
-    ax.tick_params(axis="y", which="minor", length=1.2, width=0.4)
-
-
 def _style_log_x(ax: plt.Axes) -> None:
     ax.set_xscale("log")
     ax.xaxis.set_major_locator(LogLocator(base=10.0))
@@ -171,7 +161,16 @@ def _style_log_x(ax: plt.Axes) -> None:
     ax.tick_params(axis="x", which="minor", length=1.2, width=0.4)
 
 
-def _apply_paper_axes_style(ax: plt.Axes, log_x: bool = True, log_y: bool = False) -> None:
+def _style_log_y(ax: plt.Axes) -> None:
+    ax.set_yscale("log")
+    ax.yaxis.set_major_locator(LogLocator(base=10.0))
+    ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10.0))
+    ax.yaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10)))
+    ax.yaxis.set_minor_formatter(NullFormatter())
+    ax.tick_params(axis="y", which="minor", length=1.2, width=0.4)
+
+
+def _apply_paper_axes_style(ax: plt.Axes, log_x: bool = False, log_y: bool = False) -> None:
     """Applies paper-wide aesthetic: top/right spine removal, faint light gray grid, uniform ticks."""
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
@@ -183,6 +182,40 @@ def _apply_paper_axes_style(ax: plt.Axes, log_x: bool = True, log_y: bool = Fals
         _style_log_x(ax)
     if log_y:
         _style_log_y(ax)
+
+
+def _set_scaled_linear_x_axis(ax: plt.Axes, x_values, base_label: str = "Stream Position") -> None:
+    x = np.asarray(pd.Series(x_values).dropna().to_numpy(), dtype=float)
+    x = x[np.isfinite(x) & (x > 0)]
+    if len(x) == 0:
+        ax.set_xlabel(base_label)
+        return
+
+    xmax = float(np.max(x))
+    ax.set_xscale("linear")
+    ax.set_xlim(left=-0.03 * xmax, right=xmax * 1.03)
+
+    if xmax >= 1000:
+        exponent = int(np.floor(np.log10(xmax)))
+        scale_factor = 10.0 ** exponent
+        label = rf"{base_label} ($\times 10^{{{exponent}}}$)"
+    else:
+        exponent = 0
+        scale_factor = 1.0
+        label = base_label
+
+    scaled_xmax = xmax / scale_factor
+    locator = MaxNLocator(nbins=4)
+    scaled_ticks = locator.tick_values(0, scaled_xmax)
+    scaled_ticks = [t for t in scaled_ticks if 0 <= t <= scaled_xmax * 1.01]
+
+    raw_ticks = [t * scale_factor for t in scaled_ticks]
+    tick_labels = [f"{t:g}" for t in scaled_ticks]
+
+    ax.set_xticks(raw_ticks)
+    ax.set_xticklabels(tick_labels)
+    ax.xaxis.set_minor_locator(NullLocator())
+    ax.set_xlabel(label)
 
 
 def _add_k_annotation(ax: plt.Axes, k_val: int, loc: str = "bottom-left") -> None:
@@ -209,6 +242,7 @@ def panel_fpr_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots(figsize=(3.2, 2.4))
+
     for method in METHODS:
         sub = agg[agg["method"] == method].sort_values("position")
         if sub.empty:
@@ -218,8 +252,7 @@ def panel_fpr_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         if (sub["std"] > 0).any():
             lower = np.maximum(sub["mean"] - sub["std"], sub["mean"] / 10.0)
             upper = sub["mean"] + sub["std"]
-            ax.fill_between(sub["position"], lower, upper, color=METHOD_COLORS[method],
-                            alpha=0.04, linewidth=0, zorder=2)
+            ax.fill_between(sub["position"], lower, upper, color=METHOD_COLORS[method], alpha=0.04, linewidth=0, zorder=2)
 
     if not ref_agg.empty:
         ref_agg = ref_agg.sort_values("position")
@@ -229,9 +262,9 @@ def panel_fpr_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             upper = ref_agg["mean"] + ref_agg["std"]
             ax.fill_between(ref_agg["position"], lower, upper, color="black", alpha=0.04, linewidth=0, zorder=1)
 
-    _apply_paper_axes_style(ax, log_x=True, log_y=True)
+    _apply_paper_axes_style(ax, log_x=False, log_y=True)
+    _set_scaled_linear_x_axis(ax, pd.concat([agg["position"], ref_agg["position"]]), "Stream Position")
     _add_k_annotation(ax, cfg.k_fixed, loc="bottom-left")
-    ax.set_xlabel("Stream Position")
     ax.set_ylabel("FPR")
     style_axes(ax)
 
@@ -243,6 +276,7 @@ def panel_fpr_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     min_log = df["log10_j_tau"].replace(-np.inf, np.nan).min()
+
     sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)].copy()
     sel["log10_j_tau"] = sel["log10_j_tau"].replace(-np.inf, min_log + 1e-6)
     agg = mean_std(sel, ["method", "position"], "log10_j_tau")
@@ -253,27 +287,27 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots(figsize=(3.2, 2.4))
+
     for method in METHODS:
         sub = agg[agg["method"] == method].sort_values("position")
         if sub.empty:
             continue
-        ax.plot(sub["position"], sub["mean"], color=METHOD_COLORS[method], marker=METHOD_MARKERS[method], markersize=3.5, linewidth=1.0, zorder=3)
+        ax.plot(sub["position"], sub["mean"], color=METHOD_COLORS[method], marker=METHOD_MARKERS[method], 
+                markersize=3.5, linewidth=1.0, zorder=3)
         if (sub["std"] > 0).any():
-            lower = sub["mean"] - sub["std"]
-            upper = sub["mean"] + sub["std"]
+            lower, upper = sub["mean"] - sub["std"], sub["mean"] + sub["std"]
             ax.fill_between(sub["position"], lower, upper, color=METHOD_COLORS[method], alpha=0.04, linewidth=0, zorder=2)
 
     if not ref_agg.empty:
         ref_agg = ref_agg.sort_values("position")
         ax.plot(ref_agg["position"], ref_agg["mean"], color="black", linestyle="--", linewidth=0.9, zorder=4)
         if (ref_agg["std"] > 0).any():
-            lower = ref_agg["mean"] - ref_agg["std"]
-            upper = ref_agg["mean"] + ref_agg["std"]
+            lower, upper = ref_agg["mean"] - ref_agg["std"], ref_agg["mean"] + ref_agg["std"]
             ax.fill_between(ref_agg["position"], lower, upper, color="black", alpha=0.04, linewidth=0, zorder=1)
 
-    _apply_paper_axes_style(ax, log_x=True, log_y=False)
+    _apply_paper_axes_style(ax, log_x=False, log_y=False)
+    _set_scaled_linear_x_axis(ax, pd.concat([agg["position"], ref_agg["position"]]), "Stream Position")
     _add_k_annotation(ax, cfg.k_fixed, loc="bottom-left")
-    ax.set_xlabel("Stream Position")
     ax.set_ylabel(r"$\log_{10} J_\tau(\mathcal{C})$")
     style_axes(ax)
 
@@ -293,6 +327,7 @@ def panel_n_balls_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots(figsize=(3.2, 2.4))
+
     for method in METHODS:
         sub = agg[agg["method"] == method].sort_values("position")
         if sub.empty:
@@ -300,18 +335,16 @@ def panel_n_balls_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         ax.plot(sub["position"], sub["mean"], color=METHOD_COLORS[method], marker=METHOD_MARKERS[method],
                 markersize=3.5, linewidth=1.0, zorder=3)
         if (sub["std"] > 0).any():
-            lower = sub["mean"] - sub["std"]
-            upper = sub["mean"] + sub["std"]
-            ax.fill_between(sub["position"], lower, upper, color=METHOD_COLORS[method],
-                            alpha=0.04, linewidth=0, zorder=2)
+            lower, upper = sub["mean"] - sub["std"], sub["mean"] + sub["std"]
+            ax.fill_between(sub["position"], lower, upper, color=METHOD_COLORS[method], alpha=0.04, linewidth=0, zorder=2)
 
     if not ref_agg.empty:
         ref_agg = ref_agg.sort_values("position")
         ax.plot(ref_agg["position"], ref_agg["mean"], color="black", linestyle="--", linewidth=0.9, zorder=4)
 
-    _apply_paper_axes_style(ax, log_x=True, log_y=False)
+    _apply_paper_axes_style(ax, log_x=False, log_y=False)
+    _set_scaled_linear_x_axis(ax, pd.concat([agg["position"], ref_agg["position"]]), "Stream Position")
     _add_k_annotation(ax, cfg.k_fixed, loc="bottom-left")
-    ax.set_xlabel("Stream Position")
     ax.set_ylabel("Number of Balls")
     style_axes(ax)
 
@@ -336,6 +369,7 @@ def panel_insertion_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots(figsize=(3.2, 2.4))
+
     for method in METHODS:
         sub = agg[agg["method"] == method].sort_values("k")
         if sub.empty:
@@ -346,10 +380,10 @@ def panel_insertion_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         if (sub["std"] > 0).any():
             lower = np.maximum(sub["mean"] - sub["std"], sub["mean"] / 10.0)
             upper = sub["mean"] + sub["std"]
-            ax.fill_between(sub["k"], lower, upper, color=METHOD_COLORS[method], 
-                            alpha=0.12, linewidth=0, zorder=2)
+            ax.fill_between(sub["k"], lower, upper, color=METHOD_COLORS[method], alpha=0.12, linewidth=0, zorder=2)
 
     _apply_paper_axes_style(ax, log_x=True, log_y=True)
+
     k_ticks = sorted(agg["k"].unique())
     if k_ticks:
         ax.set_xticks(k_ticks)
@@ -373,6 +407,7 @@ def panel_vectors_vs_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots(figsize=(3.2, 2.4))
+
     for method in METHODS:
         sub = vectors_agg[vectors_agg["method"] == method].sort_values("position")
         if sub.empty:
@@ -380,9 +415,9 @@ def panel_vectors_vs_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         ax.plot(sub["position"], sub["mean"], color=METHOD_COLORS[method], marker=METHOD_MARKERS[method],
                 markersize=3.5, linewidth=1.0, zorder=3)
 
-    _apply_paper_axes_style(ax, log_x=True, log_y=True)
+    _apply_paper_axes_style(ax, log_x=False, log_y=False)
+    _set_scaled_linear_x_axis(ax, vectors_agg["position"], "Stream Position")
     _add_k_annotation(ax, cfg.k_fixed, loc="bottom-left")
-    ax.set_xlabel("Stream Position")
     ax.set_ylabel("Vectors Inserted")
     style_axes(ax)
 
@@ -400,6 +435,7 @@ def panel_filter_size(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots(figsize=(3.2, 2.4))
+
     for method in METHODS:
         sub = size_agg[size_agg["method"] == method].sort_values("position")
         if sub.empty:
@@ -407,9 +443,9 @@ def panel_filter_size(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         ax.plot(sub["position"], sub["mean"], color=METHOD_COLORS[method], marker=METHOD_MARKERS[method],
                 markersize=3.5, linewidth=1.0, zorder=3)
 
-    _apply_paper_axes_style(ax, log_x=True, log_y=False)
+    _apply_paper_axes_style(ax, log_x=False, log_y=False)
+    _set_scaled_linear_x_axis(ax, size_agg["position"], "Stream Position")
     _add_k_annotation(ax, cfg.k_fixed, loc="top-left")
-    ax.set_xlabel("Stream Position")
     ax.set_ylabel("Filter Total Size (KB)")
     style_axes(ax)
 
