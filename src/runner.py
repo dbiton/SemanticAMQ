@@ -865,7 +865,8 @@ def stream_rebuild_worker(
             radii = filt.all_radiuses
             rows.append({
                 "dataset": dataset, "policy": policy, "T": T, "k": k, "seed": seed,
-                "position": c, "fpr": _fpr(filt),
+                "position": c - checkpoint_set[0] + 1,
+                "fpr": _fpr(filt),
                 "log10_j_tau": _log10_J(radii, dim, tau=tau_mid),
                 "n_balls": len(radii),
                 "memory_bytes": filt.get_bytesize(),
@@ -910,7 +911,8 @@ def stream_rebuild_worker(
             radii = filt.all_radiuses
             rows.append({
                 "dataset": dataset, "policy": policy, "T": T, "k": k, "seed": seed,
-                "position": pos, "fpr": _fpr(filt),
+                "position": pos - bootstrap_n,
+                "fpr": _fpr(filt),
                 "log10_j_tau": _log10_J(radii, dim, tau=tau_mid),
                 "n_balls": len(radii),
                 "memory_bytes": filt.get_bytesize(),
