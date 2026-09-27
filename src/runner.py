@@ -203,8 +203,23 @@ _CONSTRUCTION_TIME_CONFIG_DIALS = {
     # candidate range that synthetic model would have searched, so this
     # changes *how* the best candidate in that range is chosen, not the
     # range itself.
+    #
+    # num_projections_per_table (K) is swept too, not left at its default of
+    # 4: K is DSHFilter's only real accuracy/memory dial (more per-projection
+    # AND-composition shrinks the false-accept rate exponentially, at the
+    # cost of needing more OR-tables to hold recall up, i.e. more bytes) --
+    # with K fixed, DSHFilter's memory budget only ever bought a bigger Bloom
+    # filter, whose own ~1% engineered error rate is swamped by K=4's
+    # structural false-accept rate on real (non-uniform-sphere) embeddings,
+    # which is why FPR measured flat at ~1.0 across the whole equal-memory
+    # sweep regardless of budget. Candidates that don't fit memory_budget or
+    # fail the calibration_min_gap guard at a given K are skipped by
+    # _build_calibrated_filter's own exception handling below, same as
+    # before.
     "DSHFilter": lambda dim, distance_threshold: [
-        {"z": float(z)} for z in DSHFilter.z_grid(distance_threshold)
+        {"num_projections_per_table": k, "z": float(z)}
+        for k in (4, 8, 16, 24, 32, 48, 64)
+        for z in DSHFilter.z_grid(distance_threshold)
     ],
 }
 
@@ -298,7 +313,14 @@ def equal_memory_worker(
     dataset: str = "",
     extra_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    config = filter_cls.__name__
+    # BallCoverFilter can be submitted multiple times at one budget, once per
+    # quantize variant (see main.generate_equal_memory) -- suffix the variant
+    # onto Config so each becomes its own labelled line downstream rather
+    # than being pooled into one "BallCoverFilter" line. The suffix uses
+    # "(...)"  rather than plot_equal_memory.aggregate's " + " delimiter, so
+    # its filter-identity split leaves the whole string intact.
+    quantize = (extra_kwargs or {}).get("quantize")
+    config = f"{filter_cls.__name__} ({quantize.value})" if quantize is not None else filter_cls.__name__
     construct_arr = _to_construct_array(vectors_construct)
     calib_arr = _to_construct_array(vectors_calibration)
     calib_actual = np.asarray(actual_calibration, dtype=bool)

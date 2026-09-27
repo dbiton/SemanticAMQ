@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 
 from filters.ball_cover.ball_cover_filter import Quantize
-from plots.plot_common import apply_style as _apply_style, save_figure
+from plots.plot_common import apply_style as _apply_style, collapse_duplicate_x, save_figure
 
 # CONFIG
 
@@ -293,6 +293,7 @@ def _line_panel(
 
     for stage in STAGES:
         sub = agg[agg["quantize"] == stage].sort_values(x_col)
+        sub = collapse_duplicate_x(sub, x_col)
         if sub.empty:
             continue
         ax.plot(
@@ -511,6 +512,7 @@ def panel_radius_inflation(df: pd.DataFrame, cfg: Config, raw_pct: bool = False)
 
     for stage in STAGES:
         sub = agg[agg["quantize"] == stage].sort_values(x_col)
+        sub = collapse_duplicate_x(sub, x_col, ci_col="std")
         if sub.empty:
             continue
         ax.plot(

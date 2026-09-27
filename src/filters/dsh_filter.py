@@ -3,7 +3,18 @@ Silvestri, PODS 2018), instantiated as h(x) = 1 iff <a,x> in [-z, z] for
 Gaussian a (a window centered at 0, since this only needs sensitivity to a
 ball around the query, not the paper's off-origin annulus), concatenated
 `num_projections_per_table` times per table across `num_tables` tables.
-Calibration reduces to the single free parameter z.
+
+Calibration has two free parameters: the window half-width z, and
+`num_projections_per_table` (K), the number of projections AND-ed together
+within a table. K is the real accuracy/memory dial -- larger K shrinks the
+false-accept rate exponentially at a fixed z, at the cost of needing more
+OR-tables (`num_tables`, auto-sized below) to hold recall up, i.e. more
+bytes. Leaving K fixed (as earlier versions did, calibrating only z) means
+memory only ever buys a bigger Bloom filter, whose own ~1% engineered error
+rate is swamped by K=4's structural false-accept rate on real, non-uniform
+embeddings -- runner.py's equal-memory sweep now grid-searches (K, z)
+jointly for exactly this reason (see its _CONSTRUCTION_TIME_CONFIG_DIALS
+entry for DSHFilter).
 
 By default (z=None) z is chosen by maximizing p(tau; z) - p(r_far; z)
 (r_far defaults to sqrt(2), the expected distance between independent

@@ -58,7 +58,7 @@ DATASET = 'ELI5'
 # drops that corpus and silently reduces the comparison to two. 2^15 leaves
 # ~10% headroom there; system_tau's non-wrapping folds need 1.8N = 58,982 rows
 # per dataset, which its shortest (HotpotQA, 97,852) clears comfortably.
-WORKLOAD_NUM_VECTORS = 100
+WORKLOAD_NUM_VECTORS = 10_000
 
 # generate_blocklist() knobs. Cluster discovery scans the whole file on disk.
 # Multiplicity is a property of the pool, not of the corpus, so a partial pool
@@ -144,12 +144,19 @@ def scaling_construction_csv(dataset: str) -> str:
 
 
 # generate_equal_memory runs once per blocklist corpus and keeps each run in
-# its own folder, mirroring quantization_csv/QUANTIZATION_DIR above.
+# its own folder, mirroring quantization_csv/QUANTIZATION_DIR above. Plotted
+# the same way too (see plot_equal_memory): one figure set per corpus, in its
+# own folder, rather than pooled into a single cross-corpus line per filter.
 EQUAL_MEMORY_DIR = "results/equal_memory"
+EQUAL_MEMORY_PLOT_DIR = "plots/equal_memory"
 
 
 def equal_memory_csv(dataset: str) -> str:
     return os.path.join(EQUAL_MEMORY_DIR, dataset, "equal_memory.csv")
+
+
+def equal_memory_plot_dir(dataset: str) -> str:
+    return os.path.join(EQUAL_MEMORY_PLOT_DIR, dataset)
 
 
 # generate_streaming runs once per blocklist corpus and keeps each run in its
@@ -166,7 +173,11 @@ def streaming_csv(dataset: str) -> str:
 # generate_equal_memory()'s own comparison set: excludes DSBFFilter/
 # CoveringLSHFallbackFilter/LSBFFilter, which degenerate to ~100% duplicate
 # predictions at realistic construct-set sizes (still used elsewhere).
-equal_memory_filters = [BallCoverFilter, HNSWFilter, IVFFilter, DSHFilter, QuantizedVectorFilter, MLPFilter]
+# BallCoverFilter is submitted separately, once per quantize variant (see
+# generate_equal_memory's ball_cover_quantizations), rather than listed here
+# as a single entry -- unlike every other filter here, it has a `quantize`
+# dial worth comparing multiple settings of side by side.
+equal_memory_filters = [HNSWFilter, IVFFilter, DSHFilter, QuantizedVectorFilter, MLPFilter]
 
 def calculate_nn_distance_threshold(
     construct_vectors: np.ndarray,
@@ -281,20 +292,27 @@ def generate_equal_memory(runner: Runner) -> None:
     equal_memory_csv()), mirroring quantization_csv/QUANTIZATION_DIR."""
     num_vectors            = WORKLOAD_NUM_VECTORS
     dim                    = 384
-    n_folds                = BLOCKLIST_FOLDS
+    n_folds                = 1
     tau                    = 0.1
-    count_memory_steps     = 10
+    # Log-spaced, not linear: the baselines' feasibility floors span two
+    # decades (IVF-PQ ~0.6%, quantized-point-set RaBitQ ~3.6%, HNSW at
+    # M=32 ~30%, of raw storage at n=100K/dim=384), so a linear sweep over
+    # the same range would waste most of its points above the last floor
+    # and barely resolve the first two. 16 steps over two decades is ~8
+    # points/decade, enough to bracket each floor on both sides.
+    count_memory_steps     = 16
     # Sweep bounds, as a fraction of raw_storage_bytes (see below).
-    min_memory_fraction    = 0.01
-    max_memory_fraction    = 0.50
+    min_memory_fraction    = 0.0033
+    max_memory_fraction    = 0.33
     # Fraction of each fold's blocklist query stream spent calibrating each
     # filter's config dial; the rest measures FPR/FNR/latency/throughput.
     calibration_fraction   = 0.2
-    # BallCoverFilter is the only equal_memory_filters entry with a `quantize`
-    # dial (see filters.ball_cover.ball_cover_filter.Quantize); the rest
-    # ignore extra_kwargs they don't recognize via _instantiate_filter's
-    # generic dispatch.
-    filter_extra_kwargs    = {BallCoverFilter: {"quantize": Quantize.TQ4}}
+    # BallCoverFilter is the one entry with a `quantize` dial worth comparing
+    # multiple settings of (see filters.ball_cover.ball_cover_filter.Quantize)
+    # -- submitted once per variant below, each becoming its own labelled
+    # line ("BallCoverFilter (TQ4)" etc. -- see runner.equal_memory_worker's
+    # Config naming) rather than picking one variant to stand in for it.
+    ball_cover_quantizations = [Quantize.TQ3, Quantize.TQ4, Quantize.TQ5, Quantize.TQ8, Quantize.FP16]
 
     workloads = blocklist_workloads(num_vectors, n_folds=n_folds)
     if not workloads:
@@ -311,10 +329,10 @@ def generate_equal_memory(runner: Runner) -> None:
     # 100% = storing the construct set raw, as a plain list of float32
     # vectors (dim*4 bytes each) -- the same denominator
     # plot_equal_memory's raw-storage-% panels divide by. Swept from
-    # min_memory_fraction to max_memory_fraction of that in
-    # count_memory_steps equal-sized jumps.
+    # min_memory_fraction to max_memory_fraction of that, log-spaced (see
+    # count_memory_steps above).
     raw_storage_bytes = int(reference_len * dim * 4)
-    memory_budgets = np.linspace(
+    memory_budgets = np.geomspace(
         raw_storage_bytes * min_memory_fraction, raw_storage_bytes * max_memory_fraction,
         count_memory_steps, dtype=int)
 
@@ -346,7 +364,19 @@ def generate_equal_memory(runner: Runner) -> None:
                         vectors_query=vectors_query,
                         actual_calibration=actual_calibration, actual_query=actual_query,
                         dataset=workload.name,
-                        extra_kwargs=filter_extra_kwargs.get(filter_cls),
+                    )
+                for quantize in ball_cover_quantizations:
+                    runner.submit(
+                        'equal_memory',
+                        output_csv=output_csv,
+                        filter_cls=BallCoverFilter,
+                        dim=dim, distance_threshold=tau,
+                        memory_budget=int(memory_budget),
+                        vectors_construct=vectors_construct, vectors_calibration=vectors_calibration,
+                        vectors_query=vectors_query,
+                        actual_calibration=actual_calibration, actual_query=actual_query,
+                        dataset=workload.name,
+                        extra_kwargs={"quantize": quantize},
                     )
 
 
@@ -361,7 +391,16 @@ def save_equal_memory(job_results: List[Tuple[str, Any]]) -> list:
 
 
 def plot_equal_memory(results: list) -> None:
-    generate_equal_memory_figures(df=pd.DataFrame(results))
+    """One figure set per corpus, each in its own folder -- mirrors
+    plot_quantization's split, for the same reason: a filter's line pooled
+    across corpora hides which specific corpus it's winning or losing on,
+    and generate_equal_memory already keeps each corpus's raw rows in its
+    own results/equal_memory/<dataset>/ file (see equal_memory_csv)."""
+    df = pd.DataFrame(results)
+    for dataset in sorted(df["Dataset"].unique()):
+        outdir = equal_memory_plot_dir(str(dataset))
+        logger.info(f"Plotting equal-memory comparison for {dataset} -> {outdir}")
+        generate_equal_memory_figures(df=df[df["Dataset"] == dataset], outdir=outdir)
 
 
 def generate_system_tau(runner: Runner) -> None:
@@ -1767,5 +1806,5 @@ def plot_all() -> None:
 
 
 if __name__ == "__main__":
-    generate_and_plot_all()
-    # plot_all()  # alternative: re-render figures from an existing results/*.csv run
+    # generate_and_plot_all()
+    plot_all()  # alternative: re-render figures from an existing results/*.csv run

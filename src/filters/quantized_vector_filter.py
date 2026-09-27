@@ -1,16 +1,26 @@
 """QuantizedVectorFilter -- per-point quantization baseline: the "compress
 the vectors" counterpart to BallCoverFilter's "compress the geometry". Keeps
 every construct vector, quantized to whichever scheme on a fixed fidelity
-ladder fits the memory budget, finest first: float16, 8-bit scalar, 4-bit
-scalar, then RaBitQ (~1 bit/dim, no codebook). Exists to find the dataset
-size at which BallCoverFilter's geometric summary wins over storing
-(compressed) points directly.
+ladder fits the memory budget, finest first: float16, then the same
+TurboQuant/scalar-quantizer rungs BallCoverFilter's own Quantize ladder sweeps
+(8, 6, 5, 4, 3, 2 bits/dim -- see filters.ball_cover.ball_cover_filter.Quantize
+for the full bits-per-dim table this mirrors), then RaBitQ (~1 bit/dim, no
+codebook) as the coarsest fallback. The finer, evenly-spaced steps (vs. the
+old FP16/8-bit/4-bit/RaBitQ ladder's big jumps) give a smoother
+accuracy-vs-memory curve to compare BallCoverFilter's own quantized variants
+against at comparable bit rates. Exists to find the dataset size at which
+BallCoverFilter's geometric summary wins over storing (compressed) points
+directly.
 
 Zero-false-negative by the same triangle-inequality argument
 BallCoverFilter._store_spheres uses: d(q,x) <= tau implies
 d(q,x_hat) <= tau + ||x - x_hat||, so accepting whenever
 d(q, x_hat_i) <= tau + eps_i, with eps_i the *measured* reconstruction error
-(never a probabilistic bound), can never produce a false negative.
+(never a probabilistic bound), can never produce a false negative. The
+TurboQuant rungs sit behind an orthonormal rotation (like BallCoverFilter's
+own TQ* rungs -- see that module's _make_rotation), which preserves every L2
+distance exactly, so this argument and eps_i's measurement both carry over
+unchanged; RaBitQ is unrotated here, unchanged from before.
 
 If not even RaBitQ fits max_memory for n vectors, this raises
 InsufficientMemoryError rather than silently dropping vectors or
@@ -27,8 +37,12 @@ from filters.filter import Filter, InsufficientMemoryError
 
 class QuantizationLevel(Enum):
     FP16 = "fp16"
-    SQ8 = "sq8"
-    SQ4 = "sq4"
+    TQ8 = "tq8"
+    SQ6 = "sq6"
+    TQ5 = "tq5"
+    TQ4 = "tq4"
+    TQ3 = "tq3"
+    TQ2 = "tq2"
     RABITQ = "rabitq"
 
 
@@ -40,13 +54,27 @@ class ErrorBudgetMode(Enum):
 
 # Finest -> coarsest. Walked in this order by _choose_level.
 _LADDER: Tuple[QuantizationLevel, ...] = (
-    QuantizationLevel.FP16, QuantizationLevel.SQ8, QuantizationLevel.SQ4, QuantizationLevel.RABITQ,
+    QuantizationLevel.FP16, QuantizationLevel.TQ8, QuantizationLevel.SQ6,
+    QuantizationLevel.TQ5, QuantizationLevel.TQ4, QuantizationLevel.TQ3,
+    QuantizationLevel.TQ2, QuantizationLevel.RABITQ,
 )
 
 _SQ_QTYPES = {
     QuantizationLevel.FP16: faiss.ScalarQuantizer.QT_fp16,
-    QuantizationLevel.SQ8: faiss.ScalarQuantizer.QT_8bit,
-    QuantizationLevel.SQ4: faiss.ScalarQuantizer.QT_4bit,
+    QuantizationLevel.TQ8: faiss.ScalarQuantizer.QT_8bit_tqmse,
+    QuantizationLevel.SQ6: faiss.ScalarQuantizer.QT_6bit,
+    QuantizationLevel.TQ5: faiss.ScalarQuantizer.QT_5bit_tq,
+    QuantizationLevel.TQ4: faiss.ScalarQuantizer.QT_4bit_tqmse,
+    QuantizationLevel.TQ3: faiss.ScalarQuantizer.QT_3bit_tqmse,
+    QuantizationLevel.TQ2: faiss.ScalarQuantizer.QT_2bit_tqmse,
+}
+
+# Rungs that need BallCoverFilter-style rotation before quantizing (every
+# TurboQuant rung; SQ6 is a plain min/max scalar quantizer like the old
+# ladder's SQ8/SQ4 were, so it doesn't). See _make_rotation.
+_ROTATED_LEVELS = {
+    QuantizationLevel.TQ8, QuantizationLevel.TQ5, QuantizationLevel.TQ4,
+    QuantizationLevel.TQ3, QuantizationLevel.TQ2,
 }
 
 _BYTES_FP32 = 4
@@ -56,6 +84,44 @@ _BYTES_FP32 = 4
 # empirically), so this isn't a capability we're giving up, just one we
 # can't safely reach.
 _RABITQ_NB_BITS = 1
+
+# Rotation seed for the TurboQuant rungs, mirroring BallCoverFilter's own
+# _ROTATION_SEED: seeded explicitly so it's already is_trained (no separate
+# training step) and reproducible, and charged as a fixed 4-byte cost rather
+# than the dim*dim matrix it expands to (see _make_rotation).
+_ROTATION_SEED = 0x5EED
+_ROTATION_SEED_BYTES = 4
+
+# Throwaway-probe training data for _fixed_overhead_bytes: random, not zeros
+# -- the MSE-trained TurboQuant rungs divide through by the data's spread
+# while training, so all-zero data (spread=0) would corrupt the trained
+# table's size. A dedicated local stream, never np.random.*, so probing a
+# level's overhead can't shift any globally-seeded sequence downstream.
+_PROBE_RNG = np.random.default_rng(_ROTATION_SEED)
+
+
+def _make_rotation(dim: int) -> faiss.VectorTransform:
+    """Same choice BallCoverFilter._make_rotation makes: Hadamard at
+    power-of-two dimensions, RandomRotationMatrix elsewhere. This project's
+    dim=384 always takes the RandomRotationMatrix branch (384 isn't a power
+    of two, so Hadamard's forced d_out=512 mismatches immediately)."""
+    rotation = faiss.HadamardRotation(dim)
+    if rotation.d_out != dim:
+        rotation = faiss.RandomRotationMatrix(dim, dim)
+    rotation.init(_ROTATION_SEED)
+    return rotation
+
+
+def _make_index(level: QuantizationLevel, dim: int) -> faiss.Index:
+    """The scalar-quantizer index this level queries/reconstructs through --
+    wrapped in an orthonormal rotation for the TurboQuant rungs (see
+    _ROTATED_LEVELS), which train()/add()/search()/reconstruct_n() all pass
+    through transparently, exactly like BallCoverFilter's own quantized
+    centers do."""
+    base = faiss.IndexScalarQuantizer(dim, _SQ_QTYPES[level], faiss.METRIC_L2)
+    if level in _ROTATED_LEVELS:
+        return faiss.IndexPreTransform(_make_rotation(dim), base)
+    return base
 
 
 # Layout accounting: one formula used both to pick a level against a byte
@@ -69,14 +135,16 @@ def _code_size(level: QuantizationLevel, dim: int) -> int:
 
 def _fixed_overhead_bytes(level: QuantizationLevel, dim: int) -> int:
     """Per-structure cost independent of n: a scalar quantizer's trained
-    per-dimension min/diff table, computed via a throwaway probe trained on
-    stand-in data so this is knowable before real vectors exist. RaBitQ has
-    no such trained table."""
+    per-dimension min/diff (or MSE) table, computed via a throwaway probe
+    trained on stand-in data so this is knowable before real vectors exist,
+    plus the rotation seed's 4 bytes for a rotated rung. RaBitQ has no
+    trained table and no rotation here."""
     if level not in _SQ_QTYPES:
         return 0
+    overhead = _ROTATION_SEED_BYTES if level in _ROTATED_LEVELS else 0
     probe = faiss.ScalarQuantizer(dim, _SQ_QTYPES[level])
-    probe.train(np.zeros((2, dim), dtype=np.float32))
-    return int(faiss.vector_to_array(probe.trained).nbytes)
+    probe.train(_PROBE_RNG.random((2, dim)).astype(np.float32))
+    return overhead + int(faiss.vector_to_array(probe.trained).nbytes)
 
 
 def _cluster_count(n: int) -> int:
@@ -189,7 +257,7 @@ class QuantizedVectorFilter(Filter):
         self.level = self._choose_level(n)
 
         if self.level in _SQ_QTYPES:
-            index = faiss.IndexScalarQuantizer(self.dim, _SQ_QTYPES[self.level], faiss.METRIC_L2)
+            index = _make_index(self.level, self.dim)
             index.train(vecs)
             index.add(vecs)
             decoded = index.reconstruct_n(0, n)

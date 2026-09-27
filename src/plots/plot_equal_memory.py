@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 
 from plots.plot_quantization import apply_style
+from plots.plot_common import collapse_duplicate_x
 
 # CONFIG
 
@@ -32,7 +33,7 @@ EMIT_PDF = False
 _EMBEDDING_DIM = 384
 
 # Display overrides for recognized filter names; anything else falls back to
-# the palettes below (see _derive_style_maps).
+# name[:-len("Filter")] in _label_for.
 _KNOWN_LABELS = {
     "BallCoverFilter": "BallFilter",
     "HNSWFilter": "HNSW",
@@ -42,36 +43,49 @@ _KNOWN_LABELS = {
     "DSBFFilter": "DSBF",
     "CoveringLSHFallbackFilter": "Covering LSH",
 }
-_KNOWN_COLORS = {
-    "BallCoverFilter": "#0072B2",
-    "HNSWFilter": "#56B4E9",
-    "IVFFilter": "#E69F00",
-}
 _KNOWN_MARKERS = {
-    "BallCoverFilter": "o",
     "HNSWFilter": "P",
     "IVFFilter": "s",
 }
-# Okabe-Ito-derived, colorblind-safe.
-_PALETTE_COLORS = ["#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7", "#56B4E9", "#F0E442", "#999999"]
-_PALETTE_MARKERS = ["o", "s", "^", "D", "v", "P", "*", "X", "h", "p"]
+# Every BallCoverFilter quantize variant (Config strings like
+# "BallCoverFilter (TQ4)" -- see runner.equal_memory_worker) draws from the
+# cold palette; every other method draws from the hot one. Two colorblind-
+# distinguishable-within-family sets, so a method's family reads from color
+# alone and its identity within that family still reads from hue. Each list
+# has more entries than there are current consumers (5 BallCoverFilter
+# variants, 5 other methods) for headroom -- see _derive_style_maps for what
+# happens if a family ever does run out (loops back rather than crashing).
+_COLD_PALETTE_COLORS = ["#023E8A", "#0077B6", "#00B4D8", "#48CAE4", "#3A0CA3", "#7209B7", "#4CC9F0", "#5A189A"]
+_HOT_PALETTE_COLORS = ["#9D0208", "#E85D04", "#FAA307", "#DC2F02", "#6A040F", "#F48C06", "#FFBA08", "#D00000"]
+_PALETTE_MARKERS = ["o", "s", "^", "D", "v", "P", "*", "X", "h", "p", "<", ">", "8", "H"]
 
 
 def _label_for(name: str) -> str:
-    if name in _KNOWN_LABELS:
-        return _KNOWN_LABELS[name]
-    return name[:-len("Filter")] if name.endswith("Filter") else name
+    """`name` is a full Config string, e.g. "BallCoverFilter (TQ4)" for one
+    of BallCoverFilter's quantize variants (see runner.equal_memory_worker) --
+    translate the base filter name and reattach the variant suffix verbatim,
+    rather than falling through to the raw, un-shortened string."""
+    base, sep, suffix = name.partition(" (")
+    label = _KNOWN_LABELS.get(base, base[:-len("Filter")] if base.endswith("Filter") else base)
+    return f"{label}{sep}{suffix}" if sep else label
+
+
+def _is_ball_filter(name: str) -> bool:
+    return name.partition(" (")[0] == "BallCoverFilter"
 
 
 def _derive_style_maps(configs: list) -> tuple:
     labels, colors, markers = {}, {}, {}
-    used_colors, used_markers = set(_KNOWN_COLORS.values()), set(_KNOWN_MARKERS.values())
-    palette_colors = iter(c for c in _PALETTE_COLORS if c not in used_colors)
-    palette_markers = iter(m for m in _PALETTE_MARKERS if m not in used_markers)
+    cold = iter(_COLD_PALETTE_COLORS)
+    hot = iter(_HOT_PALETTE_COLORS)
+    palette_markers = iter(m for m in _PALETTE_MARKERS if m not in set(_KNOWN_MARKERS.values()))
 
     for name in configs:
         labels[name] = _label_for(name)
-        colors[name] = _KNOWN_COLORS.get(name) or next(palette_colors, _PALETTE_COLORS[0])
+        if _is_ball_filter(name):
+            colors[name] = next(cold, _COLD_PALETTE_COLORS[0])
+        else:
+            colors[name] = next(hot, _HOT_PALETTE_COLORS[0])
         markers[name] = _KNOWN_MARKERS.get(name) or next(palette_markers, _PALETTE_MARKERS[0])
 
     return labels, colors, markers
@@ -206,10 +220,13 @@ def aggregate(df: pd.DataFrame, value_col: str, dim: int = _EMBEDDING_DIM) -> pd
 
 # Raw-pct panels' x-axis view: a filter that spends more than raw storage
 # would cost is a real, plottable outcome (see aggregate()'s docstring on
-# DSHFilter), but the interesting comparison -- how far below 100% of raw
-# each method gets -- lives in [1%, 100%]. Bounding the view here only
-# clips what's drawn, not the underlying data.
-_RAW_PCT_X_BOUNDS = (1.0, 100.0)
+# DSHFilter), and the panel should show it rather than crop it off -- only
+# the left edge (below 1% of raw is never informative) is fixed. The right
+# edge is left to matplotlib's autoscale, so it always reaches whatever the
+# worst filter in this particular run actually spent, rather than a
+# hardcoded ceiling that could either clip real data or leave dead space.
+_RAW_PCT_X_MIN = 1.0
+
 
 def _line_panel(
     df: pd.DataFrame,
@@ -219,7 +236,7 @@ def _line_panel(
     cfg: Config,
     log_y: bool = False,
     y_bounds: Optional[tuple] = None,
-    x_bounds: Optional[tuple] = None,
+    x_min: Optional[float] = None,
     x_col: str = "Memory Budget (MB)",
     xlabel: str = "Memory Budget (MB)",
 ) -> pd.DataFrame:
@@ -230,6 +247,7 @@ def _line_panel(
 
     for name in cfg.configs:
         sub = agg[agg["filter"] == name].sort_values(x_col)
+        sub = collapse_duplicate_x(sub, x_col)
         if sub.empty:
             continue
         has_ci = (sub["ci95"] > 0).any()
@@ -248,8 +266,8 @@ def _line_panel(
                 zorder=3,
             )
 
-    if x_bounds is not None:
-        ax.set_xlim(*x_bounds)
+    if x_min is not None:
+        ax.set_xlim(left=x_min)
 
     if log_y:
         ax.set_yscale("log")
@@ -278,7 +296,7 @@ def panel_fpr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 def panel_fpr_raw_pct(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _line_panel(df, "FPR", "False Positive Rate", "equal-memory-fpr-raw-pct.png", cfg,
-                       y_bounds=(-0.05, 1.05), x_bounds=_RAW_PCT_X_BOUNDS,
+                       y_bounds=(-0.05, 1.05), x_min=_RAW_PCT_X_MIN,
                        x_col="Memory Usage (% of Raw)", xlabel="Memory Usage (% of Raw)")
 
 
@@ -288,7 +306,7 @@ def panel_fnr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 def panel_fnr_raw_pct(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _line_panel(df, "FNR", "False Negative Rate", "equal-memory-fnr-raw-pct.png", cfg,
-                       y_bounds=(-0.05, 1.05), x_bounds=_RAW_PCT_X_BOUNDS,
+                       y_bounds=(-0.05, 1.05), x_min=_RAW_PCT_X_MIN,
                        x_col="Memory Usage (% of Raw)", xlabel="Memory Usage (% of Raw)")
 
 
@@ -302,7 +320,7 @@ def panel_latency(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 def panel_latency_raw_pct(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _line_panel(df, "Latency (ms)", "Construction Latency (ms)",
                        "equal-memory-latency-raw-pct.png", cfg, log_y=True,
-                       x_bounds=_RAW_PCT_X_BOUNDS,
+                       x_min=_RAW_PCT_X_MIN,
                        x_col="Memory Usage (% of Raw)", xlabel="Memory Usage (% of Raw)")
 
 
@@ -315,7 +333,7 @@ def panel_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 def panel_throughput_raw_pct(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _line_panel(
         df, "Throughput (qps)", "Throughput (queries/s)", "equal-memory-throughput-raw-pct.png", cfg,
-        log_y=True, x_bounds=_RAW_PCT_X_BOUNDS,
+        log_y=True, x_min=_RAW_PCT_X_MIN,
         x_col="Memory Usage (% of Raw)", xlabel="Memory Usage (% of Raw)",
     )
 
