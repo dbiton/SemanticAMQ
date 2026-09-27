@@ -254,7 +254,26 @@ class DSHFilter(Filter):
             else max(self._capacity, len(vectors) * self.num_tables)
         )
         self.filter = _BloomFilter(capacity=capacity, error_rate=self._error_rate)
-        self._insert_batch(vectors)
+        try:
+            self._insert_batch(vectors)
+        except IndexError as e:
+            # pybloom_live raises a bare IndexError once its bit array fills
+            # up. That happens here when max_memory bounds self._capacity
+            # below the len(vectors) * num_tables distinct (table, code)
+            # entries this construction actually inserts -- a memory-budget
+            # infeasibility like any other, not a crash. Re-raise as the
+            # shared InsufficientMemoryError so _build_calibrated_filter's
+            # per-candidate except clause skips this dial candidate instead
+            # of the raw IndexError propagating out and failing the whole
+            # equal-memory worker job.
+            raise InsufficientMemoryError(
+                f"DSHFilter's Bloom filter (capacity={capacity}, "
+                f"error_rate={self._error_rate}) filled up while inserting "
+                f"{len(vectors)} vectors x {self.num_tables} tables at "
+                f"num_projections_per_table={self.num_projections_per_table}: "
+                f"max_memory={self.max_memory} is too small for this many "
+                f"distinct (table, code) entries."
+            ) from e
 
     def query(self, vectors: np.ndarray, tau: Optional[float] = None) -> List[bool]:
         if self.filter is None:
