@@ -39,18 +39,25 @@ EMIT_PDF = False
 # runner.py's multiprocessing machinery). NONE is the raw/unquantized cover
 # (stage="ball"); every other entry shares that cover's memory budget
 # (stage="quantizing"), so a more compact code packs more balls into it.
+#
+# Every rung runner.QUANTIZATION_SWEEP sweeps, ordered by rate (bits/dim) so
+# the ladder reads in that order on an axis -- see the Quantize docstring's
+# table. Quantize.RABITQ is the one rung deliberately excluded from both: its
+# zero-false-negative property is an empirical bound, not a proof, unlike
+# every other rung, and runner.py doesn't sweep it either, so there is no
+# data for it to plot. A results file predating one of these rungs simply
+# has no rows for it; every panel already tolerates an absent stage by not
+# drawing/counting it.
 QUANTIZE_SWEEP = (
-    Quantize.FP32, Quantize.FP16, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
-    Quantize.TQ3, Quantize.PQ4_R2, Quantize.PQ8_R2,
+    Quantize.FP32, Quantize.FP16,
+    Quantize.SQ8, Quantize.TQ8,
+    Quantize.SQ6, Quantize.TQ5,
+    Quantize.SQ4, Quantize.TQ4,
+    Quantize.TQ3,
+    Quantize.TQ2, Quantize.PQ4_R2, Quantize.PQ8_R2,
     # Down to 1 b/dim via the same two-subquantizer-width pairing the 2 b/dim
-    # rung already has -- see runner.QUANTIZATION_SWEEP. Quantize.RABITQ is
-    # deliberately excluded (its zero-false-negative property is an
-    # empirical bound, not a proof, unlike every other rung). A results file
-    # from before PQ4_R1/PQ8_R1 were swept simply has no rows for them;
-    # every panel already tolerates an absent stage by not drawing/counting
-    # it -- and one that still carries old RABITQ rows plots without
-    # complaint too, since STAGES no longer includes it.
-    Quantize.PQ4_R1, Quantize.PQ8_R1,
+    # rung already has -- see runner.QUANTIZATION_SWEEP.
+    Quantize.TQ1, Quantize.PQ4_R1, Quantize.PQ8_R1,
 )
 STAGES = [q.value for q in QUANTIZE_SWEEP]
 STAGE_LABELS = {
@@ -58,11 +65,16 @@ STAGE_LABELS = {
     Quantize.FP32.value: "FP32 (32b)",
     Quantize.FP16.value: "FP16 (16b)",
     Quantize.SQ8.value: "SQ8 (8b)",
+    Quantize.TQ8.value: "TQ8 (8b)",
     Quantize.SQ6.value: "SQ6 (6b)",
+    Quantize.TQ5.value: "TQ5 (5b)",
     Quantize.SQ4.value: "SQ4 (4b)",
+    Quantize.TQ4.value: "TQ4 (4b)",
     Quantize.TQ3.value: "TQ3 (3b)",
+    Quantize.TQ2.value: "TQ2 (2b)",
     Quantize.PQ4_R2.value: "PQ4 (2b)",
     Quantize.PQ8_R2.value: "PQ8 (2b)",
+    Quantize.TQ1.value: "TQ1 (1b)",
     Quantize.PQ4_R1.value: "PQ4 (1b)",
     Quantize.PQ8_R1.value: "PQ8 (1b)",
     Quantize.RABITQ.value: "RaBitQ (1b)",
@@ -72,11 +84,14 @@ STAGE_LABELS = {
 # panels had before per-quantize breakdown existed.
 BASELINE_STAGE = Quantize.FP32.value
 
-# tab10 has 10 qualitative colors, enough for the swept variants with room to
-# spare; zip() stops at the shorter of the two, so re-adding a rung is safe.
-_STAGE_PALETTE = plt.get_cmap("tab10").colors
+# tab20 has 20 qualitative colors, enough for the 15 swept variants with room
+# to spare; zip() stops at the shorter of the two, so re-adding a rung is
+# safe as long as it stays under 20. (tab10 was enough before TQ1/TQ2/TQ4/
+# TQ5/TQ8 joined the sweep -- at 15 stages it silently left the last 5
+# without a color, which is a KeyError waiting at STAGE_COLORS[stage].)
+_STAGE_PALETTE = plt.get_cmap("tab20").colors
 STAGE_COLORS = dict(zip(STAGES, _STAGE_PALETTE))
-_STAGE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "p"]
+_STAGE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "p", "<", ">", "8", "H", "d"]
 STAGE_MARKERS = dict(zip(STAGES, _STAGE_MARKERS))
 
 D_DIM = 384  # embedding dimensionality; objectives are stored pre-logged

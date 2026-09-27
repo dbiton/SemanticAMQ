@@ -217,12 +217,15 @@ def _build_calibrated_filter(
     construct_arr: np.ndarray,
     calib_arr: np.ndarray,
     calib_actual: np.ndarray,
+    extra_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Any, float]:
     """Builds filter_cls at memory_budget, picking whichever registered config
     dial candidate scores best (F1) on the calibration set. Returns
     (filter_instance, construction_seconds) -- the latter sums only time
     inside .construct() calls, excluding the calibration .query() calls used
-    to score candidates, so it reflects reaching a ready-to-query filter."""
+    to score candidates, so it reflects reaching a ready-to-query filter.
+    extra_kwargs is forwarded to _instantiate_filter for filters outside the
+    config-dial registries (e.g. BallCoverFilter's quantize)."""
     name = filter_cls.__name__
     construction_time = 0.0
 
@@ -264,7 +267,7 @@ def _build_calibrated_filter(
             )
         return best_instance, construction_time
 
-    filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold)
+    filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold, extra_kwargs=extra_kwargs)
     t0 = time.perf_counter()
     filter_instance.construct(construct_arr)
     construction_time = time.perf_counter() - t0
@@ -293,6 +296,7 @@ def equal_memory_worker(
     actual_calibration: List[bool],
     actual_query: List[bool],
     dataset: str = "",
+    extra_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     config = filter_cls.__name__
     construct_arr = _to_construct_array(vectors_construct)
@@ -302,7 +306,7 @@ def equal_memory_worker(
     try:
         filter_instance, construction_time = _build_calibrated_filter(
             filter_cls, dim, memory_budget, distance_threshold,
-            construct_arr, calib_arr, calib_actual,
+            construct_arr, calib_arr, calib_actual, extra_kwargs=extra_kwargs,
         )
     except InsufficientMemoryError as e:
         # Expected at small budgets -- recorded as an explicit infeasible

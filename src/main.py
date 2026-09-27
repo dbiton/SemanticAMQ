@@ -31,7 +31,7 @@ from plots.plot_blocklist import generate_blocklist_figures
 from plots.plot_budget import generate_budget_figures
 from plots.plot_common import DATASETS, DATASET_LABELS
 from typing import Any, Dict, List, Optional, Tuple
-from filters.ball_cover.ball_cover_filter import BallCoverFilter
+from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize
 from filters.dsh_filter import DSHFilter
 from filters.hnsw_filter import HNSWFilter
 from filters.ivf_filter import IVFFilter
@@ -44,7 +44,7 @@ from vector_source import VectorSource
 configure_logging()
 logger = logging.getLogger(__name__)
 
-MAX_WORKERS = 8
+MAX_WORKERS = 20
 DATASET = 'ELI5'
 
 # Vectors/dataset, split 80% construction / 20% queries. One knob for every
@@ -58,7 +58,7 @@ DATASET = 'ELI5'
 # drops that corpus and silently reduces the comparison to two. 2^15 leaves
 # ~10% headroom there; system_tau's non-wrapping folds need 1.8N = 58,982 rows
 # per dataset, which its shortest (HotpotQA, 97,852) clears comfortably.
-WORKLOAD_NUM_VECTORS = 100_000
+WORKLOAD_NUM_VECTORS = 100
 
 # generate_blocklist() knobs. Cluster discovery scans the whole file on disk.
 # Multiplicity is a property of the pool, not of the corpus, so a partial pool
@@ -252,9 +252,10 @@ def compute_static_actual_results(
 
 def generate_equal_memory(runner: Runner) -> None:
     """Equal-memory (SOTA) comparison across equal_memory_filters. Sweeps
-    count_memory_steps budgets scaled off the construct set itself (one
-    sphere per point, see bytes_per_sphere_at_1to1 below). For each budget,
-    every filter's best config is chosen on a held-out calibration set (see
+    count_memory_steps budgets from 10% to 100% of raw storage (storing the
+    construct set as a plain list of float32 vectors, dim*4 bytes each) in
+    equal-sized steps -- see raw_storage_bytes below. For each budget, every
+    filter's best config is chosen on a held-out calibration set (see
     runner.py::_build_calibrated_filter), then FPR/FNR/latency/throughput are
     measured on a separate held-out query set.
 
@@ -283,9 +284,17 @@ def generate_equal_memory(runner: Runner) -> None:
     n_folds                = BLOCKLIST_FOLDS
     tau                    = 0.1
     count_memory_steps     = 10
+    # Sweep bounds, as a fraction of raw_storage_bytes (see below).
+    min_memory_fraction    = 0.01
+    max_memory_fraction    = 0.50
     # Fraction of each fold's blocklist query stream spent calibrating each
     # filter's config dial; the rest measures FPR/FNR/latency/throughput.
     calibration_fraction   = 0.2
+    # BallCoverFilter is the only equal_memory_filters entry with a `quantize`
+    # dial (see filters.ball_cover.ball_cover_filter.Quantize); the rest
+    # ignore extra_kwargs they don't recognize via _instantiate_filter's
+    # generic dispatch.
+    filter_extra_kwargs    = {BallCoverFilter: {"quantize": Quantize.TQ4}}
 
     workloads = blocklist_workloads(num_vectors, n_folds=n_folds)
     if not workloads:
@@ -299,10 +308,15 @@ def generate_equal_memory(runner: Runner) -> None:
     # generate_scaling's k -- they are scaled off the smallest corpus's
     # reference set rather than computed per corpus.
     reference_len = min(len(w.selections[0]["reference"]) for w in workloads)
-    # Scaled off the construct set itself: one sphere per point.
-    bytes_per_sphere_at_1to1 = (dim + 1) * 4 * 4.0
-    max_memory_budget = int(reference_len * bytes_per_sphere_at_1to1)
-    memory_budgets = np.linspace(0, max_memory_budget, count_memory_steps + 1, dtype=int)[1:]
+    # 100% = storing the construct set raw, as a plain list of float32
+    # vectors (dim*4 bytes each) -- the same denominator
+    # plot_equal_memory's raw-storage-% panels divide by. Swept from
+    # min_memory_fraction to max_memory_fraction of that in
+    # count_memory_steps equal-sized jumps.
+    raw_storage_bytes = int(reference_len * dim * 4)
+    memory_budgets = np.linspace(
+        raw_storage_bytes * min_memory_fraction, raw_storage_bytes * max_memory_fraction,
+        count_memory_steps, dtype=int)
 
     for workload in workloads:
         output_csv = equal_memory_csv(workload.name)
@@ -332,6 +346,7 @@ def generate_equal_memory(runner: Runner) -> None:
                         vectors_query=vectors_query,
                         actual_calibration=actual_calibration, actual_query=actual_query,
                         dataset=workload.name,
+                        extra_kwargs=filter_extra_kwargs.get(filter_cls),
                     )
 
 
@@ -1646,37 +1661,16 @@ def generate_and_plot_all() -> None:
     runner = Runner(num_workers=MAX_WORKERS)
 
     try:
-        generate_quantization(runner)
+        generate_equal_memory(runner)
     except Exception:
         logger.exception("An error occurred")
     '''
-    try:
-        generate_quantization(runner)
-    except Exception:
-        logger.exception("An error occurred")
-
-
-    try:
-        generate_system_tau(runner)
-    except Exception:
-        logger.exception("An error occurred")
-
-    try:
-        generate_quantization(runner)
-    except Exception:
-        logger.exception("An error occurred")
     try:
         generate_scaling(runner)
     except Exception:
         logger.exception("An error occurred")
-    '''
-    '''
     try:
         generate_streaming(runner)
-    except Exception:
-        logger.exception("An error occurred")
-    try:
-        generate_equal_memory(runner)
     except Exception:
         logger.exception("An error occurred")
     try:
@@ -1773,5 +1767,5 @@ def plot_all() -> None:
 
 
 if __name__ == "__main__":
-    # generate_and_plot_all()
-    plot_all()  # alternative: re-render figures from an existing results/*.csv run
+    generate_and_plot_all()
+    # plot_all()  # alternative: re-render figures from an existing results/*.csv run
