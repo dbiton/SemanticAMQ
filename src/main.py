@@ -294,16 +294,18 @@ def generate_equal_memory(runner: Runner) -> None:
     dim                    = 384
     n_folds                = 1
     tau                    = 0.1
-    # Log-spaced, not linear: the baselines' feasibility floors span two
-    # decades (IVF-PQ ~0.6%, quantized-point-set RaBitQ ~3.6%, HNSW at
-    # M=32 ~30%, of raw storage at n=100K/dim=384), so a linear sweep over
-    # the same range would waste most of its points above the last floor
-    # and barely resolve the first two. 16 steps over two decades is ~8
-    # points/decade, enough to bracket each floor on both sides.
-    count_memory_steps     = 16
+    # Log-spaced, not linear: the baselines' feasibility floors span more
+    # than a decade below this range's top (IVF-PQ ~0.6%, quantized-point-set
+    # RaBitQ ~3.6%, of raw storage at n=100K/dim=384 -- HNSW's ~30% floor
+    # sits above max_memory_fraction entirely, so it is expected to stay
+    # infeasible throughout), so a linear sweep would waste points at the top
+    # and barely resolve the first two floors. 17 steps over this range's
+    # 2 decades is ~8 points/decade, matching the resolution the wider
+    # sweep used.
+    count_memory_steps     = 17
     # Sweep bounds, as a fraction of raw_storage_bytes (see below).
-    min_memory_fraction    = 0.0033
-    max_memory_fraction    = 0.33
+    min_memory_fraction    = 0.001
+    max_memory_fraction    = 0.10
     # Fraction of each fold's blocklist query stream spent calibrating each
     # filter's config dial; the rest measures FPR/FNR/latency/throughput.
     calibration_fraction   = 0.2

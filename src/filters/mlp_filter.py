@@ -93,6 +93,11 @@ class MLPFilter(Filter):
     # random seeds at this architecture (measured; 700 already got most of
     # the way, 500 was inconsistent).
     TARGET_GRADIENT_STEPS = 900
+    # Compute-time safety valve on _choose_hidden_dim's budget-driven width,
+    # not an accuracy cap -- see its docstring. Generous relative to HIDDEN_DIM
+    # so the equal-memory sweep's realistic budget range actually drives
+    # hidden_dim instead of saturating against this.
+    MAX_HIDDEN_DIM = 1024
     LR_DECAY_STAGES = 5
     LR_DECAY_GAMMA = 0.6
     BATCH_SIZE = 256
@@ -137,7 +142,14 @@ class MLPFilter(Filter):
         # largest integer that actually fits it.
         while hidden_dim > 0 and hidden_dim * hidden_dim + hidden_dim * (self.dim + 3) + 1 > max_params:
             hidden_dim -= 1
-        hidden_dim = min(hidden_dim, self.HIDDEN_DIM)
+        # MAX_HIDDEN_DIM is a compute-time safety valve only (training cost
+        # is quadratic-ish in hidden_dim), not an accuracy cap -- clamping to
+        # HIDDEN_DIM (the empirically-tuned no-budget default, 128) here used
+        # to silently defeat the whole point of this method: every budget
+        # above the byte cost of a 128-wide network built the exact same
+        # model, so an equal-memory sweep measured a flat, non-improving MLP
+        # past that point instead of one that uses the memory it's given.
+        hidden_dim = min(hidden_dim, self.MAX_HIDDEN_DIM)
 
         if hidden_dim < 1:
             raise ValueError(f"max_memory={self.max_memory} is too small for an MLP with dim={self.dim}")
@@ -269,9 +281,15 @@ class MLPFilter(Filter):
 
         # See TARGET_GRADIENT_STEPS: fix the number of gradient updates, not
         # the number of passes over the data, so training cost doesn't scale
-        # with how many batches one epoch happens to contain.
+        # with how many batches one epoch happens to contain. TARGET_GRADIENT_STEPS
+        # itself was only measured at HIDDEN_DIM=128 (see its docstring); a
+        # wider network built by a generous memory budget has more parameters
+        # to fit and empirically needs proportionally more updates to reach
+        # the same convergence, or the extra capacity a bigger budget buys
+        # goes untrained rather than translating into lower error.
+        target_steps = self.TARGET_GRADIENT_STEPS * max(1.0, self.hidden_dim / self.HIDDEN_DIM)
         steps_per_epoch = max(1, -(-len(X) // self.BATCH_SIZE))  # ceil division
-        epochs = max(1, -(-self.TARGET_GRADIENT_STEPS // steps_per_epoch))
+        epochs = max(1, -(-int(target_steps) // steps_per_epoch))
         scheduler = optim.lr_scheduler.StepLR(
             optimizer, step_size=max(1, epochs // self.LR_DECAY_STAGES), gamma=self.LR_DECAY_GAMMA)
 
