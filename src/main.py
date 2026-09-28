@@ -368,7 +368,7 @@ def generate_equal_memory(runner: Runner) -> None:
     equal_memory_csv()), mirroring quantization_csv/QUANTIZATION_DIR."""
     num_vectors            = WORKLOAD_NUM_VECTORS
     dim                    = 384
-    n_folds                = 1
+    n_folds                = 5
     tau                    = 0.1
     # Log-spaced, not linear: the baselines' feasibility floors span more
     # than a decade below this range's top (IVF-PQ ~0.6%, quantized-point-set
@@ -378,7 +378,7 @@ def generate_equal_memory(runner: Runner) -> None:
     # and barely resolve the first two floors. 17 steps over this range's
     # 2 decades is ~8 points/decade, matching the resolution the wider
     # sweep used.
-    count_memory_steps     = 17
+    count_memory_steps     = 16
     # Sweep bounds, as a fraction of raw_storage_bytes (see below).
     min_memory_fraction    = 0.001
     max_memory_fraction    = 0.10
@@ -390,7 +390,7 @@ def generate_equal_memory(runner: Runner) -> None:
     # -- submitted once per variant below, each becoming its own labelled
     # line ("BallCoverFilter (TQ4)" etc. -- see runner.equal_memory_worker's
     # Config naming) rather than picking one variant to stand in for it.
-    ball_cover_quantizations = [Quantize.TQ3, Quantize.TQ4, Quantize.TQ5, Quantize.TQ8, Quantize.FP16]
+    ball_cover_quantizations = [Quantize.TQ4]
 
     workloads = blocklist_workloads(num_vectors, n_folds=n_folds)
     if not workloads:
@@ -1890,5 +1890,5 @@ def plot_all() -> None:
 
 
 if __name__ == "__main__":
-    # generate_and_plot_all()
-    plot_all()  # alternative: re-render figures from an existing results/*.csv run
+    generate_and_plot_all()
+    # plot_all()  # alternative: re-render figures from an existing results/*.csv run
