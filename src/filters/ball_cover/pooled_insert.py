@@ -117,6 +117,8 @@ class PooledInsert(InsertInterface):
 
     @staticmethod
     def _exhaustive_search(centers: np.ndarray, queries: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        if len(centers) == 0:
+            return np.empty((len(queries), 0), dtype=np.float32), np.empty((len(queries), 0), dtype=np.int64)
         dim = centers.shape[1]
         index = faiss.IndexFlatL2(dim)
         index.add(centers)
@@ -141,16 +143,23 @@ class PooledInsert(InsertInterface):
         if len(X) == 0:
             return
 
-        # Add uncovered vectors in chunks and rebuild when max capacity is hit
+        # Add uncovered vectors and rebuild when max capacity is hit
         pool_capacity = max(1, filter.max_spheres - self._get_target_spheres(filter))
 
-        for offset in range(0, len(X), pool_capacity):
-            chunk = X[offset : offset + pool_capacity]
-            zero_radii = np.zeros(len(chunk), dtype=np.float32)
-            filter._add_spheres(chunk, zero_radii)
-
+        offset = 0
+        while offset < len(X):
+            # Rebuild if capacity limit is reached
             if filter._num_spheres >= filter.max_spheres:
                 self._rebuild(filter)
+
+            available_cap = filter.max_spheres - filter._num_spheres
+            if available_cap <= 0:
+                break
+
+            chunk_size = min(pool_capacity, available_cap, len(X) - offset)
+            chunk = X[offset : offset + chunk_size]
+            filter._add_spheres(chunk, np.zeros(len(chunk), dtype=np.float32))
+            offset += chunk_size
 
 
     def remove(self, filter: Filter, vectors: np.ndarray) -> List[bool]:

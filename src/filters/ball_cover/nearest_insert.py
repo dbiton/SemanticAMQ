@@ -26,6 +26,8 @@ class NearestInsert(InsertInterface):
 
     @staticmethod
     def _exhaustive_search(centers: np.ndarray, queries: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        if len(centers) == 0:
+            return np.empty((len(queries), 0), dtype=np.float32), np.empty((len(queries), 0), dtype=np.int64)
         dim = centers.shape[1]
         index = faiss.IndexFlatL2(dim)
         index.add(centers)
@@ -34,6 +36,13 @@ class NearestInsert(InsertInterface):
 
 
     def insert(self, filter: Filter, vectors: np.ndarray) -> None:
+        if len(vectors) == 0:
+            return
+
+        if filter._num_spheres == 0:
+            filter.construct(vectors)
+            return
+
         X = np.ascontiguousarray(vectors, dtype=np.float32)
         active_indices = filter.all_spheres
         centers = filter.all_centers
