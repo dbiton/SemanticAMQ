@@ -133,6 +133,8 @@ class DoublingInsert(InsertInterface):
 
     @staticmethod
     def _exhaustive_search(centers: np.ndarray, queries: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        if len(centers) == 0:
+            return np.empty((len(queries), 0), dtype=np.float32), np.empty((len(queries), 0), dtype=np.int64)
         dim = centers.shape[1]
         index = faiss.IndexFlatL2(dim)
         index.add(centers)
