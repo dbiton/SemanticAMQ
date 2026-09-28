@@ -9,12 +9,17 @@ import numpy as np
 from src.filters.ball_cover.ball_cover_filter import BallCoverFilter
 from src.filters.ball_cover.ball_interfaces import ConstructInterface
 from src.filters.ball_cover.gonzales_construct import GonzalesConstruct
+from src.filters.ball_cover.merge_construct import MergeConstruct
+from src.filters.ball_cover.kmeans_construct import KMeansConstruct
+from src.filters.ball_cover.minimax_construct import MinimaxConstruct
+from src.filters.ball_cover.split_construct import SplitConstruct
 
 DIM = 8
 
 def get_constructors():
-    """Generates the (sole, live) construct strategy."""
-    return [GonzalesConstruct()]
+    """Every construct strategy; GonzalesConstruct is the live default."""
+    return [GonzalesConstruct(), MergeConstruct(), MergeConstruct(seed_multiplier=4),
+            KMeansConstruct(), MinimaxConstruct(), SplitConstruct()]
 
 
 def run_construct(construct_method: ConstructInterface, budget: int, vecs: np.ndarray):
