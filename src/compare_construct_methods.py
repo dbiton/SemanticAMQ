@@ -63,6 +63,11 @@ K_FRACTIONS = (0.005, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2)
 METHODS = {
     "gonzalez": GonzalesConstruct,
     "merge": MergeConstruct,
+    # seed_multiplier=8: the default that best preserves merge's own quality
+    # (log10_J close to plain merge's, unlike 2x/4x) while still giving a
+    # meaningful construction-time win at scale -- see the profiling note in
+    # merge_construct.py's docstring and this session's report.
+    "merge_seeded": lambda: MergeConstruct(seed_multiplier=8),
     "kmeans": KMeansConstruct,
     "minimax": MinimaxConstruct,
     "split": SplitConstruct,

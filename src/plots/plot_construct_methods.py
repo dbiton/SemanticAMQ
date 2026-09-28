@@ -19,6 +19,16 @@ orange (dE 13.7, floor 15); violet clears every gate against all three
 (worst pair dE 16.3 normal, CVD 9.2). Light surface only: these are paper
 figures and no dark variant is rendered, which is the one gate violet would
 miss (dE 1.9 against the dark blue step).
+
+kmeans is computed and written to the CSVs by compare_construct_methods.py
+like every other method, but is faceted out of METHOD_ORDER here rather
+than added as a fifth categorical hue: a fifth slot has no validated
+all-pairs option left (checked -- every remaining palette slot collides with
+one of blue/orange/aqua/violet or with each other), and kmeans was already
+the weakest method (not competitive with Gonzalez on FPR at several
+(corpus, k) points -- see project memory), so it is the one dropped.
+merge_seeded takes over kmeans's orange slot (re-validated above under its
+new label -- the hex set is unchanged, just relabeled).
 """
 
 from __future__ import annotations
@@ -37,11 +47,12 @@ from plots.plot_common import apply_style, mean_std, save_figure, style_axes
 DPI = 300
 EMIT_PDF = False
 
-METHOD_ORDER = ["gonzalez", "merge", "kmeans", "minimax", "split"]
+METHOD_ORDER = ["gonzalez", "merge", "merge_seeded", "minimax", "split"]
 METHOD_LABELS = {
     "gonzalez": "Gonzalez (default)",
     "merge": "Bottom-up merge",
     "kmeans": "k-means++ + Lloyd",
+    "merge_seeded": "Bottom-up merge (Gonzalez-seeded)",
     "minimax": "Gonzalez + minimax search",
     "split": "Top-down split",
 }
@@ -49,14 +60,16 @@ METHOD_COLORS = {
     "gonzalez": "#52514e",
     "merge": "#2a78d6",
     "kmeans": "#eb6834",
+    "merge_seeded": "#eb6834",
     "minimax": "#1baf7a",
     "split": "#4a3aa7",
 }
 # Shape as well as hue, so identity survives grayscale and CVD, and the
 # low-contrast aqua line still reads.
-METHOD_MARKERS = {"gonzalez": "o", "merge": "s", "kmeans": "^", "minimax": "D", "split": "v"}
-METHOD_LINESTYLES = {"gonzalez": (0, (3, 1.5)), "merge": "-", "kmeans": "-", "minimax": "-",
-                     "split": "-"}
+METHOD_MARKERS = {"gonzalez": "o", "merge": "s", "kmeans": "^", "merge_seeded": "^",
+                  "minimax": "D", "split": "v"}
+METHOD_LINESTYLES = {"gonzalez": (0, (3, 1.5)), "merge": "-", "kmeans": "-", "merge_seeded": "-",
+                     "minimax": "-", "split": "-"}
 
 _XLABEL = r"Ball budget $k$ (% of $|B|$)"
 

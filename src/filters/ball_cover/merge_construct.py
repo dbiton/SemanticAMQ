@@ -41,7 +41,20 @@ class MergeConstruct(ConstructInterface):
     candidate search (IndexFlatL2 over the current ball set) at a working
     set close to n several times before it shrinks geometrically; starting
     from m << n balls skips most of that, at the cost of merging from a
-    coarser, already-committed partition instead of every original point."""
+    coarser, already-committed partition instead of every original point.
+
+    Profiled 2026-09-28 on WikiAnswers at k=1000: seed_multiplier in
+    {2, 4, 8} all cut construction time sharply at n=100K (421s unseeded ->
+    45s / 99s / 161s), but quality (log10_J at tau=0.1) only holds up at the
+    high end -- 2x and 4x land worse than even GonzalesConstruct, while 8x
+    stays close to the unseeded merge (and far better than Gonzalez). At
+    small n/k (n=10K, k=1000, ratio 10) every seeded variant is both slower
+    and lower quality than unseeded merge: GonzalesConstruct's own O(n*m)
+    seed-selection cost isn't amortized when there's little geometric
+    shrinkage left to skip. compare_construct_methods.py's "merge_seeded"
+    entry uses seed_multiplier=8 as the default that best preserves quality;
+    it converges toward unseeded merge automatically as k grows relative to
+    n (m = min(seed_multiplier*k, n) saturates at n)."""
 
     def __init__(self, candidates: int = 16, seed_multiplier: Optional[float] = None) -> None:
         self.candidates = candidates
