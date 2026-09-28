@@ -261,6 +261,81 @@ def compute_static_actual_results(
     return (nn_sq_dist[:, 0] <= distance_threshold ** 2).tolist()
 
 
+def stratified_calibration_split(
+    stream: np.ndarray,
+    actual: List[bool],
+    calibration_fraction: float,
+    seed: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, List[bool], List[bool]]:
+    """Cuts a query stream into a calibration slice and a disjoint measurement
+    slice that carry the SAME duplicate rate, and returns
+    (calibration_vectors, measurement_vectors, calibration_actual,
+    measurement_actual).
+
+    Stratified on `actual`, and shuffled within each stratum, because
+    BlocklistWorkload.query_vectors hands back its three query classes
+    *concatenated in order* -- positives, then hard negatives, then easy
+    negatives. A prefix slice of that is not a sample of it. At the sweep's
+    own settings (BLOCKLIST_QUERY_FRACTION's frac_positive=0.2 and
+    calibration_fraction=0.2) the prefix was exactly the positive block, so:
+
+      - calibration saw a set that was ~91% duplicates on Quora, where F1 is
+        maximised by answering "duplicate" unconditionally -- which is the
+        config _build_calibrated_filter then picked, and the reason filters
+        reported FPR near 1.0 while their FNR was 0.
+      - measurement saw the negatives only: 2 of 16,000 Quora queries were
+        within tau of the construct set, 0 of 16,000 on WikiAnswers and
+        ChatGPTParaphrases. Every reported FNR was therefore either a
+        2-sample estimate or the fn/(fn+tp)==0/0 fallback of 0.0, not a
+        measurement -- IVFFilter's "FNR 1.000" was it missing both of Quora's
+        two positives.
+
+    Stratifying keeps both slices representative of the whole stream, so the
+    dial chosen on one is the dial that should win on the other."""
+    stream = np.asarray(stream)
+    labels = np.asarray(actual, dtype=bool)
+    if len(stream) != len(labels):
+        raise ValueError(
+            f"stratified_calibration_split: {len(stream)} vectors but {len(labels)} labels.")
+
+    rng = np.random.default_rng(seed)
+    calibration_idx, measurement_idx = [], []
+    for value in (True, False):
+        group = np.flatnonzero(labels == value)
+        if len(group) == 0:
+            continue
+        rng.shuffle(group)
+        # round(), not floor, so a small positive stratum still lands in
+        # calibration; len(group)-1 so a stratum is never consumed whole,
+        # leaving the measurement slice without it.
+        n_calibration = 0
+        if len(group) > 1:
+            n_calibration = min(len(group) - 1,
+                                max(1, round(len(group) * calibration_fraction)))
+        calibration_idx.append(group[:n_calibration])
+        measurement_idx.append(group[n_calibration:])
+
+    calibration_idx = rng.permutation(np.concatenate(calibration_idx)) if calibration_idx else np.empty(0, dtype=np.int64)
+    measurement_idx = rng.permutation(np.concatenate(measurement_idx)) if measurement_idx else np.empty(0, dtype=np.int64)
+
+    if labels.any() and not labels[calibration_idx].any():
+        # Nothing downstream can recover from this: F1 is 0 for every config
+        # dial candidate, so _build_calibrated_filter's `f1 > best_f1` picks
+        # whichever candidate it happened to try first.
+        logger.warning(
+            "stratified_calibration_split: calibration slice holds no duplicates, so every "
+            "config dial candidate will score F1=0 and the first one tried wins by default.")
+    if not labels.any():
+        logger.warning(
+            f"stratified_calibration_split: none of the {len(stream)} queries is within tau of "
+            "the construct set, so FNR is undefined (reported as 0.0) for every filter. tau is "
+            "too tight for this corpus's duplicate geometry -- see "
+            "BlocklistWorkload.cluster_membership.")
+
+    return (stream[calibration_idx], stream[measurement_idx],
+            labels[calibration_idx].tolist(), labels[measurement_idx].tolist())
+
+
 def generate_equal_memory(runner: Runner) -> None:
     """Equal-memory (SOTA) comparison across equal_memory_filters. Sweeps
     count_memory_steps budgets from 10% to 100% of raw storage (storing the
@@ -278,8 +353,9 @@ def generate_equal_memory(runner: Runner) -> None:
     and generate_quantization use, so every filter here is compared at the
     same operating point quantization_worker uses. Each fold's query
     stream (see BlocklistWorkload.query_vectors) is split into a calibration
-    slice and a disjoint measurement slice, replacing the old flat
-    percentage_calibration split of one dataset.
+    slice and a disjoint measurement slice -- stratified on the ground truth,
+    NOT a prefix cut, see stratified_calibration_split -- replacing the old
+    flat percentage_calibration split of one dataset.
 
     Runs over every blocklist corpus and fold; plot_equal_memory pools all of
     them into one line per filter at each memory budget, so -- like
@@ -344,12 +420,18 @@ def generate_equal_memory(runner: Runner) -> None:
         for fold, sel in enumerate(workload.selections):
             vectors_construct = workload.rows(sel["reference"])
             stream = workload.query_vectors(sel)
-            n_calibration = max(1, round(len(stream) * calibration_fraction))
-            vectors_calibration = stream[:n_calibration]
-            vectors_query = stream[n_calibration:]
-
-            actual_calibration = compute_static_actual_results(vectors_construct, vectors_calibration, tau)
-            actual_query = compute_static_actual_results(vectors_construct, vectors_query, tau)
+            # Ground truth over the whole stream first, then a STRATIFIED cut
+            # into the two slices -- a prefix cut of query_vectors' ordered
+            # (positive, hard, easy) concatenation put every positive in
+            # calibration and none in measurement. See
+            # stratified_calibration_split for what that did to the numbers.
+            actual_stream = compute_static_actual_results(vectors_construct, stream, tau)
+            vectors_calibration, vectors_query, actual_calibration, actual_query = (
+                stratified_calibration_split(stream, actual_stream, calibration_fraction, seed=fold))
+            logger.info(
+                f"{workload.name} fold {fold}: calibration {len(vectors_calibration)} vectors "
+                f"({sum(actual_calibration)} duplicates), measurement {len(vectors_query)} "
+                f"({sum(actual_query)} duplicates)")
 
             for memory_budget in memory_budgets:
                 logger.info(

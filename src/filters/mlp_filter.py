@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from typing import List, Optional
-from filters.filter import Filter
+from filters.filter import Filter, InsufficientMemoryError
 
 
 class DistanceRegressor(nn.Module):
@@ -63,18 +63,28 @@ class MLPFilter(Filter):
     any distance_threshold at query time, rather than needing to be retrained
     per threshold.
 
-    Two sample families make up the training set, both labelled with the
+    Three sample families make up the training set, all labelled with the
     exact nearest distance to `vectors` (self-distances included, so every
-    construct vector itself is a zero-distance example). Neither assumes
+    construct vector itself is a zero-distance example). None assumes
     unit-normalised input -- every scale below is derived from `vectors`
     itself, so the same code trains correctly whether embeddings sit on the
-    unit sphere or not:
+    unit sphere or not. Together they cover the distance axis continuously
+    from 0 outwards, which is the property that matters: a band with no
+    training samples in it is a band the regressor extrapolates into, and
+    the sign of that extrapolation is not specified by anything in the loss.
       - anchor samples: each construct vector jittered by a random direction
         and a radius drawn uniformly up to ANCHOR_RADIUS_MULTIPLIER times the
         near-field scale (distance_threshold when known, else the data's own
         median nearest-neighbor spacing -- see _near_field_scale). This is
         where resolution matters most, since it straddles the actual
         accept/reject boundary.
+      - mid-field samples: also anchor-centered, radii log-spaced from the
+        anchor family's outer radius (or the set's own median spacing, if
+        that is wider) out to its ambient spread (_ambient_scale), and only
+        when those two edges are far enough apart to be worth sampling
+        (MIDFIELD_MIN_BAND_RATIO). This is the band real queries actually
+        fall in and the one the other two families left empty -- see
+        MIDFIELD_SAMPLES_PER_VECTOR for what that cost.
       - global samples: points scattered around the data's centroid at radii
         log-spaced from the data's own ambient spread (_ambient_scale) out to
         GLOBAL_RADIUS_SPAN times that, so the regressor sees the distance
@@ -106,6 +116,28 @@ class MLPFilter(Filter):
     GLOBAL_RADIUS_SPAN = 100.0
     ANCHOR_SAMPLES_PER_VECTOR = 4
     GLOBAL_SAMPLES_PER_VECTOR = 2
+    # Mid-field samples per construct vector: the band between the anchor
+    # jitter's outer radius (ANCHOR_RADIUS_MULTIPLIER * near_scale) and the
+    # construct set's own ambient spread. This is where real query vectors
+    # actually live, and before this family existed nothing in the training
+    # set did. Measured on the Quora blocklist workload (|B|=20,000,
+    # tau=0.1): 69% of real queries have a nearest-construct distance in
+    # [0.3, 1.0), a band that held 0.00% of the training samples -- 71% sat
+    # below 0.3 and 29% above 1.0. The regressor had to extrapolate every
+    # one of those queries from the near-field side, which is why it called
+    # them duplicates and reported FPR between 0.3 and 0.9 with FNR 0
+    # regardless of how much memory it was given. Sized to match the anchor
+    # family so the gap is covered as densely as the region around tau.
+    MIDFIELD_SAMPLES_PER_VECTOR = 4
+    # The mid-field family exists to bridge a GAP between the near field and
+    # the ambient scale, so it only fires when there is one: the band must
+    # span at least this ratio. On a sparse construct set the two edges nearly
+    # touch (30 gaussian points in 32-d: band [6.35, 7.14], ratio 1.12) and
+    # sampling it just piles mass at one radius, right where the far field
+    # already starts -- which measurably cost both self-recall and
+    # neighbor-recall there. The blocklist reference sets span 3.6x
+    # ([0.3, 1.07]), comfortably clear of this.
+    MIDFIELD_MIN_BAND_RATIO = 1.5
     # Down-weights the far-field samples' contribution to the loss: without
     # this, SmoothL1 spends its gradient budget fitting the (less important)
     # far field as accurately as the near field, which measurably starved the
@@ -152,7 +184,17 @@ class MLPFilter(Filter):
         hidden_dim = min(hidden_dim, self.MAX_HIDDEN_DIM)
 
         if hidden_dim < 1:
-            raise ValueError(f"max_memory={self.max_memory} is too small for an MLP with dim={self.dim}")
+            # InsufficientMemoryError, not ValueError: this is the shared
+            # "budget too tight to build at all" signal that
+            # runner.equal_memory_worker turns into an explicit infeasible
+            # row. As a ValueError it escaped that handler and took the whole
+            # per-budget sweep job down -- the same failure mode DSHFilter's
+            # bare IndexError had.
+            raise InsufficientMemoryError(
+                f"max_memory={self.max_memory} bytes is too small for an MLPFilter with "
+                f"dim={self.dim}: the smallest two-hidden-layer network (hidden_dim=1) needs "
+                f"{(1 + (self.dim + 3) + 1) * 4} bytes of float32 parameters."
+            )
 
         return hidden_dim
 
@@ -178,18 +220,18 @@ class MLPFilter(Filter):
         return nearest_distances
 
 
-    def _near_field_scale(self, vectors: np.ndarray) -> float:
-        """The radius that matters most for the real accept/reject decision:
-        distance_threshold when the caller gave one (every real caller does),
-        else a data-driven fallback -- the median nearest-neighbor distance
-        within `vectors` itself, from a bounded subsample so this stays cheap
-        even for a large construct set."""
-        if self.distance_threshold is not None:
-            return max(float(self.distance_threshold), 1e-6)
+    def _median_nn_spacing(self, vectors: np.ndarray) -> float:
+        """How far apart `vectors` typically sit: the median
+        nearest-*other*-neighbor distance within the set, from a bounded
+        subsample so this stays cheap even for a large construct set.
 
+        This is the construct set's own resolution. Two callers need it:
+        _near_field_scale, as its fallback when no threshold was given, and
+        _generate_training_data, to keep the mid-field family from sampling
+        inside it (see MIDFIELD_SAMPLES_PER_VECTOR)."""
         n = len(vectors)
         if n < 2:
-            return 1.0
+            return 0.0
         sample_size = min(256, n)
         idx = self.rng.choice(n, size=sample_size, replace=False)
         sample = vectors[idx]
@@ -197,8 +239,17 @@ class MLPFilter(Filter):
               - 2.0 * (sample @ vectors.T))
         d2 = np.maximum(d2, 0.0)
         d2[np.arange(sample_size), idx] = np.inf  # exclude self-match
-        nn_dist = np.sqrt(d2.min(axis=1))
-        return max(float(np.median(nn_dist)), 1e-6)
+        return float(np.median(np.sqrt(d2.min(axis=1))))
+
+    def _near_field_scale(self, vectors: np.ndarray) -> float:
+        """The radius that matters most for the real accept/reject decision:
+        distance_threshold when the caller gave one (every real caller does),
+        else the construct set's own median nearest-neighbor spacing."""
+        if self.distance_threshold is not None:
+            return max(float(self.distance_threshold), 1e-6)
+        if len(vectors) < 2:
+            return 1.0
+        return max(self._median_nn_spacing(vectors), 1e-6)
 
 
     def _ambient_scale(self, vectors: np.ndarray, centroid: np.ndarray) -> float:
@@ -226,18 +277,46 @@ class MLPFilter(Filter):
         directions = self._sample_unit_directions(num_anchor_samples)
         anchor_samples = base_vectors + directions * radii
 
+        far_scale = self._ambient_scale(vectors, centroid)
+
+        # Mid-field: anchor-centered, radii log-spaced across the band between
+        # the anchor family's outer radius and the construct set's own ambient
+        # spread -- the band real queries occupy (see
+        # MIDFIELD_SAMPLES_PER_VECTOR). Anchor-centered rather than
+        # centroid-centered so the samples land on the data's own shell, where
+        # queries come from, instead of on a sphere around the centroid.
+        # Never inside the construct set's own typical spacing: within that
+        # radius the near-field family already owns the resolution, and the
+        # regressor's job there is the sharp dip to 0 at each anchor. Putting
+        # mid-field mass inside it competes with that dip instead of adding
+        # information, which measurably cost self-recall on a sparse construct
+        # set (30 gaussian points in 32-d, median spacing 6.3, tau 0.3: 0.97
+        # -> 0.77). On the blocklist reference sets the two regimes are far
+        # apart -- they are built from duplicate clusters, so their median
+        # spacing is 0.0 and the band still starts at 3*tau as intended.
+        near_outer = max(self.ANCHOR_RADIUS_MULTIPLIER * near_scale,
+                         self._median_nn_spacing(vectors))
+        midfield_samples = np.empty((0, self.dim), dtype=np.float32)
+        if far_scale >= near_outer * self.MIDFIELD_MIN_BAND_RATIO:
+            num_midfield_samples = num_anchors * self.MIDFIELD_SAMPLES_PER_VECTOR
+            midfield_base = np.repeat(vectors, self.MIDFIELD_SAMPLES_PER_VECTOR, axis=0)
+            midfield_log = self.rng.uniform(
+                np.log10(near_outer), np.log10(far_scale), size=num_midfield_samples)
+            midfield_radii = (10.0 ** midfield_log).astype(np.float32).reshape(-1, 1)
+            midfield_directions = self._sample_unit_directions(num_midfield_samples)
+            midfield_samples = midfield_base + midfield_directions * midfield_radii
+
         # Far-field: log-spaced radii from the data's own ambient scale out to
         # GLOBAL_RADIUS_SPAN times that, centered on the data's centroid --
         # this is what teaches the regressor that distance keeps growing well
         # past the construct set, instead of leaving that region undefined.
-        far_scale = self._ambient_scale(vectors, centroid)
         num_global_samples = num_anchors * self.GLOBAL_SAMPLES_PER_VECTOR
         log_span = self.rng.uniform(0.0, np.log10(self.GLOBAL_RADIUS_SPAN), size=num_global_samples)
         global_radii = (far_scale * (10.0 ** log_span)).astype(np.float32).reshape(-1, 1)
         global_directions = self._sample_unit_directions(num_global_samples)
         global_samples = centroid[None, :] + global_directions * global_radii
 
-        X = np.vstack([vectors, anchor_samples, global_samples]).astype(np.float32)
+        X = np.vstack([vectors, anchor_samples, midfield_samples, global_samples]).astype(np.float32)
         # Self-distances included: every anchor's nearest neighbor in
         # `vectors` (which contains it) is itself, at distance 0 -- exactly
         # the label a duplicate-of-itself example should carry.
@@ -253,13 +332,14 @@ class MLPFilter(Filter):
         # log-space (see query()) is equivalent to thresholding raw distance.
         y = np.log1p(distances).astype(np.float32)
 
-        # Near samples (real anchors + anchor jitter) get full weight; far
-        # samples are down-weighted (see FAR_FIELD_LOSS_WEIGHT) so they still
-        # teach "distance keeps growing out here" without competing for
-        # gradient budget against the near-threshold precision that actually
-        # drives the accept/reject decision.
+        # Near and mid-field samples get full weight -- between them they
+        # cover every distance a real query is at, so both sides of the
+        # accept/reject decision are theirs. Only the far field is
+        # down-weighted (see FAR_FIELD_LOSS_WEIGHT): it still teaches
+        # "distance keeps growing out here" without competing for gradient
+        # budget against the region the decision is actually made in.
         weights = np.full(len(X), self.FAR_FIELD_LOSS_WEIGHT, dtype=np.float32)
-        weights[:num_anchors + num_anchor_samples] = 1.0
+        weights[:num_anchors + num_anchor_samples + len(midfield_samples)] = 1.0
 
         return X, y, weights
 

@@ -167,24 +167,54 @@ def _f1_score(predicted: np.ndarray, actual: np.ndarray) -> float:
 
 _IVF_NPROBE_CANDIDATES = (1, 2, 4, 8, 16, 32, 64)
 _HNSW_EF_SEARCH_CANDIDATES = (16, 32, 64, 128, 256, 512)
+# HNSW graph degree. Unlike ef_search this is not free: the level-0 neighbour
+# table alone is n * 2M * 4 bytes, which at M=32, n=80,000 is 20.5MB -- more
+# than the whole top budget of the equal-memory sweep, and nothing
+# quantization does to the vector codes can shrink it. Left fixed at 32, HNSW
+# therefore reported infeasible at every budget in that sweep while IVF's
+# structural overhead (nlist centroids) was being sized to the budget for it.
+# Descending so the finest graph that fits is tried first, matching
+# HNSWFilter._choose_quantize's finest-first order on the other axis.
+_HNSW_M_CANDIDATES = (32, 16, 8, 4)
 
 
-# Filters with a cheap post-construction query-time dial: score every candidate on one built instance.
-# Every dial here must reach the underlying index, not just set a Python
-# attribute -- see IVFFilter.nprobe / HNSWFilter.ef_search, both properties
-# for exactly that reason.
+# Filters with a cheap post-construction query-time dial: score every candidate
+# on one built instance. Each entry maps the class name to a callable taking the
+# built instance and returning a list of SETTINGS DICTS -- each dict a complete
+# assignment of that filter's query-time dials, applied together.
+#
+# Dicts rather than (attr, value) pairs because a pair list cannot express a
+# filter with two dials: swept as a flat list, the instance accumulates state
+# from earlier candidates and only one attribute gets restored at the end,
+# leaving the other wherever the last candidate tried left it.
+#
+# Every dial here must take effect on an already-built instance, not just set
+# an inert Python attribute -- see IVFFilter.nprobe / HNSWFilter.ef_search,
+# both properties for exactly that reason (accept_radius_scale needs no
+# property: query() reads it on every call).
 _POST_CONSTRUCTION_CONFIG_DIALS = {
-    "DSBFFilter": lambda f: [("vote_threshold", t) for t in range(1, f.num_tables + 1)],
+    "DSBFFilter": lambda f: [{"vote_threshold": t} for t in range(1, f.num_tables + 1)],
     # Swept on a log-ish grid up to nlist, not exhaustively (nlist can be in the hundreds).
     "IVFFilter": lambda f: [
-        ("nprobe", p) for p in sorted({c for c in _IVF_NPROBE_CANDIDATES if c <= f.nlist} | {f.nlist})
+        {"nprobe": p} for p in sorted({c for c in _IVF_NPROBE_CANDIDATES if c <= f.nlist} | {f.nlist})
     ],
     # efSearch is HNSW's accuracy/speed dial and costs no memory, exactly
     # like IVF's nprobe. Without it HNSW competed at a fixed efSearch=64
     # against an IVF whose nprobe was tuned per budget -- not an equal
     # comparison of the two baselines.
-    "HNSWFilter": lambda f: [("ef_search", e) for e in _HNSW_EF_SEARCH_CANDIDATES],
+    "HNSWFilter": lambda f: [{"ef_search": e} for e in _HNSW_EF_SEARCH_CANDIDATES],
 }
+
+# Accept-radius multipliers on tau, swept for any filter exposing
+# query_squared_nn_distance() (IVFFilter, HNSWFilter). Those two threshold an
+# approximate index's ESTIMATE of the nearest-neighbor distance, and the lossy
+# codes bias that estimate upward by more than tau itself at these budgets --
+# testing it against the exact tau made both answer "not a duplicate" to
+# nearly every true duplicate. See IVFFilter's module docstring for the
+# measurement. Sweeping the radius costs no extra searches: the radius is a
+# comparison against distances one search pass already returned, so
+# _tune_post_construction scores the whole grid off each pass.
+_ACCEPT_RADIUS_SCALES = (1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0)
 
 # Filters whose configuration changes memory layout at construction time: one build per candidate.
 # A value may be a static list of kwargs (LSBFFilter) or a callable
@@ -192,6 +222,16 @@ _POST_CONSTRUCTION_CONFIG_DIALS = {
 # depend on the sweep's own parameters (DSHFilter's z grid).
 _CONSTRUCTION_TIME_CONFIG_DIALS = {
     "LSBFFilter": [{"verify": True}, {"verify": False}],
+    # M sizes the graph, which is allocated at construction time, so unlike
+    # ef_search it cannot be tuned on a built instance -- see
+    # _HNSW_M_CANDIDATES for why leaving it fixed made HNSW infeasible
+    # everywhere. HNSWFilter is in BOTH dial registries: each M here is built
+    # once and then scored at its own best ef_search (see
+    # _tune_post_construction), so M is not chosen by an artifact of one
+    # arbitrary ef_search. Candidates whose graph does not fit the budget
+    # raise InsufficientMemoryError from construct()'s pre-build floor check,
+    # before any graph is actually built, so the infeasible ones are cheap.
+    "HNSWFilter": lambda dim, distance_threshold: [{"M": m} for m in _HNSW_M_CANDIDATES],
     # DSHFilter bakes z into every inserted point's hash codes, so unlike
     # IVFFilter.nprobe/HNSWFilter.ef_search it cannot be tuned post-hoc on a
     # single built instance -- it needs one build per candidate, exactly
@@ -222,6 +262,61 @@ _CONSTRUCTION_TIME_CONFIG_DIALS = {
         for z in DSHFilter.z_grid(distance_threshold)
     ],
 }
+
+
+def _tune_post_construction(
+    filter_instance: Any,
+    name: str,
+    calib_arr: np.ndarray,
+    calib_actual: np.ndarray,
+) -> float:
+    """Sets filter_instance's query-time dials to whichever combination scores
+    best (F1) on the calibration set, and returns that F1 -- or the instance's
+    as-built F1 when it has no tunable dial.
+
+    Two dial sources, both free of memory cost:
+      - the registered search-shaping dial (_POST_CONSTRUCTION_CONFIG_DIALS),
+        one query pass per candidate settings dict;
+      - the accept radius (_ACCEPT_RADIUS_SCALES), for any filter exposing
+        query_squared_nn_distance(). The radius only reinterprets distances a
+        search already returned, so the whole grid is scored off each search
+        pass rather than costing a pass of its own.
+
+    Split out of _build_calibrated_filter so the construction-time dial loop
+    can use it too. It could not before: that loop `return`ed as soon as it
+    picked a build, so a filter registered in BOTH dial tables (HNSWFilter now
+    is) silently never got its query-time dial tuned at all."""
+    if len(calib_arr) == 0:
+        return 0.0
+
+    dial = _POST_CONSTRUCTION_CONFIG_DIALS.get(name)
+    settings_grid = dial(filter_instance) if dial is not None else [{}]
+    tunes_radius = hasattr(filter_instance, "query_squared_nn_distance")
+
+    def apply(settings: Dict[str, Any]) -> None:
+        for attr, value in settings.items():
+            setattr(filter_instance, attr, value)
+
+    best_settings, best_f1 = None, -1.0
+    for settings in settings_grid:
+        apply(settings)
+        if tunes_radius:
+            sq_dist = np.asarray(filter_instance.query_squared_nn_distance(calib_arr), dtype=np.float64)
+            for scale in _ACCEPT_RADIUS_SCALES:
+                radius = filter_instance.distance_threshold * scale
+                f1 = _f1_score(sq_dist <= radius * radius, calib_actual)
+                if f1 > best_f1:
+                    best_settings = {**settings, "accept_radius_scale": scale}
+                    best_f1 = f1
+        else:
+            f1 = _f1_score(np.asarray(filter_instance.query(calib_arr), dtype=bool), calib_actual)
+            if f1 > best_f1:
+                best_settings, best_f1 = settings, f1
+
+    if best_settings is not None:
+        apply(best_settings)
+        logger.debug(f"{name}: calibrated {best_settings} at F1={best_f1:.4f}")
+    return best_f1
 
 
 def _build_calibrated_filter(
@@ -268,10 +363,13 @@ def _build_calibrated_filter(
                 # whole sweep row as long as some other candidate works.
                 last_error = e
                 continue
-            f1 = (
-                _f1_score(np.asarray(candidate.query(calib_arr), dtype=bool), calib_actual)
-                if len(calib_arr) > 0 else 0.0
-            )
+            # Each construction candidate gets its own query-time dial tuned
+            # before being scored, so the comparison between them is between
+            # their BEST achievable operating points -- HNSWFilter is in both
+            # registries (M at construction, ef_search after it), and scoring
+            # every M at one arbitrary ef_search would pick M by an artifact
+            # of that choice.
+            f1 = _tune_post_construction(candidate, name, calib_arr, calib_actual)
             if f1 > best_f1:
                 best_f1, best_instance = f1, candidate
         if best_instance is None:
@@ -280,6 +378,10 @@ def _build_calibrated_filter(
                 f"max_memory={memory_budget} bytes / passed its calibration guard "
                 f"(last error: {last_error})."
             )
+        # No re-tune needed: _tune_post_construction leaves each candidate
+        # set to its own best dial value before returning, and the later
+        # candidates it ran on are separate instances, so best_instance is
+        # already at the operating point its winning F1 was measured at.
         return best_instance, construction_time
 
     filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold, extra_kwargs=extra_kwargs)
@@ -287,15 +389,7 @@ def _build_calibrated_filter(
     filter_instance.construct(construct_arr)
     construction_time = time.perf_counter() - t0
 
-    if name in _POST_CONSTRUCTION_CONFIG_DIALS and len(calib_arr) > 0:
-        best_attr, best_value, best_f1 = None, None, -1.0
-        for attr, value in _POST_CONSTRUCTION_CONFIG_DIALS[name](filter_instance):
-            setattr(filter_instance, attr, value)
-            f1 = _f1_score(np.asarray(filter_instance.query(calib_arr), dtype=bool), calib_actual)
-            if f1 > best_f1:
-                best_attr, best_value, best_f1 = attr, value, f1
-        if best_attr is not None:
-            setattr(filter_instance, best_attr, best_value)
+    _tune_post_construction(filter_instance, name, calib_arr, calib_actual)
 
     return filter_instance, construction_time
 
