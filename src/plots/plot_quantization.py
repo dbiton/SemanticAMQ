@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 
 from filters.ball_cover.ball_cover_filter import Quantize
-from plots.plot_common import apply_style as _apply_style, save_figure
+from plots.plot_common import apply_style as _apply_style, collapse_duplicate_x, save_figure
 
 # CONFIG
 
@@ -39,13 +39,25 @@ EMIT_PDF = False
 # runner.py's multiprocessing machinery). NONE is the raw/unquantized cover
 # (stage="ball"); every other entry shares that cover's memory budget
 # (stage="quantizing"), so a more compact code packs more balls into it.
+#
+# Every rung runner.QUANTIZATION_SWEEP sweeps, ordered by rate (bits/dim) so
+# the ladder reads in that order on an axis -- see the Quantize docstring's
+# table. Quantize.RABITQ is the one rung deliberately excluded from both: its
+# zero-false-negative property is an empirical bound, not a proof, unlike
+# every other rung, and runner.py doesn't sweep it either, so there is no
+# data for it to plot. A results file predating one of these rungs simply
+# has no rows for it; every panel already tolerates an absent stage by not
+# drawing/counting it.
 QUANTIZE_SWEEP = (
-    Quantize.FP32, Quantize.FP16, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
-    Quantize.TQ3, Quantize.PQ4_R2, Quantize.PQ8_R2,
-    # The ladder stops at 2 b/dim: both 1 b/dim rungs (Quantize.PQ4_R1 and
-    # Quantize.RABITQ) are left out -- see runner.QUANTIZATION_SWEEP for why.
-    # Rows for either are dropped by aggregate()'s `stages` filter, so older
-    # results files that still carry them plot without complaint.
+    Quantize.FP32, Quantize.FP16,
+    Quantize.SQ8, Quantize.TQ8,
+    Quantize.SQ6, Quantize.TQ5,
+    Quantize.SQ4, Quantize.TQ4,
+    Quantize.TQ3,
+    Quantize.TQ2, Quantize.PQ4_R2, Quantize.PQ8_R2,
+    # Down to 1 b/dim via the same two-subquantizer-width pairing the 2 b/dim
+    # rung already has -- see runner.QUANTIZATION_SWEEP.
+    Quantize.TQ1, Quantize.PQ4_R1, Quantize.PQ8_R1,
 )
 STAGES = [q.value for q in QUANTIZE_SWEEP]
 STAGE_LABELS = {
@@ -53,12 +65,18 @@ STAGE_LABELS = {
     Quantize.FP32.value: "FP32 (32b)",
     Quantize.FP16.value: "FP16 (16b)",
     Quantize.SQ8.value: "SQ8 (8b)",
+    Quantize.TQ8.value: "TQ8 (8b)",
     Quantize.SQ6.value: "SQ6 (6b)",
+    Quantize.TQ5.value: "TQ5 (5b)",
     Quantize.SQ4.value: "SQ4 (4b)",
+    Quantize.TQ4.value: "TQ4 (4b)",
     Quantize.TQ3.value: "TQ3 (3b)",
+    Quantize.TQ2.value: "TQ2 (2b)",
     Quantize.PQ4_R2.value: "PQ4 (2b)",
     Quantize.PQ8_R2.value: "PQ8 (2b)",
+    Quantize.TQ1.value: "TQ1 (1b)",
     Quantize.PQ4_R1.value: "PQ4 (1b)",
+    Quantize.PQ8_R1.value: "PQ8 (1b)",
     Quantize.RABITQ.value: "RaBitQ (1b)",
 }
 # Reference stage for the two relative-objective panels: the raw/unquantized
@@ -66,11 +84,14 @@ STAGE_LABELS = {
 # panels had before per-quantize breakdown existed.
 BASELINE_STAGE = Quantize.FP32.value
 
-# tab10 has 10 qualitative colors, enough for the swept variants with room to
-# spare; zip() stops at the shorter of the two, so re-adding a rung is safe.
-_STAGE_PALETTE = plt.get_cmap("tab10").colors
+# tab20 has 20 qualitative colors, enough for the 15 swept variants with room
+# to spare; zip() stops at the shorter of the two, so re-adding a rung is
+# safe as long as it stays under 20. (tab10 was enough before TQ1/TQ2/TQ4/
+# TQ5/TQ8 joined the sweep -- at 15 stages it silently left the last 5
+# without a color, which is a KeyError waiting at STAGE_COLORS[stage].)
+_STAGE_PALETTE = plt.get_cmap("tab20").colors
 STAGE_COLORS = dict(zip(STAGES, _STAGE_PALETTE))
-_STAGE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "p"]
+_STAGE_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "p", "<", ">", "8", "H", "d"]
 STAGE_MARKERS = dict(zip(STAGES, _STAGE_MARKERS))
 
 D_DIM = 384  # embedding dimensionality; objectives are stored pre-logged
@@ -108,6 +129,8 @@ _REQUIRED_COLUMNS = [
     "log10_J",
     "log10_J_tau",
     "fpr",
+    "fpr_hard",
+    "fpr_easy",
     "fnr",
     "stage_time_s",
     "cum_time_s",
@@ -224,6 +247,14 @@ def aggregate(df: pd.DataFrame, value_col: str, cfg: Config, use_tau: bool = Fal
     mem = grouped["memory_bytes"].mean().reset_index(name="memory_bytes")
     agg = agg.merge(mem, on=["quantize", "k"])
     agg["Memory (MB)"] = agg["memory_bytes"] / (1024 * 1024)
+
+    # n_construct predates some existing results files (see HAS_RAW_STORAGE):
+    # only add the raw-storage-percentage column when it's actually there, so
+    # aggregate() keeps working against older data for every other column.
+    if "n_construct" in sel.columns:
+        n_construct = grouped["n_construct"].mean().reset_index(name="n_construct")
+        agg = agg.merge(n_construct, on=["quantize", "k"])
+        agg["Memory (% of Raw)"] = 100.0 * agg["memory_bytes"] / (agg["n_construct"] * D_DIM * 4)
     return agg
 
 
@@ -250,6 +281,8 @@ def _line_panel(
     y_bounds: Optional[tuple] = None,
     relative_to_baseline: bool = False,
     extra=None,
+    x_col: str = "Memory (MB)",
+    xlabel: str = "Memory Usage (MB)",
 ) -> pd.DataFrame:
     agg = aggregate(df, value_col, cfg, use_tau=use_tau)
     if relative_to_baseline:
@@ -259,17 +292,18 @@ def _line_panel(
     fig, ax = plt.subplots()
 
     for stage in STAGES:
-        sub = agg[agg["quantize"] == stage].sort_values("Memory (MB)")
+        sub = agg[agg["quantize"] == stage].sort_values(x_col)
+        sub = collapse_duplicate_x(sub, x_col)
         if sub.empty:
             continue
         ax.plot(
-            sub["Memory (MB)"], sub["mean"],
+            sub[x_col], sub["mean"],
             color=STAGE_COLORS[stage], marker=STAGE_MARKERS[stage], markersize=2.5,
             linewidth=0.8, zorder=2,
         )
         if (sub["ci95"] > 0).any():
             ax.errorbar(
-                sub["Memory (MB)"], sub["mean"], yerr=sub["ci95"],
+                sub[x_col], sub["mean"], yerr=sub["ci95"],
                 fmt="none", ecolor=STAGE_COLORS[stage],
                 elinewidth=0.5, capsize=1.5, capthick=0.5, zorder=3,
             )
@@ -290,7 +324,7 @@ def _line_panel(
     elif y_bounds is not None:
         ax.set_ylim(*y_bounds)
 
-    ax.set_xlabel("Memory Usage (MB)")
+    ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     _style_axes(ax)
     if extra is not None:
@@ -301,70 +335,113 @@ def _line_panel(
     return agg
 
 
+# quantization.csv predates the n_construct column (see quantization_worker);
+# a file without it can still render every other panel, just not the
+# raw-storage-percentage variants -- checked once per figure-generation run
+# rather than once per panel.
+_RAW_PCT_X = dict(x_col="Memory (% of Raw)", xlabel="Memory (% of Raw)")
+
+
+def _raw_pct_filename(filename: str) -> str:
+    root, ext = os.path.splitext(filename)
+    return f"{root}-raw-pct{ext}"
+
+
 # Panel (a): geometric objective reduction
 
-def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+def panel_geometric_objective(df: pd.DataFrame, cfg: Config, raw_pct: bool = False) -> pd.DataFrame:
+    filename = "quantization-geometric-objective.png"
     return _line_panel(
         df, "log10_J", r"$\log_{10} J(\mathcal{C})/J_{\mathrm{ball}}$",
-        "quantization-geometric-objective.png", cfg, use_tau=False, relative_to_baseline=True,
+        _raw_pct_filename(filename) if raw_pct else filename, cfg, use_tau=False,
+        relative_to_baseline=True, **(_RAW_PCT_X if raw_pct else {}),
     )
 
 
 # Panel (b): tau-expanded objective reduction
 
-def panel_threshold_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+def panel_threshold_objective(df: pd.DataFrame, cfg: Config, raw_pct: bool = False) -> pd.DataFrame:
     def annotate(ax: plt.Axes) -> None:
         ax.text(
             0.97, 0.95, rf"$\tau = {cfg.tau:g}$",
-            transform=ax.transAxes, ha="right", va="top", fontsize=5.5,
+            transform=ax.transAxes, ha="right", va="top", fontsize=6.6,
         )
 
+    filename = "quantization-threshold-expanded-objective.png"
     return _line_panel(
         df, "log10_J_tau", r"$\log_{10} J_\tau(\mathcal{C})/J_{\tau,\mathrm{ball}}$",
-        "quantization-threshold-expanded-objective.png", cfg, use_tau=True,
-        relative_to_baseline=True, extra=annotate,
+        _raw_pct_filename(filename) if raw_pct else filename, cfg, use_tau=True,
+        relative_to_baseline=True, extra=annotate, **(_RAW_PCT_X if raw_pct else {}),
     )
 
 
 # Panel (c): false positive rate
 
-def panel_fpr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+def panel_fpr(df: pd.DataFrame, cfg: Config, raw_pct: bool = False) -> pd.DataFrame:
     # Linear, not log: FPR is legitimately 0 for many points (a log axis
     # can't represent 0). y-min pinned to 0, top auto-scales.
+    filename = "quantization-false-positive-rate.png"
     return _line_panel(
-        df, "fpr", "FPR", "quantization-false-positive-rate.png", cfg,
-        use_tau=True, y_bounds=(0, None),
+        df, "fpr", "FPR", _raw_pct_filename(filename) if raw_pct else filename, cfg,
+        use_tau=True, y_bounds=(0, None), **(_RAW_PCT_X if raw_pct else {}),
+    )
+
+
+# Panel (c-hard)/(c-easy): the same pooled FPR split by query class, the same
+# distinction plot_blocklist reports separately for the reason its own
+# comment gives -- a pooled rate is dominated by whichever class the corpus
+# happens to have more of. fpr_hard is held-out members of duplicate clusters
+# NOT in the reference set (same tight local geometry as B, so this is what
+# actually tests whether the cover localises B rather than just density);
+# fpr_easy is singletons, i.e. undiscriminating background traffic.
+
+def panel_fpr_hard(df: pd.DataFrame, cfg: Config, raw_pct: bool = False) -> pd.DataFrame:
+    filename = "quantization-false-positive-rate-hard.png"
+    return _line_panel(
+        df, "fpr_hard", "FPR (hard negatives)", _raw_pct_filename(filename) if raw_pct else filename,
+        cfg, use_tau=True, y_bounds=(0, None), **(_RAW_PCT_X if raw_pct else {}),
+    )
+
+
+def panel_fpr_easy(df: pd.DataFrame, cfg: Config, raw_pct: bool = False) -> pd.DataFrame:
+    filename = "quantization-false-positive-rate-easy.png"
+    return _line_panel(
+        df, "fpr_easy", "FPR (easy negatives)", _raw_pct_filename(filename) if raw_pct else filename,
+        cfg, use_tau=True, y_bounds=(0, None), **(_RAW_PCT_X if raw_pct else {}),
     )
 
 
 # Panel (d): construction time
 
-def panel_construction_time(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+def panel_construction_time(df: pd.DataFrame, cfg: Config, raw_pct: bool = False) -> pd.DataFrame:
     # stage_time_s == cum_time_s in quantization_worker (single from-scratch
     # construction per row), so one line per quantize method is the whole picture.
+    filename = "quantization-construction-time.png"
     return _line_panel(
-        df, "cum_time_s", "Time (s)", "quantization-construction-time.png", cfg,
-        use_tau=False, log_y=True,
+        df, "cum_time_s", "Time (s)", _raw_pct_filename(filename) if raw_pct else filename, cfg,
+        use_tau=False, log_y=True, **(_RAW_PCT_X if raw_pct else {}),
     )
 
 
 # Panel (e): query throughput
 
-def panel_query_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+def panel_query_throughput(df: pd.DataFrame, cfg: Config, raw_pct: bool = False) -> pd.DataFrame:
     """Batched-query throughput of filt.query(), per quantize variant.
     Measured at the sweep's single tau, which costs no generality: query cost
     doesn't depend on the threshold (every ball is checked regardless).
     Log-scaled since a quantizer's decode overhead (e.g. PQ) can separate
     lines by an order of magnitude from the raw/NONE cover."""
+    filename = "quantization-query-throughput.png"
     return _line_panel(
         df, "query_throughput_qps", "Throughput (q/s)",
-        "quantization-query-throughput.png", cfg, use_tau=False, log_y=True,
+        _raw_pct_filename(filename) if raw_pct else filename, cfg, use_tau=False, log_y=True,
+        **(_RAW_PCT_X if raw_pct else {}),
     )
 
 
 # Panel (f): main-index accesses saved
 
-def panel_index_accesses_saved(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+def panel_index_accesses_saved(df: pd.DataFrame, cfg: Config, raw_pct: bool = False) -> pd.DataFrame:
     """Share of queries the filter answers on its own, so they never reach
     the main index. A rejected query is a saved access; a positive (true or
     false) falls through, so saved% == 100 - positive rate. This is the
@@ -382,31 +459,34 @@ def panel_index_accesses_saved(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             # Top-left, not top-right like panel (b): this curve rises with
             # memory, so the right half is where the lines are.
             0.03, 0.95, rf"$\tau = {cfg.tau:g}$",
-            transform=ax.transAxes, ha="left", va="top", fontsize=5.5,
+            transform=ax.transAxes, ha="left", va="top", fontsize=6.6,
         )
 
+    filename = "quantization-index-accesses-saved.png"
     return _line_panel(
         df, "index_accesses_saved_pct", "Index Accesses Saved (%)",
-        "quantization-index-accesses-saved.png", cfg, use_tau=True,
-        y_bounds=(0, 100), extra=annotate,
+        _raw_pct_filename(filename) if raw_pct else filename, cfg, use_tau=True,
+        y_bounds=(0, 100), extra=annotate, **(_RAW_PCT_X if raw_pct else {}),
     )
 
 
 # Panel (g): ball count per quantize variant
 
-def panel_n_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+def panel_n_balls(df: pd.DataFrame, cfg: Config, raw_pct: bool = False) -> pd.DataFrame:
     """Realized ball count per quantize variant across the memory-usage
     sweep: a quantizer with a smaller per-center code packs more balls into
     the same budget, so at a given x the lines are expected to separate,
     with PQ/SQ4 highest and None/FP16/BF16 lowest."""
+    filename = "quantization-n-balls.png"
     return _line_panel(
-        df, "n_balls", "Number of Balls", "quantization-n-balls.png", cfg, use_tau=False,
+        df, "n_balls", "Number of Balls", _raw_pct_filename(filename) if raw_pct else filename,
+        cfg, use_tau=False, **(_RAW_PCT_X if raw_pct else {}),
     )
 
 
 # Panel (h): radius inflation due to quantization
 
-def panel_radius_inflation(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+def panel_radius_inflation(df: pd.DataFrame, cfg: Config, raw_pct: bool = False) -> pd.DataFrame:
     """Mean +/- stddev of what encoding cost each ball's radius: the stored
     radius minus the one the unquantized cover measured, after
     BallCoverFilter._tight_radii re-measures against the decoded centers
@@ -421,6 +501,7 @@ def panel_radius_inflation(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     reconstruction error to spend those savings on. A rung sitting below
     zero is covering the same points in less volume than the raw cover, so
     read this as encoding cost net of that saving, not as error alone."""
+    x_col, xlabel = (_RAW_PCT_X["x_col"], _RAW_PCT_X["xlabel"]) if raw_pct else ("Memory (MB)", "Memory Usage (MB)")
     mean_agg = aggregate(df, "radius_inflation_mean", cfg, use_tau=False)
     std_agg = aggregate(df, "radius_inflation_std", cfg, use_tau=False)
     std_agg = std_agg[["quantize", "k", "mean"]].rename(columns={"mean": "std"})
@@ -430,16 +511,17 @@ def panel_radius_inflation(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     fig, ax = plt.subplots()
 
     for stage in STAGES:
-        sub = agg[agg["quantize"] == stage].sort_values("Memory (MB)")
+        sub = agg[agg["quantize"] == stage].sort_values(x_col)
+        sub = collapse_duplicate_x(sub, x_col, ci_col="std")
         if sub.empty:
             continue
         ax.plot(
-            sub["Memory (MB)"], sub["mean"],
+            sub[x_col], sub["mean"],
             color=STAGE_COLORS[stage], marker=STAGE_MARKERS[stage], markersize=2.5,
             linewidth=0.8, zorder=2,
         )
         ax.errorbar(
-            sub["Memory (MB)"], sub["mean"], yerr=sub["std"],
+            sub[x_col], sub["mean"], yerr=sub["std"],
             fmt="none", ecolor=STAGE_COLORS[stage],
             elinewidth=0.5, capsize=1.5, capthick=0.5, zorder=3,
         )
@@ -455,26 +537,28 @@ def panel_radius_inflation(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     # worst-case bound, so log buys nothing to offset that.
     ax.axhline(0.0, color="black", linewidth=0.5, zorder=1)
 
-    ax.set_xlabel("Memory Usage (MB)")
+    ax.set_xlabel(xlabel)
     ax.set_ylabel("Radius Inflation")
     _style_axes(ax)
 
     _fix_margins(fig)
-    _save(fig, "quantization-radius-inflation.png", cfg)
+    filename = "quantization-radius-inflation.png"
+    _save(fig, _raw_pct_filename(filename) if raw_pct else filename, cfg)
     return agg
 
 
 # Diagnostic panel (not part of the paper figure set): false negative rate
 
-def panel_fnr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+def panel_fnr(df: pd.DataFrame, cfg: Config, raw_pct: bool = False) -> pd.DataFrame:
     """Sanity-check panel, not for the paper: FNR should be exactly 0 for
     every row (already hard-asserted in quantization_worker and re-checked
     by _validate_schema), so this renders as a flat line at 0 under normal
     operation -- fixed [0, 1] y-range so a violation would be dramatically
     visible instead of auto-scaling into a misleading wobble."""
+    filename = "quantization-false-negative-rate.png"
     return _line_panel(
-        df, "fnr", "FNR", "quantization-false-negative-rate.png", cfg,
-        use_tau=True, y_bounds=(-0.02, 1.02),
+        df, "fnr", "FNR", _raw_pct_filename(filename) if raw_pct else filename, cfg,
+        use_tau=True, y_bounds=(-0.02, 1.02), **(_RAW_PCT_X if raw_pct else {}),
     )
 
 
@@ -502,7 +586,7 @@ def save_legend(df: pd.DataFrame, cfg: Config) -> None:
     fig.legend(
         handles, labels,
         loc="center", ncol=min(5, len(stages)),
-        frameon=False, fontsize=7,
+        frameon=False, fontsize=8.4,
     )
     fig.patch.set_alpha(0.0)
 
@@ -570,7 +654,7 @@ def generate_quantization_figures(
     dpi: int = DPI,
     emit_pdf: bool = EMIT_PDF,
 ) -> None:
-    """Library entry point: renders the seven paper panels + one diagnostic
+    """Library entry point: renders the ten paper panels + one diagnostic
     FNR panel (+ legend) from an in-memory DataFrame, or from `load_data()`
     (reads INPUT_PATH) if `df` is omitted. panel_fnr is excluded from the
     LaTeX subfigure snippet printed below, since it's a sanity check, not
@@ -585,12 +669,38 @@ def generate_quantization_figures(
     panel_geometric_objective(df, cfg)
     panel_threshold_objective(df, cfg)
     panel_fpr(df, cfg)
+    panel_fpr_hard(df, cfg)
+    panel_fpr_easy(df, cfg)
     panel_construction_time(df, cfg)
     panel_query_throughput(df, cfg)
     panel_index_accesses_saved(df, cfg)
     panel_n_balls(df, cfg)
     panel_radius_inflation(df, cfg)
     panel_fnr(df, cfg)
+
+    # Same panels again, against memory usage as a percentage of raw
+    # (uncompressed float32) vector storage instead of absolute MB -- needs
+    # the n_construct column (see quantization_worker), absent from results
+    # files predating it.
+    if "n_construct" in df.columns:
+        panel_geometric_objective(df, cfg, raw_pct=True)
+        panel_threshold_objective(df, cfg, raw_pct=True)
+        panel_fpr(df, cfg, raw_pct=True)
+        panel_fpr_hard(df, cfg, raw_pct=True)
+        panel_fpr_easy(df, cfg, raw_pct=True)
+        panel_construction_time(df, cfg, raw_pct=True)
+        panel_query_throughput(df, cfg, raw_pct=True)
+        panel_index_accesses_saved(df, cfg, raw_pct=True)
+        panel_n_balls(df, cfg, raw_pct=True)
+        panel_radius_inflation(df, cfg, raw_pct=True)
+        panel_fnr(df, cfg, raw_pct=True)
+    else:
+        print(
+            "Note: input has no n_construct column, so the raw-storage-percentage panels "
+            "were skipped. Rerun generate_quantization() (main.py) with a current runner.py "
+            "to get them."
+        )
+
     save_legend(df, cfg)
 
     print_summary(df, cfg)
@@ -614,6 +724,16 @@ def generate_quantization_figures(
     \centering
     \includegraphics[width=\linewidth]{figures/quantization-false-positive-rate.png}
     \caption{False positive rate}
+\end{subfigure}
+\begin{subfigure}[b]{0.24\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/quantization-false-positive-rate-hard.png}
+    \caption{FPR, hard negatives}
+\end{subfigure}
+\begin{subfigure}[b]{0.24\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/quantization-false-positive-rate-easy.png}
+    \caption{FPR, easy negatives}
 \end{subfigure}
 \begin{subfigure}[b]{0.24\linewidth}
     \centering

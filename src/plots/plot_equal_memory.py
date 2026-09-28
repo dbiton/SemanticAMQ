@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 
 from plots.plot_quantization import apply_style
+from plots.plot_common import collapse_duplicate_x
 
 # CONFIG
 
@@ -27,8 +28,12 @@ OUTDIR = "plots/equal_memory/"
 DPI = 400
 EMIT_PDF = False
 
+# Embedding dimensionality: fixed at 384 across every blocklist-workload
+# evaluation (see main.generate_equal_memory's own dim=384).
+_EMBEDDING_DIM = 384
+
 # Display overrides for recognized filter names; anything else falls back to
-# the palettes below (see _derive_style_maps).
+# name[:-len("Filter")] in _label_for.
 _KNOWN_LABELS = {
     "BallCoverFilter": "BallFilter",
     "HNSWFilter": "HNSW",
@@ -38,36 +43,49 @@ _KNOWN_LABELS = {
     "DSBFFilter": "DSBF",
     "CoveringLSHFallbackFilter": "Covering LSH",
 }
-_KNOWN_COLORS = {
-    "BallCoverFilter": "#0072B2",
-    "HNSWFilter": "#56B4E9",
-    "IVFFilter": "#E69F00",
-}
 _KNOWN_MARKERS = {
-    "BallCoverFilter": "o",
     "HNSWFilter": "P",
     "IVFFilter": "s",
 }
-# Okabe-Ito-derived, colorblind-safe.
-_PALETTE_COLORS = ["#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7", "#56B4E9", "#F0E442", "#999999"]
-_PALETTE_MARKERS = ["o", "s", "^", "D", "v", "P", "*", "X", "h", "p"]
+# Every BallCoverFilter quantize variant (Config strings like
+# "BallCoverFilter (TQ4)" -- see runner.equal_memory_worker) draws from the
+# cold palette; every other method draws from the hot one. Two colorblind-
+# distinguishable-within-family sets, so a method's family reads from color
+# alone and its identity within that family still reads from hue. Each list
+# has more entries than there are current consumers (5 BallCoverFilter
+# variants, 5 other methods) for headroom -- see _derive_style_maps for what
+# happens if a family ever does run out (loops back rather than crashing).
+_COLD_PALETTE_COLORS = ["#023E8A", "#0077B6", "#00B4D8", "#48CAE4", "#3A0CA3", "#7209B7", "#4CC9F0", "#5A189A"]
+_HOT_PALETTE_COLORS = ["#9D0208", "#E85D04", "#FAA307", "#DC2F02", "#6A040F", "#F48C06", "#FFBA08", "#D00000"]
+_PALETTE_MARKERS = ["o", "s", "^", "D", "v", "P", "*", "X", "h", "p", "<", ">", "8", "H"]
 
 
 def _label_for(name: str) -> str:
-    if name in _KNOWN_LABELS:
-        return _KNOWN_LABELS[name]
-    return name[:-len("Filter")] if name.endswith("Filter") else name
+    """`name` is a full Config string, e.g. "BallCoverFilter (TQ4)" for one
+    of BallCoverFilter's quantize variants (see runner.equal_memory_worker) --
+    translate the base filter name and reattach the variant suffix verbatim,
+    rather than falling through to the raw, un-shortened string."""
+    base, sep, suffix = name.partition(" (")
+    label = _KNOWN_LABELS.get(base, base[:-len("Filter")] if base.endswith("Filter") else base)
+    return f"{label}{sep}{suffix}" if sep else label
+
+
+def _is_ball_filter(name: str) -> bool:
+    return name.partition(" (")[0] == "BallCoverFilter"
 
 
 def _derive_style_maps(configs: list) -> tuple:
     labels, colors, markers = {}, {}, {}
-    used_colors, used_markers = set(_KNOWN_COLORS.values()), set(_KNOWN_MARKERS.values())
-    palette_colors = iter(c for c in _PALETTE_COLORS if c not in used_colors)
-    palette_markers = iter(m for m in _PALETTE_MARKERS if m not in used_markers)
+    cold = iter(_COLD_PALETTE_COLORS)
+    hot = iter(_HOT_PALETTE_COLORS)
+    palette_markers = iter(m for m in _PALETTE_MARKERS if m not in set(_KNOWN_MARKERS.values()))
 
     for name in configs:
         labels[name] = _label_for(name)
-        colors[name] = _KNOWN_COLORS.get(name) or next(palette_colors, _PALETTE_COLORS[0])
+        if _is_ball_filter(name):
+            colors[name] = next(cold, _COLD_PALETTE_COLORS[0])
+        else:
+            colors[name] = next(hot, _HOT_PALETTE_COLORS[0])
         markers[name] = _KNOWN_MARKERS.get(name) or next(palette_markers, _PALETTE_MARKERS[0])
 
     return labels, colors, markers
@@ -158,20 +176,57 @@ def load_data() -> pd.DataFrame:
 
 # Aggregation
 
-def aggregate(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
+def aggregate(df: pd.DataFrame, value_col: str, dim: int = _EMBEDDING_DIM) -> pd.DataFrame:
     """Mean + 95% CI of `value_col` over any repeated runs, per (filter,
-    memory budget); a single run per (filter, budget) gives ci95=0."""
+    memory budget); a single run per (filter, budget) gives ci95=0.
+
+    Also derives "Memory Usage (% of Raw)" when the input has both a
+    "Construct Size" and a "Memory Usage" column: the percentage a filter
+    actually costs against the alternative of storing its construct set as a
+    plain list of raw float32 vectors (Construct Size * dim * 4 bytes) --
+    not the budget it was merely *given*. A filter like IVFPQ can saturate
+    well under its assigned budget (see print_summary's "used/budget"
+    column), so budget-as-%-of-raw would put every filter at the same x
+    position at a given sweep step regardless of what it actually spent,
+    collapsing the very comparison this panel exists to show.
+
+    Construct Size is averaged within each (filter, budget) group -- the
+    same "aggregate, then combine" pattern plot_quantization.aggregate() and
+    plot_budget._raw_storage_pct_x() use for their own memory columns --
+    purely so a pooled group's raw-storage denominator is computed from
+    real per-row data rather than an arbitrary single row's value; in this
+    sweep every corpus is in fact trimmed to the same reference-set size
+    (see main._fold_selections), so the average is exact, not approximate."""
     work = df.copy()
     work["filter"] = work["Config"].str.split(" + ", regex=False).str[0]
     work["Memory Budget (MB)"] = work["Memory Budget"] / (1024 * 1024)
 
-    grouped = work.groupby(["filter", "Memory Budget (MB)"])[value_col]
-    agg = grouped.agg(mean="mean", sem="sem", n="count").reset_index()
+    grouped = work.groupby(["filter", "Memory Budget (MB)"])
+    agg = grouped[value_col].agg(mean="mean", sem="sem", n="count").reset_index()
     agg["ci95"] = np.where(agg["n"] > 1, 1.96 * agg["sem"].fillna(0.0), 0.0)
+
+    if "Construct Size" in work.columns and "Memory Usage" in work.columns:
+        construct_size = grouped["Construct Size"].mean().reset_index(name="Construct Size")
+        usage = grouped["Memory Usage"].mean().reset_index(name="Memory Usage (mean)")
+        agg = agg.merge(construct_size, on=["filter", "Memory Budget (MB)"])
+        agg = agg.merge(usage, on=["filter", "Memory Budget (MB)"])
+        raw_bytes = agg["Construct Size"] * dim * 4
+        agg["Memory Usage (% of Raw)"] = 100.0 * agg["Memory Usage (mean)"] / raw_bytes
     return agg
 
 
-# Line panels: x = memory budget, one line per filter config
+# Line panels: x = memory budget (or, in the "_raw_pct" panels, that budget
+# as a percentage of raw vector storage), one line per filter config
+
+# Raw-pct panels' x-axis view: a filter that spends more than raw storage
+# would cost is a real, plottable outcome (see aggregate()'s docstring on
+# DSHFilter), and the panel should show it rather than crop it off -- only
+# the left edge (below 1% of raw is never informative) is fixed. The right
+# edge is left to matplotlib's autoscale, so it always reaches whatever the
+# worst filter in this particular run actually spent, rather than a
+# hardcoded ceiling that could either clip real data or leave dead space.
+_RAW_PCT_X_MIN = 1.0
+
 
 def _line_panel(
     df: pd.DataFrame,
@@ -181,6 +236,9 @@ def _line_panel(
     cfg: Config,
     log_y: bool = False,
     y_bounds: Optional[tuple] = None,
+    x_min: Optional[float] = None,
+    x_col: str = "Memory Budget (MB)",
+    xlabel: str = "Memory Budget (MB)",
 ) -> pd.DataFrame:
     agg = aggregate(df, value_col)
 
@@ -188,12 +246,13 @@ def _line_panel(
     fig, ax = plt.subplots()
 
     for name in cfg.configs:
-        sub = agg[agg["filter"] == name].sort_values("Memory Budget (MB)")
+        sub = agg[agg["filter"] == name].sort_values(x_col)
+        sub = collapse_duplicate_x(sub, x_col)
         if sub.empty:
             continue
         has_ci = (sub["ci95"] > 0).any()
         ax.plot(
-            sub["Memory Budget (MB)"], sub["mean"],
+            sub[x_col], sub["mean"],
             color=cfg.colors[name],
             marker=cfg.markers[name], markersize=2.5,
             linewidth=0.8,
@@ -201,15 +260,14 @@ def _line_panel(
         )
         if has_ci:
             ax.errorbar(
-                sub["Memory Budget (MB)"], sub["mean"], yerr=sub["ci95"],
+                sub[x_col], sub["mean"], yerr=sub["ci95"],
                 fmt="none", ecolor=cfg.colors[name],
                 elinewidth=0.5, capsize=1.5, capthick=0.5,
                 zorder=3,
             )
 
-    ax.set_xscale("log", base=2)
-    ax.xaxis.set_major_locator(LogLocator(base=2.0))
-    ax.xaxis.set_major_formatter(LogFormatterMathtext(base=2.0))
+    if x_min is not None:
+        ax.set_xlim(left=x_min)
 
     if log_y:
         ax.set_yscale("log")
@@ -221,7 +279,7 @@ def _line_panel(
     elif y_bounds is not None:
         ax.set_ylim(*y_bounds)
 
-    ax.set_xlabel("Memory Budget (MB)")
+    ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.grid(axis="both", which="major", linewidth=0.35, alpha=0.4, zorder=0)
     ax.set_axisbelow(True)
@@ -236,8 +294,20 @@ def panel_fpr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _line_panel(df, "FPR", "False Positive Rate", "equal-memory-fpr.png", cfg, y_bounds=(-0.05, 1.05))
 
 
+def panel_fpr_raw_pct(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    return _line_panel(df, "FPR", "False Positive Rate", "equal-memory-fpr-raw-pct.png", cfg,
+                       y_bounds=(-0.05, 1.05), x_min=_RAW_PCT_X_MIN,
+                       x_col="Memory Usage (% of Raw)", xlabel="Memory Usage (% of Raw)")
+
+
 def panel_fnr(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _line_panel(df, "FNR", "False Negative Rate", "equal-memory-fnr.png", cfg, y_bounds=(-0.05, 1.05))
+
+
+def panel_fnr_raw_pct(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    return _line_panel(df, "FNR", "False Negative Rate", "equal-memory-fnr-raw-pct.png", cfg,
+                       y_bounds=(-0.05, 1.05), x_min=_RAW_PCT_X_MIN,
+                       x_col="Memory Usage (% of Raw)", xlabel="Memory Usage (% of Raw)")
 
 
 def panel_latency(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
@@ -247,9 +317,24 @@ def panel_latency(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _line_panel(df, "Latency (ms)", "Construction Latency (ms)", "equal-memory-latency.png", cfg, log_y=True)
 
 
+def panel_latency_raw_pct(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    return _line_panel(df, "Latency (ms)", "Construction Latency (ms)",
+                       "equal-memory-latency-raw-pct.png", cfg, log_y=True,
+                       x_min=_RAW_PCT_X_MIN,
+                       x_col="Memory Usage (% of Raw)", xlabel="Memory Usage (% of Raw)")
+
+
 def panel_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _line_panel(
         df, "Throughput (qps)", "Throughput (queries/s)", "equal-memory-throughput.png", cfg, log_y=True
+    )
+
+
+def panel_throughput_raw_pct(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    return _line_panel(
+        df, "Throughput (qps)", "Throughput (queries/s)", "equal-memory-throughput-raw-pct.png", cfg,
+        log_y=True, x_min=_RAW_PCT_X_MIN,
+        x_col="Memory Usage (% of Raw)", xlabel="Memory Usage (% of Raw)",
     )
 
 
@@ -273,7 +358,7 @@ def save_legend(cfg: Config) -> None:
     fig.legend(
         handles, labels,
         loc="center", ncol=len(cfg.configs),
-        frameon=False, fontsize=7,
+        frameon=False, fontsize=8.4,
     )
     fig.patch.set_alpha(0.0)
 
@@ -367,6 +452,23 @@ def generate_equal_memory_figures(
     panel_fnr(df, cfg)
     panel_latency(df, cfg)
     panel_throughput(df, cfg)
+
+    # Same four panels again, against actual memory usage as a percentage of
+    # raw (uncompressed float32) vector storage instead of absolute MB --
+    # needs the "Construct Size" and "Memory Usage" columns (see
+    # equal_memory_worker), absent from results files predating them.
+    if "Construct Size" in df.columns and "Memory Usage" in df.columns:
+        panel_fpr_raw_pct(df, cfg)
+        panel_fnr_raw_pct(df, cfg)
+        panel_latency_raw_pct(df, cfg)
+        panel_throughput_raw_pct(df, cfg)
+    else:
+        print(
+            "Note: input is missing 'Construct Size' and/or 'Memory Usage', so the "
+            "raw-storage-percentage panels were skipped. Rerun generate_equal_memory() "
+            "(main.py) with a current runner.py to get them."
+        )
+
     save_legend(cfg)
 
     print_summary(df, cfg)

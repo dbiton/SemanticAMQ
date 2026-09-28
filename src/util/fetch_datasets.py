@@ -1,3 +1,4 @@
+import ast
 import os
 import h5py
 
@@ -16,10 +17,10 @@ from datasets.combine import concatenate_datasets
 from scipy.cluster.hierarchy import DisjointSet
 from sklearn.preprocessing import normalize
 
-# from util.dataset_paths import dataset_filenames
+from util.dataset_paths import dataset_filenames  # load_embeds/load_meta both index this
 
 embeds_dir = "datasets"
-MAX_STREAM_LENGTH = 250_000  # 1 million
+MAX_STREAM_LENGTH = 750_000
 models: Dict[str, SentenceTransformer] = {}
 
 def load_embeds(dataset_name: str, N: int):
@@ -59,21 +60,75 @@ def writer(path: str):
             os.remove(tmp_path)
             raise
 
+def _write_meta(hf, meta: Dict[str, List[Any]], n: int) -> None:
+    """Persist each metadata column alongside the embeddings, truncated to the
+    same n rows so column i always describes embedding i.
+
+    Without this the metadata was asserted and then dropped, which silently
+    cost the two columns that carry ground truth rather than decoration:
+    build_quora's `set_id` (the transitive closure of the duplicate-label
+    graph -- the only way to recover Quora's labelled paraphrase clusters,
+    since they are NOT recoverable from the embeddings) and build_ccnews's
+    `domain` (what shows a duplicate cluster spans multiple outlets, i.e. that
+    it is syndication rather than one site reposting itself).
+
+    Integer columns are stored as int64, everything else as UTF-8 strings;
+    None becomes "" (several builders pad unused columns with None).
+    """
+    dt = h5py.string_dtype(encoding="utf-8")
+    for key, values in meta.items():
+        col = list(values)[:n]
+        if col and all(isinstance(v, (int, np.integer)) and not isinstance(v, bool) for v in col):
+            hf.create_dataset(f"meta/{key}", data=np.asarray(col, dtype=np.int64))
+        else:
+            col = ["" if v is None else str(v).replace("\x00", "") for v in col]
+            hf.create_dataset(f"meta/{key}", data=col, dtype=dt)
+
+
 def pack_and_dump(path: str, texts: List[str], meta: Dict[str, List[Any]], model_name: str = "all-MiniLM-L6-v2"):
     assert all(len(v) == len(texts) for v in meta.values()), "Metadata length mismatch"
     with writer(path) as f:
         if f is None:
             print(f'Skipping "{path}" because it already exists')
             return
-        embeds = embed_strings(texts[:MAX_STREAM_LENGTH], model_name=model_name)
+        # Everything below is truncated to the number of vectors actually
+        # embedded. "text" used to be written at full length while "embeds"
+        # stopped at MAX_STREAM_LENGTH, so the two had different row counts on
+        # any corpus larger than the cap -- harmless only because both start at
+        # row 0. Meta columns must line up with the embeddings to be usable as
+        # labels at all, so all three are cut to the same n here.
+        texts = texts[:MAX_STREAM_LENGTH]
+        embeds = embed_strings(texts, model_name=model_name)
         normalized_embeds = normalize(embeds)
+        n = len(embeds)
         with h5py.File(f, "w") as hf:
             hf.create_dataset("embeds", data=embeds)
             hf.create_dataset("normalized_embeds", data=normalized_embeds)
             dt = h5py.string_dtype(encoding='utf-8')
-            texts = [t.replace('\x00', '') for t in texts]
+            texts = [t.replace('\x00', '') for t in texts[:n]]
             hf.create_dataset("text", data=texts, dtype=dt)
+            _write_meta(hf, meta, n)
     print(f"Saved HDF5 to {path}")
+
+
+def load_meta(dataset_name: str, N: Optional[int] = None) -> Dict[str, np.ndarray]:
+    """Metadata columns written by _write_meta, as {column: array of N rows}.
+
+    Returns {} for the datasets built before metadata was persisted -- their
+    .pkl predates _write_meta and has no "meta" group, so a caller that needs
+    e.g. Quora's set_id must delete that file and rebuild.
+    """
+    path = dataset_filenames[dataset_name]
+    out: Dict[str, np.ndarray] = {}
+    with h5py.File(path, "r") as f:
+        if "meta" not in f:
+            return out
+        for key in f["meta"]:
+            col = f["meta"][key][:N] if N is not None else f["meta"][key][:]
+            if col.dtype.kind in ("S", "O"):
+                col = np.array([v.decode("utf-8") if isinstance(v, bytes) else v for v in col], dtype=object)
+            out[key] = col
+    return out
 
 def build_eli5() -> Tuple[List[str], Dict[str, List[Any]]]:
     ds = load_dataset("sentence-transformers/eli5", trust_remote_code=True)
@@ -169,18 +224,73 @@ def build_quora() -> Tuple[List[str], Dict[str, List[Any]]]:
     return texts, meta
 
 def build_mmlu() -> Tuple[List[str], Dict[str, List[Any]]]:
-    # MMLU (Massive Multitask Language Understanding)
-    # The 'all' config loads all subjects (STEM, humanities, etc.)
+    """MMLU ('all' config: every subject, and the test/validation/dev/
+    auxiliary_train splits concatenated).
+
+    Embeds the question TOGETHER WITH its answer choices, rather than the
+    question alone. That is the faithful representation of an MMLU item: 31
+    questions in a 9k sample recur with DIFFERENT choice sets (e.g. "The
+    terrestrial planet cores contain mostly metal because"), and with the
+    choices dropped those distinct items were indistinguishable.
+
+    It does NOT, however, fix MMLU's inflated duplicate rate, and it is worth
+    recording why so nobody re-attempts this. Measured on 9k items:
+
+        rows repeating a question exactly            5.5%
+        rows that are a fully repeated item          5.2%
+        pairs within embedding distance <= 0.01     29.9%  (question only)
+                                                    29.2%  (question+choices)
+
+    String-level duplication is ~5%, but distance-based duplication is ~30%,
+    and adding the choices barely moves it. The gap is not an extraction bug:
+    it is all-MiniLM-L6-v2 failing to resolve short, formulaic multiple-choice
+    text, mapping textually distinct items to within 0.01 of each other. The
+    choices are formulaic too, so they add little separating signal.
+
+    Consequence: MMLU's nonzero redundancy at small tau in system_tau.csv
+    (redundancy_rate 0.0120 at tau=0.01, against 0.0000 for ELI5/HotpotQA/
+    MsMarco) measures encoder resolution, not duplicate structure -- and this
+    builder cannot fix that. Treating MMLU as a duplicate corpus needs either a
+    higher-resolution encoder or ground truth defined by string/label identity
+    instead of distance.
+
+    Choices are joined with " | " so the option boundaries survive
+    tokenization. Note MiniLM truncates at 256 word-pieces, so for the few
+    long-passage items in auxiliary_train the trailing choices can still be
+    cut -- those items remain under-disambiguated, just far fewer of them.
+
+    Keeps subject/answer/split in metadata: `subject` is a ready-made topical
+    grouping (57 of them), which is a natural source of hard negatives -- items
+    that are lexically close but semantically distinct, MMLU's real strength
+    (template variants such as "the degree of Q(sqrt(2) + sqrt(3))" vs
+    "Q(sqrt(2), sqrt(3))" sit ~0.2 apart yet have different answers).
+    """
     print("Loading MMLU (config: 'all')...")
     ds = load_dataset("cais/mmlu", "all")
-        
-    texts = []
-    # Iterate over available splits (usually 'test', 'validation', 'dev', 'auxiliary_train')
+
+    texts, subject, answer, split_name = [], [], [], []
+    # Splits: 'test', 'validation', 'dev', 'auxiliary_train'
     for split in ds:
-        if "question" in ds[split].features:
-            texts.extend(ds[split]["question"])
-            
-    meta = {}
+        feats = ds[split].features
+        if "question" not in feats:
+            continue
+        questions = ds[split]["question"]
+        n = len(questions)
+        choices = ds[split]["choices"] if "choices" in feats else [None] * n
+        subjects = ds[split]["subject"] if "subject" in feats else [""] * n
+        answers = ds[split]["answer"] if "answer" in feats else [-1] * n
+        for q, ch, sub, ans in zip(questions, choices, subjects, answers):
+            options = " | ".join(str(c) for c in ch) if ch else ""
+            texts.append(f"{q} {options}".strip() if options else q)
+            subject.append(sub or "")
+            answer.append(int(ans) if isinstance(ans, (int, np.integer)) else -1)
+            split_name.append(split)
+
+    meta = {
+        "subject": subject,
+        "answer": answer,
+        "split": split_name,
+    }
     return texts, meta
 
 def build_hotpotqa() -> Tuple[List[str], Dict[str, List[Any]]]:
@@ -251,8 +361,192 @@ def build_pes2o() -> Tuple[List[str], Dict[str, List[Any]]]:
     meta = {}
     return texts, meta
 
+def build_ccnews() -> Tuple[List[str], Dict[str, List[Any]]]:
+    """CC-News: news articles from CommonCrawl News (2017-2019), via the
+    Parquet-native vblagoje/cc_news mirror (no loading script, so it still
+    works on datasets>=4.0 -- see build_pes2o for why that matters).
+
+    Chosen over the other news corpora specifically for *syndication*: the
+    same wire story (AP/Reuters) republished across outlets with a rewritten
+    headline and lightly edited lede. That produces high-multiplicity clusters
+    of near-duplicates that are NOT byte-identical, which is the one property
+    WildChat cannot supply -- its duplicate clusters are mostly exact reposts,
+    so a hash set answers them and a geometric filter earns nothing.
+
+    Deliberately NOT Multi-News or NewSHead: those cluster *different*
+    articles covering the same event, which are topical siblings, not
+    near-duplicates. Measured L2 distance between topical siblings is ~0.79 on
+    this embedding model, far too large for a ball cover to exploit (a ball
+    that wide covers the whole corpus). Syndicated copies sit at ~0.1, which
+    is the regime the filter works in.
+
+    The article body is embedded rather than the title: outlets rewrite
+    headlines more often than they rewrite wire copy, and MiniLM's 256-token
+    window truncates to roughly the lede -- the most-copied part of the story.
+
+    MIN_CHARS drops stubs (paywall notices, "enable JavaScript", truncated
+    feeds). Those are byte-identical boilerplate repeated across thousands of
+    pages, and they would manufacture exactly the giant *exact*-duplicate
+    clusters this dataset was picked to avoid.
+    """
+    MIN_CHARS = 400
+
+    print(f"Loading CC-News (streaming first {MAX_STREAM_LENGTH} articles)...")
+    ds = load_dataset("vblagoje/cc_news", split="train", streaming=True)
+    # The stream arrives in per-domain runs (measured: the first 60k records
+    # cover only 752 domains, in blocks). A contiguous prefix would therefore
+    # over-sample a handful of outlets -- and syndication is by definition a
+    # CROSS-outlet phenomenon, so that prefix would under-represent the very
+    # clusters this dataset was added to provide. Shuffling the shard order
+    # and a read buffer spreads the sample across publishers.
+    ds = ds.shuffle(seed=42, buffer_size=50_000)
+
+    texts, title, domain, date, url = [], [], [], [], []
+    seen = 0
+    for ex in ds:
+        body = (ex.get("text") or "").strip()
+        if len(body) < MIN_CHARS:
+            continue
+        texts.append(body)
+        title.append(ex.get("title") or "")
+        # Publisher, kept so a duplicate cluster can be shown to span multiple
+        # outlets -- the evidence that a cluster is syndication rather than one
+        # site reposting itself.
+        domain.append(ex.get("domain") or "")
+        date.append(ex.get("date") or "")
+        url.append(ex.get("url") or "")
+        seen += 1
+        if seen >= MAX_STREAM_LENGTH:
+            break
+
+    meta = {
+        "title": title,
+        "domain": domain,
+        "date": date,
+        "url": url,
+    }
+    return texts, meta
+
+
+def build_chatgpt_paraphrases() -> Tuple[List[str], Dict[str, List[Any]]]:
+    """ChatGPT-generated paraphrase clusters (humarin/chatgpt-paraphrases):
+    each source text (from SQuAD 2.0 or CNN/DailyMail, one row per source)
+    ships with 5 LLM-generated paraphrases, so a source plus its 5
+    paraphrases is one cluster of 6 by construction.
+
+    Excludes the dataset's "quora" source split (also present as raw Quora
+    questions, ~59% of the source texts) -- BLOCKLIST_DATASETS already has a
+    separate Quora corpus, and re-adding its questions here as LLM
+    rewrites would make the two corpora's clusters overlap in content
+    rather than add an independent one.
+
+    Added as a synthetic-paraphrase counterpart to WikiAnswers' editor-labelled
+    rephrasings, after WikiAnswers-scale community datasets (TaPaCo,
+    StackExchange's official duplicate-question pairs) turned out too sparse
+    once actually clustered: their "duplicate" label means "same underlying
+    topic," which does not imply nearby embeddings, and eps=0.4 seed-ball
+    discovery on a 360k-row sample recovered only ~10-25k usable vectors from
+    either. The same check on this corpus recovered a median cluster size of
+    5 out of the native 6 (largest discovered cluster 18, where a few
+    different sources' paraphrases happened to land within eps of each
+    other) and ~166k usable vectors from that same sample size -- an LLM
+    paraphrase is built to preserve meaning while varying wording, which is
+    much closer to WikiAnswers/Quora's rephrasings than to a "same problem"
+    moderation label.
+
+    `set_id` is written to metadata for the same reason as WikiAnswers', but
+    -- like WikiAnswers -- generate_blocklist clusters geometrically rather
+    than from this label, so every blocklist corpus shares one cluster
+    definition.
+
+    Capped at MAX_STREAM_LENGTH total rows (source texts + paraphrases), same
+    as build_wikianswers().
+    """
+    print(f"Loading ChatGPT-paraphrases (up to {MAX_STREAM_LENGTH} rows, excluding quora sources)...")
+    ds = load_dataset("humarin/chatgpt-paraphrases")["train"]
+    ds = ds.filter(lambda ex: ex["source"] != "quora")
+
+    texts, set_id = [], []
+    for i, ex in enumerate(ds):
+        paraphrases = ex["paraphrases"]
+        if isinstance(paraphrases, str):
+            paraphrases = ast.literal_eval(paraphrases)
+        texts.append(ex["text"])
+        set_id.append(i)
+        for p in paraphrases:
+            texts.append(p)
+            set_id.append(i)
+        if len(texts) >= MAX_STREAM_LENGTH:
+            break
+
+    meta = {"set_id": set_id}
+    return texts, meta
+
+
+def build_wikianswers() -> Tuple[List[str], Dict[str, List[Any]]]:
+    """WikiAnswers paraphrase clusters, via the Parquet-native
+    embedding-data/WikiAnswers mirror. Each row is a `set` of user-submitted
+    questions that WikiAnswers editors marked as asking the same thing.
+
+    Added for the one property neither WildChat nor CC-News supplies:
+    duplicates that are REPHRASINGS rather than reposts. Measured on a
+    40k-question sample of this corpus:
+
+        exact duplicates (d <= 0.01)       0.2%
+        rephrasings      (0.01 < d <= 0.4) 53.2%
+        intra-cluster NN distance          median 0.376 (p25 0.235, p75 0.534)
+        ambient pairwise distance          median 1.354
+        cluster size                       median 27, max 51
+
+    Compare WildChat and CC-News, where ~84% of duplicates are byte-identical
+    and a hash set answers them. Here a hash set catches essentially nothing,
+    which is what makes this corpus the one that can justify a *geometric*
+    filter -- while the clusters stay far tighter than topical siblings
+    (~0.79), so the cover still has room to work.
+
+    `set_id` is written to metadata, so ground truth comes from the editors'
+    labels instead of from a distance threshold. That matters beyond
+    convenience: everywhere else "duplicate" is defined as "within tau", the
+    same quantity the filter thresholds, which makes FPR partly circular.
+    Labels break that circularity.
+
+    Singleton sets are dropped -- with no partner they can never be a true
+    positive, and would only pad the corpus with guaranteed negatives.
+    """
+    print(f"Loading WikiAnswers (streaming up to {MAX_STREAM_LENGTH} questions)...")
+    ds = load_dataset("embedding-data/WikiAnswers", split="train", streaming=True)
+
+    texts, set_id = [], []
+    for i, ex in enumerate(ds):
+        members = [t for t in (ex.get("set") or []) if t]
+        if len(members) < 2:
+            continue
+        for t in members:
+            texts.append(t)
+            set_id.append(i)
+        if len(texts) >= MAX_STREAM_LENGTH:
+            break
+
+    meta = {"set_id": set_id}
+    return texts, meta
+
+
 if __name__ == "__main__":
     os.makedirs(embeds_dir, exist_ok=True)
+
+    try:
+        print("generating CC-News...")
+        texts, meta = build_ccnews()
+        pack_and_dump(os.path.join(embeds_dir, "embeds_ccnews.pkl"), texts, meta)
+    except Exception as e:
+        print(f"Failed to generate CC-News: {e}")
+
+    try:
+        print("generating ChatGPT-paraphrases...")
+        texts, meta = build_chatgpt_paraphrases()
+        pack_and_dump(os.path.join(embeds_dir, "embeds_chatgpt_paraphrases.pkl"), texts, meta)
+    except Exception as e:
+        print(f"Failed to generate ChatGPT-paraphrases: {e}")
 
     try:
         print("generating StackOverflow...")
@@ -323,5 +617,12 @@ if __name__ == "__main__":
         pack_and_dump(os.path.join(embeds_dir, "embeds_pes2o.pkl"), texts, meta)
     except Exception as e:
         print(f"Failed to generate peS2o: {e}")
+
+    try:
+        print("generating WikiAnswers...")
+        texts, meta = build_wikianswers()
+        pack_and_dump(os.path.join(embeds_dir, "embeds_wikianswers.pkl"), texts, meta)
+    except Exception as e:
+        print(f"Failed to generate WikiAnswers: {e}")
 
     print("Done.")

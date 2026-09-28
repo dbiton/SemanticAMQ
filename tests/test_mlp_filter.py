@@ -37,12 +37,15 @@ class TestMLPInit(unittest.TestCase):
 
     def test_max_memory_derives_hidden_dim(self):
         dim = 16
-        # Parameter formula: 4 * (h * (dim + 2) + 1) <= max_memory
-        # For dim=16, 1 parameter unit in hidden dim is (16 + 2) = 18 params = 72 bytes.
-        # Target h = 10 -> bytes = 4 * (10 * 18 + 1) = 724 bytes
+        # DistanceRegressor has two hidden layers (see its docstring for why
+        # one isn't enough): params = h^2 + h*(dim+3) + 1, not the single
+        # layer's linear h*(dim+2)+1.
+        # For dim=16: h^2 + 19h + 1 <= max_params. At budget=724 bytes,
+        # max_params = 724 // 4 = 181. h=6 -> 36+114+1=151 <= 181 (fits);
+        # h=7 -> 49+133+1=183 > 181 (doesn't) -- so the largest fitting h is 6.
         budget = 724
         f = MLPFilter(dim=dim, distance_threshold=R, max_memory=budget)
-        self.assertEqual(f.hidden_dim, 10)
+        self.assertEqual(f.hidden_dim, 6)
 
     def test_max_memory_too_small_raises_value_error(self):
         # Requires at least 4 * (DIM + 3) bytes for h=1

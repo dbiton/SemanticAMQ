@@ -293,7 +293,7 @@ def panel_vectors_vs_balls(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     ax2.set_ylabel("Number of Balls")
 
     ax1.text(0.97, 0.06, "solid: vectors inserted -- dashed: ball count", transform=ax1.transAxes,
-             ha="right", va="bottom", fontsize=5)
+             ha="right", va="bottom", fontsize=6.0)
     style_axes(ax1)
 
     save_figure(fig, "streaming-vectors-vs-balls.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
@@ -335,7 +335,7 @@ def panel_filter_size(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     ax2.set_ylim(y1_min / bytes_per_ball, y1_max / bytes_per_ball)
 
     ax1.text(0.97, 0.06, "solid: size (bytes) -- dashed: ball count", transform=ax1.transAxes,
-             ha="right", va="bottom", fontsize=5)
+             ha="right", va="bottom", fontsize=6.0)
     style_axes(ax1)
 
     save_figure(fig, "streaming-filter-size.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
@@ -355,7 +355,7 @@ def save_method_legend(cfg: Config) -> None:
     # entry too, instead of only an in-panel text annotation.
     handles.append(plt.Line2D([0], [0], color="black", linestyle="--", linewidth=1.0))
     labels.append("Static rebuild (oracle)")
-    fig.legend(handles, labels, loc="center", ncol=3, frameon=False, fontsize=6.5)
+    fig.legend(handles, labels, loc="center", ncol=3, frameon=False, fontsize=7.8)
     fig.patch.set_alpha(0.0)
     save_figure(fig, "streaming-method-legend.png", cfg.outdir, cfg.dpi, cfg.emit_pdf, transparent=True)
 

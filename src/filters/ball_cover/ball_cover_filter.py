@@ -3,8 +3,7 @@ import faiss
 import sys
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Tuple, Optional
-from hyperspheres_volume import estimate_hypersphere_volume
+from typing import List, Optional
 from filters.filter import Filter, InsufficientMemoryError
 from filters.ball_cover.ball_interfaces import ConstructInterface, InsertInterface
 from filters.ball_cover.gonzales_construct import GonzalesConstruct
@@ -23,18 +22,37 @@ class Quantize(Enum):
         32   FP32     raw float32                      1536   0
         16   FP16     scalar fp16                       768   0
          8   SQ8      scalar 8-bit                      384   3 KB
+         8   TQ8      rotation + TurboQuant 8-bit        384   seed only
          6   SQ6      scalar 6-bit                      288   3 KB
+         5   TQ5      rotation + TurboQuant 5-bit        240   seed only
          4   SQ4      scalar 4-bit                      192   3 KB
+         4   TQ4      rotation + TurboQuant 4-bit        192   seed only
          3   TQ3      rotation + TurboQuant 3-bit       144   60 B + seed
+         2   TQ2      rotation + TurboQuant 2-bit         96   seed only
          2   PQ4_R2   PQ, 4-bit subquantizers (m=192)    96   24 KB
          2   PQ8_R2   PQ, 8-bit subquantizers (m=96)     96   384 KB
+         1   TQ1      rotation + TurboQuant 1-bit         48   seed only
          1   PQ4_R1   PQ, 4-bit subquantizers (m=96)     48   24 KB
+         1   PQ8_R1   PQ, 8-bit subquantizers (m=48)     48   384 KB
          1   RABITQ   rotation + RaBitQ                  56   seed only
+
+    TQ1/TQ2/TQ4/TQ5/TQ8 fill out the rest of faiss's TurboQuant family
+    alongside TQ3 (see _ENCODINGS): evaluation-only for now (added to
+    runner.QUANTIZATION_SWEEP but deliberately not to
+    plot_quantization.QUANTIZE_SWEEP, so they generate rows without yet
+    appearing in any figure). Unlike TQ3, none of these five have had
+    rotation's benefit individually re-measured against real embeddings --
+    they inherit rotate=True from TQ3 for consistency within the TurboQuant
+    family, not because it has been shown to pay off at every one of these
+    bit rates (a synthetic probe suggested it might not always help, e.g.
+    at 8-bit -- see the results this sweep produces before trusting that).
+    TQ5 has no MSE-trained ("tqmse") faiss variant, unlike the others --
+    QT_5bit_tq is the plain (quantile-based) TurboQuant encoder.
 
     Every ball also stores its radius as fp16, so a ball costs center + 2
     bytes -- see bytes_per_ball().
 
-    CAVEAT on RABITQ: the other nine rows are exact ADC, so search() returns
+    CAVEAT on RABITQ: the other ten rows are exact ADC, so search() returns
     ||q - decode(c)|| and the one-sided inflation in _store_spheres is a
     proof. RaBitQ instead scores through its own estimator, which is not tied
     to sa_decode's output: measured against exact distances over 3.6M
@@ -54,12 +72,18 @@ class Quantize(Enum):
     NONE = "FP32"     # back-compat alias: FP32 *is* the unquantized baseline
     FP16 = "FP16"
     SQ8 = "SQ8"
+    TQ8 = "TQ8"
     SQ6 = "SQ6"
+    TQ5 = "TQ5"
     SQ4 = "SQ4"
+    TQ4 = "TQ4"
     TQ3 = "TQ3"
+    TQ2 = "TQ2"
     PQ4_R2 = "PQ4@2"
     PQ8_R2 = "PQ8@2"
+    TQ1 = "TQ1"
     PQ4_R1 = "PQ4@1"
+    PQ8_R1 = "PQ8@1"
     RABITQ = "RaBitQ"
 
 
@@ -107,14 +131,24 @@ _ENCODINGS = {
     Quantize.FP32: _Encoding(rate=32, kind="flat"),
     Quantize.FP16: _Encoding(rate=16, kind="sq", qtype=faiss.ScalarQuantizer.QT_fp16),
     Quantize.SQ8: _Encoding(rate=8, kind="sq", qtype=faiss.ScalarQuantizer.QT_8bit),
+    # The rest of faiss's TurboQuant family, alongside TQ3 -- see the
+    # Quantize docstring for why these are evaluation-only (swept but not
+    # plotted) for now. All MSE-trained ("tqmse") except TQ5, which faiss
+    # only offers as the plain quantile-based QT_5bit_tq.
+    Quantize.TQ8: _Encoding(rate=8, kind="sq", qtype=faiss.ScalarQuantizer.QT_8bit_tqmse, rotate=True),
     Quantize.SQ6: _Encoding(rate=6, kind="sq", qtype=faiss.ScalarQuantizer.QT_6bit),
+    Quantize.TQ5: _Encoding(rate=5, kind="sq", qtype=faiss.ScalarQuantizer.QT_5bit_tq, rotate=True),
     Quantize.SQ4: _Encoding(rate=4, kind="sq", qtype=faiss.ScalarQuantizer.QT_4bit),
+    Quantize.TQ4: _Encoding(rate=4, kind="sq", qtype=faiss.ScalarQuantizer.QT_4bit_tqmse, rotate=True),
     # QT_3bit_tqmse is the MSE-trained TurboQuant variant; there is no plain
     # (min-max) 3-bit scalar quantizer in faiss to compare it against.
     Quantize.TQ3: _Encoding(rate=3, kind="sq", qtype=faiss.ScalarQuantizer.QT_3bit_tqmse, rotate=True),
+    Quantize.TQ2: _Encoding(rate=2, kind="sq", qtype=faiss.ScalarQuantizer.QT_2bit_tqmse, rotate=True),
     Quantize.PQ4_R2: _Encoding(rate=2, kind="pq", nbits=4),
     Quantize.PQ8_R2: _Encoding(rate=2, kind="pq", nbits=8),
+    Quantize.TQ1: _Encoding(rate=1, kind="sq", qtype=faiss.ScalarQuantizer.QT_1bit_tqmse, rotate=True),
     Quantize.PQ4_R1: _Encoding(rate=1, kind="pq", nbits=4),
+    Quantize.PQ8_R1: _Encoding(rate=1, kind="pq", nbits=8),
     Quantize.RABITQ: _Encoding(rate=1, kind="rabitq", rotate=True),
 }
 
@@ -650,7 +684,7 @@ class BallCoverFilter(Filter):
         self.all_centers_index.remove_ids(faiss.IDSelectorBatch(sphere_indices))
         self._radius_inflation[sphere_indices] = 0.0
 
-    def construct(self, vectors: np.ndarray) -> Tuple[float, float]:
+    def construct(self, vectors: np.ndarray) -> None:
         """Builds the filter in bulk from construct_method's output via _add_spheres().
 
         If no insert_method is provided, the index acts as a static filter. Otherwise,
@@ -661,7 +695,15 @@ class BallCoverFilter(Filter):
         _train_quantizer), and it is re-runnable: calling it again on a
         filter that has already been constructed and inserted into is what
         runner's "periodic" streaming policy does, so it fully resets the id
-        pool, the per-ball inflation, and the insert strategy's bookkeeping."""
+        pool, the per-ball inflation, and the insert strategy's bookkeeping.
+
+        Returns nothing. This used to return estimate_hypersphere_volume's
+        overlap-aware bounds on the cover's volume, which made every caller
+        pay for them whether or not it read them -- and almost none did. That
+        measurement now belongs to whoever wants it: runner's
+        _tau_volume_bounds_log10 computes the same bounds from all_centers and
+        all_radiuses, at any tau, and is called only by the worker whose
+        figure needs them."""
         centers, radii = self.construct_method.construct_filter(self, vectors)
         centers = np.ascontiguousarray(centers, dtype=np.float32)
         radii = np.asarray(radii, dtype=np.float32)
@@ -673,7 +715,7 @@ class BallCoverFilter(Filter):
         self._constructed = True
 
         if n == 0:
-            return self._log_volume_bounds()
+            return
 
         sphere_indices = self._add_spheres(centers, radii)
         self._store_spheres(sphere_indices, centers, radii, member_vectors=vectors)
@@ -683,7 +725,6 @@ class BallCoverFilter(Filter):
             self.insert_method.initialize_buffers(self, sphere_indices, centers, radii)
 
         self._all_centers = None
-        return self._log_volume_bounds()
 
     def query(self, vectors: np.ndarray, distance_threshold: float) -> list[bool]:
         if not self._constructed:
@@ -794,13 +835,6 @@ class BallCoverFilter(Filter):
             )
 
         return self.insert_method.remove(self, vectors)
-
-    def _log_volume_bounds(self) -> Tuple[float, float]:
-        if self._num_spheres == 0:
-            return -np.inf, -np.inf
-        current_centers = self.all_centers
-        self._all_centers = None
-        return estimate_hypersphere_volume(current_centers, self.all_radiuses, return_log=True)
 
     def get_bytesize(self) -> int:
         if not self._constructed:
