@@ -1683,14 +1683,9 @@ def generate_streaming(runner: Runner) -> None:
     n_stream_window = n_init + n_insert
     negative_pool_size = max(n_negative, round(negative_pool_percent * num_vectors))
 
-    total_stream_size = k_folds * n_stream_window
-    negative_pool_start = total_stream_size
-    negative_pool_end = negative_pool_start + negative_pool_size
-
     # Each fold uses separate non-overlapping stream window, the negative pool starts after the last fold.
-    fold_stride = n_stream_window
-    offsets = [f * fold_stride for f in range(k_folds)]
-    negative_pool_start = offsets[-1] + n_stream_window
+    offsets = [f * n_stream_window for f in range(k_folds)]
+    negative_pool_start = k_folds * n_stream_window
     negative_pool_end = negative_pool_start + negative_pool_size
 
     # Bootstrap (construct()) covers positions [0, n_init); the position
@@ -1713,7 +1708,7 @@ def generate_streaming(runner: Runner) -> None:
                 f"{name}: has only {total_rows} vectors on disk; generate_streaming's "
                 f"non-wrapping {k_folds}-fold sweep at num_vectors={num_vectors} needs at least "
                 f"{negative_pool_end} (room for {k_folds} stream windows of {n_stream_window} "
-                f"vectors each, advancing by {fold_stride}, plus a {negative_pool_size}-vector "
+                f"vectors each, advancing by {n_stream_window}, plus a {negative_pool_size}-vector "
                 "negative-candidate pool past the last one). Raise the dataset's available "
                 "vectors, or lower num_vectors."
             )
