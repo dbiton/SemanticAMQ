@@ -1,6 +1,7 @@
 """BallCoverFilter construction methods compared on the blocklist workload:
 GonzalesConstruct (the default) against MergeConstruct, KMeansConstruct,
-MinimaxConstruct and SplitConstruct.
+MinimaxConstruct (plain and with sphere-projected centers), SplitConstruct
+and SphereMergeConstruct.
 
 Same construction and query sets as generate_budget / generate_quantization
 (main.blocklist_workloads), with ground truth defined as distance to the
@@ -48,6 +49,7 @@ from filters.ball_cover.merge_construct import MergeConstruct
 from filters.ball_cover.kmeans_construct import KMeansConstruct
 from filters.ball_cover.minimax_construct import MinimaxConstruct
 from filters.ball_cover.split_construct import SplitConstruct
+from filters.ball_cover.sphere_merge_construct import SphereMergeConstruct
 from util.dataset_paths import dataset_filenames
 from vector_source import VectorSource
 
@@ -70,7 +72,12 @@ METHODS = {
     "merge_seeded": lambda: MergeConstruct(seed_multiplier=8),
     "kmeans": KMeansConstruct,
     "minimax": MinimaxConstruct,
+    # minimax's own centers, moved onto the data's sphere before the radii are
+    # measured (exact_cover.sphere_centers) -- isolates what the sphere
+    # projection alone is worth, at minimax's cost.
+    "minimax_sphere": lambda: MinimaxConstruct(sphere=True),
     "split": SplitConstruct,
+    "sphere_merge": SphereMergeConstruct,
 }
 # main.BLOCKLIST_DATASETS' registry names, repeated here so importing this
 # module (which every worker does) doesn't import main and its ML stack.

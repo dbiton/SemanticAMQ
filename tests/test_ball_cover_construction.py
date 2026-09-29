@@ -13,13 +13,16 @@ from src.filters.ball_cover.merge_construct import MergeConstruct
 from src.filters.ball_cover.kmeans_construct import KMeansConstruct
 from src.filters.ball_cover.minimax_construct import MinimaxConstruct
 from src.filters.ball_cover.split_construct import SplitConstruct
+from src.filters.ball_cover.sphere_merge_construct import SphereMergeConstruct
+from src.filters.ball_cover.exact_cover import exact_cover, sphere_centers, sphere_radius
 
 DIM = 8
 
 def get_constructors():
     """Every construct strategy; GonzalesConstruct is the live default."""
     return [GonzalesConstruct(), MergeConstruct(), MergeConstruct(seed_multiplier=4),
-            KMeansConstruct(), MinimaxConstruct(), SplitConstruct()]
+            KMeansConstruct(), MinimaxConstruct(), MinimaxConstruct(sphere=True), SplitConstruct(),
+            SphereMergeConstruct()]
 
 
 def run_construct(construct_method: ConstructInterface, budget: int, vecs: np.ndarray):
@@ -160,6 +163,118 @@ class TestSharedContract(unittest.TestCase):
         c2, r2 = run_construct(construct, 12, vecs)
         np.testing.assert_array_equal(c1, c2)
         np.testing.assert_array_equal(r1, r2)
+
+
+def _unit(x: np.ndarray) -> np.ndarray:
+    return (x / np.linalg.norm(x, axis=1, keepdims=True)).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# exact_cover.sphere_radius / sphere_centers -- the shared sphere projection
+# ---------------------------------------------------------------------------
+
+class TestSphereProjection(unittest.TestCase):
+
+    def test_sphere_radius_detects_equal_norm_data(self):
+        self.assertAlmostEqual(sphere_radius(_unit(_rand(50, seed=41))), 1.0, places=5)
+        self.assertAlmostEqual(sphere_radius(3.0 * _unit(_rand(50, seed=42))), 3.0, places=4)
+        self.assertEqual(sphere_radius(_rand(50, seed=43)), 0.0)
+        self.assertEqual(sphere_radius(np.zeros((5, DIM), dtype=np.float32)), 0.0)
+        self.assertEqual(sphere_radius(np.empty((0, DIM), dtype=np.float32)), 0.0)
+
+    def test_sphere_centers_share_one_norm_and_still_cover(self):
+        """Only the centers move; exact_cover must still hold every vector,
+        including when some projected centers end up with no members."""
+        vecs = _unit(_clustered(6, 30, spread=0.3, seed=44))
+        centroids = np.vstack([vecs[i * 30:(i + 1) * 30].mean(0) for i in range(6)] +
+                              [_rand(3, seed=45)])  # 3 centers far from any data
+        moved = sphere_centers(vecs, centroids, 1.0)
+        norms = np.linalg.norm(moved, axis=1)
+        self.assertLess(norms.max() - norms.min(), 1e-5)
+        self.assertGreaterEqual(norms.min(), 1.0 - 1e-6)
+        # directions are preserved
+        cos = np.einsum("ij,ij->i", moved / norms[:, None],
+                        centroids / np.linalg.norm(centroids, axis=1, keepdims=True))
+        self.assertTrue(np.all(cos > 1.0 - 1e-5))
+        centers, radii = exact_cover(vecs, moved)
+        self.assertTrue(_covering_ok(vecs, centers, radii))
+
+    def test_sphere_centers_norm_is_clipped_for_wide_caps(self):
+        e = np.eye(DIM, dtype=np.float32)
+        vecs = np.vstack([e, -e])
+        moved = sphere_centers(vecs, np.full((1, DIM), 1e-3, dtype=np.float32), 1.0)
+        self.assertTrue(np.all(np.isfinite(moved)))
+        self.assertLessEqual(float(np.linalg.norm(moved)), 5.0 + 1e-5)
+
+
+# ---------------------------------------------------------------------------
+# SphereMergeConstruct -- the sphere path and its duplicate/empty handling
+# ---------------------------------------------------------------------------
+
+class TestSphereMergeConstruct(unittest.TestCase):
+
+    def test_covers_unit_normalized_data(self):
+        """Equal-norm input takes the sphere path (centers moved off the
+        MEB centers), so the shared contract's Gaussian data never reaches it."""
+        for vecs in (_unit(_rand(400, seed=31)), _unit(_clustered(8, 40, spread=0.2, seed=32))):
+            for budget in (5, 30, 120):
+                centers, radii = run_construct(SphereMergeConstruct(), budget, vecs)
+                self.assertLessEqual(len(centers), budget)
+                self.assertTrue(_covering_ok(vecs, centers, radii), f"budget={budget}")
+
+    def test_centers_share_one_norm_on_sphere_data(self):
+        """A common norm is what keeps nearest-center assignment angular;
+        unequal norms break exact_cover's and _tight_radii's assumption."""
+        centers, _ = run_construct(SphereMergeConstruct(), 20, _unit(_rand(300, seed=33)))
+        norms = np.linalg.norm(centers, axis=1)
+        self.assertLess(norms.max() - norms.min(), 1e-5 * norms.mean())
+        self.assertGreaterEqual(norms.min(), 1.0 - 1e-6)
+
+    def test_scaled_sphere_is_detected(self):
+        vecs = 10.0 * _unit(_rand(300, seed=34))
+        centers, radii = run_construct(SphereMergeConstruct(), 20, vecs)
+        norms = np.linalg.norm(centers, axis=1)
+        self.assertLess(norms.max() - norms.min(), 1e-5 * norms.mean())
+        self.assertGreaterEqual(norms.min(), 10.0 * (1.0 - 1e-6))
+        self.assertTrue(_covering_ok(vecs, centers, radii, tol=1e-2))
+
+    def test_data_off_a_sphere_keeps_meb_centers(self):
+        centers, radii = run_construct(SphereMergeConstruct(), 20, _rand(300, seed=35))
+        norms = np.linalg.norm(centers, axis=1)
+        self.assertGreater(norms.max() - norms.min(), 0.1)
+
+    def test_heavy_exact_duplicates_on_sphere(self):
+        """Duplicates collapse to one zero-radius ball before merging; the
+        refinement round must not then lose a vector or leave a ball over
+        budget when several centers compete for the same repeated point."""
+        rng = np.random.default_rng(36)
+        distinct = _unit(_rand(6, seed=37))
+        vecs = np.vstack([np.repeat(distinct, 40, axis=0), _unit(_rand(20, seed=38))])
+        vecs = vecs[rng.permutation(len(vecs))]
+        for budget in (3, 8, 25):
+            centers, radii = run_construct(SphereMergeConstruct(), budget, vecs)
+            self.assertLessEqual(len(centers), budget)
+            self.assertTrue(np.all(radii >= 0.0))
+            self.assertTrue(_covering_ok(vecs, centers, radii), f"budget={budget}")
+
+    def test_fewer_distinct_points_than_budget(self):
+        """n > k but only 3 distinct vectors: no merge runs, and centers the
+        refinement round leaves empty are dropped rather than returned as
+        zero-radius balls."""
+        vecs = np.repeat(_unit(_rand(3, seed=39)), 20, axis=0)
+        centers, radii = run_construct(SphereMergeConstruct(), 10, vecs)
+        self.assertLessEqual(len(centers), 3)
+        self.assertTrue(_covering_ok(vecs, centers, radii))
+
+    def test_antipodal_points_single_ball(self):
+        """A cap wider than a hemisphere: the MEB center is ~0 and the
+        norm that minimizes the cap is unbounded. Must still cover, finitely."""
+        e = np.eye(DIM, dtype=np.float32)
+        vecs = np.vstack([e, -e])
+        centers, radii = run_construct(SphereMergeConstruct(), 1, vecs)
+        self.assertEqual(len(centers), 1)
+        self.assertTrue(np.all(np.isfinite(centers)) and np.all(np.isfinite(radii)))
+        self.assertTrue(_covering_ok(vecs, centers, radii))
 
 
 # ---------------------------------------------------------------------------

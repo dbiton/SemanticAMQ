@@ -100,9 +100,32 @@ class MergeConstruct(ConstructInterface):
 
 
     def _mutual_cheapest_pairs(self, centers: np.ndarray, radii: np.ndarray, dim: int,
-                               max_pairs: int) -> Tuple[np.ndarray, np.ndarray]:
+                               max_pairs: int, mass: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
         """Disjoint (p, q) ball pairs that are each other's cheapest merge
-        among their candidate edges, cheapest first, at most max_pairs."""
+        among their candidate edges, cheapest first, at most max_pairs.
+        `mass` (member count per ball) is passed through to _edge_costs."""
+        a = len(centers)
+        lo, hi, dist = self._candidate_edges(centers, dim)
+        cost = self._edge_costs(lo, hi, dist, radii, dim, mass)
+
+        # Total order on edges, ties broken by edge id, so the globally
+        # cheapest edge is always mutual and every round makes progress --
+        # duplicate-heavy corpora produce many exactly tied costs.
+        edge = lo * a + hi
+        rank = np.empty(len(edge), dtype=np.int64)
+        rank[np.lexsort((edge, cost))] = np.arange(len(edge))
+        best = np.full(a, len(edge), dtype=np.int64)
+        np.minimum.at(best, lo, rank)
+        np.minimum.at(best, hi, rank)
+
+        mutual = np.flatnonzero((best[lo] == rank) & (best[hi] == rank))
+        mutual = mutual[np.argsort(rank[mutual])][:max_pairs]
+        return lo[mutual], hi[mutual]
+
+
+    def _candidate_edges(self, centers: np.ndarray, dim: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(lo, hi, dist): one undirected edge from every ball to each of its
+        `candidates` nearest centers, lo < hi, sorted by edge id."""
         a = len(centers)
         m = min(self.candidates, a - 1)
         C = np.ascontiguousarray(centers, dtype=np.float32)
@@ -121,22 +144,14 @@ class MergeConstruct(ConstructInterface):
         # ranks candidates -- _merge measures the pairs it acts on exactly.
         lo, hi = np.minimum(src, nbr), np.maximum(src, nbr)
         edge, idx = np.unique(lo * a + hi, return_index=True)
-        lo, hi = edge // a, edge % a
-        dist = np.sqrt(np.maximum(d2[idx], 0.0))
-        cost = MinHeapInsert._compute_merged_radius(dim, radii[lo], radii[hi], dist)[1]
+        return edge // a, edge % a, np.sqrt(np.maximum(d2[idx], 0.0))
 
-        # Total order on edges, ties broken by edge id, so the globally
-        # cheapest edge is always mutual and every round makes progress --
-        # duplicate-heavy corpora produce many exactly tied costs.
-        rank = np.empty(len(edge), dtype=np.int64)
-        rank[np.lexsort((edge, cost))] = np.arange(len(edge))
-        best = np.full(a, len(edge), dtype=np.int64)
-        np.minimum.at(best, lo, rank)
-        np.minimum.at(best, hi, rank)
 
-        mutual = np.flatnonzero((best[lo] == rank) & (best[hi] == rank))
-        mutual = mutual[np.argsort(rank[mutual])][:max_pairs]
-        return lo[mutual], hi[mutual]
+    def _edge_costs(self, lo: np.ndarray, hi: np.ndarray, dist: np.ndarray, radii: np.ndarray,
+                    dim: int, mass: Optional[np.ndarray] = None) -> np.ndarray:
+        """Merge cost of each candidate edge: MinHeapInsert's log volume of
+        the enclosing ball beyond its two parts. Ignores `mass`."""
+        return MinHeapInsert._compute_merged_radius(dim, radii[lo], radii[hi], dist)[1]
 
 
     @staticmethod
