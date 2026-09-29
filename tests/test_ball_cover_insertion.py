@@ -13,6 +13,7 @@ from src.filters.ball_cover.nearest_insert import NearestInsert
 from src.filters.ball_cover.least_inflation_insert import LeastInflationInsert
 from src.filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
 from src.filters.ball_cover.doubling_insert import DoublingInsert
+from src.filters.ball_cover.pooled_insert import PooledInsert
 
 DIM = 8
 
@@ -23,23 +24,19 @@ def get_insertion_strategies():
         'least_inflation': LeastInflationInsert(),
         'exhaustive_merge': ExhaustiveMergeInsert(),
         'doubling': DoublingInsert(),
+        'pooled': PooledInsert()
     }
 
 
 def _seed(f: BallCoverFilter, centers: np.ndarray, radii: np.ndarray) -> None:
-    """Puts an explicit ball set into `f` the way construct() would -- fit the
-    codebook on the centers, then store them once (which is where radii pick
-    up their encoding error). Mirrors BallCoverFilter.construct() minus the
-    construct_method, so these tests exercise the real invariants."""
+    """Puts an explicit ball set into `f` the way construct() would -- train the
+    quantizer on the centers, then store them via _add_spheres().
+    Mirrors BallCoverFilter.construct() minus the construct_method, so these tests 
+    exercise the real invariants."""
     centers = np.ascontiguousarray(centers, dtype=np.float32)
-    n = len(centers)
-    f._ensure_capacity(max(n, 1))
+    radii = np.ascontiguousarray(radii, dtype=np.float32)
     f._train_quantizer(centers)
-    ids = np.arange(n, dtype=np.int64)
-    f._all_spheres[:n] = ids.astype(np.int32)
-    f._num_spheres = n
-    f._all_centers = None
-    f._store_spheres(ids, centers, radii)
+    f._add_spheres(centers, radii)
     f._constructed = True
 
 
@@ -186,7 +183,7 @@ class TestNoRelocationStrategies(unittest.TestCase):
             _seed(f, centers, radii)
             
             old_centers = f.all_centers
-            strategy.insert(f, new_vectors)
+            f.insert(new_vectors)
             new_centers = f.all_centers
             
             np.testing.assert_array_equal(new_centers, old_centers, err_msg=name)
@@ -280,18 +277,18 @@ class TestDoublingStrategy(unittest.TestCase):
         strategy = DoublingInsert(growth_budget_fraction=1.0)
         f = BallCoverFilter(dim=DIM, insert_method=strategy, max_spheres=max_spheres, quantize=Quantize.NONE)
         f.construct(_rand(max_spheres, seed=32))
-        self.assertEqual(f._num_spheres, max_spheres)
+        self.assertEqual(len(f.all_spheres), max_spheres)
 
         # Insert one not-already-covered vector at a time -- each becomes a
         # singleton, so this exercises the exact growth -> rebuild -> shrink
         # cycle instead of jumping straight to the threshold in one batch.
         rng = np.random.default_rng(33)
-        max_seen = f._num_spheres
+        max_seen = len(f.all_spheres)
         for _ in range(max_spheres + 2):
             f.insert(rng.standard_normal((1, DIM)).astype(np.float32))
-            max_seen = max(max_seen, f._num_spheres)
+            max_seen = max(max_seen, len(f.all_spheres))
 
-        self.assertLessEqual(f._num_spheres, max_spheres)
+        self.assertLessEqual(len(f.all_spheres), max_spheres)
         self.assertGreater(max_seen, max_spheres)  # it did actually grow past budget first
         self.assertLessEqual(max_seen, max_spheres * 2)  # never exceeds the configured cap
 
@@ -321,7 +318,7 @@ class TestDoublingStrategy(unittest.TestCase):
             missing = np.where(~np.array(found))[0]
             self.assertEqual(len(missing), 0, f"false negative(s) at indices {missing.tolist()}")
 
-        self.assertLessEqual(f._num_spheres, max_spheres)
+        self.assertLessEqual(len(f.all_spheres), max_spheres)
 
 
 if __name__ == "__main__":

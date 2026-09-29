@@ -35,14 +35,18 @@ class DoublingInsert(InsertInterface):
             )
         self.growth_budget_fraction = growth_budget_fraction
 
+
     def initialize_buffers(self, filter: Filter, spheres_indices: np.ndarray, centers: np.ndarray, radii: np.ndarray) -> None:
         pass
+
 
     def ensure_capacity(self, required_cap: int) -> None:
         pass
 
+
     def reset_buffers(self, capacity: int) -> None:
         pass
+
 
     @staticmethod
     def _gonzalez_select_with_uncertainty(
@@ -107,11 +111,13 @@ class DoublingInsert(InsertInterface):
         radii[nonempty] = np.maximum.reduceat(reach[order], starts[nonempty])
         return centers, radii
 
+
     def _rebuild_threshold(self, filter: Filter) -> int:
         return max(
             filter.max_spheres + 1,
             int(round(filter.max_spheres * (1.0 + self.growth_budget_fraction))),
         )
+
 
     def _rebuild(self, filter: Filter) -> None:
         points = np.ascontiguousarray(filter.all_centers, dtype=np.float32)
@@ -121,39 +127,50 @@ class DoublingInsert(InsertInterface):
             points, uncertainty, filter.max_spheres
         )
 
-        filter._num_spheres = 0
-        for center, radius in zip(new_centers, new_radii):
-            filter._add_spheres(center[None, :], radius)
-        # No index work here: BallCoverFilter.insert() encodes whatever
-        # centers this left in _all_centers and retires the ids it dropped.
+        filter._remove_spheres(filter.all_spheres)
+        filter._add_spheres(new_centers, new_radii)
+
 
     @staticmethod
     def _exhaustive_search(centers: np.ndarray, queries: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        if len(centers) == 0:
+            return np.empty((len(queries), 0), dtype=np.float32), np.empty((len(queries), 0), dtype=np.int64)
         dim = centers.shape[1]
         index = faiss.IndexFlatL2(dim)
         index.add(centers)
         d2, labels = index.search(queries, len(centers))
         return np.sqrt(np.maximum(d2, 0.0)), labels
 
+
     def insert(self, filter: Filter, vectors: np.ndarray) -> None:
+        if len(vectors) == 0:
+            return
+
         X = np.ascontiguousarray(vectors, dtype=np.float32)
 
-        centers = filter.all_centers
-        radii = filter.all_radiuses
-        # Must index radii by labels, not positionally -- labels give each
-        # match's position in `centers`, not sorted-rank order.
-        dist, labels = self._exhaustive_search(centers, X)
-        is_already_covered = np.any(dist <= radii[labels], axis=1)
-        X = X[~is_already_covered]
+        # Filter out covered vectors only if spheres exist
+        if filter._num_spheres > 0:
+            centers = filter.all_centers
+            radii = filter.all_radiuses
+            dist, labels = self._exhaustive_search(centers, X)
+            is_already_covered = np.any(dist <= radii[labels], axis=1)
+            X = X[~is_already_covered]
 
-        for vec in X:
-            filter._add_spheres(vec[None, :], 0.0)
+        if len(X) == 0:
+            return
 
+        # Batch-add uncovered vectors as zero-radius spheres
+        zero_radii = np.zeros(len(X), dtype=np.float32)
+        filter._add_spheres(X, zero_radii)
+
+        # Rebuild if growth threshold exceeded
         if filter._num_spheres >= self._rebuild_threshold(filter):
             self._rebuild(filter)
 
+
     def remove(self, filter: Filter, vectors: np.ndarray) -> List[bool]:
         raise NotImplementedError("DoublingInsert does not support remove operation.")
+
 
     def get_bytesize(self, filter: Filter) -> int:
         return 0

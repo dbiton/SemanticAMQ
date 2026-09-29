@@ -5,7 +5,7 @@ from filters.ball_cover.ball_interfaces import InsertInterface, Filter
 
 
 class MinHeapInsert(InsertInterface):
-    _MAX_NEIGHBORS = 50
+    _MAX_NEIGHBORS = 10
     _COMPACTION_RATIO = 2
     _BATCH_SIZE = 2048
 
@@ -117,8 +117,7 @@ class MinHeapInsert(InsertInterface):
             if np.any(contained_indices):
                 contained_spheres = current_spheres[contained_indices]
                 current_spheres = current_spheres[~contained_indices]
-                filter._all_spheres[:filter._num_spheres] = np.concatenate([current_spheres, contained_spheres])
-                filter._num_spheres -= len(contained_spheres)
+                filter._remove_spheres(contained_spheres)
                 self._sphere_versions[contained_spheres] += 1
                 current_radiuses = current_radiuses[~contained_indices]
                 center_distances = center_distances[~contained_indices]
@@ -152,19 +151,20 @@ class MinHeapInsert(InsertInterface):
             centers_diff = center_i - center_j
             distance_ij = float(np.sqrt(np.dot(centers_diff, centers_diff)))
 
-            if distance_ij > 0.0:
+            if distance_ij + radius_j <= radius_i:
+                new_center = center_i.copy()
+                new_radius = float(radius_i)
+            elif distance_ij + radius_i <= radius_j:
+                new_center = center_j.copy()
+                new_radius = float(radius_j)
+            else:
                 weight_j = ((radius_j - radius_i) / (2.0 * distance_ij)) + 0.5
                 weight_i = ((radius_i - radius_j) / (2.0 * distance_ij)) + 0.5
                 new_center = weight_j * center_j + weight_i * center_i
-            else:
-                new_center = center_i
+                new_radius = float(self._compute_merged_radius(filter.dim, radius_i, radius_j, distance_ij)[0])
 
-            new_radius = float(self._compute_merged_radius(filter.dim, radius_i, radius_j, distance_ij)[0])
-
-            current_spheres = filter.all_spheres[(filter.all_spheres != i) & (filter.all_spheres != j)]
-            filter._all_spheres[:filter._num_spheres] = np.concatenate([current_spheres, [i, j]])
+            filter._remove_spheres(np.array([i, j]))
             self._sphere_versions[[i, j]] += 1
-            filter._num_spheres -= 2
 
             self.add_sphere(filter, new_center, new_radius)
 

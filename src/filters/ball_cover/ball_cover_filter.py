@@ -12,6 +12,7 @@ from filters.ball_cover.nearest_insert import NearestInsert
 from filters.ball_cover.least_inflation_insert import LeastInflationInsert
 from filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
 from filters.ball_cover.doubling_insert import DoublingInsert
+from filters.ball_cover.pooled_insert import PooledInsert
 
 
 class Quantize(Enum):
@@ -154,9 +155,9 @@ _ENCODINGS = {
 
 
 class BallCoverFilter(Filter):
+    _BYTES_PER_FLOAT16 = 2
     _BYTES_PER_FLOAT32 = 4
     _BYTES_PER_FLOAT64 = 8
-    _BYTES_PER_FLOAT16 = 2
 
     # Coverage-comparison safety margin: FAISS's IndexFlatL2.search() isn't
     # bit-reproducible across different query-batch shapes, so a ball whose
@@ -182,7 +183,7 @@ class BallCoverFilter(Filter):
         self,
         dim: int,
         construct_method: Optional[ConstructInterface] = GonzalesConstruct(),
-        insert_method: Optional[InsertInterface] = NearestInsert(),
+        insert_method: Optional[InsertInterface] = MinHeapInsert(),
         quantize: Quantize = Quantize.NONE,
         max_memory: Optional[int] = None,
         max_spheres: Optional[int] = None,
@@ -201,19 +202,20 @@ class BallCoverFilter(Filter):
 
         self._num_spheres = 0
         self._all_spheres = np.arange(self.max_spheres, dtype=np.int32)
-        self._all_centers = None # lazily rebuilt cache, not persistent state
+        self._all_centers = None # temporary decoded array used only during insertions, not persistent allocation
         self._all_radiuses = np.empty((self.max_spheres,), dtype=np.float32)
-        self._radius_inflation = np.zeros((self.max_spheres,), dtype=np.float32)
 
         if self.insert_method:
             self.insert_method.ensure_capacity(self.max_spheres)
 
     @property
     def all_spheres(self) -> np.ndarray:
+        """A NumPy view of active sphere indices currently allocated in the filter."""
         return self._all_spheres[:self._num_spheres]
 
     @property
     def all_centers(self) -> np.ndarray:
+        """A NumPy view of active sphere centers decoded directly from the FAISS index."""
         if self._all_centers is None:
             self._all_centers = np.empty((len(self._all_radiuses), self.dim), dtype=np.float32)
             if self._num_spheres > 0:
@@ -223,14 +225,9 @@ class BallCoverFilter(Filter):
 
     @property
     def all_radiuses(self) -> np.ndarray:
+        """A NumPy view of active sphere radii corresponding to the active spheres."""
         return self._all_radiuses[self.all_spheres]
 
-    @property
-    def all_radius_inflation(self) -> np.ndarray:
-        """Per-ball radius cost of encoding (0 for Quantize.NONE, and
-        negative where the coverage pass more than paid for it) -- see
-        _radius_inflation's docstring in __init__."""
-        return self._radius_inflation[self.all_spheres]
 
     def _ensure_capacity(self, required_cap: int) -> None:
         current_cap = len(self._all_radiuses)
@@ -252,42 +249,68 @@ class BallCoverFilter(Filter):
         new_radiuses[:current_cap] = self._all_radiuses
         self._all_radiuses = new_radiuses
 
-        new_inflation = np.zeros((new_cap,), dtype=np.float32)
-        new_inflation[:current_cap] = self._radius_inflation
-        self._radius_inflation = new_inflation
-
         if self.insert_method:
             self.insert_method.ensure_capacity(new_cap)
+
 
     def _reset_buffers(self, capacity: int) -> None:
         self._ensure_capacity(capacity)
         self._num_spheres = 0
-        self._all_centers = None
-        self._all_radiuses[:] = 0.0
-        self._radius_inflation[:] = 0.0
         self.all_centers_index = self._make_faiss_index(self.quantize)
+        self._all_radiuses[:] = 0.0
+        self._all_centers = None
         self._constructed = False
 
         if self.insert_method:
             self.insert_method.reset_buffers(capacity)
 
+
     def _add_spheres(self, centers: np.ndarray, radii: np.ndarray) -> np.ndarray:
-        num_new_spheres = len(centers)
-        if num_new_spheres == 0:
+        if len(centers) == 0:
             return np.empty(0, dtype=np.int32)
+
+        centers = np.ascontiguousarray(centers, dtype=np.float32)
+        radii = np.asarray(radii, dtype=np.float32)
+        num_new_spheres = len(centers)
 
         self._ensure_capacity(self._num_spheres + num_new_spheres)
         new_sphere_indices = self._all_spheres[self._num_spheres : self._num_spheres + num_new_spheres]
-        self._all_centers[new_sphere_indices] = centers
-        self._all_radiuses[new_sphere_indices] = radii
+        self.all_centers_index.add_with_ids(centers, new_sphere_indices.astype(np.int64))
+        self._all_radiuses[new_sphere_indices] = self._fp16_ceil(radii + self._encoding_error(centers))
         self._num_spheres += num_new_spheres
+
+        if self._all_centers is not None:
+            self._all_centers[new_sphere_indices] = centers
+
         return new_sphere_indices
+
+
+    def _remove_spheres(self, sphere_indices: np.ndarray) -> None:
+        if len(sphere_indices) == 0:
+            return
+
+        sphere_indices = np.ascontiguousarray(sphere_indices, dtype=np.int64)
+        removed_sphere_mask = np.isin(self.all_spheres, sphere_indices)
+        active_spheres = self.all_spheres[~removed_sphere_mask]
+        removed_spheres = self.all_spheres[removed_sphere_mask]
+        num_active_spheres = len(active_spheres)
+
+        self._all_spheres[:num_active_spheres] = active_spheres
+        self._all_spheres[num_active_spheres : self._num_spheres] = removed_spheres
+        self.all_centers_index.remove_ids(faiss.IDSelectorBatch(sphere_indices))
+        self._all_radiuses[sphere_indices] = 0.0
+        self._num_spheres = num_active_spheres
+
+        if self._all_centers is not None:
+            self._all_centers[sphere_indices] = 0.0
+
 
     def _calculate_max_spheres(self, max_memory: Optional[int]) -> int:
         if max_memory is None:
             return sys.maxsize
         usable = max(0, max_memory - self._codebook_bytes())
         return max(1, usable // self.bytes_per_ball())
+
 
     def _calculate_max_construct_spheres(self, insertion_memory_percent: float) -> int:
         if insertion_memory_percent <= 0.0:
@@ -298,6 +321,7 @@ class BallCoverFilter(Filter):
             return self._calculate_max_spheres(construct_memory)
 
         return max(1, int(self.max_spheres * (1.0 - insertion_memory_percent / 100.0)))
+
 
     @staticmethod
     def _pq_m_for(dim: int, rate: int, nbits: int) -> int:
@@ -312,8 +336,8 @@ class BallCoverFilter(Filter):
                 return m
         raise InsufficientMemoryError(
             f"No valid PQ subquantizer count for dim={dim} at {rate} bit(s)/dim "
-            f"with {nbits}-bit codes."
-        )
+            f"with {nbits}-bit codes.")
+
 
     @staticmethod
     def _fp16_ceil(radii: np.ndarray) -> np.ndarray:
@@ -330,6 +354,7 @@ class BallCoverFilter(Filter):
         up = np.nextafter(half, np.float16(np.inf))
         return np.where(half.astype(np.float32) < radii, up, half).astype(np.float32)
 
+
     def _make_faiss_index(self, quantize: Quantize) -> faiss.IndexIDMap2:
         spec = _ENCODINGS[quantize]
 
@@ -341,24 +366,10 @@ class BallCoverFilter(Filter):
         elif spec.kind == "pq":
             m = self._pq_m_for(self.dim, spec.rate, spec.nbits)
             index = faiss.IndexPQ(self.dim, m, spec.nbits, faiss.METRIC_L2)
-            # ST_PQ is asymmetric distance computation (ADC): the raw float32
-            # query is scored against the *decoded* stored codes, so the query
-            # is never encoded. That is what makes the one-sided radius
-            # inflation in _store_spheres correct and tight -- see query().
-            # ST_SDC/ST_polysemous encode the query too and would silently
-            # break the zero-false-negative guarantee, so pin it.
             assert index.search_type == faiss.IndexPQ.ST_PQ, (
-                f"BallCoverFilter requires ADC (ST_PQ); got search_type={index.search_type}"
-            )
+                f"BallCoverFilter requires ADC (ST_PQ); got search_type={index.search_type}")
         elif spec.kind == "rabitq":
             index = faiss.IndexRaBitQ(self.dim, faiss.METRIC_L2)
-            # faiss defaults qb=4, i.e. it quantizes the *query* to 4 bits.
-            # That contradicts the invariant every other row relies on (see
-            # query()), so pin it off. Note this does NOT make RaBitQ's
-            # search exact: unlike ADC, it scores through its own estimator
-            # rather than against sa_decode's output, so search() and
-            # _encoding_error() describe different reconstructions -- see
-            # the caveat on Quantize.RABITQ.
             index.qb = 0
         else:
             raise ValueError(f"Unknown encoding kind {spec.kind!r} for {quantize}")
@@ -367,6 +378,7 @@ class BallCoverFilter(Filter):
             index = faiss.IndexPreTransform(self._make_rotation(self.dim), index)
 
         return faiss.IndexIDMap2(index)
+
 
     @staticmethod
     def _make_rotation(dim: int) -> faiss.VectorTransform:
@@ -399,6 +411,7 @@ class BallCoverFilter(Filter):
         rotation.init(_ROTATION_SEED)
         return rotation
 
+
     def _coder(self, index: Optional[faiss.IndexIDMap2] = None) -> faiss.Index:
         """The level that owns sa_encode/sa_decode: the pre-transform wrapper
         when there is one, so encoding applies the rotation and decoding
@@ -411,6 +424,7 @@ class BallCoverFilter(Filter):
             index = self.all_centers_index
         return faiss.downcast_index(index.index)
 
+
     def _leaf_index(self, index: Optional[faiss.IndexIDMap2] = None) -> faiss.Index:
         """The quantizer itself, past any pre-transform -- for reading .pq /
         .sq / RaBitQ model parameters."""
@@ -419,11 +433,13 @@ class BallCoverFilter(Filter):
             return faiss.downcast_index(leaf.index)
         return leaf
 
+
     def bytes_per_ball(self, index: Optional[faiss.IndexIDMap2] = None) -> int:
         """Encoded center + fp16 radius. sa_code_size() is well defined
         before training and through a pre-transform, so this is callable at
         __init__ time, when the memory budget is turned into a ball count."""
         return self._coder(index).sa_code_size() + self._BYTES_PER_FLOAT16
+
 
     def _codebook_bytes(self, index: Optional[faiss.IndexIDMap2] = None) -> int:
         """Fixed, per-filter cost that does not scale with the ball count."""
@@ -431,21 +447,12 @@ class BallCoverFilter(Filter):
         index = self._leaf_index(index)
 
         if isinstance(index, faiss.IndexPQ):
-            # Computed from the layout, not from pq.centroids.nbytes, which
-            # reads 0 until the index is trained -- and __init__ sizes the
-            # ball budget against an untrained one.
             pq = index.pq
             total += int(pq.M) * (1 << int(pq.nbits)) * int(pq.dsub) * self._BYTES_PER_FLOAT32
         elif isinstance(index, faiss.IndexScalarQuantizer):
             trained = faiss.vector_to_array(index.sq.trained)
             if len(trained) == 0:
                 probe = faiss.IndexScalarQuantizer(self.dim, index.sq.qtype, faiss.METRIC_L2)
-                # Random probes, not zeros: the MSE-trained (TurboQuant)
-                # variants divide through by the spread while training.
-                # A local Generator, never np.random.*: this runs from
-                # __init__, and drawing from the global stream would shift
-                # every globally-seeded sequence downstream (runner seeds per
-                # fold), making results depend on how many filters got built.
                 probe.train(_PROBE_RNG.random((2, self.dim)).astype(np.float32))
                 trained = faiss.vector_to_array(probe.sq.trained)
             total += int(trained.nbytes)
@@ -453,6 +460,19 @@ class BallCoverFilter(Filter):
             total += int(faiss.vector_to_array(index.center).nbytes)
 
         return total
+
+
+    def _encoding_error(self, centers: np.ndarray) -> np.ndarray:
+        """Per-center ||c - decode(encode(c))||, measured against the trained
+        codebook -- never a probabilistic bound. sa_encode/sa_decode are used
+        as the uniform binding fallback across index types, and at the _coder()
+        level so a rotation is applied on encode and undone on decode."""
+        coder = self._coder()
+        if _ENCODINGS[self.quantize].kind == "flat" or not coder.is_trained:
+            return np.zeros(len(centers), dtype=np.float32)
+        decoded = coder.sa_decode(coder.sa_encode(centers))
+        return np.linalg.norm(centers - decoded, axis=1).astype(np.float32)
+
 
     def _train_quantizer(self, centers: np.ndarray) -> faiss.IndexIDMap2:
         """Fits the one codebook this filter will ever use, on the ball
@@ -479,32 +499,23 @@ class BallCoverFilter(Filter):
         so unlike the codebook's *contents*, nothing about the filter's byte
         footprint depends on what this sees -- only its fidelity does.
         """
-        if _ENCODINGS[self.quantize].kind == "flat":
+        spec = _ENCODINGS[self.quantize]
+
+        if spec.kind == "flat" or len(centers) == 0:
             return self._make_faiss_index(self.quantize)
 
-        spec = _ENCODINGS[self.quantize]
-        # PQ k-means is a hard floor, not a warning: faiss asserts
-        # nx >= k inside Clustering::train_encoded, so a PQ codebook with
-        # ksub = 2**nbits centroids cannot be fitted to fewer than ksub ball
-        # centers. PQ8_R2 needs 256. Caught here so a too-tight budget
-        # surfaces as InsufficientMemoryError (which runner records as an
-        # infeasible row) instead of an unhandled RuntimeError mid-sweep.
         min_centers = (1 << spec.nbits) if spec.kind == "pq" else 2
         if len(centers) < min_centers:
             raise InsufficientMemoryError(
                 f"Not enough memory to fit a {self.quantize.value} codebook: {len(centers)} ball "
                 f"center(s), but this encoding needs at least {min_centers} to train on. "
-                "Requires a larger max_memory or a coarser encoding."
-            )
+                "Requires a larger max_memory or a coarser encoding.")
 
         index = self._make_faiss_index(self.quantize)
         leaf = faiss.downcast_index(index.index)
         if isinstance(leaf, faiss.IndexPreTransform):
             leaf = faiss.downcast_index(leaf.index)
         if isinstance(leaf, faiss.IndexPQ):
-            # k-means over ball centers, of which there are usually far fewer
-            # than the 39 * ksub faiss would like. The codebook is allowed to
-            # come out under-filled rather than refusing to build.
             leaf.pq.cp.min_points_per_centroid = 1
 
         index.train(centers)
@@ -514,9 +525,10 @@ class BallCoverFilter(Filter):
             raise InsufficientMemoryError(
                 f"max_memory={self.max_memory} bytes cannot hold a {self.quantize.value} filter: its "
                 f"fixed codebook alone is {codebook} bytes, leaving no room for even "
-                f"one {per_ball}-byte ball."
-            )
+                f"one {per_ball}-byte ball.")
+
         return index
+
 
     def _tight_radii(
         self,
@@ -602,87 +614,6 @@ class BallCoverFilter(Filter):
                 radii[home[i]] = home_dist[i]
         return radii
 
-    def _encoding_error(self, centers: np.ndarray) -> np.ndarray:
-        """Per-center ||c - decode(encode(c))||, measured against the trained
-        codebook -- never a probabilistic bound. sa_encode/sa_decode are used
-        as the uniform binding fallback across index types, and at the _coder()
-        level so a rotation is applied on encode and undone on decode."""
-        if _ENCODINGS[self.quantize].kind == "flat":
-            return np.zeros(len(centers), dtype=np.float32)
-        coder = self._coder()
-        decoded = coder.sa_decode(coder.sa_encode(centers))
-        return np.linalg.norm(centers - decoded, axis=1).astype(np.float32)
-
-    def _store_spheres(
-        self,
-        sphere_indices: np.ndarray,
-        centers: np.ndarray,
-        radii: np.ndarray,
-        member_vectors: Optional[np.ndarray] = None,
-    ) -> None:
-        """Writes (center, radius) pairs into the already-trained index.
-
-        Two ways to land on a radius that query() can trust, both of which
-        have to account for the center being replaced by its lossy encoding:
-
-        `member_vectors` given (construct()) -- the vectors the balls have to
-        cover are in hand, so the radii are *measured* against the decoded
-        centers by _tight_radii and stored as-is. `radii` is then only the
-        pre-encoding baseline, used to record how much was actually paid.
-
-        `member_vectors` omitted (insert()) -- streaming, with no member set
-        to measure against, so each radius is inflated by its own center's
-        encoding error instead: the sound bound, just a looser one.
-
-        The inflation is applied exactly once, at the moment a center is
-        written -- which is the whole reason nothing rebuilds. A radius only
-        needs inflating when it was measured against a center that is about
-        to be replaced by its lossy encoding (any center an insert strategy
-        relocates). Once stored, `all_centers` hands back the *decoded*
-        center, so every radius an insert strategy derives from it is already
-        correct with respect to what query() scores against, and must not be
-        inflated again. Re-inflating on each touch is what made the old
-        rebuild path grow radii without bound.
-        """
-        sphere_indices = np.ascontiguousarray(sphere_indices, dtype=np.int64)
-        if len(sphere_indices) == 0:
-            return
-        centers = np.ascontiguousarray(centers, dtype=np.float32)
-        radii = np.asarray(radii, dtype=np.float32)
-
-        error = None if member_vectors is not None else self._encoding_error(centers)
-        # add_with_ids appends rather than overwrites, so an id being
-        # rewritten (a relocated/merged ball) has to be dropped first.
-        if self.all_centers_index.ntotal > 0:
-            self.all_centers_index.remove_ids(faiss.IDSelectorBatch(sphere_indices))
-        self.all_centers_index.add_with_ids(centers, sphere_indices)
-
-        if error is not None:
-            self._all_radiuses[sphere_indices] = self._fp16_ceil(radii + error)
-            self._radius_inflation[sphere_indices] = error
-            return
-
-        # reconstruct_batch, not sa_decode(sa_encode(centers)): this reads the
-        # codes the index just stored, so the radii are measured against the
-        # exact vectors query() will score, with no assumption that add()
-        # and sa_encode() agree.
-        decoded = self.all_centers_index.reconstruct_batch(sphere_indices)
-        stored = self._fp16_ceil(self._tight_radii(member_vectors, centers, decoded, radii))
-        self._all_radiuses[sphere_indices] = stored
-        # What encoding actually cost, rather than the bound it would have
-        # been charged. Negative wherever the coverage pass more than paid
-        # for the center's error -- a real saving against the unquantized
-        # cover, not a bookkeeping artifact.
-        self._radius_inflation[sphere_indices] = stored - radii
-
-    def _drop_spheres(self, sphere_indices: np.ndarray) -> None:
-        """Evicts ids an insert strategy retired (merged away, absorbed) from
-        the index, so ntotal keeps tracking _num_spheres."""
-        sphere_indices = np.ascontiguousarray(sphere_indices, dtype=np.int64)
-        if len(sphere_indices) == 0 or self.all_centers_index.ntotal == 0:
-            return
-        self.all_centers_index.remove_ids(faiss.IDSelectorBatch(sphere_indices))
-        self._radius_inflation[sphere_indices] = 0.0
 
     def construct(self, vectors: np.ndarray) -> None:
         """Builds the filter in bulk from construct_method's output via _add_spheres().
@@ -695,36 +626,27 @@ class BallCoverFilter(Filter):
         _train_quantizer), and it is re-runnable: calling it again on a
         filter that has already been constructed and inserted into is what
         runner's "periodic" streaming policy does, so it fully resets the id
-        pool, the per-ball inflation, and the insert strategy's bookkeeping.
+        pool, the per-ball inflation, and the insert strategy's bookkeeping."""
+        if len(vectors) == 0:
+            self._constructed = True
+            return
 
-        Returns nothing. This used to return estimate_hypersphere_volume's
-        overlap-aware bounds on the cover's volume, which made every caller
-        pay for them whether or not it read them -- and almost none did. That
-        measurement now belongs to whoever wants it: runner's
-        _tau_volume_bounds_log10 computes the same bounds from all_centers and
-        all_radiuses, at any tau, and is called only by the worker whose
-        figure needs them."""
         centers, radii = self.construct_method.construct_filter(self, vectors)
         centers = np.ascontiguousarray(centers, dtype=np.float32)
         radii = np.asarray(radii, dtype=np.float32)
-        n = len(centers)
-        self._reset_buffers(n)
-        _ = self.all_centers
+        self._reset_buffers(len(vectors))
 
-        self.all_centers_index = self._make_faiss_index(self.quantize) if n == 0 else self._train_quantizer(centers)
-        self._constructed = True
-
-        if n == 0:
-            return
-
+        self.all_centers_index = self._train_quantizer(centers)
         sphere_indices = self._add_spheres(centers, radii)
-        self._store_spheres(sphere_indices, centers, radii, member_vectors=vectors)
+        self._all_radiuses[sphere_indices] = self._fp16_ceil(self._tight_radii(vectors, centers, self.all_centers, radii))
 
-        # initialize insert method buffers if given
         if self.insert_method:
-            self.insert_method.initialize_buffers(self, sphere_indices, centers, radii)
+            _ = self.all_centers # intialize centers view for insertion
+            self.insert_method.initialize_buffers(self, sphere_indices, self.all_centers, self.all_radiuses)
 
-        self._all_centers = None
+        self._constructed = True
+        self._all_centers = None # clear temporary centers view
+
 
     def query(self, vectors: np.ndarray, distance_threshold: float) -> list[bool]:
         if not self._constructed:
@@ -735,106 +657,61 @@ class BallCoverFilter(Filter):
 
         Q = np.ascontiguousarray(vectors, dtype=np.float32)
         d2, labels = self.all_centers_index.search(Q, self._num_spheres)
-
-        missing = labels < 0
-        surface = np.sqrt(np.maximum(d2, 0.0)) - self._all_radiuses[np.where(missing, 0, labels)]
-        if missing.any():
-            surface = np.where(missing, np.inf, surface)
+        surface = np.where(labels >= 0, np.sqrt(np.maximum(d2, 0.0)) - self._all_radiuses[np.maximum(labels, 0)], np.inf)
         return (surface.min(axis=1) <= distance_threshold + self._COVERAGE_EPSILON).tolist()
 
-    def insert(self, vectors: np.ndarray) -> None:
-        """Streaming insertion into an already-constructed filter. Nothing is
-        retrained and nothing is rebuilt: whatever centers the strategy
-        leaves behind are encoded once, with construct()'s codebook, and
-        written straight into the index.
 
-        insert_method strategies mutate _all_centers/_all_radiuses/
-        _all_spheres in place, so the sync below is by sphere id: ids whose
-        center the strategy actually changed (relocated, merged, or newly
-        allocated) get re-encoded and re-inflated; ids it only grew the
-        radius of are left alone, because a radius measured against an
-        already-decoded center needs no inflation; ids it retired are dropped
-        from the index."""
+    def insert(self, vectors: np.ndarray) -> None:
         if not self._constructed:
             raise ValueError(
                 "BallCoverFilter.insert() requires a constructed filter -- call construct() first. "
                 "insert() reuses the codebook and PQ nbits that construct() fixed, and has no "
-                "centers to fit them from on its own."
-            )
+                "centers to fit them from on its own.")
 
         if not self._coder().is_trained:
             raise ValueError(
                 "BallCoverFilter.insert() has no codebook to encode with: construct() produced "
                 "zero balls, so the quantizer was never fitted. Call construct() on a non-empty "
-                "vector set first."
-            )
+                "vector set first.")
 
         if not self.insert_method:
             raise ValueError(
                 "BallCoverFilter.insert() requires an insertion strategy: insert_method is None. "
                 "Provide an InsertInterface implementation (e.g., NearestInsert, MinHeapInsert) "
-                "when instantiating BallCoverFilter to enable streaming insertions."
-            )
+                "when instantiating BallCoverFilter to enable streaming insertions.")
 
         if len(vectors) == 0:
             return
 
-        prev_ids = self.all_spheres.copy()
-        # Materializes the _all_centers cache the strategies write through.
-        prev_centers = self.all_centers.copy()
-
+        _ = self.all_centers # intialize centers view for insertion
         self.insert_method.insert(self, vectors)
+        self._all_centers = None # clear temporary centers view
 
-        new_ids = self.all_spheres.copy()
-        new_centers = self._all_centers[new_ids]
-
-        # Position of each still-active id in the pre-insert snapshot, -1 for
-        # ids the strategy newly allocated.
-        prev_pos = np.full(len(self._all_radiuses), -1, dtype=np.int64)
-        prev_pos[prev_ids] = np.arange(len(prev_ids), dtype=np.int64)
-        pos = prev_pos[new_ids]
-
-        unchanged = pos >= 0
-        if unchanged.any():
-            unchanged[unchanged] = np.all(
-                new_centers[unchanged] == prev_centers[pos[unchanged]], axis=1
-            )
-        changed = ~unchanged
-
-        alive = np.zeros(len(self._all_radiuses), dtype=bool)
-        alive[new_ids] = True
-        self._drop_spheres(prev_ids[~alive[prev_ids]])
-
-        if changed.any():
-            changed_ids = new_ids[changed]
-            self._store_spheres(changed_ids, new_centers[changed], self._all_radiuses[changed_ids])
-
-        # Strategies write raw float32 radii straight into _all_radiuses, so
-        # re-settle every active ball onto the fp16 grid bytes_per_ball()
-        # charges for. Idempotent, and only ever rounds up.
-        self._all_radiuses[new_ids] = self._fp16_ceil(self._all_radiuses[new_ids])
-
-        # Drop the cache so the next read comes back decoded, i.e. equal to
-        # what query() actually scores against.
-        self._all_centers = None
 
     def add(self, vectors: np.ndarray) -> None:
         self.insert(vectors)
 
+
     def remove(self, vectors: np.ndarray) -> List[bool]:
         if not self._constructed:
             raise ValueError(
-                "BallCoverFilter.insert() requires a constructed filter -- call construct() first."
-            )
+                "BallCoverFilter.remove() requires a constructed filter -- call construct() first.")
 
         if not self.insert_method:
             raise ValueError(
-                "BallCoverFilter.insert() requires an insertion strategy: insert_method is None. "
+                "BallCoverFilter.remove() requires an insertion strategy: insert_method is None. "
                 "Provide an InsertInterface implementation (e.g., NearestInsert, MinHeapInsert) "
-                "when instantiating BallCoverFilter to enable streaming insertions."
-            )
+                "when instantiating BallCoverFilter to enable streaming insertions.")
 
-        return self.insert_method.remove(self, vectors)
+        if len(vectors) == 0:
+            return []
+
+        _ = self.all_centers # intialize centers view for insertion
+        result = self.insert_method.remove(self, vectors)
+        self._all_centers = None # clear temporary centers view
+
+        return result
+
 
     def get_bytesize(self) -> int:
         if not self._constructed:
@@ -843,6 +720,7 @@ class BallCoverFilter(Filter):
         if self.insert_method:
             filter_bytes += self.insert_method.get_bytesize(self)
         return filter_bytes
+
 
     def get_construction_bytesize(self) -> int:
         if not self.construct_method:

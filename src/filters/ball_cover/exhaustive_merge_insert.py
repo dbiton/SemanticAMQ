@@ -111,7 +111,7 @@ class ExhaustiveMergeInsert(InsertInterface):
 
                 n -= 1
 
-        filter._num_spheres = 0
+        filter._remove_spheres(filter.all_spheres)
         filter._add_spheres(c[:n].astype(np.float32), r[:n].astype(np.float32))
 
 
