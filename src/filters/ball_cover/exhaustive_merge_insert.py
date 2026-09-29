@@ -51,6 +51,16 @@ class ExhaustiveMergeInsert(InsertInterface):
             c[:n] = np.asarray(filter.all_centers[:n], dtype=np.float64)
             r[:n] = np.asarray(filter.all_radiuses[:n], dtype=np.float64)
 
+        # src[i]: which of the filter's current balls slot i still holds
+        # untouched, or -1 once it holds a new or merged ball. Only those get
+        # re-encoded at the end: re-adding an untouched ball re-encodes an
+        # already-decoded center, and on a lossy encoding that charges its
+        # re-encoding drift to the radius again on every call -- 200 no-op
+        # inserts grew TQ5 radii by up to 18.8.
+        orig_ids = filter.all_spheres.astype(np.int64)
+        src = np.full(capacity, -1, dtype=np.int64)
+        src[:n] = np.arange(n)
+
         X = np.ascontiguousarray(vectors, dtype=np.float64)
 
         for x in X:
@@ -62,6 +72,7 @@ class ExhaustiveMergeInsert(InsertInterface):
 
             c[n] = x
             r[n] = 0.0
+            src[n] = -1
             n += 1
 
             while n > max_k:
@@ -102,17 +113,33 @@ class ExhaustiveMergeInsert(InsertInterface):
                 i, j = int(i), int(j)
 
                 c_new, r_new = self._merge_two_balls(c[i], r[i], c[j], r[j])
+                if r_new == r[i] and np.array_equal(c_new, c[i]):
+                    pass  # i already contained j: slot i is untouched
+                elif r_new == r[j] and np.array_equal(c_new, c[j]):
+                    src[i] = src[j]
+                else:
+                    src[i] = -1
                 c[i] = c_new
                 r[i] = r_new
 
                 if j != n - 1:
                     c[j] = c[n - 1]
                     r[j] = r[n - 1]
+                    src[j] = src[n - 1]
 
                 n -= 1
 
-        filter._remove_spheres(filter.all_spheres)
-        filter._add_spheres(c[:n].astype(np.float32), r[:n].astype(np.float32))
+        kept = src[:n] >= 0
+        keep_ids = orig_ids[src[:n][kept]]
+        filter._remove_spheres(orig_ids[~np.isin(orig_ids, keep_ids)])
+        new_ids = filter._add_spheres(c[:n][~kept].astype(np.float32), r[:n][~kept].astype(np.float32))
+        # Put the balls back in slot order, as re-adding all of them used to:
+        # the next insert() reads them in this order, and its merge search
+        # breaks ties by position.
+        order = np.empty(n, dtype=filter._all_spheres.dtype)
+        order[kept] = keep_ids
+        order[~kept] = new_ids
+        filter._all_spheres[:n] = order
 
 
     def remove(self, filter: Filter, vectors: np.ndarray) -> List[bool]:

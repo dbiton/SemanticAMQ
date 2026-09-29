@@ -606,8 +606,9 @@ QUANTIZATION_SWEEP = (
     # of plot_quantization.QUANTIZE_SWEEP (a separate, hand-kept list, not
     # imported from here -- see that file's comment) so no figure changes
     # until they've actually been looked at. All exact ADC like the rest of
-    # the scalar-quantizer rungs, so this doesn't touch the zero-false-
-    # negative guarantee.
+    # the scalar-quantizer rungs -- TQ5 only once BallCoverFilter.query()
+    # removes its codec's norm offset (see _Encoding.norm_offset); before
+    # that it broke the zero-false-negative invariant this worker asserts.
     Quantize.TQ1, Quantize.TQ2, Quantize.TQ4, Quantize.TQ5, Quantize.TQ8,
 )
 
