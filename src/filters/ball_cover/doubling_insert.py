@@ -23,7 +23,7 @@ class DoublingInsert(InsertInterface):
     The rebuild can't call GonzalesConstruct directly: each active ball's
     own radius must carry into re-clustering as positional uncertainty (the
     points it covered could be anywhere within that radius) -- the same
-    reconstruction-error technique BallCoverFilter._store_spheres uses for
+    reconstruction-error technique BallCoverFilter._add_spheres uses for
     quantized centers -- so the farthest-first selection is mirrored here
     with that one addition."""
 
