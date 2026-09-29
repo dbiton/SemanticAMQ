@@ -606,8 +606,9 @@ QUANTIZATION_SWEEP = (
     # of plot_quantization.QUANTIZE_SWEEP (a separate, hand-kept list, not
     # imported from here -- see that file's comment) so no figure changes
     # until they've actually been looked at. All exact ADC like the rest of
-    # the scalar-quantizer rungs, so this doesn't touch the zero-false-
-    # negative guarantee.
+    # the scalar-quantizer rungs -- TQ5 only once BallCoverFilter.query()
+    # removes its codec's norm offset (see _Encoding.norm_offset); before
+    # that it broke the zero-false-negative invariant this worker asserts.
     Quantize.TQ1, Quantize.TQ2, Quantize.TQ4, Quantize.TQ5, Quantize.TQ8,
 )
 
@@ -690,6 +691,10 @@ def quantization_worker(
     radii = filt.all_radiuses
     log10_J = _log10_J(radii, dim)
 
+    radius_inflation = filt.all_radius_inflation
+    radius_inflation_mean = float(np.mean(radius_inflation)) if len(radius_inflation) else 0.0
+    radius_inflation_std = float(np.std(radius_inflation)) if len(radius_inflation) else 0.0
+
     memory_bytes = filt.get_bytesize()
 
     q0 = time.perf_counter()
@@ -725,7 +730,16 @@ def quantization_worker(
         "n_index_accesses": n_index_accesses,
         "index_accesses_saved": n_q - n_index_accesses,
         "index_accesses_saved_pct": (1.0 - n_index_accesses / max(n_q, 1)) * 100.0,
-        "n_balls": filt._num_spheres, "memory_bytes": memory_bytes, "seed": seed
+        "n_balls": filt._num_spheres, "memory_bytes": memory_bytes, "seed": seed,
+        "radius_inflation_mean": radius_inflation_mean,
+        "radius_inflation_std": radius_inflation_std,
+        # Size of the set every ball cover in this row is built over -- fixed
+        # per (dataset, seed), not swept, but recorded per row (rather than
+        # left for a caller to look up separately) so plot_quantization can
+        # express memory_bytes as a percentage of storing this set raw
+        # (n_construct * dim float32s) without needing its own copy of the
+        # corpus.
+        "n_construct": len(construct_arr),
     })
 
     bad = [r for r in rows if r["fnr"] != 0]
@@ -1196,10 +1210,13 @@ def stream_rebuild_worker(
     dataset: str,
     k: int,
     seed: int,
-    tau_mid: float,
+    tau: float,
     policy: str,
     vectors_stream: VectorInput,
-    vectors_negative: VectorInput,
+    vectors_query: VectorInput,
+    actual_at_checkpoint: Dict[int, List[bool]],
+    n_hard: int,
+    n_easy: int,
     checkpoints: List[int],
     T: Optional[int] = None,
     insertion_level: Optional[str] = None,
@@ -1207,65 +1224,88 @@ def stream_rebuild_worker(
     fold_offset: Optional[int] = None,
     bootstrap_n: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """Simulates one rebuild policy over vectors_stream, reporting FPR and
-    amortized cost per checkpoint.
+    """Simulates one rebuild policy over vectors_stream (a blocklist fold's
+    reference set B, in arrival order -- see main.generate_streaming),
+    reporting query FPR and amortized cost per checkpoint.
       "streaming": BallCoverFilter.insert() per arrival, never rebuilt.
       "periodic": like "streaming", rebuilt from scratch every T arrivals.
       "oracle": rebuilt from scratch at every checkpoint.
     sweep/fold_offset are pass-through tag columns only.
 
-    bootstrap_n (streaming/periodic only) sizes the initial construct()
-    window independently of the ball budget k -- default min(k, n) reproduces
-    the old behavior, but that ties the bootstrap set 1:1 to the ball count,
-    which for k <= n gives GonzalesConstruct one input point per center and
-    hence zero-radius balls at position 0. Pass an explicit bootstrap_n
-    (e.g. an order of magnitude larger than k) to start from a filter with
-    real coverage instead."""
+    vectors_query is the fold's [positives, hard, easy] query stream (see
+    main.BlocklistWorkload.query_vectors), with n_hard/n_easy the trailing
+    hard and easy slices, split out as fpr_hard/fpr_easy exactly as
+    quantization_worker does. actual_at_checkpoint[c] is its distance-based
+    ground truth against vectors_stream[:c] -- computed once by the caller,
+    since every policy and method on a fold shares it.
+
+    bootstrap_n sizes the initial construct() window independently of the
+    ball budget k -- default min(k, n), which for k <= n gives
+    GonzalesConstruct one input point per center and hence zero-radius balls
+    at position 0. Pass an explicit bootstrap_n (e.g. an order of magnitude
+    larger than k) to start from a filter with real coverage instead. Both
+    policies checkpoint only past it, and report position as arrivals since
+    it, so their rows line up."""
     stream_arr = _to_construct_array(vectors_stream)
-    negative_arr = _to_construct_array(vectors_negative)
+    query_arr = _to_construct_array(vectors_query)
     n = len(stream_arr)
+    n_q = len(query_arr)
+    if n_hard + n_easy > n_q:
+        raise ValueError(f"n_hard+n_easy ({n_hard + n_easy}) exceeds n_queries ({n_q})")
+    n_pos = n_q - n_hard - n_easy
     metric, method = _rebuild_policy_tags(policy, insertion_level)
     # we reserve 20% memory pool for pooled insertion, other methods construct at 100% capacity
     insert_memory_percent = 20.0 if insertion_level == "pooled" else 0.0
+    bootstrap_n = min(bootstrap_n if bootstrap_n is not None else k, n)
+    checkpoint_set = sorted(set(c for c in checkpoints if bootstrap_n < c <= n))
+    missing = [c for c in checkpoint_set if c not in actual_at_checkpoint]
+    if missing:
+        raise ValueError(f"actual_at_checkpoint has no ground truth for checkpoint(s) {missing}")
+
+    def _checkpoint_row(filt: BallCoverFilter, pos: int, cumulative_time_s: float) -> Dict[str, Any]:
+        """Measures one checkpoint. Raises rather than recording a false
+        negative, like every other FNR check here: every stream vector seen
+        so far must still be recalled, and so must every query the ground
+        truth says is within tau of them."""
+        recalled = np.asarray(filt.query(stream_arr[:pos], distance_threshold=tau), dtype=bool)
+        actual = np.asarray(actual_at_checkpoint[pos], dtype=bool)
+        predicted = np.asarray(filt.query(query_arr, distance_threshold=tau), dtype=bool)
+        rates = _confusion_rates(predicted, actual)
+        if not recalled.all() or rates["fnr"] != 0.0:
+            raise ValueError(
+                f"Zero-false-negative invariant violated (dataset={dataset}, policy={policy}, "
+                f"insertion_level={insertion_level}, k={k}, seed={seed}, position={pos}): "
+                f"stream fnr={1.0 - recalled.mean()}, query fnr={rates['fnr']}"
+            )
+        # Same [positives, hard, easy] layout as quantization_worker's query
+        # stream -- hard then easy negatives are the trailing n_hard+n_easy.
+        hard_rates = _confusion_rates(predicted[n_pos:n_pos + n_hard], actual[n_pos:n_pos + n_hard])
+        easy_rates = _confusion_rates(predicted[n_pos + n_hard:], actual[n_pos + n_hard:])
+        radii = filt.all_radiuses
+        return {
+            "dataset": dataset, "policy": policy, "T": T, "k": k, "seed": seed,
+            "position": pos - bootstrap_n, "tau": tau,
+            "fpr": rates["fpr"], "fnr": rates["fnr"],
+            "fpr_hard": hard_rates["fpr"], "fpr_easy": easy_rates["fpr"],
+            "n_queries": n_q, "n_duplicates": int(actual.sum()),
+            "log10_j_tau": _log10_J(radii, dim, tau=tau),
+            "n_balls": len(radii),
+            "memory_bytes": filt.get_bytesize(),
+            "cumulative_time_s": cumulative_time_s,
+            "amortized_cost_s": cumulative_time_s / pos,
+            "metric": metric, "method": method, "sweep": sweep, "fold_offset": fold_offset,
+        }
 
     rows: List[Dict[str, Any]] = []
     cumulative_time_s = 0.0
 
-    def _fpr(filt: BallCoverFilter) -> float:
-        predicted = filt.query(negative_arr, distance_threshold=tau_mid)
-        return float(np.mean(predicted)) if len(predicted) else 0.0
-
-    def _assert_fnr_zero(filt: BallCoverFilter, seen: np.ndarray, pos: int) -> None:
-        """Every stream vector seen so far must still be recalled; raises
-        rather than recording a violation, like every other FNR check here."""
-        recalled = filt.query(seen, distance_threshold=tau_mid)
-        fnr = float(np.mean(~np.asarray(recalled, dtype=bool))) if len(recalled) else 0.0
-        if fnr != 0.0:
-            raise ValueError(
-                f"Zero-false-negative invariant violated (dataset={dataset}, policy={policy}, "
-                f"insertion_level={insertion_level}, k={k}, seed={seed}, position={pos}): fnr={fnr}"
-            )
-
     if policy == "oracle":
-        checkpoint_set = sorted(set(c for c in checkpoints if 0 < c <= n))
         for c in checkpoint_set:
             filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
             t0 = time.perf_counter()
             filt.construct(stream_arr[:c])
             cumulative_time_s += time.perf_counter() - t0
-            _assert_fnr_zero(filt, stream_arr[:c], c)
-            radii = filt.all_radiuses
-            rows.append({
-                "dataset": dataset, "policy": policy, "T": T, "k": k, "seed": seed,
-                "position": c - checkpoint_set[0] + 1,
-                "fpr": _fpr(filt),
-                "log10_j_tau": _log10_J(radii, dim, tau=tau_mid),
-                "n_balls": len(radii),
-                "memory_bytes": filt.get_bytesize(),
-                "cumulative_time_s": cumulative_time_s,
-                "amortized_cost_s": cumulative_time_s / c,
-                "metric": metric, "method": method, "sweep": sweep, "fold_offset": fold_offset,
-            })
+            rows.append(_checkpoint_row(filt, c, cumulative_time_s))
         return rows
 
     if policy not in ("streaming", "periodic"):
@@ -1282,8 +1322,6 @@ def stream_rebuild_worker(
     # Bootstrap via one shared construct() (identical across insertion_level)
     # so every checkpoint from bootstrap_n onward compares each method's own
     # decision rule.
-    bootstrap_n = min(bootstrap_n if bootstrap_n is not None else k, n)
-    checkpoint_set = sorted(set(c for c in checkpoints if bootstrap_n < c <= n))
     t0 = time.perf_counter()
     filt.construct(stream_arr[:bootstrap_n])
     cumulative_time_s += time.perf_counter() - t0
@@ -1299,19 +1337,7 @@ def stream_rebuild_worker(
         cumulative_time_s += time.perf_counter() - t0
 
         if ci < len(checkpoint_set) and pos == checkpoint_set[ci]:
-            _assert_fnr_zero(filt, stream_arr[:pos], pos)
-            radii = filt.all_radiuses
-            rows.append({
-                "dataset": dataset, "policy": policy, "T": T, "k": k, "seed": seed,
-                "position": pos - bootstrap_n,
-                "fpr": _fpr(filt),
-                "log10_j_tau": _log10_J(radii, dim, tau=tau_mid),
-                "n_balls": len(radii),
-                "memory_bytes": filt.get_bytesize(),
-                "cumulative_time_s": cumulative_time_s,
-                "amortized_cost_s": cumulative_time_s / pos,
-                "metric": metric, "method": method, "sweep": sweep, "fold_offset": fold_offset,
-            })
+            rows.append(_checkpoint_row(filt, pos, cumulative_time_s))
             ci += 1
 
     return rows

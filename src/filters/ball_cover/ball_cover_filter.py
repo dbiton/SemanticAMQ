@@ -25,7 +25,7 @@ class Quantize(Enum):
          8   SQ8      scalar 8-bit                      384   3 KB
          8   TQ8      rotation + TurboQuant 8-bit        384   seed only
          6   SQ6      scalar 6-bit                      288   3 KB
-         5   TQ5      rotation + TurboQuant 5-bit        240   seed only
+         5   TQ5      rotation + TurboQuant 5-bit        248   seed only
          4   SQ4      scalar 4-bit                      192   3 KB
          4   TQ4      rotation + TurboQuant 4-bit        192   seed only
          3   TQ3      rotation + TurboQuant 3-bit       144   60 B + seed
@@ -48,14 +48,17 @@ class Quantize(Enum):
     bit rates (a synthetic probe suggested it might not always help, e.g.
     at 8-bit -- see the results this sweep produces before trusting that).
     TQ5 has no MSE-trained ("tqmse") faiss variant, unlike the others --
-    QT_5bit_tq is the plain (quantile-based) TurboQuant encoder.
+    QT_5bit_tq is the plain (quantile-based) TurboQuant encoder, which also
+    stores each center's exact norm (the 8 bytes above 5 * 384 / 8 = 240) and
+    folds it into search(); see _Encoding.norm_offset for what query() does
+    about that.
 
     Every ball also stores its radius as fp16, so a ball costs center + 2
     bytes -- see bytes_per_ball().
 
-    CAVEAT on RABITQ: the other ten rows are exact ADC, so search() returns
-    ||q - decode(c)|| and the one-sided inflation in _store_spheres is a
-    proof. RaBitQ instead scores through its own estimator, which is not tied
+    CAVEAT on RABITQ: every other row is exact ADC -- search() returns
+    ||q - decode(c)||, TQ5 once query() removes its norm offset -- so the
+    one-sided inflation in _add_spheres is a proof. RaBitQ instead scores through its own estimator, which is not tied
     to sa_decode's output: measured against exact distances over 3.6M
     (query, center) pairs on real embeddings it under-estimated every single
     time, by 0.13 to 0.33, which is safe (an under-estimate only over-accepts)
@@ -96,6 +99,16 @@ class _Encoding:
     qtype: Optional[int] = None    # ScalarQuantizer.QT_* -- kind == "sq"
     nbits: int = 0                 # bits per subquantizer -- kind == "pq"
     rotate: bool = False           # see _ROTATION_SEED
+    # faiss's plain (non-"tqmse") TurboQuant scalar quantizers, QT_<n>bit_tq,
+    # store each vector's exact norm in 8 extra code bytes and score
+    # ||q||^2 - 2<q, decode(c)> + ||c||^2 -- i.e. ||q - decode(c)||^2 plus a
+    # per-center constant ||c||^2 - ||decode(c)||^2. That is not a distance to
+    # any point, so the triangle-inequality argument query() rests on fails:
+    # measured on WildChat, search() over-estimated ||q - decode(c)|| by up to
+    # 0.145, and an over-estimate is a false negative. query() subtracts the
+    # constant back out (see _search_offsets), which makes such an encoding
+    # exact ADC like the rest.
+    norm_offset: bool = False
 
 
 # An orthonormal rotation in front of the quantizer. Orthonormal is the
@@ -138,7 +151,8 @@ _ENCODINGS = {
     # only offers as the plain quantile-based QT_5bit_tq.
     Quantize.TQ8: _Encoding(rate=8, kind="sq", qtype=faiss.ScalarQuantizer.QT_8bit_tqmse, rotate=True),
     Quantize.SQ6: _Encoding(rate=6, kind="sq", qtype=faiss.ScalarQuantizer.QT_6bit),
-    Quantize.TQ5: _Encoding(rate=5, kind="sq", qtype=faiss.ScalarQuantizer.QT_5bit_tq, rotate=True),
+    Quantize.TQ5: _Encoding(rate=5, kind="sq", qtype=faiss.ScalarQuantizer.QT_5bit_tq, rotate=True,
+                            norm_offset=True),
     Quantize.SQ4: _Encoding(rate=4, kind="sq", qtype=faiss.ScalarQuantizer.QT_4bit),
     Quantize.TQ4: _Encoding(rate=4, kind="sq", qtype=faiss.ScalarQuantizer.QT_4bit_tqmse, rotate=True),
     # QT_3bit_tqmse is the MSE-trained TurboQuant variant; there is no plain
@@ -183,7 +197,7 @@ class BallCoverFilter(Filter):
         self,
         dim: int,
         construct_method: Optional[ConstructInterface] = GonzalesConstruct(),
-        insert_method: Optional[InsertInterface] = MinHeapInsert(),
+        insert_method: Optional[InsertInterface] = NearestInsert(),
         quantize: Quantize = Quantize.NONE,
         max_memory: Optional[int] = None,
         max_spheres: Optional[int] = None,
@@ -204,6 +218,7 @@ class BallCoverFilter(Filter):
         self._all_spheres = np.arange(self.max_spheres, dtype=np.int32)
         self._all_centers = None # temporary decoded array used only during insertions, not persistent allocation
         self._all_radiuses = np.empty((self.max_spheres,), dtype=np.float32)
+        self._radius_inflation = np.zeros((self.max_spheres,), dtype=np.float32)
 
         if self.insert_method:
             self.insert_method.ensure_capacity(self.max_spheres)
@@ -228,6 +243,15 @@ class BallCoverFilter(Filter):
         """A NumPy view of active sphere radii corresponding to the active spheres."""
         return self._all_radiuses[self.all_spheres]
 
+    @property
+    def all_radius_inflation(self) -> np.ndarray:
+        """Per-ball radius cost of encoding (0 for Quantize.NONE). Set by
+        construct() to the stored radius minus construct_method's pre-encoding
+        radius -- negative where the coverage pass more than paid for the
+        center's error -- and by _add_spheres() to the center's own encoding
+        error for every ball an insert strategy allocates."""
+        return self._radius_inflation[self.all_spheres]
+
 
     def _ensure_capacity(self, required_cap: int) -> None:
         current_cap = len(self._all_radiuses)
@@ -249,6 +273,10 @@ class BallCoverFilter(Filter):
         new_radiuses[:current_cap] = self._all_radiuses
         self._all_radiuses = new_radiuses
 
+        new_inflation = np.zeros((new_cap,), dtype=np.float32)
+        new_inflation[:current_cap] = self._radius_inflation
+        self._radius_inflation = new_inflation
+
         if self.insert_method:
             self.insert_method.ensure_capacity(new_cap)
 
@@ -258,6 +286,7 @@ class BallCoverFilter(Filter):
         self._num_spheres = 0
         self.all_centers_index = self._make_faiss_index(self.quantize)
         self._all_radiuses[:] = 0.0
+        self._radius_inflation[:] = 0.0
         self._all_centers = None
         self._constructed = False
 
@@ -276,11 +305,20 @@ class BallCoverFilter(Filter):
         self._ensure_capacity(self._num_spheres + num_new_spheres)
         new_sphere_indices = self._all_spheres[self._num_spheres : self._num_spheres + num_new_spheres]
         self.all_centers_index.add_with_ids(centers, new_sphere_indices.astype(np.int64))
-        self._all_radiuses[new_sphere_indices] = self._fp16_ceil(radii + self._encoding_error(centers))
+        encoding_error = self._encoding_error(centers)
+        self._all_radiuses[new_sphere_indices] = self._fp16_ceil(radii + encoding_error)
+        self._radius_inflation[new_sphere_indices] = encoding_error
         self._num_spheres += num_new_spheres
 
         if self._all_centers is not None:
-            self._all_centers[new_sphere_indices] = centers
+            # Decoded, not `centers`: insert strategies read this cache to
+            # decide what a ball already covers, and the stored radius is
+            # measured around where the ball actually sits. Caching the raw
+            # center let MinHeapInsert treat a vector within r + err of it as
+            # covered while query() scored it against a center up to err
+            # farther away -- 27.7% false negatives at TQ1 on WildChat.
+            self._all_centers[new_sphere_indices] = self.all_centers_index.reconstruct_batch(
+                new_sphere_indices.astype(np.int64))
 
         return new_sphere_indices
 
@@ -299,6 +337,7 @@ class BallCoverFilter(Filter):
         self._all_spheres[num_active_spheres : self._num_spheres] = removed_spheres
         self.all_centers_index.remove_ids(faiss.IDSelectorBatch(sphere_indices))
         self._all_radiuses[sphere_indices] = 0.0
+        self._radius_inflation[sphere_indices] = 0.0
         self._num_spheres = num_active_spheres
 
         if self._all_centers is not None:
@@ -474,6 +513,25 @@ class BallCoverFilter(Filter):
         return np.linalg.norm(centers - decoded, axis=1).astype(np.float32)
 
 
+    def _search_offsets(self) -> np.ndarray:
+        """Per-ball constant search() adds on top of ||q - decode(c)||^2,
+        indexed by sphere id (see _Encoding.norm_offset). Measured from the
+        index on every call rather than stored: searching from the origin
+        returns the codec's own stored-norm term ||c||^2, and decode gives
+        ||decode(c)||^2, so the offset is a function of each ball's code and
+        costs no bytes beyond it."""
+        offsets = np.zeros(len(self._all_radiuses), dtype=np.float32)
+        if self._num_spheres == 0:
+            return offsets
+        origin = np.zeros((1, self.dim), dtype=np.float32)
+        d2, labels = self.all_centers_index.search(origin, self._num_spheres)
+        valid = labels[0] >= 0
+        ids = labels[0][valid]
+        decoded = self.all_centers_index.reconstruct_batch(ids)
+        offsets[ids] = d2[0][valid] - np.einsum("ij,ij->i", decoded, decoded)
+        return offsets
+
+
     def _train_quantizer(self, centers: np.ndarray) -> faiss.IndexIDMap2:
         """Fits the one codebook this filter will ever use, on the ball
         centers themselves, and *returns* the index. Called exactly once, by
@@ -539,7 +597,7 @@ class BallCoverFilter(Filter):
     ) -> np.ndarray:
         """The smallest radii around the *decoded* centers that still cover
         every construct vector -- the exact measurement the `radii + error`
-        bound in _store_spheres only approximates.
+        bound in _add_spheres only approximates.
 
         Two things make this tighter than that bound. First, the distance is
         measured from where the ball actually sits after encoding, so a ball
@@ -626,19 +684,30 @@ class BallCoverFilter(Filter):
         _train_quantizer), and it is re-runnable: calling it again on a
         filter that has already been constructed and inserted into is what
         runner's "periodic" streaming policy does, so it fully resets the id
-        pool, the per-ball inflation, and the insert strategy's bookkeeping."""
+        pool, the per-ball inflation, and the insert strategy's bookkeeping.
+
+        Returns nothing. This used to return estimate_hypersphere_volume's
+        overlap-aware bounds on the cover's volume, which made every caller
+        pay for them whether or not it read them -- and almost none did. That
+        measurement now belongs to whoever wants it: runner's
+        _tau_volume_bounds_log10 computes the same bounds from all_centers and
+        all_radiuses, at any tau, and is called only by the worker whose
+        figure needs them."""
         if len(vectors) == 0:
+            self._reset_buffers(0)
             self._constructed = True
             return
 
         centers, radii = self.construct_method.construct_filter(self, vectors)
         centers = np.ascontiguousarray(centers, dtype=np.float32)
         radii = np.asarray(radii, dtype=np.float32)
-        self._reset_buffers(len(vectors))
+        self._reset_buffers(len(centers))
 
         self.all_centers_index = self._train_quantizer(centers)
         sphere_indices = self._add_spheres(centers, radii)
-        self._all_radiuses[sphere_indices] = self._fp16_ceil(self._tight_radii(vectors, centers, self.all_centers, radii))
+        stored = self._fp16_ceil(self._tight_radii(vectors, centers, self.all_centers, radii))
+        self._all_radiuses[sphere_indices] = stored
+        self._radius_inflation[sphere_indices] = stored - radii
 
         if self.insert_method:
             _ = self.all_centers # intialize centers view for insertion
@@ -657,6 +726,8 @@ class BallCoverFilter(Filter):
 
         Q = np.ascontiguousarray(vectors, dtype=np.float32)
         d2, labels = self.all_centers_index.search(Q, self._num_spheres)
+        if _ENCODINGS[self.quantize].norm_offset:
+            d2 = d2 - self._search_offsets()[np.maximum(labels, 0)]
         surface = np.where(labels >= 0, np.sqrt(np.maximum(d2, 0.0)) - self._all_radiuses[np.maximum(labels, 0)], np.inf)
         return (surface.min(axis=1) <= distance_threshold + self._COVERAGE_EPSILON).tolist()
 
@@ -685,6 +756,12 @@ class BallCoverFilter(Filter):
 
         _ = self.all_centers # intialize centers view for insertion
         self.insert_method.insert(self, vectors)
+        # Strategies that grow a ball in place (NearestInsert,
+        # LeastInflationInsert) write raw float32 radii straight into
+        # _all_radiuses, so re-settle every active ball onto the fp16 grid
+        # bytes_per_ball() charges for. Idempotent, and only ever rounds up.
+        active = self.all_spheres
+        self._all_radiuses[active] = self._fp16_ceil(self._all_radiuses[active])
         self._all_centers = None # clear temporary centers view
 
 

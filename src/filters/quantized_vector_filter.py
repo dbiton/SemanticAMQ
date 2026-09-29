@@ -13,7 +13,7 @@ BallCoverFilter's geometric summary wins over storing (compressed) points
 directly.
 
 Zero-false-negative by the same triangle-inequality argument
-BallCoverFilter._store_spheres uses: d(q,x) <= tau implies
+BallCoverFilter._add_spheres uses: d(q,x) <= tau implies
 d(q,x_hat) <= tau + ||x - x_hat||, so accepting whenever
 d(q, x_hat_i) <= tau + eps_i, with eps_i the *measured* reconstruction error
 (never a probabilistic bound), can never produce a false negative. The
@@ -76,6 +76,13 @@ _ROTATED_LEVELS = {
     QuantizationLevel.TQ8, QuantizationLevel.TQ5, QuantizationLevel.TQ4,
     QuantizationLevel.TQ3, QuantizationLevel.TQ2,
 }
+
+# Rungs whose faiss codec folds each vector's stored exact norm into
+# search(): QT_5bit_tq scores ||q - x_hat||^2 + (||x||^2 - ||x_hat||^2), not
+# ||q - x_hat||^2, so it is not exact w.r.t. decode() and the eps_i argument
+# fails unless query() subtracts that per-vector constant back out (see
+# _search_offsets and BallCoverFilter's _Encoding.norm_offset).
+_NORM_OFFSET_LEVELS = {QuantizationLevel.TQ5}
 
 _BYTES_FP32 = 4
 # Plain sign-bit RaBitQ (nb_bits=1) -- exactly "1 bit per dimension", and
@@ -333,9 +340,12 @@ class QuantizedVectorFilter(Filter):
         thresh_sq = (float(tau) + self._eps_per_vector()) ** 2
 
         if self._sq_index is not None:
-            # faiss's ScalarQuantizer ADC is exact w.r.t. decode(), so this
-            # is safe for the zero-false-negative acceptance rule.
+            # faiss's ScalarQuantizer ADC is exact w.r.t. decode() -- for the
+            # norm-offset rungs only once _search_offsets() is removed -- so
+            # this is safe for the zero-false-negative acceptance rule.
             d2, ids = self._sq_index.search(q, self._n)
+            if self.level in _NORM_OFFSET_LEVELS:
+                d2 = d2 - self._search_offsets()[np.maximum(ids, 0)]
             hit = (d2 <= thresh_sq[ids]).any(axis=1)
         else:
             # RaBitQ's own search is a fast *probabilistic* estimator, not
@@ -347,6 +357,20 @@ class QuantizedVectorFilter(Filter):
             hit = (d2 <= thresh_sq[None, :]).any(axis=1)
 
         return hit.tolist()
+
+
+    def _search_offsets(self) -> np.ndarray:
+        """Per-vector constant search() adds on top of ||q - decode(x)||^2
+        (see _NORM_OFFSET_LEVELS), measured on every call rather than stored:
+        searching from the origin returns the codec's stored ||x||^2, and
+        decode gives ||decode(x)||^2, so it costs no bytes beyond the codes."""
+        origin = np.zeros((1, self.dim), dtype=np.float32)
+        d2, ids = self._sq_index.search(origin, self._n)
+        decoded = self._sq_index.reconstruct_n(0, self._n)
+        offsets = np.zeros(self._n, dtype=np.float32)
+        valid = ids[0] >= 0
+        offsets[ids[0][valid]] = d2[0][valid] - np.einsum("ij,ij->i", decoded, decoded)[ids[0][valid]]
+        return offsets
 
 
     def get_bytesize(self) -> int:

@@ -466,7 +466,7 @@ def save_method_legend(cfg: Config) -> None:
     handles.append(plt.Line2D([0], [0], color="black", linestyle="--", linewidth=1.0))
     labels.append("Static rebuild (oracle)")
 
-    fig.legend(handles, labels, loc="center", ncol=3, frameon=False, fontsize=6.5)
+    fig.legend(handles, labels, loc="center", ncol=3, frameon=False, fontsize=7.8)
     fig.patch.set_alpha(0.0)
     save_figure(fig, "streaming-method-legend.png", cfg.outdir, cfg.dpi, cfg.emit_pdf, transparent=True)
 
