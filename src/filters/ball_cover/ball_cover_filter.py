@@ -54,7 +54,7 @@ class Quantize(Enum):
     bytes -- see bytes_per_ball().
 
     CAVEAT on RABITQ: the other ten rows are exact ADC, so search() returns
-    ||q - decode(c)|| and the one-sided inflation in _store_spheres is a
+    ||q - decode(c)|| and the one-sided inflation in _add_spheres is a
     proof. RaBitQ instead scores through its own estimator, which is not tied
     to sa_decode's output: measured against exact distances over 3.6M
     (query, center) pairs on real embeddings it under-estimated every single
@@ -183,7 +183,7 @@ class BallCoverFilter(Filter):
         self,
         dim: int,
         construct_method: Optional[ConstructInterface] = GonzalesConstruct(),
-        insert_method: Optional[InsertInterface] = MinHeapInsert(),
+        insert_method: Optional[InsertInterface] = NearestInsert(),
         quantize: Quantize = Quantize.NONE,
         max_memory: Optional[int] = None,
         max_spheres: Optional[int] = None,
@@ -204,6 +204,7 @@ class BallCoverFilter(Filter):
         self._all_spheres = np.arange(self.max_spheres, dtype=np.int32)
         self._all_centers = None # temporary decoded array used only during insertions, not persistent allocation
         self._all_radiuses = np.empty((self.max_spheres,), dtype=np.float32)
+        self._radius_inflation = np.zeros((self.max_spheres,), dtype=np.float32)
 
         if self.insert_method:
             self.insert_method.ensure_capacity(self.max_spheres)
@@ -228,6 +229,15 @@ class BallCoverFilter(Filter):
         """A NumPy view of active sphere radii corresponding to the active spheres."""
         return self._all_radiuses[self.all_spheres]
 
+    @property
+    def all_radius_inflation(self) -> np.ndarray:
+        """Per-ball radius cost of encoding (0 for Quantize.NONE). Set by
+        construct() to the stored radius minus construct_method's pre-encoding
+        radius -- negative where the coverage pass more than paid for the
+        center's error -- and by _add_spheres() to the center's own encoding
+        error for every ball an insert strategy allocates."""
+        return self._radius_inflation[self.all_spheres]
+
 
     def _ensure_capacity(self, required_cap: int) -> None:
         current_cap = len(self._all_radiuses)
@@ -249,6 +259,10 @@ class BallCoverFilter(Filter):
         new_radiuses[:current_cap] = self._all_radiuses
         self._all_radiuses = new_radiuses
 
+        new_inflation = np.zeros((new_cap,), dtype=np.float32)
+        new_inflation[:current_cap] = self._radius_inflation
+        self._radius_inflation = new_inflation
+
         if self.insert_method:
             self.insert_method.ensure_capacity(new_cap)
 
@@ -258,6 +272,7 @@ class BallCoverFilter(Filter):
         self._num_spheres = 0
         self.all_centers_index = self._make_faiss_index(self.quantize)
         self._all_radiuses[:] = 0.0
+        self._radius_inflation[:] = 0.0
         self._all_centers = None
         self._constructed = False
 
@@ -276,7 +291,9 @@ class BallCoverFilter(Filter):
         self._ensure_capacity(self._num_spheres + num_new_spheres)
         new_sphere_indices = self._all_spheres[self._num_spheres : self._num_spheres + num_new_spheres]
         self.all_centers_index.add_with_ids(centers, new_sphere_indices.astype(np.int64))
-        self._all_radiuses[new_sphere_indices] = self._fp16_ceil(radii + self._encoding_error(centers))
+        encoding_error = self._encoding_error(centers)
+        self._all_radiuses[new_sphere_indices] = self._fp16_ceil(radii + encoding_error)
+        self._radius_inflation[new_sphere_indices] = encoding_error
         self._num_spheres += num_new_spheres
 
         if self._all_centers is not None:
@@ -299,6 +316,7 @@ class BallCoverFilter(Filter):
         self._all_spheres[num_active_spheres : self._num_spheres] = removed_spheres
         self.all_centers_index.remove_ids(faiss.IDSelectorBatch(sphere_indices))
         self._all_radiuses[sphere_indices] = 0.0
+        self._radius_inflation[sphere_indices] = 0.0
         self._num_spheres = num_active_spheres
 
         if self._all_centers is not None:
@@ -539,7 +557,7 @@ class BallCoverFilter(Filter):
     ) -> np.ndarray:
         """The smallest radii around the *decoded* centers that still cover
         every construct vector -- the exact measurement the `radii + error`
-        bound in _store_spheres only approximates.
+        bound in _add_spheres only approximates.
 
         Two things make this tighter than that bound. First, the distance is
         measured from where the ball actually sits after encoding, so a ball
@@ -628,17 +646,20 @@ class BallCoverFilter(Filter):
         runner's "periodic" streaming policy does, so it fully resets the id
         pool, the per-ball inflation, and the insert strategy's bookkeeping."""
         if len(vectors) == 0:
+            self._reset_buffers(0)
             self._constructed = True
             return
 
         centers, radii = self.construct_method.construct_filter(self, vectors)
         centers = np.ascontiguousarray(centers, dtype=np.float32)
         radii = np.asarray(radii, dtype=np.float32)
-        self._reset_buffers(len(vectors))
+        self._reset_buffers(len(centers))
 
         self.all_centers_index = self._train_quantizer(centers)
         sphere_indices = self._add_spheres(centers, radii)
-        self._all_radiuses[sphere_indices] = self._fp16_ceil(self._tight_radii(vectors, centers, self.all_centers, radii))
+        stored = self._fp16_ceil(self._tight_radii(vectors, centers, self.all_centers, radii))
+        self._all_radiuses[sphere_indices] = stored
+        self._radius_inflation[sphere_indices] = stored - radii
 
         if self.insert_method:
             _ = self.all_centers # intialize centers view for insertion
