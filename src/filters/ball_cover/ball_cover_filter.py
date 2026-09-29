@@ -684,7 +684,15 @@ class BallCoverFilter(Filter):
         _train_quantizer), and it is re-runnable: calling it again on a
         filter that has already been constructed and inserted into is what
         runner's "periodic" streaming policy does, so it fully resets the id
-        pool, the per-ball inflation, and the insert strategy's bookkeeping."""
+        pool, the per-ball inflation, and the insert strategy's bookkeeping.
+
+        Returns nothing. This used to return estimate_hypersphere_volume's
+        overlap-aware bounds on the cover's volume, which made every caller
+        pay for them whether or not it read them -- and almost none did. That
+        measurement now belongs to whoever wants it: runner's
+        _tau_volume_bounds_log10 computes the same bounds from all_centers and
+        all_radiuses, at any tau, and is called only by the worker whose
+        figure needs them."""
         if len(vectors) == 0:
             self._reset_buffers(0)
             self._constructed = True

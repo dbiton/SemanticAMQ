@@ -691,6 +691,10 @@ def quantization_worker(
     radii = filt.all_radiuses
     log10_J = _log10_J(radii, dim)
 
+    radius_inflation = filt.all_radius_inflation
+    radius_inflation_mean = float(np.mean(radius_inflation)) if len(radius_inflation) else 0.0
+    radius_inflation_std = float(np.std(radius_inflation)) if len(radius_inflation) else 0.0
+
     memory_bytes = filt.get_bytesize()
 
     q0 = time.perf_counter()
@@ -726,7 +730,16 @@ def quantization_worker(
         "n_index_accesses": n_index_accesses,
         "index_accesses_saved": n_q - n_index_accesses,
         "index_accesses_saved_pct": (1.0 - n_index_accesses / max(n_q, 1)) * 100.0,
-        "n_balls": filt._num_spheres, "memory_bytes": memory_bytes, "seed": seed
+        "n_balls": filt._num_spheres, "memory_bytes": memory_bytes, "seed": seed,
+        "radius_inflation_mean": radius_inflation_mean,
+        "radius_inflation_std": radius_inflation_std,
+        # Size of the set every ball cover in this row is built over -- fixed
+        # per (dataset, seed), not swept, but recorded per row (rather than
+        # left for a caller to look up separately) so plot_quantization can
+        # express memory_bytes as a percentage of storing this set raw
+        # (n_construct * dim float32s) without needing its own copy of the
+        # corpus.
+        "n_construct": len(construct_arr),
     })
 
     bad = [r for r in rows if r["fnr"] != 0]
