@@ -1,6 +1,8 @@
-"""Scaling-evaluation figures: BallCoverFilter throughput vs batch size / stream size,
-on one representative dataset (see main.py's _SCALING_DATASET). Query, insertion,
-and construction throughput each get one line per filter size k.
+"""Scaling-evaluation figures: BallCoverFilter throughput vs batch size / stream size.
+Rows come from every blocklist corpus/fold (see main.py's generate_scaling(), which
+reuses blocklist_workloads()) and are pooled per k/n value, since throughput is
+dataset-invariant here. Query, insertion, and construction throughput each get one
+line per filter size k.
 """
 
 from __future__ import annotations
@@ -155,7 +157,7 @@ def generate_legend_figure(line_values: List[float], cfg: Config) -> None:
         labels.append(str(int(lv)))
 
     ax.legend(handles, labels, loc="center", ncol=len(line_values),
-              title="Filter Size (k)", frameon=False, fontsize=8, title_fontsize=9)
+              title="Filter Size (k)", frameon=False, fontsize=9.6, title_fontsize=10.8)
 
     save_figure(fig, "scaling-legend.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
     plt.close(fig)
@@ -163,22 +165,22 @@ def generate_legend_figure(line_values: List[float], cfg: Config) -> None:
 
 def panel_query_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _throughput_panel(
-        df, "batch_size", "throughput_qps", "Query Throughput (queries/s)",
+        df, "batch_size", "throughput_qps", "Query OPS",
         "Batch size", "scaling-query-throughput.png", cfg,
     )
 
 
 def panel_insert_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _throughput_panel(
-        df, "batch_size", "throughput_ips", "Insertion Throughput (vectors/s)",
+        df, "batch_size", "throughput_ips", "Insertion OPS",
         "Batch size", "scaling-insertion-throughput.png", cfg,
     )
 
 
 def panel_construction_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return _throughput_panel(
-        df, "n", "throughput_vps", "Construction Throughput (vectors/s)",
-        "Stream size (n)", "scaling-construction-throughput.png", cfg,
+        df, "n", "throughput_vps", "Construction OPS",
+        r"Initialization size ($|X|$)", "scaling-construction-throughput.png", cfg,
     )
 
 

@@ -3,13 +3,35 @@ Silvestri, PODS 2018), instantiated as h(x) = 1 iff <a,x> in [-z, z] for
 Gaussian a (a window centered at 0, since this only needs sensitivity to a
 ball around the query, not the paper's off-origin annulus), concatenated
 `num_projections_per_table` times per table across `num_tables` tables.
-Calibration reduces to the single free parameter z.
 
-Calibration maximizes p(tau; z) - p(r_far; z) (r_far defaults to sqrt(2),
-the expected distance between independent unit-sphere points), not
-p(0) - p(tau): two points at distance 0 always collide regardless of z, so
-p(0) carries no signal. Both probabilities are estimated by batched Monte
-Carlo, and z is chosen from a bounded grid.
+Calibration has two free parameters: the window half-width z, and
+`num_projections_per_table` (K), the number of projections AND-ed together
+within a table. K is the real accuracy/memory dial -- larger K shrinks the
+false-accept rate exponentially at a fixed z, at the cost of needing more
+OR-tables (`num_tables`, auto-sized below) to hold recall up, i.e. more
+bytes. Leaving K fixed (as earlier versions did, calibrating only z) means
+memory only ever buys a bigger Bloom filter, whose own ~1% engineered error
+rate is swamped by K=4's structural false-accept rate on real, non-uniform
+embeddings -- runner.py's equal-memory sweep now grid-searches (K, z)
+jointly for exactly this reason (see its _CONSTRUCTION_TIME_CONFIG_DIALS
+entry for DSHFilter).
+
+By default (z=None) z is chosen by maximizing p(tau; z) - p(r_far; z)
+(r_far defaults to sqrt(2), the expected distance between independent
+unit-sphere points) under a synthetic model: X uniform on the unit sphere,
+Q at distance r from X in a random direction. That model is a real-data
+*proxy*, not real data -- real embeddings cluster far more tightly than a
+uniform sphere (see BallCoverFilter's docstring), so it can misjudge where
+the best z is. HNSWFilter/IVFFilter's query-time dials (ef_search/nprobe)
+are instead grid-searched empirically against real calibration data in
+runner._build_calibrated_filter; z cannot be tuned that way post-hoc
+because it is baked into every inserted point's hash codes, not a
+query-time knob. `z_grid()` exposes the same candidate grid this synthetic
+search would sweep, so a caller with real labeled calibration data (as
+runner.py's equal-memory sweep has) can instead build one DSHFilter per
+candidate z and pick whichever scores best on that real data -- the same
+empirical-selection treatment IVF/HNSW get, applied at construction time
+since that is the only time DSH's z can move.
 
 If the best achievable gap falls below `calibration_min_gap`, the
 constructor raises RuntimeError rather than silently building a
@@ -47,6 +69,7 @@ class DSHFilter(Filter):
         far_reference_distance: Optional[float] = None,
         max_spheres: Optional[int] = None,
         seed: int = 42,
+        z: Optional[float] = None,
     ):
         super().__init__(dim, max_memory=max_memory)
         self.distance_threshold = float(distance_threshold)
@@ -63,10 +86,24 @@ class DSHFilter(Filter):
 
         rng = np.random.default_rng(seed)
 
-        self.z, best_gap, self._p_table_tau = self._calibrate(
-            rng, dim, self.distance_threshold, self.far_reference_distance,
-            num_projections_per_table, calibration_grid,
-        )
+        if z is None:
+            self.z, best_gap, self._p_table_tau = self._calibrate(
+                rng, dim, self.distance_threshold, self.far_reference_distance,
+                num_projections_per_table, calibration_grid,
+            )
+        else:
+            # z chosen by the caller (e.g. an empirical grid-search against
+            # real calibration data, see z_grid()'s docstring) rather than
+            # this file's synthetic sphere model. p_table_tau still has to be
+            # measured at that z to size num_tables below, and the gap check
+            # still applies: a badly-chosen z (from any source) that cannot
+            # separate tau from far_reference_distance would otherwise size
+            # num_tables absurdly large or raise a confusing error later.
+            self.z = float(z)
+            p_tau = self._match_probability(rng, dim, self.distance_threshold, self.z)
+            p_far = self._match_probability(rng, dim, self.far_reference_distance, self.z)
+            best_gap = p_tau - p_far
+            self._p_table_tau = p_tau ** num_projections_per_table
         if best_gap < calibration_min_gap:
             raise RuntimeError(
                 f"DSHFilter calibration did not converge to a usable operating point: "
@@ -152,6 +189,24 @@ class DSHFilter(Filter):
                 break
         return float(p_hat)
 
+    @staticmethod
+    def z_grid(
+        distance_threshold: float,
+        far_reference_distance: Optional[float] = None,
+        calibration_grid: int = 13,
+    ) -> np.ndarray:
+        """The same bounded candidate grid the synthetic-model calibration
+        (`_calibrate`) would search, exposed so a caller with real labeled
+        calibration data can instead build one DSHFilter(z=candidate) per
+        entry and pick whichever scores best empirically (see module
+        docstring) -- rather than duplicating this formula at the call site."""
+        tau = float(distance_threshold)
+        r_far = (
+            far_reference_distance if far_reference_distance is not None
+            else max(math.sqrt(2.0), 2.5 * tau)
+        )
+        return np.linspace(0.1 * tau, 3.0 * r_far, calibration_grid)
+
     def _calibrate(
         self, rng: np.random.Generator, dim: int, tau: float, r_far: float,
         num_projections_per_table: int, calibration_grid: int,
@@ -159,7 +214,7 @@ class DSHFilter(Filter):
         """Grid-search the window half-width z maximizing p(tau;z) - p(r_far;z)
         for a single projection, then raise the per-projection probabilities
         to num_projections_per_table (AND composition within a table)."""
-        z_candidates = np.linspace(0.1 * tau, 3.0 * r_far, calibration_grid)
+        z_candidates = self.z_grid(tau, r_far, calibration_grid)
         best_z, best_gap, best_p_tau = float(z_candidates[0]), -1.0, 0.0
         for z in z_candidates:
             p_tau = self._match_probability(rng, dim, tau, float(z))
@@ -199,7 +254,26 @@ class DSHFilter(Filter):
             else max(self._capacity, len(vectors) * self.num_tables)
         )
         self.filter = _BloomFilter(capacity=capacity, error_rate=self._error_rate)
-        self._insert_batch(vectors)
+        try:
+            self._insert_batch(vectors)
+        except IndexError as e:
+            # pybloom_live raises a bare IndexError once its bit array fills
+            # up. That happens here when max_memory bounds self._capacity
+            # below the len(vectors) * num_tables distinct (table, code)
+            # entries this construction actually inserts -- a memory-budget
+            # infeasibility like any other, not a crash. Re-raise as the
+            # shared InsufficientMemoryError so _build_calibrated_filter's
+            # per-candidate except clause skips this dial candidate instead
+            # of the raw IndexError propagating out and failing the whole
+            # equal-memory worker job.
+            raise InsufficientMemoryError(
+                f"DSHFilter's Bloom filter (capacity={capacity}, "
+                f"error_rate={self._error_rate}) filled up while inserting "
+                f"{len(vectors)} vectors x {self.num_tables} tables at "
+                f"num_projections_per_table={self.num_projections_per_table}: "
+                f"max_memory={self.max_memory} is too small for this many "
+                f"distinct (table, code) entries."
+            ) from e
 
     def query(self, vectors: np.ndarray, tau: Optional[float] = None) -> List[bool]:
         if self.filter is None:

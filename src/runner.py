@@ -26,6 +26,7 @@ from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 
 from logging_config import configure_logging
 from filters.filter import InsufficientMemoryError
+from filters.dsh_filter import DSHFilter
 from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize
 from filters.quantized_vector_filter import QuantizedVectorFilter
 from filters.ball_cover.nearest_insert import NearestInsert
@@ -167,29 +168,156 @@ def _f1_score(predicted: np.ndarray, actual: np.ndarray) -> float:
 
 _IVF_NPROBE_CANDIDATES = (1, 2, 4, 8, 16, 32, 64)
 _HNSW_EF_SEARCH_CANDIDATES = (16, 32, 64, 128, 256, 512)
+# HNSW graph degree. Unlike ef_search this is not free: the level-0 neighbour
+# table alone is n * 2M * 4 bytes, which at M=32, n=80,000 is 20.5MB -- more
+# than the whole top budget of the equal-memory sweep, and nothing
+# quantization does to the vector codes can shrink it. Left fixed at 32, HNSW
+# therefore reported infeasible at every budget in that sweep while IVF's
+# structural overhead (nlist centroids) was being sized to the budget for it.
+# Descending so the finest graph that fits is tried first, matching
+# HNSWFilter._choose_quantize's finest-first order on the other axis.
+_HNSW_M_CANDIDATES = (32, 16, 8, 4)
 
 
-# Filters with a cheap post-construction query-time dial: score every candidate on one built instance.
-# Every dial here must reach the underlying index, not just set a Python
-# attribute -- see IVFFilter.nprobe / HNSWFilter.ef_search, both properties
-# for exactly that reason.
+# Filters with a cheap post-construction query-time dial: score every candidate
+# on one built instance. Each entry maps the class name to a callable taking the
+# built instance and returning a list of SETTINGS DICTS -- each dict a complete
+# assignment of that filter's query-time dials, applied together.
+#
+# Dicts rather than (attr, value) pairs because a pair list cannot express a
+# filter with two dials: swept as a flat list, the instance accumulates state
+# from earlier candidates and only one attribute gets restored at the end,
+# leaving the other wherever the last candidate tried left it.
+#
+# Every dial here must take effect on an already-built instance, not just set
+# an inert Python attribute -- see IVFFilter.nprobe / HNSWFilter.ef_search,
+# both properties for exactly that reason (accept_radius_scale needs no
+# property: query() reads it on every call).
 _POST_CONSTRUCTION_CONFIG_DIALS = {
-    "DSBFFilter": lambda f: [("vote_threshold", t) for t in range(1, f.num_tables + 1)],
+    "DSBFFilter": lambda f: [{"vote_threshold": t} for t in range(1, f.num_tables + 1)],
     # Swept on a log-ish grid up to nlist, not exhaustively (nlist can be in the hundreds).
     "IVFFilter": lambda f: [
-        ("nprobe", p) for p in sorted({c for c in _IVF_NPROBE_CANDIDATES if c <= f.nlist} | {f.nlist})
+        {"nprobe": p} for p in sorted({c for c in _IVF_NPROBE_CANDIDATES if c <= f.nlist} | {f.nlist})
     ],
     # efSearch is HNSW's accuracy/speed dial and costs no memory, exactly
     # like IVF's nprobe. Without it HNSW competed at a fixed efSearch=64
     # against an IVF whose nprobe was tuned per budget -- not an equal
     # comparison of the two baselines.
-    "HNSWFilter": lambda f: [("ef_search", e) for e in _HNSW_EF_SEARCH_CANDIDATES],
+    "HNSWFilter": lambda f: [{"ef_search": e} for e in _HNSW_EF_SEARCH_CANDIDATES],
 }
 
+# Accept-radius multipliers on tau, swept for any filter exposing
+# query_squared_nn_distance() (IVFFilter, HNSWFilter). Those two threshold an
+# approximate index's ESTIMATE of the nearest-neighbor distance, and the lossy
+# codes bias that estimate upward by more than tau itself at these budgets --
+# testing it against the exact tau made both answer "not a duplicate" to
+# nearly every true duplicate. See IVFFilter's module docstring for the
+# measurement. Sweeping the radius costs no extra searches: the radius is a
+# comparison against distances one search pass already returned, so
+# _tune_post_construction scores the whole grid off each pass.
+_ACCEPT_RADIUS_SCALES = (1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0)
+
 # Filters whose configuration changes memory layout at construction time: one build per candidate.
+# A value may be a static list of kwargs (LSBFFilter) or a callable
+# (dim, distance_threshold) -> list of kwargs, for a dial whose candidates
+# depend on the sweep's own parameters (DSHFilter's z grid).
 _CONSTRUCTION_TIME_CONFIG_DIALS = {
     "LSBFFilter": [{"verify": True}, {"verify": False}],
+    # M sizes the graph, which is allocated at construction time, so unlike
+    # ef_search it cannot be tuned on a built instance -- see
+    # _HNSW_M_CANDIDATES for why leaving it fixed made HNSW infeasible
+    # everywhere. HNSWFilter is in BOTH dial registries: each M here is built
+    # once and then scored at its own best ef_search (see
+    # _tune_post_construction), so M is not chosen by an artifact of one
+    # arbitrary ef_search. Candidates whose graph does not fit the budget
+    # raise InsufficientMemoryError from construct()'s pre-build floor check,
+    # before any graph is actually built, so the infeasible ones are cheap.
+    "HNSWFilter": lambda dim, distance_threshold: [{"M": m} for m in _HNSW_M_CANDIDATES],
+    # DSHFilter bakes z into every inserted point's hash codes, so unlike
+    # IVFFilter.nprobe/HNSWFilter.ef_search it cannot be tuned post-hoc on a
+    # single built instance -- it needs one build per candidate, exactly
+    # like LSBFFilter.verify above. Without this, z came only from a
+    # synthetic uniform-sphere model (see DSHFilter's module docstring),
+    # while IVF/HNSW's dials were already selected by F1 on real calibration
+    # data -- an asymmetry that understated DSH's achievable accuracy on
+    # real, non-uniform embeddings. z_grid() reuses the same bounded
+    # candidate range that synthetic model would have searched, so this
+    # changes *how* the best candidate in that range is chosen, not the
+    # range itself.
+    #
+    # num_projections_per_table (K) is swept too, not left at its default of
+    # 4: K is DSHFilter's only real accuracy/memory dial (more per-projection
+    # AND-composition shrinks the false-accept rate exponentially, at the
+    # cost of needing more OR-tables to hold recall up, i.e. more bytes) --
+    # with K fixed, DSHFilter's memory budget only ever bought a bigger Bloom
+    # filter, whose own ~1% engineered error rate is swamped by K=4's
+    # structural false-accept rate on real (non-uniform-sphere) embeddings,
+    # which is why FPR measured flat at ~1.0 across the whole equal-memory
+    # sweep regardless of budget. Candidates that don't fit memory_budget or
+    # fail the calibration_min_gap guard at a given K are skipped by
+    # _build_calibrated_filter's own exception handling below, same as
+    # before.
+    "DSHFilter": lambda dim, distance_threshold: [
+        {"num_projections_per_table": k, "z": float(z)}
+        for k in (4, 8, 16, 24, 32, 48, 64)
+        for z in DSHFilter.z_grid(distance_threshold)
+    ],
 }
+
+
+def _tune_post_construction(
+    filter_instance: Any,
+    name: str,
+    calib_arr: np.ndarray,
+    calib_actual: np.ndarray,
+) -> float:
+    """Sets filter_instance's query-time dials to whichever combination scores
+    best (F1) on the calibration set, and returns that F1 -- or the instance's
+    as-built F1 when it has no tunable dial.
+
+    Two dial sources, both free of memory cost:
+      - the registered search-shaping dial (_POST_CONSTRUCTION_CONFIG_DIALS),
+        one query pass per candidate settings dict;
+      - the accept radius (_ACCEPT_RADIUS_SCALES), for any filter exposing
+        query_squared_nn_distance(). The radius only reinterprets distances a
+        search already returned, so the whole grid is scored off each search
+        pass rather than costing a pass of its own.
+
+    Split out of _build_calibrated_filter so the construction-time dial loop
+    can use it too. It could not before: that loop `return`ed as soon as it
+    picked a build, so a filter registered in BOTH dial tables (HNSWFilter now
+    is) silently never got its query-time dial tuned at all."""
+    if len(calib_arr) == 0:
+        return 0.0
+
+    dial = _POST_CONSTRUCTION_CONFIG_DIALS.get(name)
+    settings_grid = dial(filter_instance) if dial is not None else [{}]
+    tunes_radius = hasattr(filter_instance, "query_squared_nn_distance")
+
+    def apply(settings: Dict[str, Any]) -> None:
+        for attr, value in settings.items():
+            setattr(filter_instance, attr, value)
+
+    best_settings, best_f1 = None, -1.0
+    for settings in settings_grid:
+        apply(settings)
+        if tunes_radius:
+            sq_dist = np.asarray(filter_instance.query_squared_nn_distance(calib_arr), dtype=np.float64)
+            for scale in _ACCEPT_RADIUS_SCALES:
+                radius = filter_instance.distance_threshold * scale
+                f1 = _f1_score(sq_dist <= radius * radius, calib_actual)
+                if f1 > best_f1:
+                    best_settings = {**settings, "accept_radius_scale": scale}
+                    best_f1 = f1
+        else:
+            f1 = _f1_score(np.asarray(filter_instance.query(calib_arr), dtype=bool), calib_actual)
+            if f1 > best_f1:
+                best_settings, best_f1 = settings, f1
+
+    if best_settings is not None:
+        apply(best_settings)
+        logger.debug(f"{name}: calibrated {best_settings} at F1={best_f1:.4f}")
+    return best_f1
 
 
 def _build_calibrated_filter(
@@ -200,49 +328,69 @@ def _build_calibrated_filter(
     construct_arr: np.ndarray,
     calib_arr: np.ndarray,
     calib_actual: np.ndarray,
+    extra_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Any, float]:
     """Builds filter_cls at memory_budget, picking whichever registered config
     dial candidate scores best (F1) on the calibration set. Returns
     (filter_instance, construction_seconds) -- the latter sums only time
     inside .construct() calls, excluding the calibration .query() calls used
-    to score candidates, so it reflects reaching a ready-to-query filter."""
+    to score candidates, so it reflects reaching a ready-to-query filter.
+    extra_kwargs is forwarded to _instantiate_filter for filters outside the
+    config-dial registries (e.g. BallCoverFilter's quantize)."""
     name = filter_cls.__name__
     construction_time = 0.0
 
     if name in _CONSTRUCTION_TIME_CONFIG_DIALS:
+        dial = _CONSTRUCTION_TIME_CONFIG_DIALS[name]
+        candidates = dial(dim, distance_threshold) if callable(dial) else dial
         best_f1, best_instance = -1.0, None
-        for kwargs in _CONSTRUCTION_TIME_CONFIG_DIALS[name]:
+        last_error: Optional[Exception] = None
+        for kwargs in candidates:
             # Via _instantiate_filter's own dispatch, not a hardcoded
             # direct-tau call, so a dial-registry filter not in
             # _DIRECT_TAU_FILTERS still gets built correctly.
-            candidate = _instantiate_filter(
-                filter_cls, dim, memory_budget, distance_threshold, extra_kwargs=kwargs
-            )
-            t0 = time.perf_counter()
-            candidate.construct(construct_arr)
-            construction_time += time.perf_counter() - t0
-            f1 = (
-                _f1_score(np.asarray(candidate.query(calib_arr), dtype=bool), calib_actual)
-                if len(calib_arr) > 0 else 0.0
-            )
+            try:
+                candidate = _instantiate_filter(
+                    filter_cls, dim, memory_budget, distance_threshold, extra_kwargs=kwargs
+                )
+                t0 = time.perf_counter()
+                candidate.construct(construct_arr)
+                construction_time += time.perf_counter() - t0
+            except (InsufficientMemoryError, RuntimeError) as e:
+                # A dial value can be infeasible at this budget (DSH's z
+                # shifts num_tables, so its memory footprint moves with the
+                # grid) or fail DSH's own calibration_min_gap guard -- either
+                # way that is one bad candidate, not a reason to fail the
+                # whole sweep row as long as some other candidate works.
+                last_error = e
+                continue
+            # Each construction candidate gets its own query-time dial tuned
+            # before being scored, so the comparison between them is between
+            # their BEST achievable operating points -- HNSWFilter is in both
+            # registries (M at construction, ef_search after it), and scoring
+            # every M at one arbitrary ef_search would pick M by an artifact
+            # of that choice.
+            f1 = _tune_post_construction(candidate, name, calib_arr, calib_actual)
             if f1 > best_f1:
                 best_f1, best_instance = f1, candidate
+        if best_instance is None:
+            raise InsufficientMemoryError(
+                f"No candidate for {name} in its construction-time config dial fit "
+                f"max_memory={memory_budget} bytes / passed its calibration guard "
+                f"(last error: {last_error})."
+            )
+        # No re-tune needed: _tune_post_construction leaves each candidate
+        # set to its own best dial value before returning, and the later
+        # candidates it ran on are separate instances, so best_instance is
+        # already at the operating point its winning F1 was measured at.
         return best_instance, construction_time
 
-    filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold)
+    filter_instance = _instantiate_filter(filter_cls, dim, memory_budget, distance_threshold, extra_kwargs=extra_kwargs)
     t0 = time.perf_counter()
     filter_instance.construct(construct_arr)
     construction_time = time.perf_counter() - t0
 
-    if name in _POST_CONSTRUCTION_CONFIG_DIALS and len(calib_arr) > 0:
-        best_attr, best_value, best_f1 = None, None, -1.0
-        for attr, value in _POST_CONSTRUCTION_CONFIG_DIALS[name](filter_instance):
-            setattr(filter_instance, attr, value)
-            f1 = _f1_score(np.asarray(filter_instance.query(calib_arr), dtype=bool), calib_actual)
-            if f1 > best_f1:
-                best_attr, best_value, best_f1 = attr, value, f1
-        if best_attr is not None:
-            setattr(filter_instance, best_attr, best_value)
+    _tune_post_construction(filter_instance, name, calib_arr, calib_actual)
 
     return filter_instance, construction_time
 
@@ -258,8 +406,16 @@ def equal_memory_worker(
     actual_calibration: List[bool],
     actual_query: List[bool],
     dataset: str = "",
+    extra_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    config = filter_cls.__name__
+    # BallCoverFilter can be submitted multiple times at one budget, once per
+    # quantize variant (see main.generate_equal_memory) -- suffix the variant
+    # onto Config so each becomes its own labelled line downstream rather
+    # than being pooled into one "BallCoverFilter" line. The suffix uses
+    # "(...)"  rather than plot_equal_memory.aggregate's " + " delimiter, so
+    # its filter-identity split leaves the whole string intact.
+    quantize = (extra_kwargs or {}).get("quantize")
+    config = f"{filter_cls.__name__} ({quantize.value})" if quantize is not None else filter_cls.__name__
     construct_arr = _to_construct_array(vectors_construct)
     calib_arr = _to_construct_array(vectors_calibration)
     calib_actual = np.asarray(actual_calibration, dtype=bool)
@@ -267,7 +423,7 @@ def equal_memory_worker(
     try:
         filter_instance, construction_time = _build_calibrated_filter(
             filter_cls, dim, memory_budget, distance_threshold,
-            construct_arr, calib_arr, calib_actual,
+            construct_arr, calib_arr, calib_actual, extra_kwargs=extra_kwargs,
         )
     except InsufficientMemoryError as e:
         # Expected at small budgets -- recorded as an explicit infeasible
@@ -283,6 +439,7 @@ def equal_memory_worker(
             'FPR': float('nan'), 'FNR': float('nan'),
             'Latency (ms)': float('nan'), 'Throughput (qps)': float('nan'),
             'Infeasible': True,
+            'Construct Size': len(construct_arr),
         }
 
     predicted: List[bool] = []
@@ -322,43 +479,92 @@ def equal_memory_worker(
         'Latency (ms)': construction_time * 1000,
         'Throughput (qps)': n_q / max(elapsed, 1e-9),
         'Infeasible': False,
+        # This corpus/fold's construct-set size, so plot_equal_memory can
+        # express Memory Budget/Usage as a percentage of storing this set
+        # raw (Construct Size * dim float32s) -- per row, since datasets
+        # pooled into this sweep don't all share the same reference-set
+        # size (see main.generate_equal_memory's min-over-corpora budget
+        # scaling), unlike the shared budget grid itself.
+        'Construct Size': len(construct_arr),
     }
 
 
 _LN10 = float(np.log(10.0))
 
 
+def _log_effective_radii(radii: np.ndarray, tau: float) -> np.ndarray:
+    """Natural log of each ball's tau-expanded radius, carried in log space --
+    -inf wherever that radius is not positive.
+
+    tau is not guaranteed positive by every caller -- a negative tau is a
+    stricter "inside by a margin" threshold (a query must sit strictly inside
+    a ball's radius, not just within it).
+    A ball whose radius that drives to zero or below covers nothing, and -inf
+    is the log-space statement of exactly that: logsumexp maps it back to a
+    zero contribution, so it drops out of the sum without ever being
+    materialised as a radius.
+
+    Kept in log space rather than clamping the radius to 0, because clamping
+    rewrites the geometry (the sum would be over a cover that does not exist)
+    to work around a representation limit. Taking the log first also avoids
+    both failure modes of the linear form: np.log of a negative radius is NaN
+    ("invalid value encountered in log"), and r**d silently returns a LARGE
+    POSITIVE number when d is even -- which would make a ball that covers
+    nothing the dominant term.
+    """
+    r = np.asarray(radii, dtype=np.float64) + float(tau)
+    logr = np.full(r.shape, -np.inf, dtype=np.float64)
+    # where= leaves the -inf in place for non-positive radii and never
+    # evaluates the log there, so no invalid-value warning is raised.
+    np.log(r, out=logr, where=r > 0.0)
+    return logr
+
+
 def _log10_J(radii: np.ndarray, dim: int, tau: float = 0.0) -> float:
     """log10 sum_i (r_i + tau)^d, safe for d in the hundreds where r^d over/underflows float64."""
-    r = np.asarray(radii, dtype=np.float64) + float(tau)
-    if r.size == 0:
+    logr = _log_effective_radii(radii, tau)
+    if logr.size == 0:
         return float('-inf')
-    with np.errstate(divide='ignore'):
-        logr = np.log(r)
     return float(logsumexp(dim * logr)) / _LN10
 
 
 def _J_tau(radii: np.ndarray, dim: int, tau: float = 0.0) -> float:
     """Linear J_tau(C) = sum_i (r_i + tau)^d; may overflow to +inf at d~384, r>~1 -- use _log10_J to plot."""
-    r = np.asarray(radii, dtype=np.float64) + float(tau)
-    if r.size == 0:
+    if len(radii) == 0:
+        return 0.0
+    # Derived from the log form rather than summed directly, so a ball with a
+    # non-positive tau-expanded radius contributes nothing instead of a large
+    # positive r**d (d is even). Still overflows to +inf at d~384, r>~1 --
+    # that is what _log10_J is for.
+    log10_j = _log10_J(radii, dim, tau)
+    if log10_j == float('-inf'):
         return 0.0
     with np.errstate(over='ignore'):
-        return float(np.sum(r ** dim))
+        return float(10.0 ** log10_j)
 
 
 def _tau_volume_bounds_log10(centers: np.ndarray, radii: np.ndarray, tau: float) -> Tuple[float, float]:
     """Log10 (lower, upper) bounds on the volume actually covered by the
     tau-expanded balls (radius + tau), via estimate_hypersphere_volume's
-    overlap-aware union bound -- the same estimator BallCoverFilter.construct()
-    uses for its own (tau=0) volume bounds, just re-run at each tau since
-    _log10_J's naive sum-of-volumes proxy ignores overlap entirely. High is
-    floored at low the same way _fpvr_bounds floored its log-ratio at 0:
-    floating-point error in the lens/Bonferroni terms can otherwise invert
-    them by a hair."""
+    overlap-aware union bound -- unlike _log10_J's naive sum-of-volumes proxy,
+    which ignores overlap entirely. High is floored at low the same way
+    _fpvr_bounds floored its log-ratio at 0: floating-point error in the
+    lens/Bonferroni terms can otherwise invert them by a hair.
+
+    This is the only home of that estimate. BallCoverFilter.construct() used
+    to run it eagerly at tau=0 and return the bounds, so every construct() in
+    the suite paid for an O(k^2) union bound that almost no caller read;
+    callers that want it now ask for it here, from all_centers/all_radiuses,
+    at whatever tau they are reporting (pass tau=0.0 for the cover's own
+    volume). Only system_tau_worker does -- see blocklist_tau_worker for a
+    worker that deliberately skips it on cost grounds."""
     if len(radii) == 0:
         return float('nan'), float('nan')
-    log_low, log_high = estimate_hypersphere_volume(centers, radii + tau, return_log=True)
+    # This estimator takes radii, not log-radii, so the degenerate case is
+    # expressed as a zero-radius ball -- which is the correct geometry for one
+    # that covers nothing, not a clamp working around a representation limit.
+    eff_radii = np.maximum(np.asarray(radii, dtype=np.float64) + float(tau), 0.0)
+    log_low, log_high = estimate_hypersphere_volume(centers, eff_radii, return_log=True)
     if np.isnan(log_low) or np.isinf(log_low):
         return float('nan'), float('nan')
     log_low /= _LN10
@@ -379,14 +585,30 @@ def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, flo
 QUANTIZATION_SWEEP = (
     Quantize.FP32, Quantize.FP16, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
     Quantize.TQ3, Quantize.PQ4_R2, Quantize.PQ8_R2,
-    # The ladder stops at 2 b/dim: both 1 b/dim rungs are left out.
-    # Quantize.PQ4_R1 halves PQ4_R2's subquantizer count at the same 4-bit
-    # width, so it buys its extra balls with reconstruction error that
-    # inflates every radius -- excluded as below the useful rate.
-    # Quantize.RABITQ is the one rung whose search() is not exact ADC, so its
-    # zero-false-negative property rests on a measured one-sided estimator
-    # rather than a proof -- see the CAVEAT on Quantize.RABITQ.
-    # Both stay constructible, just not swept.
+    # Down to 1 b/dim via two subquantizer-width options, the same pairing
+    # the 2 b/dim rung already has (PQ4_R2 vs PQ8_R2): PQ4_R1 packs more,
+    # coarser subquantizers; PQ8_R1 packs fewer, finer ones, at the same
+    # rate and the same 48-byte center cost (see the Quantize docstring's
+    # table). Both are exact ADC, so their zero-false-negative property is a
+    # proof like the rest of the ladder's.
+    #
+    # Quantize.RABITQ is deliberately NOT swept here: unlike every other rung,
+    # its search() is not exact ADC -- it scores through its own estimator,
+    # so its zero-false-negative property rests on a measured one-sided
+    # bound (3.6M (query, center) pairs, always under-estimated) rather than
+    # a proof. Safe in every measurement taken so far, but a materially
+    # weaker guarantee than the other ten rungs; see the CAVEAT on
+    # Quantize.RABITQ. Stays constructible, just not swept by default.
+    Quantize.PQ4_R1, Quantize.PQ8_R1,
+    # The rest of faiss's TurboQuant family alongside TQ3 (TQ1/TQ2/TQ4/TQ5/
+    # TQ8 -- see the Quantize docstring). Evaluation-only: swept here so
+    # results/quantization.csv carries their rows, but deliberately left out
+    # of plot_quantization.QUANTIZE_SWEEP (a separate, hand-kept list, not
+    # imported from here -- see that file's comment) so no figure changes
+    # until they've actually been looked at. All exact ADC like the rest of
+    # the scalar-quantizer rungs, so this doesn't touch the zero-false-
+    # negative guarantee.
+    Quantize.TQ1, Quantize.TQ2, Quantize.TQ4, Quantize.TQ5, Quantize.TQ8,
 )
 
 
@@ -400,6 +622,8 @@ def quantization_worker(
     vectors_construct: VectorInput,
     vectors_query: VectorInput,
     actual_results: List[bool],
+    n_hard: int,
+    n_easy: int,
 ) -> List[Dict[str, Any]]:
     """Builds one BallCoverFilter cover per (dataset, k, seed, quantize) and
     evaluates it at a single tau. Returns one row, tagged
@@ -410,6 +634,19 @@ def quantization_worker(
     of queries are duplicates), so the tau-dependent columns (fpr,
     log10_J_tau, index_accesses_saved_pct) are unambiguous without the plots
     having to pick one tau out of several.
+
+    n_hard/n_easy split fpr into fpr_hard/fpr_easy, the same distinction
+    blocklist_tau_worker/budget_worker report: vectors_query is [positives,
+    hard negatives, easy negatives] in that order (see
+    BlocklistWorkload.query_vectors), so the last n_hard+n_easy entries are
+    hard then easy negatives and the rest are positives. Unlike
+    blocklist_tau_worker/budget_worker, ground truth here is distance-to-tau
+    (compute_static_actual_results), not cluster membership,
+    so a hard/easy-negative row is not unconditionally a true negative the
+    way it is there -- fpr_hard/fpr_easy go through the same confusion-rate
+    helper as the pooled fpr rather than a plain mean, so the rare row where
+    a "hard negative" is within tau by the distance definition is still
+    counted correctly.
 
     max_memory is derived from k using Quantize.FP32's byte-per-ball size and
     held fixed across every quantize candidate, so a more compact code packs
@@ -431,6 +668,9 @@ def quantization_worker(
         )
 
     actual = np.asarray(actual_results, dtype=bool)
+    if n_hard + n_easy > n_q:
+        raise ValueError(f"n_hard+n_easy ({n_hard + n_easy}) exceeds n_queries ({n_q})")
+    n_pos = n_q - n_hard - n_easy
     stage = "ball" if quantize == Quantize.FP32 else "quantizing"
 
     rows: List[Dict[str, Any]] = []
@@ -468,11 +708,17 @@ def quantization_worker(
     n_index_accesses = int(predicted_arr.sum())
 
     rates = _confusion_rates(predicted, actual)
+    # Same [positives, hard, easy] layout as blocklist_tau_worker/budget_worker's query stream
+    # (see BlocklistWorkload.query_vectors) -- hard then easy negatives are
+    # the trailing n_hard+n_easy entries.
+    hard_rates = _confusion_rates(predicted_arr[n_pos:n_pos + n_hard], actual[n_pos:n_pos + n_hard])
+    easy_rates = _confusion_rates(predicted_arr[n_pos + n_hard:], actual[n_pos + n_hard:])
     rows.append({
         "dataset": dataset, "k": k, "quantize": quantize.value, "stage": stage, "tau": tau,
         "log10_J": log10_J,
         "log10_J_tau": _log10_J(radii, dim, tau=tau),
         "fpr": rates["fpr"], "fnr": rates["fnr"],
+        "fpr_hard": hard_rates["fpr"], "fpr_easy": easy_rates["fpr"],
         "stage_time_s": stage_time, "cum_time_s": stage_time,
         "query_throughput_qps": n_q / max(query_time, 1e-9),
         "n_queries": n_q,
@@ -593,44 +839,190 @@ def system_tau_worker(
     return rows
 
 
-def system_worker(
+def _blocklist_cover_rows(
     dim: int,
     dataset: str,
-    k: int,
-    tau_values: List[float],
-    redundancy_pcts: List[float],
     seed: int,
-    vectors_construct: VectorInput,
-    vectors_query: VectorInput,
-    actual_results_by_tau: Dict[float, List[bool]],
+    k_fractions: List[float],
+    tau_values: List[float],
+    vectors_reference: VectorInput,
+    vectors_positive: VectorInput,
+    vectors_hard_negative: VectorInput,
+    vectors_easy_negative: VectorInput,
+    volume_bounds: bool,
 ) -> List[Dict[str, Any]]:
-    """Same measurement as system_tau_worker -- one cover per (dataset,
-    fold), swept over query-time tau -- but each tau here was solved for a
-    *target* redundancy percentage on this split's own query stream (see
-    main.generate_system), so tau differs per dataset/fold while the target
-    percentage is shared. Adds that target as `redundancy_pct`, which is
-    the shared x-axis plot_system plots against in place of tau.
+    """Shared core of blocklist_tau_worker and budget_worker: build a
+    BallCoverFilter per k in k_fractions and emit one sweep="tau" row per
+    (k, tau) pair. Both callers read only these rows -- see each one's own
+    docstring for which axis it treats as fixed and which it sweeps.
 
-    tau_values and redundancy_pcts are parallel lists: tau_values[i] is the
-    threshold solved for redundancy_pcts[i]. Two nearby targets can collapse
-    onto the same tau (a mass spike of exact-duplicate embeddings), so the
-    two are zipped positionally against system_tau_worker's per-tau rows,
-    which come back one per tau_values entry in order -- a tau->pct dict
-    would silently drop one of the colliding targets."""
-    if len(tau_values) != len(redundancy_pcts):
-        raise ValueError(
-            f"tau_values ({len(tau_values)}) and redundancy_pcts "
-            f"({len(redundancy_pcts)}) must be parallel lists"
-        )
+    Negatives are split in two and never pooled. Hard negatives are members of
+    duplicate clusters that were NOT blocklisted: same tight local geometry as
+    B, so a filter that merely detects "is this vector in a dense region"
+    fails them and only one that localises B passes. Easy negatives are
+    singletons, i.e. background traffic. A pooled FPR would be dominated by
+    whichever class happened to be larger.
 
-    rows = system_tau_worker(
-        dim=dim, dataset=dataset, k=k, tau_values=tau_values, seed=seed,
-        vectors_construct=vectors_construct, vectors_query=vectors_query,
-        actual_results_by_tau=actual_results_by_tau,
-    )
-    for row, pct in zip(rows, redundancy_pcts):
-        row["redundancy_pct"] = float(pct)
+    volume_bounds adds the overlap-aware log10_vol_low/log10_vol_high columns
+    (_tau_volume_bounds_log10). Off by default because that bound is ~O(k^2)
+    -- ~160s at k=9665 -- and blocklist_tau_worker sweeps a whole tau grid per
+    k, which multiplies that cost by the length of the grid and dominates the
+    run. budget_worker passes a single tau, so it pays it once per k and turns
+    this on; see the log10_j_tau comment below for the cheap sum-of-volumes
+    proxy that is always reported.
+    """
+    B = np.ascontiguousarray(_to_construct_array(vectors_reference), dtype=np.float32)
+    pos = np.ascontiguousarray(_to_construct_array(vectors_positive), dtype=np.float32)
+    hard = np.ascontiguousarray(_to_construct_array(vectors_hard_negative), dtype=np.float32)
+    easy = np.ascontiguousarray(_to_construct_array(vectors_easy_negative), dtype=np.float32)
+
+    # Exact nearest-reference distances: the workload's own geometry, reported
+    # so a row is interpretable without re-deriving it (delta vs d_hard).
+    bix = faiss.IndexFlatL2(dim)
+    bix.add(B)
+
+    def nn_dist(Q):
+        if len(Q) == 0:
+            return np.zeros(0, dtype=np.float32)
+        d2, _ = bix.search(Q, 1)
+        return np.sqrt(np.clip(d2[:, 0], 0, None))
+
+    d_pos_med = float(np.median(nn_dist(pos))) if len(pos) else float("nan")
+    d_hard_med = float(np.median(nn_dist(hard))) if len(hard) else float("nan")
+
+    n_queries = len(pos) + len(hard) + len(easy)
+    rows: List[Dict[str, Any]] = []
+
+    for kf in k_fractions:
+        k = min(max(1, round(kf * len(B))), len(B))
+        filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
+        filt.construct(B)
+        radii = filt.all_radiuses
+        centers = np.ascontiguousarray(filt.all_centers, dtype=np.float32)
+
+        cix = faiss.IndexFlatL2(dim)
+        cix.add(centers)
+
+        def margin(Q):
+            """Smallest (distance to a ball's centre - that ball's radius) over
+            every ball: the query is flagged iff this is <= tau. Searching all
+            balls rather than a top-m probe, since a query can sit nearest to
+            one centre while another, fatter ball is the one that covers it."""
+            if len(Q) == 0:
+                return np.zeros(0, dtype=np.float32)
+            D, I = cix.search(Q, len(radii))
+            return (np.sqrt(np.clip(D, 0, None)) - radii[I]).min(axis=1)
+
+        m_pos, m_hard, m_easy = margin(pos), margin(hard), margin(easy)
+        r_med = float(np.median(radii)) if len(radii) else 0.0
+
+        for tau in tau_values:
+            tau = float(tau)
+            # Recomputed per tau because tau expands every ball (eff. radius
+            # r_i + tau), so both the geometric objective and the volume
+            # bounds are functions of tau at fixed k, not constants of the
+            # cover.
+            recall = float(np.mean(m_pos <= tau)) if len(m_pos) else 0.0
+            fpr_hard = float(np.mean(m_hard <= tau)) if len(m_hard) else 0.0
+            fpr_easy = float(np.mean(m_easy <= tau)) if len(m_easy) else 0.0
+            # Pooled FPR over both negative classes, for the "FPR vs tau" view
+            # where the split into hard/easy is not the axis of interest.
+            n_neg = len(hard) + len(easy)
+            fpr = ((fpr_hard * len(hard)) + (fpr_easy * len(easy))) / n_neg if n_neg else 0.0
+
+            n_flagged = (recall * len(pos)) + (fpr_hard * len(hard)) + (fpr_easy * len(easy))
+            saved = 100.0 * (1.0 - n_flagged / max(n_queries, 1))
+
+            vol_low, vol_high = float('nan'), float('nan')
+            if volume_bounds:
+                vol_low, vol_high = _tau_volume_bounds_log10(centers, radii, tau)
+
+            rows.append({
+                "dataset": dataset, "seed": seed, "sweep": "tau",
+                "k": len(radii), "n_reference": len(B),
+                # k_fraction is the nominal knob and is identical across
+                # datasets and folds; `compression` is what it realised here,
+                # which is not (|B| differs per dataset and per fold, so k =
+                # round(kf*|B|) lands on a different ratio each time). Group
+                # and filter on k_fraction -- grouping on compression makes
+                # every fold its own singleton group, which silently drops the
+                # error bars and matches only one dataset when filtering.
+                "k_fraction": float(kf),
+                "compression": len(B) / max(len(radii), 1),
+                "r_med": r_med, "r_max": float(radii.max()) if len(radii) else 0.0,
+                "tau": tau, "recall": recall,
+                "fpr": fpr, "fpr_hard": fpr_hard, "fpr_easy": fpr_easy,
+                "n_positive": len(pos), "n_hard": len(hard), "n_easy": len(easy),
+                "n_queries": n_queries,
+                "accesses_saved_pct": saved,
+                # log10_J is a logsumexp over the balls, i.e. O(k), so it is
+                # always reported -- but it sums each ball's volume
+                # independently and double-counts overlap. The overlap-aware
+                # union bound above is the tighter number, and is opt-in
+                # because it is ~O(k^2) (see volume_bounds in the docstring).
+                "j_tau": _J_tau(radii, dim, tau=tau),
+                "log10_j_tau": _log10_J(radii, dim, tau=tau),
+                "log10_vol_low": vol_low,
+                "log10_vol_high": vol_high,
+                "n_balls": len(radii),
+                "d_pos_med": d_pos_med, "d_hard_med": d_hard_med,
+                "memory_bytes": filt.get_bytesize(),
+            })
     return rows
+
+
+def blocklist_tau_worker(
+    dim: int,
+    dataset: str,
+    seed: int,
+    k_fraction: float,
+    tau_values: List[float],
+    vectors_reference: VectorInput,
+    vectors_positive: VectorInput,
+    vectors_hard_negative: VectorInput,
+    vectors_easy_negative: VectorInput,
+) -> List[Dict[str, Any]]:
+    """Asymmetric blocklist workload (main.generate_blocklist): a tight
+    reference set B, a broad query stream, positives that are held-out members
+    of B's own duplicate clusters.
+
+    Ball budget k is fixed (a single k_fraction, not a sweep -- varying it is
+    budget_worker's job); tau is swept over tau_values so FPR/recall/accesses
+    are read as one corpus's response curve at that one budget.
+    """
+    return _blocklist_cover_rows(
+        dim, dataset, seed, [k_fraction], tau_values,
+        vectors_reference, vectors_positive, vectors_hard_negative, vectors_easy_negative,
+        volume_bounds=False,
+    )
+
+
+def budget_worker(
+    dim: int,
+    dataset: str,
+    seed: int,
+    k_fractions: List[float],
+    tau: float,
+    vectors_reference: VectorInput,
+    vectors_positive: VectorInput,
+    vectors_hard_negative: VectorInput,
+    vectors_easy_negative: VectorInput,
+) -> List[Dict[str, Any]]:
+    """The same asymmetric blocklist workload as blocklist_tau_worker
+    (main.generate_budget), read along the other axis: tau is fixed at a
+    single value and the ball budget k is swept over k_fractions, so recall
+    becomes a measurement instead of a fixed operating point.
+
+    Always requests the overlap-aware volume bounds: this is the one
+    blocklist-workload sweep that can afford them (~O(k^2) per row, paid once
+    per budget rather than once per (budget, tau) as blocklist_tau_worker's
+    grid would multiply it out to).
+    """
+    return _blocklist_cover_rows(
+        dim, dataset, seed, k_fractions, [tau],
+        vectors_reference, vectors_positive, vectors_hard_negative, vectors_easy_negative,
+        volume_bounds=True,
+    )
 
 
 def query_performance_worker(
@@ -927,7 +1319,12 @@ def stream_rebuild_worker(
 
 _WORKER_FNS: Dict[str, Any] = {
     'system_tau': system_tau_worker,
-    'system': system_worker,
+    'blocklist': blocklist_tau_worker,
+    # Same underlying cover-and-margin core (_blocklist_cover_rows), second
+    # worker: generate_budget runs the identical blocklist measurement but
+    # sweeps the ball budget at a fixed tau instead of sweeping tau at a fixed
+    # budget (see main.generate_budget).
+    'budget': budget_worker,
     'quantization': quantization_worker,
     'query_performance': query_performance_worker,
     'equal_memory': equal_memory_worker,

@@ -33,16 +33,21 @@ DATASET_MARKERS = {"eli5": "o", "mmlu": "s", "wildchat": "^", "msmarco": "D", "h
 
 def apply_style(dpi: int = 300) -> None:
     plt.rcParams.update({
-        "figure.figsize": (1.70, 1.50),
+        # Scaled by the same 1.2x as the font sizes below, so the ratio of
+        # text to canvas is unchanged -- keeps every fixed, non-tight
+        # subplots_adjust() margin elsewhere (tuned for the old ratio, and
+        # relied on to align panels placed side by side) still fitting
+        # without touching each one individually.
+        "figure.figsize": (1.70 * 1.2, 1.50 * 1.2),
         "figure.dpi": dpi,
         "savefig.dpi": dpi,
         "font.family": "serif",
         "font.serif": ["Linux Libertine O", "Libertine", "DejaVu Serif"],
         "mathtext.fontset": "stix",
-        "axes.labelsize": 7,
-        "xtick.labelsize": 6,
-        "ytick.labelsize": 6,
-        "axes.titlesize": 7,
+        "axes.labelsize": 8.4,
+        "xtick.labelsize": 7.2,
+        "ytick.labelsize": 7.2,
+        "axes.titlesize": 8.4,
         "axes.spines.top": False,
         "axes.spines.right": False,
         "axes.linewidth": 0.5,
@@ -55,8 +60,8 @@ def apply_style(dpi: int = 300) -> None:
         "xtick.minor.size": 0,
         "ytick.minor.size": 0,
         "legend.frameon": False,
-        "legend.fontsize": 7,
-        "legend.title_fontsize": 7,
+        "legend.fontsize": 8.4,
+        "legend.title_fontsize": 8.4,
     })
 
 
@@ -115,6 +120,54 @@ def mean_std(df: pd.DataFrame, group_cols: List[str], value_col: str) -> pd.Data
     return agg.drop(columns=["_mean", "_std", "_count"])
 
 
+def collapse_duplicate_x(sub: pd.DataFrame, x_col: str, value_col: str = "mean",
+                         ci_col: str = "ci95") -> pd.DataFrame:
+    """Averages rows that land on the same x value together into one point.
+
+    Shared by plot_equal_memory.py and plot_quantization.py, both of which
+    can plot several distinct sweep steps that saturate to the exact same
+    realized memory: BallCoverFilter's ball count is capped by the construct
+    set's own size and by how much a bigger cover actually helps, so several
+    *nominal* budgets/k values can build the identical cover and report
+    identical memory_bytes (confirmed directly in both evaluations' results
+    -- e.g. quantization.csv's TQ3 column reports the same memory_bytes at
+    k=8192, 16384, 32768 and 65536 alike). Each caller's aggregate() groups
+    by the nominal sweep variable (Memory Budget / k), not realized memory,
+    so those stay separate rows; plotted against realized memory (MB or %
+    of raw) they would otherwise show as several overlapping points at one x
+    position, most visibly on construction latency, a wall-clock measurement
+    that varies run to run even when the built filter is byte-for-byte
+    identical. Averaged here (weighted by each row's sample count `n`) into
+    a single representative point instead.
+
+    `value_col`/`ci_col` default to the "mean"/"ci95" columns every caller's
+    aggregate() produces, but plot_quantization's radius-inflation panel
+    tracks ball-to-ball spread as "std" instead of seed-variance "ci95", so
+    both are overridable.
+
+    Grouped on a rounded key rather than the raw float column: two rows "the
+    same" memory can differ in the last bit or two from independent
+    floating-point aggregation, and would otherwise silently stay as
+    separate, near-identical points rather than being combined."""
+    if sub.empty or x_col not in sub.columns:
+        return sub
+
+    key = sub[x_col].round(6)
+    n = sub["n"] if "n" in sub.columns else pd.Series(1, index=sub.index)
+    total_n = n.groupby(key).transform("sum")
+    weight = n / total_n.replace(0, 1)
+
+    agg_spec = {
+        x_col: (x_col, "mean"),
+        value_col: (value_col, lambda s: float(np.average(s, weights=weight.loc[s.index]))),
+        "n": ("n", "sum") if "n" in sub.columns else (x_col, "size"),
+    }
+    if ci_col in sub.columns:
+        agg_spec[ci_col] = (ci_col, lambda s: float(np.average(s, weights=weight.loc[s.index])))
+
+    return sub.groupby(key, as_index=False).agg(**agg_spec)
+
+
 def save_dataset_legend(outdir: str, dpi: int, emit_pdf: bool = False, filename: str = "dataset-legend.png") -> None:
     apply_style(dpi)
     fig, ax = plt.subplots(figsize=(6.4, 0.25))
@@ -125,6 +178,6 @@ def save_dataset_legend(outdir: str, dpi: int, emit_pdf: bool = False, filename:
         for d in DATASETS
     ]
     labels = [DATASET_LABELS[d] for d in DATASETS]
-    fig.legend(handles, labels, loc="center", ncol=len(DATASETS), frameon=False, fontsize=7)
+    fig.legend(handles, labels, loc="center", ncol=len(DATASETS), frameon=False, fontsize=8.4)
     fig.patch.set_alpha(0.0)
     save_figure(fig, filename, outdir, dpi, emit_pdf, transparent=True)

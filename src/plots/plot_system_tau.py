@@ -234,7 +234,7 @@ def panel_volume_bounds(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     ax.set_xlabel(r"$\tau$")
     ax.set_ylabel(wrap_label(r"$\log_{10}$ Volume Bounds"))
     ax.text(0.97, 0.06, "dashed: lower -- solid: upper", transform=ax.transAxes,
-           ha="right", va="bottom", fontsize=5)
+           ha="right", va="bottom", fontsize=6.0)
     style_axes(ax)
 
     fig.subplots_adjust(left=0.26, right=0.97, top=0.95, bottom=0.24)

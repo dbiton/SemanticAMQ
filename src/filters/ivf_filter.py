@@ -16,6 +16,27 @@ nbits, until per-vector codes get at least half the budget. If even the
 smallest configuration overruns max_memory, construct() raises
 InsufficientMemoryError rather than shipping an over-budget index.
 
+Accept radius: query() thresholds the index's ESTIMATED nearest-neighbor
+distance, and both of IVFPQ's lossy steps bias that estimate upward -- the
+PQ code cannot represent the residual exactly, so a pair at true distance 0
+comes back at the codes' reconstruction error. At tau=0.1 on 384-d
+embeddings that bias is larger than tau itself: measured on the Quora
+blocklist workload at |B|=4,000 and 10% of raw storage (nlist=63, pq_m=64,
+nbits=7), pairs whose true distance was <= 0.1 came back with a median
+estimate of 0.294. Thresholding those at tau flagged 3 of 38 true
+duplicates -- FNR 0.92, FPR 0.00, i.e. a filter that answers "not a
+duplicate" to almost everything, which is exactly what the equal-memory
+sweep reported for IVFFilter on three of its five corpora.
+
+The estimate is still strongly discriminative there (true duplicates
+median 0.294, true non-duplicates median 0.994), so what was broken was the
+decision rule, not the index: `accept_radius_scale` multiplies tau to give
+the radius query() actually tests, and runner.py calibrates it on held-out
+labeled data exactly as it calibrates nprobe. At the same budget that scale
+reaches FPR 0.000 / FNR 0.263 (F1 0.836 against 0.146 at scale 1.0). It buys
+no memory and FPR/FNR are still scored against the true tau, so too generous
+a scale is paid for in FPR. Default 1.0 = the old exact-tau rule.
+
 FAISS's IVFPQ precomputed ADC table is explicitly disabled (see
 _PRECOMPUTED_TABLE_DISABLED): faiss switches it on during train(), it costs
 nlist * pq_m * 2**nbits * 4 bytes of resident memory -- tens of MB, often
@@ -71,9 +92,14 @@ class IVFFilter(Filter):
         pq_m: Optional[int] = None,
         max_spheres: Optional[int] = None,
         seed: int = 42,
+        accept_radius_scale: float = 1.0,
     ):
         super().__init__(dim, max_memory=max_memory)
         self.distance_threshold = float(distance_threshold)
+        # See the module docstring's "Accept radius" section. 1.0 reproduces
+        # the exact-tau rule, so every caller that does not calibrate this
+        # (every evaluation outside the equal-memory sweep) is unaffected.
+        self.accept_radius_scale = float(accept_radius_scale)
         self._nlist_override = nlist
         self._nprobe = nprobe
         self._pq_m_override = pq_m
@@ -294,18 +320,28 @@ class IVFFilter(Filter):
                     f"{actual} bytes."
                 )
 
-    def query(self, vectors: np.ndarray, tau: Optional[float] = None) -> List[bool]:
+    def query_squared_nn_distance(self, vectors: np.ndarray) -> np.ndarray:
+        """The index's ESTIMATE of each query's squared nearest-neighbor
+        distance, np.inf where the search found nothing (faiss's id=-1).
+
+        Split out of query() so runner.py's calibration can score every
+        accept radius from one search pass instead of re-searching per
+        radius -- the radius is a comparison against these numbers, it does
+        not change the search that produced them."""
         if not self._constructed:
             raise ValueError("IVFFilter has not been constructed.")
-        if tau is None:
-            tau = self.distance_threshold
         vecs = np.ascontiguousarray(vectors, dtype=np.float32)
         if len(vecs) == 0 or self.index is None or self.index.ntotal == 0:
-            return [False] * len(vecs)
+            return np.full(len(vecs), np.inf, dtype=np.float64)
         sq_dist, ids = self.index.search(vecs, 1)
-        found = ids[:, 0] != -1
-        is_dup = found & (sq_dist[:, 0] <= float(tau) ** 2)
-        return is_dup.tolist()
+        out = sq_dist[:, 0].astype(np.float64)
+        return np.where(ids[:, 0] != -1, out, np.inf)
+
+    def query(self, vectors: np.ndarray, tau: Optional[float] = None) -> List[bool]:
+        if tau is None:
+            tau = self.distance_threshold
+        radius = float(tau) * self.accept_radius_scale
+        return (self.query_squared_nn_distance(vectors) <= radius ** 2).tolist()
 
     def insert(self, vectors: np.ndarray) -> None:
         if self.index is None:

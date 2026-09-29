@@ -61,13 +61,23 @@ class TestQVFZeroFalseNegatives(unittest.TestCase):
         self._assert_no_fn(ErrorBudgetMode.PER_VECTOR, budget=200_000, seed_offset=3)
 
     def test_zero_false_negatives_at_coarsest_level(self):
-        """Forces the RaBitQ rung specifically (a budget too tight for sq4
+        """Forces the RaBitQ rung specifically (a budget too tight for tq2
         but just big enough for rabitq) -- the level with the largest eps_i,
-        and the only one that takes the non-SIMD fallback query path."""
+        and the only one that takes the non-SIMD fallback query path.
+
+        Needs a large-ish dim, not the suite's usual DIM=32: RaBitQ's
+        code_size is ceil(dim/8) + a small fixed per-vector constant, while
+        TQ2's is dim/4 -- at dim=32 that fixed constant is a big enough
+        fraction of the total that RaBitQ actually costs MORE than TQ2,
+        making RaBitQ unreachable (TQ2 always wins first). At dim=384 (this
+        project's real embedding size, and the regime the docstring's
+        bits-per-dim table describes), RaBitQ's near-56-byte center is
+        genuinely below TQ2's ~96 bytes, so it's reachable as intended."""
+        dim = 384
         n = 200
-        vecs = _rand(n, seed=11)
-        budget = _footprint_bytes(QuantizationLevel.RABITQ, n, DIM, ErrorBudgetMode.PER_CLUSTER, 8) + 8
-        f = QuantizedVectorFilter(dim=DIM, distance_threshold=0.3, max_memory=budget,
+        vecs = _rand(n, dim=dim, seed=11)
+        budget = _footprint_bytes(QuantizationLevel.RABITQ, n, dim, ErrorBudgetMode.PER_CLUSTER, 8) + 8
+        f = QuantizedVectorFilter(dim=dim, distance_threshold=0.3, max_memory=budget,
                                    error_budget_mode=ErrorBudgetMode.PER_CLUSTER, seed=3)
         f.construct(vecs)
         self.assertEqual(f.level, QuantizationLevel.RABITQ)
@@ -116,36 +126,44 @@ class TestQVFMemoryAccounting(unittest.TestCase):
         f = QuantizedVectorFilter(dim=DIM, distance_threshold=R, max_memory=200_000)
         self.assertEqual(f.get_bytesize(), 0)
 
+    # sq6 is the ladder's one plain (non-MSE-trained, unrotated) scalar
+    # quantizer below fp16/tq8, so -- like sq8 in the old ladder -- its
+    # trained table is exactly 2 floats/dim (min + diff), a clean formula to
+    # hand-derive. tq8's MSE-trained table has no such closed form (it's a
+    # faiss implementation detail, not a fixed multiple of dim), so it can't
+    # stand in for sq8 here the way sq6 can.
+    _SQ6_CODE_SIZE = -(-(DIM * 6) // 8)  # ceil(6 bits/dim)
+
     def test_bytesize_matches_hand_computed_global(self):
         n = 100
-        # sq8 code (dim bytes/vector) + sq8's trained min/diff table
-        # (2 floats/dim) + one global float32 error budget. Budget set to
-        # exactly this so sq8 is selected (fp16 needs n*dim*2, well over).
-        expected = n * DIM + 2 * DIM * 4 + 4
+        # sq6 code (ceil(6*dim/8) bytes/vector) + sq6's trained min/diff
+        # table (2 floats/dim) + one global float32 error budget. Budget set
+        # to exactly this so sq6 is selected (fp16/tq8 need far more/vector).
+        expected = n * self._SQ6_CODE_SIZE + 2 * DIM * 4 + 4
         f = QuantizedVectorFilter(dim=DIM, distance_threshold=R, max_memory=expected,
                                    error_budget_mode=ErrorBudgetMode.GLOBAL)
         f.construct(_rand(n))
-        self.assertEqual(f.level, QuantizationLevel.SQ8)
+        self.assertEqual(f.level, QuantizationLevel.SQ6)
         self.assertEqual(f.get_bytesize(), expected)
 
     def test_bytesize_matches_hand_computed_per_cluster(self):
         n = 100
         k = _cluster_count(n)
-        expected = n * DIM + 2 * DIM * 4 + k * 4 + n * _id_bytes(k)
+        expected = n * self._SQ6_CODE_SIZE + 2 * DIM * 4 + k * 4 + n * _id_bytes(k)
         f = QuantizedVectorFilter(dim=DIM, distance_threshold=R, max_memory=expected,
                                    error_budget_mode=ErrorBudgetMode.PER_CLUSTER)
         f.construct(_rand(n))
-        self.assertEqual(f.level, QuantizationLevel.SQ8)
+        self.assertEqual(f.level, QuantizationLevel.SQ6)
         self.assertEqual(f.get_bytesize(), expected)
 
     def test_bytesize_matches_hand_computed_per_vector(self):
         n = 100
         eps_bits = 8
-        expected = n * DIM + 2 * DIM * 4 + n  # eps_bits=8 -> exactly 1 byte/vector
+        expected = n * self._SQ6_CODE_SIZE + 2 * DIM * 4 + n  # eps_bits=8 -> exactly 1 byte/vector
         f = QuantizedVectorFilter(dim=DIM, distance_threshold=R, max_memory=expected,
                                    error_budget_mode=ErrorBudgetMode.PER_VECTOR, per_vector_eps_bits=eps_bits)
         f.construct(_rand(n))
-        self.assertEqual(f.level, QuantizationLevel.SQ8)
+        self.assertEqual(f.level, QuantizationLevel.SQ6)
         self.assertEqual(f.get_bytesize(), expected)
 
     def test_bytesize_grows_with_more_vectors(self):
