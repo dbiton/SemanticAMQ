@@ -134,9 +134,6 @@ class TestQuantizedVectorFilterLevels(unittest.TestCase):
         dim = 128
         X = _clustered(1500, dim=dim)
         tau = 0.1
-        # Near-duplicates strictly inside tau: QVF has no coverage epsilon, so
-        # a query exactly at tau + eps_i is decided by float noise on every
-        # level -- a separate, level-independent issue this test stays clear of.
         rng = np.random.default_rng(3)
         step = rng.standard_normal(X.shape)
         step *= rng.uniform(0.2, 0.9, (len(X), 1)) * tau / np.linalg.norm(step, axis=1, keepdims=True)
@@ -151,6 +148,10 @@ class TestQuantizedVectorFilterLevels(unittest.TestCase):
                     self.assertEqual(f.level, level)
                     got = np.asarray(f.query(near, tau=tau))
                     self.assertTrue(got.all(), f"{np.sum(~got)} of {len(got)} near-duplicates rejected")
+                    # Exact duplicates at tau=0 sit on the eps_i boundary --
+                    # see QuantizedVectorFilter._COVERAGE_EPSILON.
+                    got = np.asarray(f.query(X, tau=0.0))
+                    self.assertTrue(got.all(), f"{np.sum(~got)} of {len(got)} stored vectors rejected at tau=0")
 
 
 if __name__ == '__main__':

@@ -194,6 +194,15 @@ class QuantizedVectorFilter(Filter):
     the quantizer depends on the target distance, only on dim/n/max_memory.
     """
 
+    # Same margin, for the same reason, as BallCoverFilter._COVERAGE_EPSILON:
+    # a query that duplicates a stored vector sits at exactly
+    # d(q, x_hat_i) = eps_i, so without it acceptance is decided by float
+    # noise between search() and the eps_i measurement -- measured on real
+    # data at tau=0, up to 48 of ~1000 exact duplicates rejected on every
+    # level (worst under per_cluster, where the cluster's max member is
+    # always on that boundary).
+    _COVERAGE_EPSILON = 1e-3
+
     def __init__(
         self,
         dim: int,
@@ -328,7 +337,7 @@ class QuantizedVectorFilter(Filter):
             return [False] * len(vectors)
 
         q = np.ascontiguousarray(vectors, dtype=np.float32)
-        thresh_sq = (float(tau) + self._eps_per_vector()) ** 2
+        thresh_sq = (float(tau) + self._eps_per_vector() + self._COVERAGE_EPSILON) ** 2
 
         if self._sq_index is not None:
             # faiss's ScalarQuantizer ADC is exact w.r.t. decode(), so this
