@@ -1321,8 +1321,8 @@ def plot_quantization(df: pd.DataFrame) -> None:
     """One figure set per corpus, each in its own folder.
 
     Split here rather than handed over whole because
-    generate_quantization_figures asserts a single dataset and a single tau,
-    and tau is solved per corpus (see generate_quantization)."""
+    generate_quantization_figures asserts a single dataset, and its panels
+    leave no room for a dataset dimension (see generate_quantization)."""
     for dataset in sorted(df["dataset"].unique()):
         outdir = quantization_plot_dir(str(dataset))
         logger.info(f"Plotting quantization for {dataset} -> {outdir}")
