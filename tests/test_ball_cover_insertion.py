@@ -24,7 +24,7 @@ def get_insertion_strategies():
         'least_inflation': LeastInflationInsert(),
         'exhaustive_merge': ExhaustiveMergeInsert(),
         'doubling': DoublingInsert(),
-        'pooled': PooledInsert()
+        'pooled': PooledInsert(),
     }
 
 
@@ -319,6 +319,133 @@ class TestDoublingStrategy(unittest.TestCase):
             self.assertEqual(len(missing), 0, f"false negative(s) at indices {missing.tolist()}")
 
         self.assertLessEqual(len(f.all_spheres), max_spheres)
+
+
+# ---------------------------------------------------------------------------
+# Every strategy, through construct() and a stream, on unit-norm data -- the
+# regime the streaming evaluation runs in.
+# ---------------------------------------------------------------------------
+
+def _unit_clusters(n: int, dim: int = 16, n_clusters: int = 12, spread: float = 0.35, seed: int = 0) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    anchors = rng.standard_normal((n_clusters, dim))
+    anchors /= np.linalg.norm(anchors, axis=1, keepdims=True)
+    x = anchors[rng.integers(0, n_clusters, n)] + spread / np.sqrt(dim) * rng.standard_normal((n, dim))
+    return (x / np.linalg.norm(x, axis=1, keepdims=True)).astype(np.float32)
+
+
+def _streaming_filter(name: str, dim: int = 16, max_spheres: int = None, max_memory: int = None) -> BallCoverFilter:
+    return BallCoverFilter(dim=dim, insert_method=get_insertion_strategies()[name], max_spheres=max_spheres,
+                           max_memory=max_memory, insert_memory_percent=20.0 if name == 'pooled' else 0.0,
+                           quantize=Quantize.NONE)
+
+
+def _recalled(f: BallCoverFilter, vecs: np.ndarray) -> np.ndarray:
+    return np.asarray(f.query(np.ascontiguousarray(vecs, dtype=np.float32), 0.0), dtype=bool)
+
+
+class TestEveryStrategyOnAStream(unittest.TestCase):
+
+    def test_long_stream_keeps_every_vector_covered(self):
+        X = _unit_clusters(900, seed=40)
+        for name in get_insertion_strategies():
+            with self.subTest(strategy=name):
+                f = _streaming_filter(name, max_spheres=24)
+                f.construct(X[:300])
+                for i in range(300, len(X)):
+                    f.insert(X[i:i + 1])
+                    if i % 150 == 0 or i == len(X) - 1:
+                        missing = np.flatnonzero(~_recalled(f, X[:i + 1]))
+                        self.assertEqual(len(missing), 0, f"{name}: {len(missing)} vectors lost at {i}")
+
+    def test_peak_bytes_never_exceed_max_memory(self):
+        """The byte rule the streaming evaluation ranks strategies under: a
+        strategy's balls *and* its own bookkeeping fit max_memory after every
+        insert(), not just after construct() (see
+        InsertInterface.max_spheres_for_budget)."""
+        X = _unit_clusters(700, seed=41)
+        budget = 40 * BallCoverFilter(dim=16, max_memory=1).bytes_per_ball()
+        for name in get_insertion_strategies():
+            with self.subTest(strategy=name):
+                f = _streaming_filter(name, max_memory=budget)
+                f.construct(X[:200])
+                peak = f.get_bytesize()
+                for i in range(200, len(X), 3):
+                    f.insert(X[i:i + 3])
+                    peak = max(peak, f.get_bytesize())
+                self.assertLessEqual(peak, budget, name)
+                self.assertTrue(_recalled(f, X).all(), name)
+
+    def test_capacity_holds_between_inserts(self):
+        X = _unit_clusters(600, seed=42)
+        for name in get_insertion_strategies():
+            with self.subTest(strategy=name):
+                f = _streaming_filter(name, max_spheres=20)
+                f.construct(X[:100])
+                for i in range(100, len(X), 7):
+                    f.insert(X[i:i + 7])
+                    # DoublingInsert overshoots max_spheres by design, up to
+                    # its rebuild threshold; everything else stays within it.
+                    cap = DoublingInsert()._rebuild_threshold(f) - 1 if name == 'doubling' else f.max_spheres
+                    self.assertLessEqual(len(f.all_spheres), cap, name)
+
+    def test_empty_batch_changes_nothing(self):
+        X = _unit_clusters(300, seed=43)
+        for name in get_insertion_strategies():
+            with self.subTest(strategy=name):
+                f = _streaming_filter(name, max_spheres=20)
+                f.construct(X[:150])
+                f.insert(X[150:200])
+                before = (f.all_centers.copy(), f.all_radiuses.copy())
+                f.insert(np.empty((0, 16), dtype=np.float32))
+                np.testing.assert_array_equal(f.all_centers, before[0], err_msg=name)
+                np.testing.assert_array_equal(f.all_radiuses, before[1], err_msg=name)
+
+    def test_exact_duplicates(self):
+        """One vector inserted many times -- a batch of copies, then again
+        between other vectors -- stays covered. Strategies that decide one
+        vector at a time spend at most one ball on the batch; DoublingInsert
+        and PooledInsert test coverage once per batch, so every copy in it
+        becomes a singleton until the next rebuild (wasteful, not unsound)."""
+        X = _unit_clusters(400, seed=44)
+        dup = X[350]
+        for name in get_insertion_strategies():
+            with self.subTest(strategy=name):
+                f = _streaming_filter(name, max_spheres=24)
+                f.construct(X[:200])
+                n_before = len(f.all_spheres)
+                f.insert(np.repeat(dup[None, :], 25, axis=0))
+                cap = DoublingInsert()._rebuild_threshold(f) - 1 if name == 'doubling' else f.max_spheres
+                self.assertLessEqual(len(f.all_spheres), cap, name)
+                if name not in ('doubling', 'pooled'):
+                    self.assertLessEqual(len(f.all_spheres), min(n_before + 1, cap), name)
+                for i in range(200, 260):
+                    f.insert(X[i:i + 1])
+                    f.insert(dup[None, :])
+                self.assertTrue(_recalled(f, np.vstack([X[:260], dup[None, :]])).all(), name)
+
+    def test_batch_larger_than_capacity(self):
+        X = _unit_clusters(500, seed=45)
+        for name in get_insertion_strategies():
+            with self.subTest(strategy=name):
+                f = _streaming_filter(name, max_spheres=16)
+                f.construct(X[:40])
+                f.insert(X[40:])  # 460 vectors into a 16-ball filter, one call
+                self.assertTrue(_recalled(f, X).all(), name)
+                cap = DoublingInsert()._rebuild_threshold(f) - 1 if name == 'doubling' else f.max_spheres
+                self.assertLessEqual(len(f.all_spheres), cap, name)
+
+    def test_float64_and_non_contiguous_input(self):
+        X = _unit_clusters(600, seed=46)
+        X64 = np.asfortranarray(X.astype(np.float64))[::2]  # float64, strided, non-C-contiguous
+        self.assertFalse(X64.flags['C_CONTIGUOUS'])
+        for name in get_insertion_strategies():
+            with self.subTest(strategy=name):
+                f = _streaming_filter(name, max_spheres=20)
+                f.construct(X64[:100])
+                for i in range(100, len(X64), 25):
+                    f.insert(X64[i:i + 25])
+                self.assertTrue(_recalled(f, X64).all(), name)
 
 
 if __name__ == "__main__":

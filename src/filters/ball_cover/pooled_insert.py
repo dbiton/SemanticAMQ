@@ -23,7 +23,8 @@ class PooledInsert(InsertInterface):
         self.target_spheres = target_spheres
 
 
-    def initialize_buffers(self, filter: Filter, spheres_indices: np.ndarray, centers: np.ndarray, radii: np.ndarray) -> None:
+    def initialize_buffers(self, filter: Filter, spheres_indices: np.ndarray, centers: np.ndarray, radii: np.ndarray,
+                           vectors: Optional[np.ndarray] = None) -> None:
         pass
 
 

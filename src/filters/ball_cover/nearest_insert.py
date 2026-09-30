@@ -1,6 +1,6 @@
 import numpy as np
 import faiss
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from filters.filter import Filter
 from filters.ball_cover.ball_interfaces import InsertInterface
 
@@ -12,7 +12,8 @@ class NearestInsert(InsertInterface):
     ball may need no growth while the nearest one is a tight singleton about
     to blow up by dist**d (see LeastInflationInsert)."""
 
-    def initialize_buffers(self, filter: Filter, spheres_indices: np.ndarray, centers: np.ndarray, radii: np.ndarray) -> None:
+    def initialize_buffers(self, filter: Filter, spheres_indices: np.ndarray, centers: np.ndarray, radii: np.ndarray,
+                           vectors: Optional[np.ndarray] = None) -> None:
         pass
 
 

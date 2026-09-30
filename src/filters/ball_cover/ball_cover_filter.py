@@ -348,7 +348,11 @@ class BallCoverFilter(Filter):
         if max_memory is None:
             return sys.maxsize
         usable = max(0, max_memory - self._codebook_bytes())
-        return max(1, usable // self.bytes_per_ball())
+        if self.insert_method is None:
+            return max(1, usable // self.bytes_per_ball())
+        # The insert strategy's own state counts against max_memory too, at
+        # its peak over a stream -- see InsertInterface.max_spheres_for_budget.
+        return max(1, self.insert_method.max_spheres_for_budget(usable, self.bytes_per_ball()))
 
 
     def _calculate_max_construct_spheres(self, insertion_memory_percent: float) -> int:
@@ -711,7 +715,8 @@ class BallCoverFilter(Filter):
 
         if self.insert_method:
             _ = self.all_centers # intialize centers view for insertion
-            self.insert_method.initialize_buffers(self, sphere_indices, self.all_centers, self.all_radiuses)
+            self.insert_method.initialize_buffers(self, sphere_indices, self.all_centers, self.all_radiuses,
+                                                  vectors=vectors)
 
         self._constructed = True
         self._all_centers = None # clear temporary centers view
