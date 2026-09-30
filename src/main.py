@@ -49,7 +49,7 @@ from vector_source import VectorSource
 configure_logging()
 logger = logging.getLogger(__name__)
 
-MAX_WORKERS = 20
+MAX_WORKERS = 64
 DATASET = 'ELI5'
 
 # Vectors/dataset, split 80% construction / 20% queries. One knob for every
@@ -63,7 +63,7 @@ DATASET = 'ELI5'
 # drops that corpus and silently reduces the comparison to two. 2^15 leaves
 # ~10% headroom there; system_tau's non-wrapping folds need 1.8N = 58,982 rows
 # per dataset, which its shortest (HotpotQA, 97,852) clears comfortably.
-WORKLOAD_NUM_VECTORS = 10_000
+WORKLOAD_NUM_VECTORS = 100_000
 
 # generate_blocklist() knobs. Cluster discovery scans the whole file on disk.
 # Multiplicity is a property of the pool, not of the corpus, so a partial pool
