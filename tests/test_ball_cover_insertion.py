@@ -14,6 +14,7 @@ from src.filters.ball_cover.least_inflation_insert import LeastInflationInsert
 from src.filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
 from src.filters.ball_cover.doubling_insert import DoublingInsert
 from src.filters.ball_cover.pooled_insert import PooledInsert
+from src.filters.ball_cover.cap_merge_insert import CapMergeInsert
 
 DIM = 8
 
@@ -25,6 +26,7 @@ def get_insertion_strategies():
         'exhaustive_merge': ExhaustiveMergeInsert(),
         'doubling': DoublingInsert(),
         'pooled': PooledInsert(),
+        'cap_merge': CapMergeInsert(),
     }
 
 
@@ -323,7 +325,8 @@ class TestDoublingStrategy(unittest.TestCase):
 
 # ---------------------------------------------------------------------------
 # Every strategy, through construct() and a stream, on unit-norm data -- the
-# regime the streaming evaluation runs in.
+# regime the streaming evaluation runs in (and the one CapMergeInsert's cap
+# geometry depends on).
 # ---------------------------------------------------------------------------
 
 def _unit_clusters(n: int, dim: int = 16, n_clusters: int = 12, spread: float = 0.35, seed: int = 0) -> np.ndarray:
@@ -446,6 +449,64 @@ class TestEveryStrategyOnAStream(unittest.TestCase):
                 for i in range(100, len(X64), 25):
                     f.insert(X64[i:i + 25])
                 self.assertTrue(_recalled(f, X64).all(), name)
+
+
+class TestCapMergeInsert(unittest.TestCase):
+
+    def test_off_sphere_vector_falls_back_to_euclidean_balls(self):
+        """The cap geometry assumes every member lies on construct()'s sphere;
+        one inserted vector off it must switch merging back to enclosing
+        balls without losing anything already covered."""
+        X = _unit_clusters(500, seed=47)
+        f = _streaming_filter('cap_merge', max_spheres=20)
+        f.construct(X[:200])
+        self.assertGreater(f.insert_method._rho, 0.0)
+        f.insert(X[200:300])
+        far = 3.0 * X[300:301]
+        f.insert(far)
+        self.assertEqual(f.insert_method._rho, 0.0)
+        f.insert(X[301:])
+        self.assertTrue(_recalled(f, np.vstack([X, far])).all())
+        self.assertLessEqual(len(f.all_spheres), 20)
+
+    def test_member_norms_within_the_sphere_tolerance_stay_covered(self):
+        """Caps are computed for member norms anywhere in [rho - eps, rho + eps];
+        norms spread across the tolerance (not just float32 rounding) must
+        not open a gap at a cap's rim."""
+        X = _unit_clusters(900, seed=50)
+        scale = np.random.default_rng(51).uniform(1 - 4e-4, 1 + 4e-4, size=(len(X), 1))
+        X = (X * scale).astype(np.float32)
+        f = _streaming_filter('cap_merge', max_spheres=16)
+        f.construct(X[:200])
+        self.assertGreater(f.insert_method._rho, 0.0)
+        for i in range(200, len(X), 5):
+            f.insert(X[i:i + 5])
+        self.assertGreater(f.insert_method._rho, 0.0)   # still in cap mode
+        self.assertGreater(f.insert_method._eps, 1e-4)
+        # Exact margins, without query()'s coverage epsilon to hide a rim gap.
+        C, r = f.all_centers.astype(np.float64), f.all_radiuses.astype(np.float64)
+        margin = (np.linalg.norm(X.astype(np.float64)[:, None, :] - C[None], axis=2) - r[None]).min(axis=1)
+        self.assertLessEqual(float(margin.max()), 1e-6)
+
+    def test_covered_insert_is_a_geometric_no_op(self):
+        X = _unit_clusters(400, seed=48)
+        f = _streaming_filter('cap_merge', max_spheres=20)
+        f.construct(X[:300])
+        f.insert(X[300:350])
+        centers, radii = f.all_centers.copy(), f.all_radiuses.copy()
+        f.insert(np.repeat(X[:10], 3, axis=0))  # every one already covered
+        np.testing.assert_array_equal(f.all_centers, centers)
+        np.testing.assert_array_equal(f.all_radiuses, radii)
+
+    def test_merged_centers_sit_outside_the_sphere(self):
+        """Merged balls go to norm 1/cos(theta), not inside the sphere where
+        an enclosing ball's center sits."""
+        X = _unit_clusters(800, seed=49)
+        f = _streaming_filter('cap_merge', max_spheres=16)
+        f.construct(X[:100])
+        f.insert(X[100:])
+        norms = np.linalg.norm(f.all_centers, axis=1)
+        self.assertTrue(np.all(norms >= 1.0 - 1e-5), norms.min())
 
 
 if __name__ == "__main__":
