@@ -1062,6 +1062,9 @@ def system_tau_worker(
     return rows
 
 
+_SURFACE_CHUNK = 2048  # queries per all-balls search in _blocklist_cover_rows
+
+
 def _blocklist_cover_rows(
     dim: int,
     dataset: str,
@@ -1135,8 +1138,12 @@ def _blocklist_cover_rows(
         centers = np.ascontiguousarray(filt.all_centers, dtype=np.float32)
 
         # Searched once per cover and thresholded per tau; query() applies the
-        # same comparison, so these are exactly its predictions.
-        surface = filt.surface_distance(Q)
+        # same comparison, so these are exactly its predictions. Chunked: the
+        # search scores every ball, and all 20K queries against 16K balls at
+        # once is ~7 GB per job, too much with a full pool of workers.
+        surface = np.concatenate(
+            [filt.surface_distance(Q[i:i + _SURFACE_CHUNK]) for i in range(0, n_queries, _SURFACE_CHUNK)]
+        ) if n_queries else np.zeros(0)
         r_med = float(np.median(radii)) if len(radii) else 0.0
 
         for tau in tau_values:
