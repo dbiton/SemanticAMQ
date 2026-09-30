@@ -173,3 +173,10 @@ cython_debug/
 # Project Specific 
 figures/
 datasets/
+# Generated plots (keep the tracked .gitkeep placeholders)
+/plots/**
+!/plots/**/
+!/plots/**/.gitkeep
+
+# Experiment results and cached computations (ground truth, cluster selections)
+/results/
