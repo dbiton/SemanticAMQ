@@ -20,7 +20,7 @@ from scipy.sparse import csr_matrix
 faiss.omp_set_num_threads(1)  # belt-and-suspenders alongside the env vars above
 
 from logging_config import configure_logging
-from runner import Runner, QUANTIZATION_SWEEP, system_tau_ground_truth_worker
+from runner import Runner, CONSTRUCT_METHODS, QUANTIZATION_SWEEP, system_tau_ground_truth_worker
 from plots.plot_quantization import generate_quantization_figures
 from plots.plot_query_performance import generate_query_performance_figures
 from plots.plot_equal_memory import generate_equal_memory_figures
@@ -29,6 +29,7 @@ from plots.plot_streaming import generate_streaming_figures
 from plots.plot_system_tau import generate_system_tau_figures
 from plots.plot_blocklist import generate_blocklist_figures
 from plots.plot_budget import generate_budget_figures
+from plots.plot_construct_methods import generate_construct_methods_figures, load_results as load_construct_methods
 from plots.plot_common import DATASETS, DATASET_LABELS
 from typing import Any, Dict, List, Optional, Tuple
 from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize
@@ -1611,7 +1612,7 @@ def generate_streaming(runner: Runner) -> None:
     # streamed filter's bootstrap and its static-rebuild oracle, so every
     # method's gap can be read against either reference. Gonzalez is the
     # filter's default; sphere_merge is the best construction method measured
-    # (compare_construct_methods.py). The k sweep keeps the default only.
+    # (generate_construct_methods). The k sweep keeps the default only.
     construct_methods  = ["gonzalez", "sphere_merge"]
     # The fixed absolute tau generate_budget/generate_quantization/
     # generate_equal_memory use, so every blocklist-workload evaluation sits
@@ -1702,6 +1703,92 @@ def plot_streaming(df: pd.DataFrame, k_fixed: int) -> None:
     generate_streaming_figures(df, k_fixed=k_fixed)
 
 
+# Construction-method comparison: one CSV per corpus (plot_construct_methods
+# draws one figure per corpus), plus one per --scale run of
+# generate_construct_methods_scale, whose "scale_" prefix keeps it out of
+# the sweep's figures.
+CONSTRUCT_METHODS_DIR = "results/construct_methods"
+CONSTRUCT_METHODS_PLOT_DIR = "plots/construct_methods"
+
+
+def construct_methods_csv(dataset: str) -> str:
+    return os.path.join(CONSTRUCT_METHODS_DIR, f"{dataset}.csv")
+
+
+def construct_methods_scale_csv(dataset: str, n: int) -> str:
+    return os.path.join(CONSTRUCT_METHODS_DIR, f"scale_{dataset}_{n}.csv")
+
+
+def generate_construct_methods(runner: Runner) -> None:
+    """BallCoverFilter's construction methods (runner.CONSTRUCT_METHODS)
+    compared on the blocklist workload: the same construction and query sets
+    as generate_budget/generate_quantization, with ground truth defined as
+    distance to the reference set at tau. Only the construction method
+    varies (see runner.construct_method_worker).
+
+    One job per (corpus, fold, method, k), so rows reach
+    construct_methods_csv(corpus) as each cover finishes, and the slow
+    large-k covers don't serialize one method's whole sweep onto a single
+    worker.
+
+    Only submits 'construct_method' jobs -- does not run `runner`."""
+    dim         = 384
+    num_vectors = WORKLOAD_NUM_VECTORS
+    n_folds     = BLOCKLIST_FOLDS
+    tau         = 0.1
+    # k as a fraction of |B|, log-spaced from 0.5% to 20%. The top of the
+    # range is generate_budget's; the bottom extends it into the budgets where
+    # every ball is wide, which is where the construction method matters most.
+    k_fractions = [0.005, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2]
+    methods     = list(CONSTRUCT_METHODS)
+
+    for workload in blocklist_workloads(num_vectors, n_folds=n_folds):
+        output_csv = construct_methods_csv(workload.plot_key)
+        for fold, sel in enumerate(workload.selections):
+            vectors_construct = workload.rows(sel["reference"])
+            vectors_query = workload.query_vectors(sel)
+            actual_results = np.asarray(
+                compute_static_actual_results(vectors_construct, vectors_query, tau), dtype=bool)
+            n = len(vectors_construct)
+            logger.info(f"{workload.name} fold {fold}: |B|={n}, {len(vectors_query)} queries, "
+                        f"{int(actual_results.sum())} within tau={tau} of B")
+            for method in methods:
+                for kf in k_fractions:
+                    runner.submit(
+                        'construct_method',
+                        output_csv=output_csv,
+                        dim=dim, dataset=workload.plot_key, method=method,
+                        k=min(max(1, round(kf * n)), n), k_fraction=kf, tau=tau, seed=fold,
+                        vectors_construct=vectors_construct, vectors_query=vectors_query,
+                        actual_results=actual_results,
+                        n_positive=len(sel["positive"]), n_hard=len(sel["hard"]),
+                    )
+
+
+def generate_construct_methods_scale(runner: Runner, dataset: str = "WikiAnswers", n: int = 100_000,
+                                     k_values: Tuple[int, ...] = (1000, 5000)) -> None:
+    """construct_filter time for every construction method on the first n
+    rows of one corpus, past the blocklist workload's size (see
+    runner.construct_method_scale_worker). Not part of the default sweep.
+
+    Only submits 'construct_method_scale' jobs -- does not run `runner`."""
+    if not os.path.exists(dataset_filenames[dataset]):
+        raise FileNotFoundError(f"{dataset}: {dataset_filenames[dataset]} not on disk.")
+    output_csv = construct_methods_scale_csv(dataset, n)
+    for method in CONSTRUCT_METHODS:
+        for k in k_values:
+            runner.submit('construct_method_scale', output_csv=output_csv,
+                          dim=384, dataset=dataset, n=n, method=method, k=k)
+
+
+def save_construct_methods(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
+    return pd.DataFrame(rows_for_mode(job_results, 'construct_method'))
+
+
+def plot_construct_methods(df: pd.DataFrame) -> None:
+    generate_construct_methods_figures(df, CONSTRUCT_METHODS_PLOT_DIR)
+
+
 def generate_and_plot_all() -> None:
     """Submit-all, run-all, then plot-all: every generate_* function below
     only submits jobs to one shared Runner instead of running its own, so
@@ -1726,6 +1813,10 @@ def generate_and_plot_all() -> None:
         generate_equal_memory(runner)
     except Exception:
         logger.exception("An error occurred")
+    try:
+        generate_construct_methods(runner)
+    except Exception:
+        logger.exception("An error occurred")
     '''
     try:
         generate_scaling(runner)
@@ -1737,6 +1828,10 @@ def generate_and_plot_all() -> None:
         logger.exception("An error occurred")
     try:
         generate_system_tau(runner)
+    except Exception:
+        logger.exception("An error occurred")
+    try:
+        generate_construct_methods_scale(runner)
     except Exception:
         logger.exception("An error occurred")
     '''
@@ -1769,6 +1864,11 @@ def plot_all() -> None:
     try:
         df = pd.read_csv(BUDGET_CSV)
         plot_budget(df)
+    except Exception:
+        logger.exception("An error occurred")
+
+    try:
+        plot_construct_methods(load_construct_methods(CONSTRUCT_METHODS_DIR))
     except Exception:
         logger.exception("An error occurred")
 

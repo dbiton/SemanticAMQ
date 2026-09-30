@@ -13,7 +13,7 @@ class SphereMergeConstruct(MergeConstruct):
     centers placed on the data's own sphere.
 
     Three changes to MergeConstruct, each measured on the blocklist workload
-    (compare_construct_methods.py, 5 corpora, tau=0.1) against
+    (main.generate_construct_methods, 5 corpora, tau=0.1) against
     MinimaxConstruct's false-positive rate:
 
     1. The merge cost is the increase of sum_i m_i (r_i + offset)^exponent,
@@ -58,7 +58,7 @@ class SphereMergeConstruct(MergeConstruct):
     Badoiu-Clarkson steps as they form, so merge costs are measured around
     near-MEB centers instead of the enclosing-ball construction's.
 
-    Measured 2026-09-29 by compare_construct_methods.py (5 corpora x 5
+    Measured 2026-09-29 by main.generate_construct_methods (5 corpora x 5
     folds), fold-paired against MinimaxConstruct: FPR -0.24 / -0.15 / -0.12
     / -0.10 at k = 5/10/15/20% of |B|, lower in 94 of those 100 rows (worst
     loss +0.01), and lower in all 75 rows at k = 0.5-2%. At 15-20% on

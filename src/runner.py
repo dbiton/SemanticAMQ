@@ -61,7 +61,7 @@ _INSERT_STRATEGIES = {
 }
 
 # Construction methods by name, as factories -- shared by
-# compare_construct_methods.py and stream_rebuild_worker's construct_method.
+# construct_method_worker and stream_rebuild_worker's construct_method.
 CONSTRUCT_METHODS = {
     "gonzalez": GonzalesConstruct,
     "merge": MergeConstruct,
@@ -773,6 +773,125 @@ def quantization_worker(
     return rows
 
 
+class _TimedConstruct:
+    """Times construct_filter alone, apart from the rest of construct()
+    (_tight_radii, index writes), which every construction method shares."""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+        self.seconds = float("nan")
+
+    def construct_filter(self, filter, vectors):
+        start = time.perf_counter()
+        out = self.inner.construct_filter(filter, vectors)
+        self.seconds = time.perf_counter() - start
+        return out
+
+    def get_bytesize(self) -> int:
+        return self.inner.get_bytesize()
+
+
+def construct_method_worker(
+    dim: int,
+    dataset: str,
+    method: str,
+    k: int,
+    k_fraction: float,
+    tau: float,
+    seed: int,
+    vectors_construct: np.ndarray,
+    vectors_query: np.ndarray,
+    actual_results: np.ndarray,
+    n_positive: int,
+    n_hard: int,
+) -> Dict[str, Any]:
+    """One BallCoverFilter built by CONSTRUCT_METHODS[method] at k balls,
+    with the filter's default quantization and no insert method, so the
+    construction method is the only thing that varies between rows.
+
+    Returns one row: cover volume, radii, FPR/FNR against distance ground
+    truth at tau, and construction time. vectors_query is main's positives,
+    then hard negatives, then easy negatives (BlocklistWorkload.query_vectors),
+    which is what the membership-based columns slice on -- those are
+    budget_worker's definitions, kept only so the Gonzalez rows can be checked
+    against results/budget.csv. seed is the fold, reported as "fold".
+
+    A nonzero FNR is a bug in the construction method, not a data point, so
+    it raises (the Runner logs and skips the job) instead of returning."""
+    construct = np.ascontiguousarray(vectors_construct, dtype=np.float32)
+    queries = np.ascontiguousarray(vectors_query, dtype=np.float32)
+    actual = np.asarray(actual_results, dtype=bool)
+    n = len(construct)
+    pos = slice(0, n_positive)
+    hard = slice(n_positive, n_positive + n_hard)
+    easy = slice(n_positive + n_hard, len(queries))
+
+    timed = _TimedConstruct(CONSTRUCT_METHODS[method]())
+    filt = BallCoverFilter(dim, construct_method=timed, max_spheres=k, insert_method=None)
+    start = time.perf_counter()
+    filt.construct(construct)
+    construct_s = time.perf_counter() - start
+
+    centers = np.ascontiguousarray(filt.all_centers, dtype=np.float32)
+    radii = filt.all_radiuses
+    start = time.perf_counter()
+    vol_low, vol_high = _tau_volume_bounds_log10(centers, radii, tau)
+    volume_s = time.perf_counter() - start
+
+    predicted = np.asarray(filt.query(queries, distance_threshold=tau), dtype=bool)
+    tp = int(np.sum(predicted & actual))
+    fp = int(np.sum(predicted & ~actual))
+    fn = int(np.sum(~predicted & actual))
+    tn = int(np.sum(~predicted & ~actual))
+
+    row = {
+        "dataset": dataset, "fold": seed, "method": method,
+        "k_fraction": float(k_fraction), "k": k, "n_balls": len(radii), "n_reference": n,
+        "tau": tau,
+        "log10_vol_low": vol_low, "log10_vol_high": vol_high,
+        "log10_j_tau": _log10_J(radii, dim, tau=tau),
+        "r_mean": float(radii.mean()), "r_med": float(np.median(radii)),
+        "r_max": float(radii.max()),
+        "fpr": fp / (fp + tn) if fp + tn else 0.0,
+        "fnr": fn / (fn + tp) if fn + tp else 0.0,
+        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "recall_membership": float(predicted[pos].mean()) if n_positive else float("nan"),
+        "fpr_hard_membership": float(predicted[hard].mean()) if n_hard else float("nan"),
+        "fpr_easy_membership": float(predicted[easy].mean()) if easy.stop > easy.start else float("nan"),
+        "method_s": timed.seconds, "construct_s": construct_s, "volume_s": volume_s,
+    }
+    if fn:
+        raise ValueError(f"Zero-false-negative invariant violated -- a bug in construction method "
+                         f"{method!r}: {row}")
+    return row
+
+
+def construct_method_scale_worker(dim: int, dataset: str, n: int, method: str, k: int) -> Dict[str, Any]:
+    """construct_filter alone on the first n rows of a corpus, plus a coverage
+    check of its output: how a construction method's time grows past the
+    blocklist workload's size. Raises on a coverage violation, as
+    construct_method_worker does on a false negative."""
+    X = np.ascontiguousarray(VectorSource(dataset, 0, n).to_array(), dtype=np.float32)
+    filt = BallCoverFilter(dim, max_spheres=k, insert_method=None)
+    start = time.perf_counter()
+    centers, radii = CONSTRUCT_METHODS[method]().construct_filter(filt, X)
+    seconds = time.perf_counter() - start
+
+    # Signed distance to the 16 nearest balls, which include the one each
+    # vector was assigned to -- the same test test_ball_cover_construction
+    # applies, at the filter's own coverage epsilon.
+    index = faiss.IndexFlatL2(dim)
+    index.add(np.ascontiguousarray(centers, dtype=np.float32))
+    d2, labels = index.search(X, min(16, len(centers)))
+    worst = float((np.sqrt(np.maximum(d2, 0.0)) - radii[labels]).min(axis=1).max())
+    row = {"dataset": dataset, "n": len(X), "method": method, "k": k, "n_balls": len(radii),
+           "method_s": seconds, "r_max": float(radii.max()), "r_mean": float(radii.mean()),
+           "worst_uncovered": worst, "covered": worst <= BallCoverFilter._COVERAGE_EPSILON}
+    if not row["covered"]:
+        raise ValueError(f"Coverage violation at scale: {row}")
+    return row
+
+
 def system_tau_ground_truth_worker(
     dim: int,
     vectors_construct: VectorInput,
@@ -1430,6 +1549,8 @@ _WORKER_FNS: Dict[str, Any] = {
     'scaling_insert': scaling_insert_worker,
     'scaling_construction': scaling_construction_worker,
     'stream_rebuild': stream_rebuild_worker,
+    'construct_method': construct_method_worker,
+    'construct_method_scale': construct_method_scale_worker,
 }
 
 
