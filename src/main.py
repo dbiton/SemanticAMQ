@@ -20,7 +20,8 @@ from scipy.sparse import csr_matrix
 faiss.omp_set_num_threads(1)  # belt-and-suspenders alongside the env vars above
 
 from logging_config import configure_logging
-from runner import Runner, CONSTRUCT_METHODS, QUANTIZATION_SWEEP, system_tau_ground_truth_worker
+from runner import (Runner, CONSTRUCT_METHODS, QUANTIZATION_SWEEP, QUERY_SOURCES,
+                    system_tau_ground_truth_worker)
 from plots.plot_quantization import generate_quantization_figures
 from plots.plot_query_performance import generate_query_performance_figures
 from plots.plot_equal_memory import generate_equal_memory_figures
@@ -48,7 +49,7 @@ from vector_source import VectorSource
 configure_logging()
 logger = logging.getLogger(__name__)
 
-MAX_WORKERS = 20
+MAX_WORKERS = 64
 DATASET = 'ELI5'
 
 # Vectors/dataset, split 80% construction / 20% queries. One knob for every
@@ -62,7 +63,7 @@ DATASET = 'ELI5'
 # drops that corpus and silently reduces the comparison to two. 2^15 leaves
 # ~10% headroom there; system_tau's non-wrapping folds need 1.8N = 58,982 rows
 # per dataset, which its shortest (HotpotQA, 97,852) clears comfortably.
-WORKLOAD_NUM_VECTORS = 10_000
+WORKLOAD_NUM_VECTORS = 100_000
 
 # generate_blocklist() knobs. Cluster discovery scans the whole file on disk.
 # Multiplicity is a property of the pool, not of the corpus, so a partial pool
@@ -186,35 +187,6 @@ equal_memory_filters = [
     PacukLSHFilter, SankowskiWygockiFilter, VAPlusFilter,
 ]
 
-def calculate_nn_distance_threshold(
-    construct_vectors: np.ndarray,
-    percentage: float,
-    sample_size: int = 5_000,
-    seed: int = 42,
-) -> float:
-    """The `percentage`-th percentile of nearest-*other*-neighbor distance
-    within a sample of construct_vectors -- ties the threshold to the actual
-    test compute_static_actual_results performs, unlike a random-pairwise
-    percentile: at large construct-set sizes a point's nearest neighbor is
-    much closer than a random pair, so a random-pairwise percentile silently
-    pushes the duplicate rate toward 100%, collapsing FPR/FNR to degenerate
-    values."""
-    n = len(construct_vectors)
-    if n < 2:
-        return 0.0
-
-    vecs = np.ascontiguousarray(construct_vectors, dtype=np.float32)
-    rng = np.random.default_rng(seed)
-    sample_idx = rng.choice(n, size=sample_size, replace=False) if sample_size < n else np.arange(n)
-
-    index = faiss.IndexFlatL2(vecs.shape[1])
-    index.add(vecs)
-    # k=2: rank 0 is the point itself (distance 0); rank 1 is the *other* nearest neighbor.
-    sq_dist, _ = index.search(vecs[sample_idx], 2)
-    nn_dist = np.sqrt(np.clip(sq_dist[:, 1], 0, None))
-    return float(np.percentile(nn_dist, percentage))
-
-
 def advancing_fold_starts(pool_len: int, k_folds: int, fold_stride: int, window_len: int) -> List[int]:
     """Non-wrapping K-fold-like sweep: fold f's window starts f*fold_stride
     into the pool and is window_len vectors wide, never wrapping back to the
@@ -280,11 +252,11 @@ def stratified_calibration_split(
     measurement_actual).
 
     Stratified on `actual`, and shuffled within each stratum, because
-    BlocklistWorkload.query_vectors hands back its three query classes
-    *concatenated in order* -- positives, then hard negatives, then easy
-    negatives. A prefix slice of that is not a sample of it. At the sweep's
-    own settings (BLOCKLIST_QUERY_FRACTION's frac_positive=0.2 and
-    calibration_fraction=0.2) the prefix was exactly the positive block, so:
+    BlocklistWorkload.query_vectors hands back its three query sources
+    *concatenated in order* -- held-out cluster members, then withheld-cluster
+    members, then singletons. A prefix slice of that is not a sample of it. At
+    the sweep's own settings (build_blocklist_workload's frac_heldout=0.2 and
+    calibration_fraction=0.2) the prefix was exactly the held-out block, so:
 
       - calibration saw a set that was ~91% duplicates on Quora, where F1 is
         maximised by answering "duplicate" unconditionally -- which is the
@@ -336,8 +308,7 @@ def stratified_calibration_split(
         logger.warning(
             f"stratified_calibration_split: none of the {len(stream)} queries is within tau of "
             "the construct set, so FNR is undefined (reported as 0.0) for every filter. tau is "
-            "too tight for this corpus's duplicate geometry -- see "
-            "BlocklistWorkload.cluster_membership.")
+            "too tight for this corpus's duplicate geometry.")
 
     return (stream[calibration_idx], stream[measurement_idx],
             labels[calibration_idx].tolist(), labels[measurement_idx].tolist())
@@ -429,7 +400,7 @@ def generate_equal_memory(runner: Runner) -> None:
             stream = workload.query_vectors(sel)
             # Ground truth over the whole stream first, then a STRATIFIED cut
             # into the two slices -- a prefix cut of query_vectors' ordered
-            # (positive, hard, easy) concatenation put every positive in
+            # (heldout, withheld, singleton) concatenation put every positive in
             # calibration and none in measurement. See
             # stratified_calibration_split for what that did to the numbers.
             actual_stream = compute_static_actual_results(vectors_construct, stream, tau)
@@ -670,22 +641,37 @@ def _group_by_label(labels: np.ndarray, wanted: np.ndarray) -> Dict[int, np.ndar
 
 
 def _selection_is_usable(selections: List[Dict[str, np.ndarray]]) -> bool:
-    """Every fold needs a reference set, something to find, and hard negatives
-    to be wrong about. Easy negatives may legitimately be absent (a corpus can
-    have no singletons), so they are not required."""
+    """Every fold needs a reference set, held-out cluster members, and
+    withheld-cluster members. Singletons may legitimately be absent (a corpus
+    can have no singletons), so they are not required."""
     return bool(selections) and all(
-        len(sel["reference"]) and len(sel["positive"]) and len(sel["hard"])
+        len(sel["reference"]) and len(sel["heldout"]) and len(sel["withheld"])
         for sel in selections
     )
 
 
+# Query sources were once named for the labels they used to imply
+# (positive/hard/easy). Selections cached under those keys are read through
+# this map, so existing folds -- and results computed on them -- stay
+# comparable with new ones.
+_LEGACY_SELECTION_KEYS = {"heldout": "positive", "withheld": "hard", "singleton": "easy"}
+_SELECTION_KEYS = ("reference", "heldout", "withheld", "singleton")
+
+
+def _load_selection_key(z: Any, fold: int, key: str) -> np.ndarray:
+    name = f"{fold}_{key}"
+    if name not in z.files and key in _LEGACY_SELECTION_KEYS:
+        name = f"{fold}_{_LEGACY_SELECTION_KEYS[key]}"
+    return z[name]
+
+
 def _fold_selections(dataset: str, labels: np.ndarray, dup_clusters: np.ndarray,
                      singletons: np.ndarray, members_by_cluster: Dict[int, np.ndarray],
-                     n_folds: int, reference_target: int, n_pos: int, n_hard: int,
-                     n_easy: int, pool_n: int, eps: float, stream_size: int,
+                     n_folds: int, reference_target: int, n_heldout: int, n_withheld: int,
+                     n_singleton: int, pool_n: int, eps: float, stream_size: int,
                      query_fraction: float, xgroup: bool,
                      cache_dir: str = BLOCKLIST_CLUSTER_DIR) -> List[Dict[str, np.ndarray]]:
-    """Per-fold reference/positive/hard/easy ROW INDICES, cached to disk.
+    """Per-fold reference/heldout/withheld/singleton ROW INDICES, cached to disk.
 
     Indices rather than vectors: they are the reproducible part, they are three
     orders of magnitude smaller than the embeddings they select, and they let a
@@ -696,7 +682,7 @@ def _fold_selections(dataset: str, labels: np.ndarray, dup_clusters: np.ndarray,
 
     Clusters are taken whole until the reference set reaches its target, so the
     multiplicity that bounds compression survives the sizing; the clusters not
-    taken are withheld and supply the hard negatives.
+    taken are withheld and supply the withheld-cluster queries.
     """
     os.makedirs(cache_dir, exist_ok=True)
     tag = "_xgroup" if xgroup else ""
@@ -706,7 +692,7 @@ def _fold_selections(dataset: str, labels: np.ndarray, dup_clusters: np.ndarray,
         f"_folds{n_folds}{tag}_selection.npz")
     if os.path.exists(path):
         with np.load(path) as z:
-            cached = [{key: z[f"{f}_{key}"] for key in ("reference", "positive", "hard", "easy")}
+            cached = [{key: _load_selection_key(z, f, key) for key in _SELECTION_KEYS}
                       for f in range(n_folds)]
         if _selection_is_usable(cached):
             logger.info(f"{dataset}: loaded cached fold selection from {path}")
@@ -729,7 +715,7 @@ def _fold_selections(dataset: str, labels: np.ndarray, dup_clusters: np.ndarray,
         rng = np.random.default_rng(fold)
         shuffled = rng.permutation(dup_clusters)
 
-        reference, positives, n_taken = [], [], 0
+        reference, heldout, n_taken = [], [], 0
         for c in shuffled:
             if len(reference) >= reference_target:
                 break
@@ -737,27 +723,27 @@ def _fold_selections(dataset: str, labels: np.ndarray, dup_clusters: np.ndarray,
             rng.shuffle(members)
             cut = max(1, int(0.8 * len(members)))
             reference.extend(members[:cut].tolist())
-            positives.extend(members[cut:].tolist())
+            heldout.extend(members[cut:].tolist())
             n_taken += 1
         # Trimmed to exactly the target so |B| matches across corpora and the
         # three stay comparable at a given k_fraction.
         reference = np.asarray(reference[:reference_target], dtype=np.int64)
-        hard_pool = np.concatenate(
+        withheld_pool = np.concatenate(
             [members_by_cluster[int(c)] for c in shuffled[n_taken:]]
         ) if n_taken < len(shuffled) else np.empty(0, dtype=np.int64)
 
         selections.append({
             "reference": reference,
-            "positive": take(rng, positives, n_pos),
-            "hard": take(rng, hard_pool, n_hard),
-            "easy": take(rng, singletons, n_easy),
+            "heldout": take(rng, heldout, n_heldout),
+            "withheld": take(rng, withheld_pool, n_withheld),
+            "singleton": take(rng, singletons, n_singleton),
         })
 
     if not _selection_is_usable(selections):
         # Not cached on purpose: an unusable split is a sizing failure, and
         # persisting it would make the failure sticky across runs.
         logger.error(
-            f"{dataset}: fold selection is empty (reference/positive/hard); not caching. "
+            f"{dataset}: fold selection is empty (reference/heldout/withheld); not caching. "
             f"Reduce WORKLOAD_NUM_VECTORS or loosen eps/min_cluster."
         )
         return selections
@@ -974,34 +960,22 @@ class BlocklistWorkload:
         return self._pool[idx] if self._pool is not None else _read_rows(self.name, idx)
 
     def query_vectors(self, sel: Dict[str, np.ndarray]) -> np.ndarray:
-        """A fold's queries as one array: positives, then hard negatives, then
-        easy negatives, in that order.
+        """A fold's queries as one array, by source: held-out members of the
+        reference set's clusters, then members of withheld clusters, then
+        singletons (runner.QUERY_SOURCES).
 
-        Ground truth is deliberately NOT returned with them. The two callers
-        need different definitions and the difference is load-bearing:
-        blocklist_tau_worker/budget_worker judge against cluster membership, while
-        generate_quantization must judge against distance to the reference set
-        (see cluster_membership and its warning)."""
-        parts = [self.rows(sel[key]) for key in ("positive", "hard", "easy") if len(sel[key])]
+        Sources are strata of the query distribution, not labels. Ground truth
+        is always distance to the reference set at tau
+        (compute_static_actual_results): a held-out member farther than tau is
+        a negative, a withheld-cluster member within tau a positive."""
+        parts = [self.rows(sel[key]) for key in QUERY_SOURCES if len(sel[key])]
         return np.concatenate(parts) if parts else np.empty((0, 0), dtype=np.float32)
 
     @staticmethod
-    def cluster_membership(sel: Dict[str, np.ndarray]) -> List[bool]:
-        """Label ground truth for query_vectors: positives are held-out members
-        of blocklisted clusters, everything else is not.
-
-        NOT usable with quantization_worker, which asserts a zero
-        false-negative invariant. That invariant holds only when "duplicate"
-        means "within tau of the reference set" -- the cover contains every
-        reference vector, so anything within tau of one is necessarily flagged.
-        A cluster member can sit FARTHER than tau from the reference set and be
-        missed legitimately, so a false negative rate above zero here means
-        tau is too tight for this corpus's own duplicate geometry, not a bug
-        in the cover itself."""
-        actual: List[bool] = []
-        for key in ("positive", "hard", "easy"):
-            actual.extend([key == "positive"] * len(sel[key]))
-        return actual
+    def source_sizes(sel: Dict[str, np.ndarray]) -> Dict[str, int]:
+        """n_heldout/n_withheld/n_singleton, as the workers that split FPR by
+        source take them."""
+        return {f"n_{key}": len(sel[key]) for key in QUERY_SOURCES}
 
 
 def build_blocklist_workload(name: str, plot_key: str, label_col: Optional[str],
@@ -1009,7 +983,7 @@ def build_blocklist_workload(name: str, plot_key: str, label_col: Optional[str],
     """Cluster a corpus and cut it into per-fold blocklist splits, or return
     None (logging why) if it cannot supply the requested sizes."""
     eps, min_cluster = BLOCKLIST_EPS, BLOCKLIST_MIN_CLUSTER
-    query_fraction, frac_positive, frac_hard = BLOCKLIST_QUERY_FRACTION, 0.2, 0.4
+    query_fraction, frac_heldout, frac_withheld = BLOCKLIST_QUERY_FRACTION, 0.2, 0.4
 
     if not os.path.exists(dataset_filenames[name]):
         logger.warning(f"Skipping {name}: not found on disk")
@@ -1053,18 +1027,18 @@ def build_blocklist_workload(name: str, plot_key: str, label_col: Optional[str],
 
     stream_size = int(round(query_fraction * num_vectors))
     reference_target = num_vectors - stream_size
-    n_pos = int(frac_positive * stream_size)
-    n_hard = int(frac_hard * stream_size)
-    n_easy = stream_size - n_pos - n_hard
+    n_heldout = int(frac_heldout * stream_size)
+    n_withheld = int(frac_withheld * stream_size)
+    n_singleton = stream_size - n_heldout - n_withheld
 
     # Feasibility up front, not fold by fold: a corpus that cannot fill |B|
-    # consumes every cluster trying, leaves none withheld, loses its hard
-    # negatives, and disappears from the results with only a per-fold warning.
+    # consumes every cluster trying, leaves none withheld, loses its
+    # withheld-cluster queries, and disappears from the results with only a per-fold warning.
     usable = int(0.8 * sizes[dup_clusters].sum())
-    if usable < reference_target + n_hard:
-        max_n = int(usable / ((1.0 - query_fraction) + frac_hard * query_fraction))
+    if usable < reference_target + n_withheld:
+        max_n = int(usable / ((1.0 - query_fraction) + frac_withheld * query_fraction))
         logger.error(
-            f"Skipping {name}: needs {reference_target} reference + {n_hard} hard-negative "
+            f"Skipping {name}: needs {reference_target} reference + {n_withheld} withheld-cluster "
             f"vectors but only {usable} are available in clusters of >={min_cluster} at "
             f"eps={eps}. Lower WORKLOAD_NUM_VECTORS to <= {max_n} for this corpus, or "
             f"loosen eps/min_cluster.")
@@ -1074,7 +1048,7 @@ def build_blocklist_workload(name: str, plot_key: str, label_col: Optional[str],
     selections = _fold_selections(
         name, labels, dup_clusters, singletons, members_by_cluster,
         n_folds=n_folds, reference_target=reference_target,
-        n_pos=n_pos, n_hard=n_hard, n_easy=n_easy,
+        n_heldout=n_heldout, n_withheld=n_withheld, n_singleton=n_singleton,
         pool_n=pool_n, eps=eps, stream_size=stream_size,
         query_fraction=query_fraction, xgroup=(name == "CCNews"))
     if not _selection_is_usable(selections):
@@ -1083,7 +1057,8 @@ def build_blocklist_workload(name: str, plot_key: str, label_col: Optional[str],
 
     logger.info(
         f"{name}: |B|={len(selections[0]['reference'])} (target {reference_target}), "
-        f"stream={stream_size} ({n_pos} pos / {n_hard} hard / {n_easy} easy)")
+        f"stream={stream_size} ({n_heldout} heldout / {n_withheld} withheld / "
+        f"{n_singleton} singleton)")
     return BlocklistWorkload(name, plot_key, selections, pool, stream_size, reference_target)
 
 
@@ -1102,9 +1077,10 @@ def blocklist_workloads(num_vectors: int, n_folds: int = BLOCKLIST_FOLDS,
 
 def generate_blocklist(runner: Runner) -> None:
     """Asymmetric blocklist workload: a tight reference set B built from
-    duplicate clusters, queried by a stream of held-out cluster members
-    (positives), members of non-blocklisted clusters (hard negatives) and
-    singletons (easy negatives).
+    duplicate clusters, queried by a stream drawn from held-out cluster
+    members, members of non-blocklisted (withheld) clusters, and singletons.
+    Those sources decide what is queried, not the answer: every query is
+    labeled by its distance to B at each tau (runner._blocklist_cover_rows).
 
     This is the workload the symmetric sweep (generate_system_tau) cannot
     measure. There, B is 80% of the same corpus the queries come from, so B is
@@ -1113,15 +1089,16 @@ def generate_blocklist(runner: Runner) -> None:
     for any ball holding more than one point -- FPR pins at 1 regardless of
     memory. Shrinking B to a set of tight clusters is what opens the budget.
 
-    Clusters are partitioned by cluster, not by vector: half are blocklisted
-    (80% of each into B, 20% held out as positives) and half are withheld
-    entirely to serve as hard negatives. Splitting by vector instead would
-    scatter every cluster across both roles and leave no hard negatives at all.
+    Clusters are partitioned by cluster, not by vector: some are blocklisted
+    (80% of each into B, 20% held out as queries) and the rest are withheld
+    entirely. Splitting by vector instead would scatter every cluster across
+    both roles and leave no withheld clusters -- the queries that test whether
+    the cover localizes to B's clusters rather than to dense regions.
 
     A single fixed ball budget (k_fraction, not a sweep) -- varying the
     budget is generate_budget's job now, at its own fixed tau.
     This evaluation is the complementary view: fix k, sweep tau, and read
-    how FPR/recall/accesses-saved respond at that one representative budget.
+    how FPR/accesses-saved respond at that one representative budget.
     k_fraction=0.1 sits in the middle of generate_budget's own 5%-20% range,
     so the two evaluations are anchored at a comparable operating point.
 
@@ -1149,9 +1126,9 @@ def generate_blocklist(runner: Runner) -> None:
                 dim=dim, dataset=workload.plot_key, seed=fold,
                 k_fraction=k_fraction, tau_values=tau_values,
                 vectors_reference=workload.rows(sel["reference"]),
-                vectors_positive=workload.rows(sel["positive"]),
-                vectors_hard_negative=workload.rows(sel["hard"]),
-                vectors_easy_negative=workload.rows(sel["easy"]),
+                vectors_heldout=workload.rows(sel["heldout"]),
+                vectors_withheld=workload.rows(sel["withheld"]),
+                vectors_singleton=workload.rows(sel["singleton"]),
             )
 
 
@@ -1170,9 +1147,9 @@ def generate_budget(runner: Runner) -> None:
     the swept variable and tau is held at one fixed value, where
     generate_blocklist instead sweeps tau at one fixed budget.
 
-    Holding tau fixed is what makes recall a measurement here rather than a
-    constant, so both recall and FPR move with the budget and the sweep shows
-    where paying for more balls stops buying either. The band is deliberately
+    Holding tau fixed holds the labels fixed, so FPR and accesses saved move
+    with the budget alone and the sweep shows where paying for more balls
+    stops buying either. The band is deliberately
     narrow (5%-20% of |B|): below it the cover is too coarse to localise B at
     a fixed threshold, and above it the budget approaches saturation, where
     each ball stands in for so few reference vectors that there is nothing
@@ -1213,9 +1190,9 @@ def generate_budget(runner: Runner) -> None:
                 dim=dim, dataset=workload.plot_key, seed=fold,
                 k_fractions=k_fractions, tau=tau,
                 vectors_reference=workload.rows(sel["reference"]),
-                vectors_positive=workload.rows(sel["positive"]),
-                vectors_hard_negative=workload.rows(sel["hard"]),
-                vectors_easy_negative=workload.rows(sel["easy"]),
+                vectors_heldout=workload.rows(sel["heldout"]),
+                vectors_withheld=workload.rows(sel["withheld"]),
+                vectors_singleton=workload.rows(sel["singleton"]),
             )
 
 
@@ -1246,16 +1223,12 @@ def generate_quantization(runner: Runner) -> None:
     the variable being swept: the quantizer here, the ball budget there. tau is
     a single fixed absolute value, the same one generate_budget and
     generate_equal_memory use, so both evaluations sit at a comparable
-    operating point. Ground truth here is distance to the reference set, not the
-    blocklist workload's cluster membership: quantization_worker asserts a
-    zero false-negative invariant that only holds under the distance
-    definition (see BlocklistWorkload.cluster_membership).
+    operating point. Ground truth is distance to the reference set at tau, as
+    everywhere.
 
-    Also passes n_hard/n_easy so quantization_worker can split fpr into
-    fpr_hard/fpr_easy the same way blocklist_tau_worker/budget_worker do,
-    from the same [positives, hard, easy] query-stream layout (see
-    BlocklistWorkload.query_vectors) -- the pooled fpr column is unchanged,
-    this only adds the breakdown alongside it.
+    Also passes the source sizes (BlocklistWorkload.source_sizes) so
+    quantization_worker can split fpr by query source the same way
+    blocklist_tau_worker/budget_worker do.
 
     Runs once per blocklist corpus, each into its own
     results/quantization/<dataset>/ folder and its own figure folder.
@@ -1298,9 +1271,6 @@ def generate_quantization(runner: Runner) -> None:
         for fold, sel in enumerate(workload.selections):
             vectors_construct = workload.rows(sel["reference"])
             vectors_query = workload.query_vectors(sel)
-            # Distance-based truth, not cluster membership: quantization_worker
-            # asserts zero false negatives, which only holds under this
-            # definition (see BlocklistWorkload.cluster_membership).
             actual_results = compute_static_actual_results(
                 vectors_construct, vectors_query, tau)
             for k in k_values:
@@ -1312,7 +1282,7 @@ def generate_quantization(runner: Runner) -> None:
                         k=k, quantize=quantize, tau=tau, seed=fold,
                         vectors_construct=vectors_construct, vectors_query=vectors_query,
                         actual_results=actual_results,
-                        n_hard=len(sel["hard"]), n_easy=len(sel["easy"]),
+                        **workload.source_sizes(sel),
                     )
 
 
@@ -1345,7 +1315,7 @@ def generate_query_performance() -> pd.DataFrame:
     dim                   = 384
     percentage_construct  = 20
     k_values              = [16, 32, 64, 128, 256, 512, 1024]
-    query_tau             = 0.35
+    query_tau             = 0.1
     seeds                 = [0, 1, 2]
     single_query_limit    = 2000
     output_csv            = "results/query_performance.csv"
@@ -1452,10 +1422,11 @@ def generate_scaling(runner: Runner) -> None:
     # magnitude in 6 lines.
     batch_sizes      = [1, 4, 16, 64, 256, 1024]
     # Throughput is threshold-independent here (query() scores every ball
-    # before comparing), so this only has to be a valid tau, not a tuned one.
-    tau_mid          = 0.35
-    # Fractions of each fold's blocklist query stream (positives + hard +
-    # easy negatives -- see BlocklistWorkload.query_vectors) consumed by the
+    # before comparing), so this only has to be a valid tau, not a tuned one;
+    # 0.1 anyway, the operating point of every other evaluation.
+    tau_mid          = 0.1
+    # Fractions of each fold's blocklist query stream (held-out + withheld +
+    # singleton -- see BlocklistWorkload.query_vectors) consumed by the
     # query and insert sweeps. Both draw from the same stream since neither
     # cares about overlap: only timing is measured, not correctness.
     # insert_vector_fraction stays smaller: insert() mutates the cover, so
@@ -1586,12 +1557,11 @@ def generate_streaming(runner: Runner) -> None:
     order rather than reshuffled, so at the last checkpoint the oracle is the
     very filter generate_blocklist builds at the same k_fraction.
 
-    Queries are the fold's query_vectors() (positives, hard negatives, easy
-    negatives), scored at every checkpoint against the distance-based ground
-    truth compute_static_actual_results gives for the part of B that has
-    arrived so far -- the definition generate_quantization and
-    generate_equal_memory use, and the one under which zero false negatives
-    is a guarantee rather than a hope (see BlocklistWorkload.cluster_membership).
+    Queries are the fold's query_vectors() (held-out, withheld, singleton),
+    scored at every checkpoint against the distance-based ground truth
+    compute_static_actual_results gives for the part of B that has arrived so
+    far -- the definition every evaluation uses, and the one under which zero
+    false negatives is a guarantee rather than a hope.
     The truth is computed here once per fold and shared by every job on it.
 
     Bootstrapping on half of B rather than on k vectors matters: construct()
@@ -1667,7 +1637,7 @@ def generate_streaming(runner: Runner) -> None:
                 output_csv=output_csv, dim=dim, dataset=workload.name, seed=fold, tau=tau, T=None,
                 vectors_stream=vectors_stream, vectors_query=vectors_query,
                 actual_at_checkpoint=actual_at_checkpoint,
-                n_hard=len(sel["hard"]), n_easy=len(sel["easy"]),
+                **workload.source_sizes(sel),
                 checkpoints=checkpoints, bootstrap_n=bootstrap_n, fold_offset=fold,
             )
 
@@ -1767,7 +1737,7 @@ def generate_construct_methods(runner: Runner) -> None:
                         k=min(max(1, round(kf * n)), n), k_fraction=kf, tau=tau, seed=fold,
                         vectors_construct=vectors_construct, vectors_query=vectors_query,
                         actual_results=actual_results,
-                        n_positive=len(sel["positive"]), n_hard=len(sel["hard"]),
+                        **workload.source_sizes(sel),
                     )
 
 

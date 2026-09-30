@@ -1,11 +1,12 @@
 """Ball-budget figures (see main.generate_budget).
 
 The same asymmetric blocklist workload as plot_blocklist, read along the other
-axis. There, tau is solved per row for a target recall and the ball budget k
-moves; here tau is pinned at one value for every row and k moves, so recall is
-an outcome rather than a held constant. That makes this the "what does a fixed
-operating threshold buy as you pay for more balls" view: recall and FPR both
-move, and the question is where the budget stops buying either.
+axis: there tau moves at a fixed ball budget; here tau is pinned at one value
+for every row and k moves. Queries are labeled by distance at that tau, so the
+labels are fixed along the whole sweep and recall is 1 by construction (the
+worker raises on a false negative). That makes this the "what does a fixed
+operating threshold buy as you pay for more balls" view: FPR and accesses
+saved move, and the question is where the budget stops buying either.
 
 The x-axis is k as a percentage of the reference set |X| -- the budget itself,
 not plot_blocklist's derived compression |X|/k, since the sweep is a narrow
@@ -13,15 +14,17 @@ linear band (5%-20%) where a reciprocal log axis would compress the whole
 range into one corner.
 
 Panels:
-  (a) Recall -- held fixed by construction in plot_blocklist, measured here.
-  (b) FPR on HARD negatives: members of duplicate clusters that were NOT
-      blocklisted, i.e. B's own local geometry. The headline number.
-  (c) FPR on EASY negatives: singletons, i.e. background traffic.
-  (d) Index accesses saved over the unfiltered baseline.
+  (a) FPR on held-out negatives: members of B's own clusters farther than tau
+      from B, inside their cluster's ball -- where most false positives live.
+  (b) FPR on withheld negatives: members of duplicate clusters that were NOT
+      blocklisted, i.e. B's own local geometry.
+  (c) FPR on singleton negatives: background traffic.
+  (d) Index accesses saved over the unfiltered baseline, with each corpus's
+      ceiling (the share of negative queries) as a thin dashed line.
   (e) Geometric objective log10 J_tau(C) = log10 sum_i (r_i + tau)^d -- the
       overlap-blind sum of ball volumes once every ball is expanded by tau.
 
-All five share one legend, written separately as budget-legend.png so the
+All of them share one legend, written separately as budget-legend.png so the
 panels can be placed side by side without repeating it.
 
 Absolute tau is not comparable between corpora (the distance at which a
@@ -128,13 +131,15 @@ def fixed_tau(df: pd.DataFrame) -> float:
 
 
 def _budget_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str,
-                  cfg: Config, bounded_unit: bool = False) -> pd.DataFrame:
+                  cfg: Config, bounded_unit: bool = False,
+                  ceiling_col: Optional[str] = None) -> pd.DataFrame:
     """plot_blocklist's shared renderer, pointed at the fixed-tau rows and at a
     budget x-axis: linear, in percent of |X|."""
     return line_panel(
         df, value_col, ylabel, filename, cfg,
         bounded_unit=bounded_unit, logx=False,
         sweep=SWEEP_TAU, x_from=lambda kf: 100.0 * kf, xlabel=_XLABEL,
+        ceiling_col=ceiling_col,
     )
 
 
@@ -158,7 +163,8 @@ def _raw_storage_pct_x(df: pd.DataFrame, dim: int = _EMBEDDING_DIM) -> pd.DataFr
 
 
 def _budget_panel_raw_pct(df: pd.DataFrame, value_col: str, ylabel: str, filename: str,
-                          cfg: Config, bounded_unit: bool = False) -> pd.DataFrame:
+                          cfg: Config, bounded_unit: bool = False,
+                          ceiling_col: Optional[str] = None) -> pd.DataFrame:
     """Same panel as _budget_panel, but against realised memory usage as a
     percentage of raw (uncompressed float32) vector storage instead of ball
     budget k -- the two axes agree in shape only up to how compact this
@@ -167,48 +173,37 @@ def _budget_panel_raw_pct(df: pd.DataFrame, value_col: str, ylabel: str, filenam
         df, value_col, ylabel, filename, cfg,
         bounded_unit=bounded_unit, logx=False,
         sweep=SWEEP_TAU, xlabel=_XLABEL_RAW_PCT,
-        x_override=_raw_storage_pct_x(df),
+        x_override=_raw_storage_pct_x(df), ceiling_col=ceiling_col,
     )
 
 
-def panel_recall(df, cfg):
-    return _budget_panel(df, "recall", "Recall", "budget-recall.png", cfg,
-                         bounded_unit=True)
+# One FPR panel per query source: (column, label, filename stem).
+_FPR_PANELS = (
+    ("fpr_heldout", "FPR (held-out negatives)", "budget-fpr-heldout"),
+    ("fpr_withheld", "FPR (withheld negatives)", "budget-fpr-withheld"),
+    ("fpr_singleton", "FPR (singleton negatives)", "budget-fpr-singleton"),
+)
 
 
-def panel_recall_raw_pct(df, cfg):
-    return _budget_panel_raw_pct(df, "recall", "Recall", "budget-recall-raw-pct.png", cfg,
-                                 bounded_unit=True)
+def panels_fpr(df, cfg):
+    for col, label, stem in _FPR_PANELS:
+        _budget_panel(df, col, label, f"{stem}.png", cfg, bounded_unit=True)
 
 
-def panel_fpr_hard(df, cfg):
-    return _budget_panel(df, "fpr_hard", "FPR (hard negatives)", "budget-fpr-hard.png",
-                         cfg, bounded_unit=True)
-
-
-def panel_fpr_hard_raw_pct(df, cfg):
-    return _budget_panel_raw_pct(df, "fpr_hard", "FPR (hard negatives)",
-                                 "budget-fpr-hard-raw-pct.png", cfg, bounded_unit=True)
-
-
-def panel_fpr_easy(df, cfg):
-    return _budget_panel(df, "fpr_easy", "FPR (easy negatives)", "budget-fpr-easy.png",
-                         cfg, bounded_unit=True)
-
-
-def panel_fpr_easy_raw_pct(df, cfg):
-    return _budget_panel_raw_pct(df, "fpr_easy", "FPR (easy negatives)",
-                                 "budget-fpr-easy-raw-pct.png", cfg, bounded_unit=True)
+def panels_fpr_raw_pct(df, cfg):
+    for col, label, stem in _FPR_PANELS:
+        _budget_panel_raw_pct(df, col, label, f"{stem}-raw-pct.png", cfg, bounded_unit=True)
 
 
 def panel_saved(df, cfg):
     return _budget_panel(df, "accesses_saved_pct", "Accesses Saved (%)",
-                         "budget-accesses-saved.png", cfg)
+                         "budget-accesses-saved.png", cfg, ceiling_col="neg_share_pct")
 
 
 def panel_saved_raw_pct(df, cfg):
     return _budget_panel_raw_pct(df, "accesses_saved_pct", "Accesses Saved (%)",
-                                 "budget-accesses-saved-raw-pct.png", cfg)
+                                 "budget-accesses-saved-raw-pct.png", cfg,
+                                 ceiling_col="neg_share_pct")
 
 
 def panel_geometric_objective(df, cfg):
@@ -283,22 +278,25 @@ def panel_volume_bounds_raw_pct(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 def print_summary(df: pd.DataFrame, tau: float) -> None:
     sel = df[df["sweep"] == SWEEP_TAU]
     print(f"\n--- Ball-budget sweep (tau fixed at {tau:g}) ---")
-    cols = ("recall", "fpr_hard", "fpr_easy", "accesses_saved_pct", "r_med", "log10_j_tau",
-            "log10_vol_low", "log10_vol_high")
+    cols = ("fpr", "fpr_heldout", "fpr_withheld", "fpr_singleton", "accesses_saved_pct",
+            "neg_share_pct", "r_med", "log10_j_tau", "log10_vol_low", "log10_vol_high")
     aggs = {c: mean_std(sel, ["dataset", "k_fraction"], c) for c in cols}
     for dataset in BLOCKLIST_DATASETS:
         sub = sel[sel["dataset"] == dataset]
         if sub.empty:
             continue
         n_ref = int(sub["n_reference"].iloc[0])
-        print(f"\n{BLOCKLIST_LABELS[dataset]} (|X|={n_ref}, delta={sub['d_pos_med'].mean():.3f}, "
-              f"d_hard={sub['d_hard_med'].mean():.3f})")
+        print(f"\n{BLOCKLIST_LABELS[dataset]} (|X|={n_ref}, "
+              f"d_heldout={sub['d_heldout_med'].mean():.3f}, "
+              f"d_withheld={sub['d_withheld_med'].mean():.3f}, "
+              f"negatives={sub['neg_share_pct'].mean():.1f}%)")
         for kf in sorted(sub["k_fraction"].unique()):
             def _m(c):
                 row = aggs[c][(aggs[c]["dataset"] == dataset) & (aggs[c]["k_fraction"] == kf)]
                 return float(row["mean"].iloc[0]) if len(row) else float("nan")
-            print(f"  k={100.0*kf:>5.1f}%  r_med={_m('r_med'):.3f} recall={_m('recall'):.3f} "
-                  f"FPR_hard={_m('fpr_hard'):.3f} FPR_easy={_m('fpr_easy'):.3f} "
+            print(f"  k={100.0*kf:>5.1f}%  r_med={_m('r_med'):.3f} FPR={_m('fpr'):.3f} "
+                  f"FPR_heldout={_m('fpr_heldout'):.3f} FPR_withheld={_m('fpr_withheld'):.3f} "
+                  f"FPR_singleton={_m('fpr_singleton'):.3f} "
                   f"saved={_m('accesses_saved_pct'):5.1f}% log10_J={_m('log10_j_tau'):.2f} "
                   f"vol=[{_m('log10_vol_low'):.2f}, {_m('log10_vol_high'):.2f}]")
     print()
@@ -315,19 +313,15 @@ def generate_budget_figures(df: Optional[pd.DataFrame] = None, outdir: str = OUT
     cfg = Config(dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
     tau = fixed_tau(df)
 
-    panel_recall(df, cfg)
-    panel_fpr_hard(df, cfg)
-    panel_fpr_easy(df, cfg)
+    panels_fpr(df, cfg)
     panel_saved(df, cfg)
     panel_geometric_objective(df, cfg)
     panel_volume_bounds(df, cfg)
 
-    # Same five panels again, against realised memory usage as a percentage
+    # Same panels again, against realised memory usage as a percentage
     # of raw (uncompressed float32) vector storage instead of ball budget k
     # -- see _raw_storage_pct_x.
-    panel_recall_raw_pct(df, cfg)
-    panel_fpr_hard_raw_pct(df, cfg)
-    panel_fpr_easy_raw_pct(df, cfg)
+    panels_fpr_raw_pct(df, cfg)
     panel_saved_raw_pct(df, cfg)
     panel_geometric_objective_raw_pct(df, cfg)
     panel_volume_bounds_raw_pct(df, cfg)

@@ -650,6 +650,39 @@ def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, flo
     }
 
 
+# The blocklist workload's query stream is drawn from three sources, in this
+# order (main.BlocklistWorkload.query_vectors): held-out members of the
+# reference set's clusters, members of clusters withheld from it, and
+# singletons. Sources are strata of the query distribution, never labels --
+# every query is labeled by distance at tau, whichever source it came from.
+QUERY_SOURCES = ("heldout", "withheld", "singleton")
+
+
+def _per_source_rates(predicted: Any, actual: Any, n_heldout: int, n_withheld: int,
+                      n_singleton: int) -> Dict[str, Any]:
+    """FPR restricted to the negatives drawn from each source, those negative
+    counts, the positive count, and neg_share_pct -- the share of negative
+    queries, which bounds accesses saved for a zero-false-negative filter.
+    predicted/actual follow the QUERY_SOURCES layout; a source with no
+    negatives reports fpr NaN rather than 0."""
+    predicted = np.asarray(predicted, dtype=bool)
+    actual = np.asarray(actual, dtype=bool)
+    sizes = (n_heldout, n_withheld, n_singleton)
+    if sum(sizes) != len(actual) or len(predicted) != len(actual):
+        raise ValueError(f"Source sizes {sizes} do not partition {len(actual)} queries "
+                         f"({len(predicted)} predictions)")
+    out: Dict[str, Any] = {}
+    start = 0
+    for source, n in zip(QUERY_SOURCES, sizes):
+        neg = ~actual[start:start + n]
+        out[f"fpr_{source}"] = float(predicted[start:start + n][neg].mean()) if neg.any() else float("nan")
+        out[f"n_neg_{source}"] = int(neg.sum())
+        start += n
+    out["n_pos"] = int(actual.sum())
+    out["neg_share_pct"] = 100.0 * (1.0 - actual.mean()) if len(actual) else float("nan")
+    return out
+
+
 # NONE is the raw/unquantized baseline point in this sweep (tagged
 # stage="ball"): one "ball" cover to compare every real quantizer against.
 QUANTIZATION_SWEEP = (
@@ -694,8 +727,9 @@ def quantization_worker(
     vectors_construct: VectorInput,
     vectors_query: VectorInput,
     actual_results: List[bool],
-    n_hard: int,
-    n_easy: int,
+    n_heldout: int,
+    n_withheld: int,
+    n_singleton: int,
 ) -> List[Dict[str, Any]]:
     """Builds one BallCoverFilter cover per (dataset, k, seed, quantize) and
     evaluates it at a single tau. Returns one row, tagged
@@ -707,18 +741,11 @@ def quantization_worker(
     log10_J_tau, index_accesses_saved_pct) are unambiguous without the plots
     having to pick one tau out of several.
 
-    n_hard/n_easy split fpr into fpr_hard/fpr_easy, the same distinction
-    blocklist_tau_worker/budget_worker report: vectors_query is [positives,
-    hard negatives, easy negatives] in that order (see
-    BlocklistWorkload.query_vectors), so the last n_hard+n_easy entries are
-    hard then easy negatives and the rest are positives. Unlike
-    blocklist_tau_worker/budget_worker, ground truth here is distance-to-tau
-    (compute_static_actual_results), not cluster membership,
-    so a hard/easy-negative row is not unconditionally a true negative the
-    way it is there -- fpr_hard/fpr_easy go through the same confusion-rate
-    helper as the pooled fpr rather than a plain mean, so the rare row where
-    a "hard negative" is within tau by the distance definition is still
-    counted correctly.
+    vectors_query is the fold's [held-out, withheld, singleton] query stream
+    (see BlocklistWorkload.query_vectors), sized by n_heldout/n_withheld/
+    n_singleton, and actual_results its distance-at-tau labels. fpr is split
+    by source into fpr_heldout/fpr_withheld/fpr_singleton, the same columns
+    blocklist_tau_worker/budget_worker report (see _per_source_rates).
 
     max_memory is derived from k using Quantize.FP32's byte-per-ball size and
     held fixed across every quantize candidate, so a more compact code packs
@@ -740,9 +767,9 @@ def quantization_worker(
         )
 
     actual = np.asarray(actual_results, dtype=bool)
-    if n_hard + n_easy > n_q:
-        raise ValueError(f"n_hard+n_easy ({n_hard + n_easy}) exceeds n_queries ({n_q})")
-    n_pos = n_q - n_hard - n_easy
+    if n_heldout + n_withheld + n_singleton != n_q:
+        raise ValueError(f"Source sizes ({n_heldout}, {n_withheld}, {n_singleton}) do not "
+                         f"partition n_queries ({n_q})")
     stage = "ball" if quantize == Quantize.FP32 else "quantizing"
 
     rows: List[Dict[str, Any]] = []
@@ -784,17 +811,12 @@ def quantization_worker(
     n_index_accesses = int(predicted_arr.sum())
 
     rates = _confusion_rates(predicted, actual)
-    # Same [positives, hard, easy] layout as blocklist_tau_worker/budget_worker's query stream
-    # (see BlocklistWorkload.query_vectors) -- hard then easy negatives are
-    # the trailing n_hard+n_easy entries.
-    hard_rates = _confusion_rates(predicted_arr[n_pos:n_pos + n_hard], actual[n_pos:n_pos + n_hard])
-    easy_rates = _confusion_rates(predicted_arr[n_pos + n_hard:], actual[n_pos + n_hard:])
     rows.append({
         "dataset": dataset, "k": k, "quantize": quantize.value, "stage": stage, "tau": tau,
         "log10_J": log10_J,
         "log10_J_tau": _log10_J(radii, dim, tau=tau),
         "fpr": rates["fpr"], "fnr": rates["fnr"],
-        "fpr_hard": hard_rates["fpr"], "fpr_easy": easy_rates["fpr"],
+        **_per_source_rates(predicted_arr, actual, n_heldout, n_withheld, n_singleton),
         "stage_time_s": stage_time, "cum_time_s": stage_time,
         "query_throughput_qps": n_q / max(query_time, 1e-9),
         "n_queries": n_q,
@@ -852,19 +874,21 @@ def construct_method_worker(
     vectors_construct: np.ndarray,
     vectors_query: np.ndarray,
     actual_results: np.ndarray,
-    n_positive: int,
-    n_hard: int,
+    n_heldout: int,
+    n_withheld: int,
+    n_singleton: int,
 ) -> Dict[str, Any]:
     """One BallCoverFilter built by CONSTRUCT_METHODS[method] at k balls,
     with the filter's default quantization and no insert method, so the
     construction method is the only thing that varies between rows.
 
     Returns one row: cover volume, radii, FPR/FNR against distance ground
-    truth at tau, and construction time. vectors_query is main's positives,
-    then hard negatives, then easy negatives (BlocklistWorkload.query_vectors),
-    which is what the membership-based columns slice on -- those are
-    budget_worker's definitions, kept only so the Gonzalez rows can be checked
-    against results/budget.csv. seed is the fold, reported as "fold".
+    truth at tau, and construction time. vectors_query is the fold's
+    [held-out, withheld, singleton] query stream
+    (BlocklistWorkload.query_vectors), sized by n_heldout/n_withheld/
+    n_singleton, so fpr splits by source as budget_worker's does (see
+    _per_source_rates), and a Gonzalez row's fpr matches results/budget.csv's
+    at the same fold and k_fraction. seed is the fold, reported as "fold".
 
     A nonzero FNR is a bug in the construction method, not a data point, so
     it raises (the Runner logs and skips the job) instead of returning."""
@@ -872,9 +896,6 @@ def construct_method_worker(
     queries = np.ascontiguousarray(vectors_query, dtype=np.float32)
     actual = np.asarray(actual_results, dtype=bool)
     n = len(construct)
-    pos = slice(0, n_positive)
-    hard = slice(n_positive, n_positive + n_hard)
-    easy = slice(n_positive + n_hard, len(queries))
 
     timed = _TimedConstruct(CONSTRUCT_METHODS[method]())
     filt = BallCoverFilter(dim, construct_method=timed, max_spheres=k, insert_method=None)
@@ -905,9 +926,7 @@ def construct_method_worker(
         "fpr": fp / (fp + tn) if fp + tn else 0.0,
         "fnr": fn / (fn + tp) if fn + tp else 0.0,
         "tp": tp, "fp": fp, "fn": fn, "tn": tn,
-        "recall_membership": float(predicted[pos].mean()) if n_positive else float("nan"),
-        "fpr_hard_membership": float(predicted[hard].mean()) if n_hard else float("nan"),
-        "fpr_easy_membership": float(predicted[easy].mean()) if easy.stop > easy.start else float("nan"),
+        **_per_source_rates(predicted, actual, n_heldout, n_withheld, n_singleton),
         "method_s": timed.seconds, "construct_s": construct_s, "volume_s": volume_s,
     }
     if fn:
@@ -1050,9 +1069,9 @@ def _blocklist_cover_rows(
     k_fractions: List[float],
     tau_values: List[float],
     vectors_reference: VectorInput,
-    vectors_positive: VectorInput,
-    vectors_hard_negative: VectorInput,
-    vectors_easy_negative: VectorInput,
+    vectors_heldout: VectorInput,
+    vectors_withheld: VectorInput,
+    vectors_singleton: VectorInput,
     volume_bounds: bool,
 ) -> List[Dict[str, Any]]:
     """Shared core of blocklist_tau_worker and budget_worker: build a
@@ -1060,12 +1079,20 @@ def _blocklist_cover_rows(
     (k, tau) pair. Both callers read only these rows -- see each one's own
     docstring for which axis it treats as fixed and which it sweeps.
 
-    Negatives are split in two and never pooled. Hard negatives are members of
-    duplicate clusters that were NOT blocklisted: same tight local geometry as
-    B, so a filter that merely detects "is this vector in a dense region"
-    fails them and only one that localises B passes. Easy negatives are
-    singletons, i.e. background traffic. A pooled FPR would be dominated by
-    whichever class happened to be larger.
+    The query stream comes from three sources (QUERY_SOURCES): held-out
+    members of the reference set's clusters, members of clusters withheld from
+    it, and singletons. Sources decide what is asked, never the answer: a
+    query is positive iff its exact distance to the reference set is <= tau,
+    recomputed per tau, so these rows mean what quantization_worker's and
+    equal_memory_worker's do. Predictions use the filter's own acceptance rule
+    (BallCoverFilter.surface_distance), so a row says what query() would.
+
+    FPR is also split by source (_per_source_rates): withheld-cluster
+    negatives test whether the cover localizes to B's clusters rather than to
+    dense regions in general, singletons are background traffic, and held-out
+    cluster-mates farther than tau are the hardest negatives of all, since
+    they sit inside their own cluster's ball. A pooled FPR alone would be
+    dominated by whichever source is larger.
 
     volume_bounds adds the overlap-aware log10_vol_low/log10_vol_high columns
     (_tau_volume_bounds_log10). Off by default because that bound is ~O(k^2)
@@ -1076,25 +1103,28 @@ def _blocklist_cover_rows(
     proxy that is always reported.
     """
     B = np.ascontiguousarray(_to_construct_array(vectors_reference), dtype=np.float32)
-    pos = np.ascontiguousarray(_to_construct_array(vectors_positive), dtype=np.float32)
-    hard = np.ascontiguousarray(_to_construct_array(vectors_hard_negative), dtype=np.float32)
-    easy = np.ascontiguousarray(_to_construct_array(vectors_easy_negative), dtype=np.float32)
+    by_source = [np.ascontiguousarray(_to_construct_array(v), dtype=np.float32)
+                 for v in (vectors_heldout, vectors_withheld, vectors_singleton)]
+    sizes = dict(zip(("n_heldout", "n_withheld", "n_singleton"), map(len, by_source)))
+    nonempty = [q for q in by_source if len(q)]
+    Q = np.concatenate(nonempty) if nonempty else np.zeros((0, dim), dtype=np.float32)
+    n_queries = len(Q)
 
-    # Exact nearest-reference distances: the workload's own geometry, reported
-    # so a row is interpretable without re-deriving it (delta vs d_hard).
+    # Exact nearest-reference distance per query: the ground truth, and the
+    # workload's own geometry, reported per source so a row is interpretable
+    # without re-deriving it (the cover's margin vs d_withheld).
     bix = faiss.IndexFlatL2(dim)
     bix.add(B)
-
-    def nn_dist(Q):
-        if len(Q) == 0:
-            return np.zeros(0, dtype=np.float32)
+    if n_queries:
         d2, _ = bix.search(Q, 1)
-        return np.sqrt(np.clip(d2[:, 0], 0, None))
+        nn = np.sqrt(np.clip(d2[:, 0], 0, None))
+    else:
+        nn = np.zeros(0, dtype=np.float32)
+    heldout_nn = nn[:sizes["n_heldout"]]
+    withheld_nn = nn[sizes["n_heldout"]:sizes["n_heldout"] + sizes["n_withheld"]]
+    d_heldout_med = float(np.median(heldout_nn)) if len(heldout_nn) else float("nan")
+    d_withheld_med = float(np.median(withheld_nn)) if len(withheld_nn) else float("nan")
 
-    d_pos_med = float(np.median(nn_dist(pos))) if len(pos) else float("nan")
-    d_hard_med = float(np.median(nn_dist(hard))) if len(hard) else float("nan")
-
-    n_queries = len(pos) + len(hard) + len(easy)
     rows: List[Dict[str, Any]] = []
 
     for kf in k_fractions:
@@ -1104,38 +1134,25 @@ def _blocklist_cover_rows(
         radii = filt.all_radiuses
         centers = np.ascontiguousarray(filt.all_centers, dtype=np.float32)
 
-        cix = faiss.IndexFlatL2(dim)
-        cix.add(centers)
-
-        def margin(Q):
-            """Smallest (distance to a ball's centre - that ball's radius) over
-            every ball: the query is flagged iff this is <= tau. Searching all
-            balls rather than a top-m probe, since a query can sit nearest to
-            one centre while another, fatter ball is the one that covers it."""
-            if len(Q) == 0:
-                return np.zeros(0, dtype=np.float32)
-            D, I = cix.search(Q, len(radii))
-            return (np.sqrt(np.clip(D, 0, None)) - radii[I]).min(axis=1)
-
-        m_pos, m_hard, m_easy = margin(pos), margin(hard), margin(easy)
+        # Searched once per cover and thresholded per tau; query() applies the
+        # same comparison, so these are exactly its predictions.
+        surface = filt.surface_distance(Q)
         r_med = float(np.median(radii)) if len(radii) else 0.0
 
         for tau in tau_values:
             tau = float(tau)
-            # Recomputed per tau because tau expands every ball (eff. radius
-            # r_i + tau), so both the geometric objective and the volume
-            # bounds are functions of tau at fixed k, not constants of the
-            # cover.
-            recall = float(np.mean(m_pos <= tau)) if len(m_pos) else 0.0
-            fpr_hard = float(np.mean(m_hard <= tau)) if len(m_hard) else 0.0
-            fpr_easy = float(np.mean(m_easy <= tau)) if len(m_easy) else 0.0
-            # Pooled FPR over both negative classes, for the "FPR vs tau" view
-            # where the split into hard/easy is not the axis of interest.
-            n_neg = len(hard) + len(easy)
-            fpr = ((fpr_hard * len(hard)) + (fpr_easy * len(easy))) / n_neg if n_neg else 0.0
-
-            n_flagged = (recall * len(pos)) + (fpr_hard * len(hard)) + (fpr_easy * len(easy))
-            saved = 100.0 * (1.0 - n_flagged / max(n_queries, 1))
+            # Labels are recomputed per tau (the paper's y(q, tau)), and so
+            # are the geometric objective and the volume bounds, since tau
+            # expands every ball (eff. radius r_i + tau).
+            actual = nn <= tau
+            predicted = surface <= tau + BallCoverFilter._COVERAGE_EPSILON
+            fn = int(np.sum(actual & ~predicted))
+            if fn:
+                raise ValueError(
+                    f"Zero-false-negative invariant violated: {fn} FN "
+                    f"(dataset={dataset}, fold={seed}, k={len(radii)}, tau={tau})")
+            rates = _confusion_rates(predicted.tolist(), actual)
+            saved = 100.0 * (1.0 - predicted.mean()) if n_queries else 0.0
 
             vol_low, vol_high = float('nan'), float('nan')
             if volume_bounds:
@@ -1154,9 +1171,12 @@ def _blocklist_cover_rows(
                 "k_fraction": float(kf),
                 "compression": len(B) / max(len(radii), 1),
                 "r_med": r_med, "r_max": float(radii.max()) if len(radii) else 0.0,
-                "tau": tau, "recall": recall,
-                "fpr": fpr, "fpr_hard": fpr_hard, "fpr_easy": fpr_easy,
-                "n_positive": len(pos), "n_hard": len(hard), "n_easy": len(easy),
+                "tau": tau,
+                "fpr": rates["fpr"], "fnr": rates["fnr"],
+                # fpr_<source>, n_neg_<source>, n_pos, and neg_share_pct --
+                # the ceiling on accesses_saved_pct for a zero-FN filter.
+                **_per_source_rates(predicted, actual, **sizes),
+                **sizes,
                 "n_queries": n_queries,
                 "accesses_saved_pct": saved,
                 # log10_J is a logsumexp over the balls, i.e. O(k), so it is
@@ -1169,7 +1189,7 @@ def _blocklist_cover_rows(
                 "log10_vol_low": vol_low,
                 "log10_vol_high": vol_high,
                 "n_balls": len(radii),
-                "d_pos_med": d_pos_med, "d_hard_med": d_hard_med,
+                "d_heldout_med": d_heldout_med, "d_withheld_med": d_withheld_med,
                 "memory_bytes": filt.get_bytesize(),
             })
     return rows
@@ -1182,21 +1202,22 @@ def blocklist_tau_worker(
     k_fraction: float,
     tau_values: List[float],
     vectors_reference: VectorInput,
-    vectors_positive: VectorInput,
-    vectors_hard_negative: VectorInput,
-    vectors_easy_negative: VectorInput,
+    vectors_heldout: VectorInput,
+    vectors_withheld: VectorInput,
+    vectors_singleton: VectorInput,
 ) -> List[Dict[str, Any]]:
     """Asymmetric blocklist workload (main.generate_blocklist): a tight
-    reference set B, a broad query stream, positives that are held-out members
-    of B's own duplicate clusters.
+    reference set B and a broad query stream drawn from held-out members of
+    B's own duplicate clusters, withheld clusters and singletons, labeled by
+    distance to B at each tau.
 
     Ball budget k is fixed (a single k_fraction, not a sweep -- varying it is
-    budget_worker's job); tau is swept over tau_values so FPR/recall/accesses
+    budget_worker's job); tau is swept over tau_values so FPR/accesses saved
     are read as one corpus's response curve at that one budget.
     """
     return _blocklist_cover_rows(
         dim, dataset, seed, [k_fraction], tau_values,
-        vectors_reference, vectors_positive, vectors_hard_negative, vectors_easy_negative,
+        vectors_reference, vectors_heldout, vectors_withheld, vectors_singleton,
         volume_bounds=False,
     )
 
@@ -1208,14 +1229,13 @@ def budget_worker(
     k_fractions: List[float],
     tau: float,
     vectors_reference: VectorInput,
-    vectors_positive: VectorInput,
-    vectors_hard_negative: VectorInput,
-    vectors_easy_negative: VectorInput,
+    vectors_heldout: VectorInput,
+    vectors_withheld: VectorInput,
+    vectors_singleton: VectorInput,
 ) -> List[Dict[str, Any]]:
     """The same asymmetric blocklist workload as blocklist_tau_worker
     (main.generate_budget), read along the other axis: tau is fixed at a
-    single value and the ball budget k is swept over k_fractions, so recall
-    becomes a measurement instead of a fixed operating point.
+    single value and the ball budget k is swept over k_fractions.
 
     Always requests the overlap-aware volume bounds: this is the one
     blocklist-workload sweep that can afford them (~O(k^2) per row, paid once
@@ -1224,7 +1244,7 @@ def budget_worker(
     """
     return _blocklist_cover_rows(
         dim, dataset, seed, k_fractions, [tau],
-        vectors_reference, vectors_positive, vectors_hard_negative, vectors_easy_negative,
+        vectors_reference, vectors_heldout, vectors_withheld, vectors_singleton,
         volume_bounds=True,
     )
 
@@ -1405,8 +1425,9 @@ def stream_rebuild_worker(
     vectors_stream: VectorInput,
     vectors_query: VectorInput,
     actual_at_checkpoint: Dict[int, List[bool]],
-    n_hard: int,
-    n_easy: int,
+    n_heldout: int,
+    n_withheld: int,
+    n_singleton: int,
     checkpoints: List[int],
     T: Optional[int] = None,
     insertion_level: Optional[str] = None,
@@ -1439,10 +1460,10 @@ def stream_rebuild_worker(
     insert_time_s the insert-only total (cumulative_time_s also counts the
     bootstrap construct()).
 
-    vectors_query is the fold's [positives, hard, easy] query stream (see
-    main.BlocklistWorkload.query_vectors), with n_hard/n_easy the trailing
-    hard and easy slices, split out as fpr_hard/fpr_easy exactly as
-    quantization_worker does. actual_at_checkpoint[c] is its distance-based
+    vectors_query is the fold's [held-out, withheld, singleton] query stream
+    (see main.BlocklistWorkload.query_vectors), sized by n_heldout/n_withheld/
+    n_singleton, with fpr split by source exactly as quantization_worker
+    does. actual_at_checkpoint[c] is its distance-based
     ground truth against vectors_stream[:c] -- computed once by the caller,
     since every policy and method on a fold shares it.
 
@@ -1457,9 +1478,9 @@ def stream_rebuild_worker(
     query_arr = _to_construct_array(vectors_query)
     n = len(stream_arr)
     n_q = len(query_arr)
-    if n_hard + n_easy > n_q:
-        raise ValueError(f"n_hard+n_easy ({n_hard + n_easy}) exceeds n_queries ({n_q})")
-    n_pos = n_q - n_hard - n_easy
+    if n_heldout + n_withheld + n_singleton != n_q:
+        raise ValueError(f"Source sizes ({n_heldout}, {n_withheld}, {n_singleton}) do not "
+                         f"partition n_queries ({n_q})")
     metric, method = _rebuild_policy_tags(policy, insertion_level)
     # By default pooled reserves a 20% pool and every other method constructs
     # at full capacity; insert_memory_percent overrides that for any method.
@@ -1499,13 +1520,6 @@ def stream_rebuild_worker(
                 f"insertion_level={insertion_level}, k={k}, seed={seed}, position={pos}): "
                 f"stream fnr={1.0 - recalled.mean()}, query fnr={rates['fnr']}"
             )
-        # Same [positives, hard, easy] layout as quantization_worker's query
-        # stream -- hard then easy negatives are the trailing n_hard+n_easy.
-        # fpr_pos: positives by cluster membership that are farther than tau
-        # from what has arrived, i.e. held-out cluster-mates the cover takes.
-        pos_rates = _confusion_rates(predicted[:n_pos], actual[:n_pos])
-        hard_rates = _confusion_rates(predicted[n_pos:n_pos + n_hard], actual[n_pos:n_pos + n_hard])
-        easy_rates = _confusion_rates(predicted[n_pos + n_hard:], actual[n_pos + n_hard:])
         radii = filt.all_radiuses
         n_inserted = pos - bootstrap_n
         streamed = policy != "oracle" and n_inserted > 0
@@ -1513,7 +1527,9 @@ def stream_rebuild_worker(
             "dataset": dataset, "policy": policy, "T": T, "k": k, "seed": seed,
             "position": pos - bootstrap_n, "tau": tau,
             "fpr": rates["fpr"], "fnr": rates["fnr"],
-            "fpr_pos": pos_rates["fpr"], "fpr_hard": hard_rates["fpr"], "fpr_easy": easy_rates["fpr"],
+            # fpr_heldout: held-out cluster-mates farther than tau from what
+            # has arrived, which sit inside their cluster's ball.
+            **_per_source_rates(predicted, actual, n_heldout, n_withheld, n_singleton),
             "n_queries": n_q, "n_duplicates": int(actual.sum()),
             "log10_j_tau": _log10_J(radii, dim, tau=tau),
             "n_balls": len(radii),
