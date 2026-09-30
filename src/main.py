@@ -1558,9 +1558,16 @@ def generate_streaming(runner: Runner) -> None:
     BallCoverFilter's insertion strategies via stream_rebuild_worker's
     policy="streaming" against a static rebuild at every checkpoint
     (policy="oracle"). Produces the streaming figure's panels: (a) FPR vs.
-    position + the static-rebuild reference, (b) threshold-expanded objective
+    position + the static-rebuild references, (b) threshold-expanded objective
     inflation vs. position -- at one fixed ball budget k, where only the
     stream position varies; (c) insertion throughput vs. filter size k.
+
+    Strategies are compared at equal bytes, not equal k: max_memory is the
+    static filter's footprint at k balls, and each strategy keeps as many
+    balls as fit with its own bookkeeping at its peak over the stream (see
+    InsertInterface.max_spheres_for_budget; peak_memory_bytes is recorded).
+    The position sweep runs once per construct method in construct_methods,
+    which builds both the bootstrap and that run's oracle.
 
     Reuses blocklist_workloads() -- the same corpora, cluster-based fold
     splits, reference set B, query stream and fixed tau as generate_blocklist/
@@ -1599,7 +1606,13 @@ def generate_streaming(runner: Runner) -> None:
     num_vectors        = WORKLOAD_NUM_VECTORS
     dim                = 384
     n_folds            = BLOCKLIST_FOLDS
-    methods            = ["nearest", "least_inflation", "pooled", "merge", "min_heap"]
+    methods            = ["nearest", "least_inflation", "pooled", "merge", "min_heap", "cap_merge"]
+    # The position sweep runs once per constructor: each builds both the
+    # streamed filter's bootstrap and its static-rebuild oracle, so every
+    # method's gap can be read against either reference. Gonzalez is the
+    # filter's default; sphere_merge is the best construction method measured
+    # (compare_construct_methods.py). The k sweep keeps the default only.
+    construct_methods  = ["gonzalez", "sphere_merge"]
     # The fixed absolute tau generate_budget/generate_quantization/
     # generate_equal_memory use, so every blocklist-workload evaluation sits
     # at the same operating point.
@@ -1652,10 +1665,12 @@ def generate_streaming(runner: Runner) -> None:
             )
 
             # --- panels (a)/(b): position sweep at the fixed budget k ---
-            for method in methods:
-                runner.submit('stream_rebuild', k=k, policy="streaming", insertion_level=method,
-                              sweep="position", **common)
-            runner.submit('stream_rebuild', k=k, policy="oracle", sweep="position", **common)
+            for construct_method in construct_methods:
+                for method in methods:
+                    runner.submit('stream_rebuild', k=k, policy="streaming", insertion_level=method,
+                                  sweep="position", construct_method=construct_method, **common)
+                runner.submit('stream_rebuild', k=k, policy="oracle", sweep="position",
+                              construct_method=construct_method, **common)
 
             # --- panel (c): filter size (k) sweep for insertion throughput ---
             max_p = max(4, int(round(np.log2(k))))
