@@ -75,11 +75,11 @@ CONSTRUCT_METHODS = {
 }
 
 # Ball-Cover as the paper presents it, used by every evaluation that does not
-# sweep one of these itself: sphere_merge is the best construction measured
-# (generate_construct_methods), TQ4 the headline center encoding. The
+# sweep one of these itself: minimax with its centers on the sphere
+# (minimax_sphere) is the construction, TQ4 the headline center encoding. The
 # quantization sweep keeps the construction and varies the encoding; the
 # construct_method and streaming sweeps stay unquantized.
-BALL_COVER_CONSTRUCT = "sphere_merge"
+BALL_COVER_CONSTRUCT = "minimax_sphere"
 BALL_COVER_QUANTIZE = Quantize.TQ4
 
 

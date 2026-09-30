@@ -1601,10 +1601,10 @@ def generate_streaming(runner: Runner) -> None:
     # The position sweep runs once per constructor: each builds both the
     # streamed filter's bootstrap and its static-rebuild oracle, so every
     # method's gap can be read against either reference. Gonzalez is the
-    # filter's default; sphere_merge is the best construction method measured
-    # (generate_construct_methods). The k sweep uses sphere_merge only
-    # (runner.BALL_COVER_CONSTRUCT), unquantized like the position sweep.
-    construct_methods  = ["gonzalez", "sphere_merge"]
+    # filter's default; runner.BALL_COVER_CONSTRUCT is the paper's
+    # construction. The k sweep uses BALL_COVER_CONSTRUCT only, unquantized
+    # like the position sweep.
+    construct_methods  = ["gonzalez", BALL_COVER_CONSTRUCT]
     # The fixed absolute tau generate_budget/generate_quantization/
     # generate_equal_memory use, so every blocklist-workload evaluation sits
     # at the same operating point.
