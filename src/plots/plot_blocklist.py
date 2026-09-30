@@ -5,18 +5,25 @@ docstring) -- varying the budget is generate_budget's job, at its own fixed
 tau. This module's whole figure set is the complementary view: tau swept at
 that one fixed budget.
 
-Panels:
-  (a) FPR vs tau, pooled over both negative classes.
-  (b) FPR on HARD negatives vs tau -- members of duplicate clusters that were
-      NOT blocklisted. Same local geometry as B (tight, high-multiplicity),
-      so only a filter that actually localises B rejects them. This is the
-      headline number.
-  (c) FPR on EASY negatives vs tau -- singletons, i.e. background traffic.
-  (d) Geometric objective log10 J_tau(C) = log10 sum_i (r_i + tau)^d vs tau --
-      the overlap-blind sum of ball volumes once every ball is expanded by tau.
-  (e) Index accesses saved vs tau.
+Every query is labeled by its distance to the reference set at tau, so the
+labels change along the tau axis. FPR is reported pooled and restricted to the
+negatives drawn from each query source (runner.QUERY_SOURCES).
 
-All five share one legend, written separately as blocklist-legend.png so
+Panels:
+  (a) FPR vs tau, pooled over every negative.
+  (b) FPR on held-out negatives -- members of B's own clusters farther than
+      tau from B. They sit inside their cluster's ball, so they are the
+      hardest negatives and where most false positives come from.
+  (c) FPR on withheld negatives -- members of duplicate clusters that were
+      NOT blocklisted. Same local geometry as B (tight, high-multiplicity),
+      so only a filter that actually localises B rejects them.
+  (d) FPR on singleton negatives -- background traffic.
+  (e) Geometric objective log10 J_tau(C) = log10 sum_i (r_i + tau)^d vs tau --
+      the overlap-blind sum of ball volumes once every ball is expanded by tau.
+  (f) Index accesses saved vs tau, with each corpus's ceiling (the share of
+      negative queries, which falls as tau grows) as a thin dashed line.
+
+All six share one legend, written separately as blocklist-legend.png so
 the panels can be placed side by side without repeating it.
 
 Absolute tau is not comparable between corpora -- the distance at which a
@@ -62,8 +69,8 @@ BLOCKLIST_MARKERS = {
 
 _REQUIRED_COLUMNS = [
     "dataset", "seed", "sweep", "k", "k_fraction", "n_reference", "compression", "r_med",
-    "tau", "recall", "fpr", "fpr_hard", "fpr_easy", "accesses_saved_pct",
-    "log10_j_tau", "d_hard_med", "d_pos_med",
+    "tau", "fpr", "fnr", "fpr_heldout", "fpr_withheld", "fpr_singleton", "neg_share_pct",
+    "accesses_saved_pct", "log10_j_tau", "d_withheld_med", "d_heldout_med",
 ]
 
 # runner.blocklist_tau_worker (mode 'blocklist') only emits sweep="tau" rows:
@@ -87,7 +94,9 @@ def validate_schema(df: pd.DataFrame) -> None:
     respectively), so both require the same columns."""
     missing = [c for c in _REQUIRED_COLUMNS if c not in df.columns]
     if missing:
-        raise ValueError(f"Input missing columns: {missing}. Present: {sorted(df.columns)}")
+        hint = (" This file labels queries by source rather than by distance at tau; "
+                "rerun generate_blocklist/generate_budget." if "recall" in df.columns else "")
+        raise ValueError(f"Input missing columns: {missing}.{hint} Present: {sorted(df.columns)}")
 
 
 def load_data() -> pd.DataFrame:
@@ -123,12 +132,24 @@ def save_blocklist_legend(outdir: str, dpi: int, emit_pdf: bool = False,
     save_figure(fig, filename, outdir, dpi, emit_pdf, transparent=True)
 
 
+def _draw_ceiling(ax, agg: pd.DataFrame, x_col: str) -> None:
+    """Each corpus's ceiling (mean_std output) as a thin dashed line in its
+    color: the most a zero-false-negative filter could reach."""
+    for dataset in BLOCKLIST_DATASETS:
+        sub = agg[agg["dataset"] == dataset].sort_values(x_col)
+        if sub.empty:
+            continue
+        ax.plot(sub[x_col], sub["mean"], color=BLOCKLIST_COLORS[dataset],
+                linestyle="--", linewidth=0.5, zorder=1)
+
+
 def line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg: Config,
                bounded_unit: bool = False, logx: bool = True,
                sweep: str = SWEEP_TAU,
                x_from: Callable[[pd.Series], pd.Series] = lambda kf: 1.0 / kf,
                xlabel: str = r"Compression $|X|/k$",
-               x_override: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+               x_override: Optional[pd.DataFrame] = None,
+               ceiling_col: Optional[str] = None) -> pd.DataFrame:
     """One line per corpus against a function of the ball budget, averaged over
     folds with +/- 1 std error bars (same convention as plot_system_tau).
 
@@ -142,15 +163,22 @@ def line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg
     instead of computing x from k_fraction via `x_from` -- for an x that
     depends on some other aggregated column (e.g. realised memory usage as a
     percentage of raw vector storage; see plot_budget's raw-storage panels),
-    where the caller has to aggregate that column itself before merging."""
-    agg = mean_std(df[df["sweep"] == sweep], ["dataset", "k_fraction"], value_col)
-    if x_override is not None:
-        agg = agg.merge(x_override, on=["dataset", "k_fraction"], how="left")
-    else:
-        agg["x"] = x_from(agg["k_fraction"])
+    where the caller has to aggregate that column itself before merging.
+
+    `ceiling_col`, if given, is drawn per corpus as a thin dashed line (see
+    _draw_ceiling) on the same x."""
+    def _with_x(agg: pd.DataFrame) -> pd.DataFrame:
+        if x_override is not None:
+            return agg.merge(x_override, on=["dataset", "k_fraction"], how="left")
+        return agg.assign(x=x_from(agg["k_fraction"]))
+
+    sel = df[df["sweep"] == sweep]
+    agg = _with_x(mean_std(sel, ["dataset", "k_fraction"], value_col))
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots()
+    if ceiling_col is not None:
+        _draw_ceiling(ax, _with_x(mean_std(sel, ["dataset", "k_fraction"], ceiling_col)), "x")
     for dataset in BLOCKLIST_DATASETS:
         sub = agg[agg["dataset"] == dataset].sort_values("x")
         if sub.empty:
@@ -197,19 +225,23 @@ def resolve_tau_kfraction(df: pd.DataFrame, k_fraction: Optional[float] = None) 
 
 
 def _tau_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg: Config,
-               k_fraction: float, bounded_unit: bool = False) -> pd.DataFrame:
+               k_fraction: float, bounded_unit: bool = False,
+               ceiling_col: Optional[str] = None) -> pd.DataFrame:
     """One line per corpus against tau, at a single compression ratio.
 
     Absolute tau is not comparable across corpora -- the distance at which a
     duplicate sits differs per embedding set, which is exactly why the
     headline workload solves tau for a target instead of fixing it. These
-    panels are for reading one corpus's own response curve.
+    panels are for reading one corpus's own response curve. `ceiling_col` is
+    as in line_panel.
     """
     sel = df[(df["sweep"] == SWEEP_TAU) & (np.isclose(df["k_fraction"], k_fraction))]
     agg = mean_std(sel, ["dataset", "tau"], value_col)
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots()
+    if ceiling_col is not None:
+        _draw_ceiling(ax, mean_std(sel, ["dataset", "tau"], ceiling_col), "tau")
     for dataset in BLOCKLIST_DATASETS:
         sub = agg[agg["dataset"] == dataset].sort_values("tau")
         if sub.empty:
@@ -233,19 +265,24 @@ def _tau_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg
 
 
 def panel_fpr_vs_tau(df, cfg, k_fraction):
-    """Pooled FPR over both negative classes as tau grows."""
+    """Pooled FPR over every negative as tau grows."""
     return _tau_panel(df, "fpr", "FPR", "blocklist-fpr-vs-tau.png", cfg,
                       k_fraction, bounded_unit=True)
 
 
-def panel_fpr_hard_vs_tau(df, cfg, k_fraction):
-    return _tau_panel(df, "fpr_hard", "FPR (hard negatives)",
-                      "blocklist-fpr-hard-vs-tau.png", cfg, k_fraction, bounded_unit=True)
+def panel_fpr_heldout_vs_tau(df, cfg, k_fraction):
+    return _tau_panel(df, "fpr_heldout", "FPR (held-out negatives)",
+                      "blocklist-fpr-heldout-vs-tau.png", cfg, k_fraction, bounded_unit=True)
 
 
-def panel_fpr_easy_vs_tau(df, cfg, k_fraction):
-    return _tau_panel(df, "fpr_easy", "FPR (easy negatives)",
-                      "blocklist-fpr-easy-vs-tau.png", cfg, k_fraction, bounded_unit=True)
+def panel_fpr_withheld_vs_tau(df, cfg, k_fraction):
+    return _tau_panel(df, "fpr_withheld", "FPR (withheld negatives)",
+                      "blocklist-fpr-withheld-vs-tau.png", cfg, k_fraction, bounded_unit=True)
+
+
+def panel_fpr_singleton_vs_tau(df, cfg, k_fraction):
+    return _tau_panel(df, "fpr_singleton", "FPR (singleton negatives)",
+                      "blocklist-fpr-singleton-vs-tau.png", cfg, k_fraction, bounded_unit=True)
 
 
 def panel_geometric_objective_vs_tau(df, cfg, k_fraction):
@@ -258,29 +295,33 @@ def panel_geometric_objective_vs_tau(df, cfg, k_fraction):
 
 def panel_saved_vs_tau(df, cfg, k_fraction):
     """Percentage of queries that never reach the backing index, as tau grows.
-    Falls monotonically: a larger tau flags more of the stream."""
+    Falls monotonically: a larger tau flags more of the stream, and makes more
+    of it positive, so the ceiling falls too."""
     return _tau_panel(df, "accesses_saved_pct", "Accesses Saved (%)",
-                      "blocklist-accesses-saved-vs-tau.png", cfg, k_fraction)
+                      "blocklist-accesses-saved-vs-tau.png", cfg, k_fraction,
+                      ceiling_col="neg_share_pct")
 
 
 def print_summary(df: pd.DataFrame, k_fraction: float) -> None:
     sel = df[(df["sweep"] == SWEEP_TAU) & (np.isclose(df["k_fraction"], k_fraction))]
     print(f"\n--- Blocklist workload summary (tau sweep at k={k_fraction:g}) ---")
-    cols = ("fpr", "fpr_hard", "fpr_easy", "recall", "accesses_saved_pct", "log10_j_tau")
+    cols = ("fpr", "fpr_heldout", "fpr_withheld", "fpr_singleton", "accesses_saved_pct",
+            "neg_share_pct", "log10_j_tau")
     aggs = {c: mean_std(sel, ["dataset", "tau"], c) for c in cols}
     for dataset in BLOCKLIST_DATASETS:
         sub = sel[sel["dataset"] == dataset]
         if sub.empty:
             continue
-        print(f"\n{BLOCKLIST_LABELS[dataset]} (delta={sub['d_pos_med'].mean():.3f}, "
-              f"d_hard={sub['d_hard_med'].mean():.3f})")
+        print(f"\n{BLOCKLIST_LABELS[dataset]} (d_heldout={sub['d_heldout_med'].mean():.3f}, "
+              f"d_withheld={sub['d_withheld_med'].mean():.3f})")
         for tau in sorted(sub["tau"].unique()):
             def _m(c):
                 row = aggs[c][(aggs[c]["dataset"] == dataset) & (aggs[c]["tau"] == tau)]
                 return float(row["mean"].iloc[0]) if len(row) else float("nan")
-            print(f"  tau={tau:.2f}  FPR={_m('fpr'):.3f} FPR_hard={_m('fpr_hard'):.3f} "
-                  f"FPR_easy={_m('fpr_easy'):.3f} recall={_m('recall'):.3f} "
-                  f"saved={_m('accesses_saved_pct'):5.1f}% log10_J={_m('log10_j_tau'):.2f}")
+            print(f"  tau={tau:.2f}  FPR={_m('fpr'):.3f} FPR_heldout={_m('fpr_heldout'):.3f} "
+                  f"FPR_withheld={_m('fpr_withheld'):.3f} FPR_singleton={_m('fpr_singleton'):.3f} "
+                  f"saved={_m('accesses_saved_pct'):5.1f}% of {_m('neg_share_pct'):5.1f}% "
+                  f"log10_J={_m('log10_j_tau'):.2f}")
     print()
 
 
@@ -295,8 +336,9 @@ def generate_blocklist_figures(df: Optional[pd.DataFrame] = None, outdir: str = 
 
     kf = resolve_tau_kfraction(df, k_fraction)
     panel_fpr_vs_tau(df, cfg, kf)
-    panel_fpr_hard_vs_tau(df, cfg, kf)
-    panel_fpr_easy_vs_tau(df, cfg, kf)
+    panel_fpr_heldout_vs_tau(df, cfg, kf)
+    panel_fpr_withheld_vs_tau(df, cfg, kf)
+    panel_fpr_singleton_vs_tau(df, cfg, kf)
     panel_geometric_objective_vs_tau(df, cfg, kf)
     panel_saved_vs_tau(df, cfg, kf)
 

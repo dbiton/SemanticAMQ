@@ -128,8 +128,8 @@ _REQUIRED_COLUMNS = [
     "log10_J",
     "log10_J_tau",
     "fpr",
-    "fpr_hard",
-    "fpr_easy",
+    "fpr_withheld",
+    "fpr_singleton",
     "fnr",
     "stage_time_s",
     "cum_time_s",
@@ -386,28 +386,33 @@ def panel_fpr(df: pd.DataFrame, cfg: Config, raw_pct: bool = False) -> pd.DataFr
     )
 
 
-# Panel (c-hard)/(c-easy): the same pooled FPR split by query class, the same
-# distinction plot_blocklist reports separately for the reason its own
-# comment gives -- a pooled rate is dominated by whichever class the corpus
-# happens to have more of. fpr_hard is held-out members of duplicate clusters
-# NOT in the reference set (same tight local geometry as B, so this is what
-# actually tests whether the cover localises B rather than just density);
-# fpr_easy is singletons, i.e. undiscriminating background traffic.
+# Panels (c-heldout)/(c-withheld)/(c-singleton): the same pooled FPR restricted
+# to the negatives drawn from each query source, the split plot_blocklist
+# reports for the reason its own comment gives -- a pooled rate is dominated
+# by whichever source the corpus happens to have more of. Held-out negatives
+# are members of the reference set's own clusters farther than tau from it,
+# inside their cluster's ball; withheld negatives are members of duplicate
+# clusters NOT in the reference set (same tight local geometry as B, so they
+# test whether the cover localises B rather than just density); singletons
+# are undiscriminating background traffic.
 
-def panel_fpr_hard(df: pd.DataFrame, cfg: Config, raw_pct: bool = False) -> pd.DataFrame:
-    filename = "quantization-false-positive-rate-hard.png"
-    return _line_panel(
-        df, "fpr_hard", "FPR (hard negatives)", _raw_pct_filename(filename) if raw_pct else filename,
-        cfg, use_tau=True, y_bounds=(0, None), **(_RAW_PCT_X if raw_pct else {}),
-    )
+_FPR_SOURCE_PANELS = (
+    ("fpr_heldout", "FPR (held-out negatives)", "quantization-false-positive-rate-heldout.png"),
+    ("fpr_withheld", "FPR (withheld negatives)", "quantization-false-positive-rate-withheld.png"),
+    ("fpr_singleton", "FPR (singleton negatives)", "quantization-false-positive-rate-singleton.png"),
+)
 
 
-def panel_fpr_easy(df: pd.DataFrame, cfg: Config, raw_pct: bool = False) -> pd.DataFrame:
-    filename = "quantization-false-positive-rate-easy.png"
-    return _line_panel(
-        df, "fpr_easy", "FPR (easy negatives)", _raw_pct_filename(filename) if raw_pct else filename,
-        cfg, use_tau=True, y_bounds=(0, None), **(_RAW_PCT_X if raw_pct else {}),
-    )
+def panels_fpr_by_source(df: pd.DataFrame, cfg: Config, raw_pct: bool = False) -> None:
+    """fpr_heldout is skipped when absent: files migrated by
+    util/rename_source_columns.py predate it and cannot derive it."""
+    for col, label, filename in _FPR_SOURCE_PANELS:
+        if col not in df.columns:
+            continue
+        _line_panel(
+            df, col, label, _raw_pct_filename(filename) if raw_pct else filename,
+            cfg, use_tau=True, y_bounds=(0, None), **(_RAW_PCT_X if raw_pct else {}),
+        )
 
 
 # Panel (d): construction time
@@ -448,12 +453,18 @@ def panel_index_accesses_saved(df: pd.DataFrame, cfg: Config, raw_pct: bool = Fa
     is what that error rate costs downstream once the workload's real
     duplicate rate is folded in.
 
-    The ceiling is the non-duplicate share of the workload (95% at the
-    calibrated tau -- a duplicate *should* reach the index), so a perfect
-    filter sits there, not at 100%. Linear axis pinned to [0, 100]: the
-    interesting range is the top of it, and a degenerate cover that accepts
-    everything sits at 0."""
+    The ceiling is the share of negative queries (neg_share_pct -- a
+    duplicate *should* reach the index), drawn as a thin dashed line: a
+    perfect filter sits there, not at 100%. Linear axis pinned to [0, 100]:
+    the interesting range is the top of it, and a degenerate cover that
+    accepts everything sits at 0. Files migrated by
+    util/rename_source_columns.py have no neg_share_pct and draw no ceiling."""
+    ceiling = (float(df.loc[df["tau"] == cfg.tau, "neg_share_pct"].mean())
+               if "neg_share_pct" in df.columns else None)
+
     def annotate(ax: plt.Axes) -> None:
+        if ceiling is not None:
+            ax.axhline(ceiling, color="0.4", linestyle="--", linewidth=0.5, zorder=1)
         ax.text(
             # Top-left, not top-right like panel (b): this curve rises with
             # memory, so the right half is where the lines are.
@@ -653,7 +664,7 @@ def generate_quantization_figures(
     dpi: int = DPI,
     emit_pdf: bool = EMIT_PDF,
 ) -> None:
-    """Library entry point: renders the ten paper panels + one diagnostic
+    """Library entry point: renders the eleven paper panels + one diagnostic
     FNR panel (+ legend) from an in-memory DataFrame, or from `load_data()`
     (reads INPUT_PATH) if `df` is omitted. panel_fnr is excluded from the
     LaTeX subfigure snippet printed below, since it's a sanity check, not
@@ -668,8 +679,7 @@ def generate_quantization_figures(
     panel_geometric_objective(df, cfg)
     panel_threshold_objective(df, cfg)
     panel_fpr(df, cfg)
-    panel_fpr_hard(df, cfg)
-    panel_fpr_easy(df, cfg)
+    panels_fpr_by_source(df, cfg)
     panel_construction_time(df, cfg)
     panel_query_throughput(df, cfg)
     panel_index_accesses_saved(df, cfg)
@@ -685,8 +695,7 @@ def generate_quantization_figures(
         panel_geometric_objective(df, cfg, raw_pct=True)
         panel_threshold_objective(df, cfg, raw_pct=True)
         panel_fpr(df, cfg, raw_pct=True)
-        panel_fpr_hard(df, cfg, raw_pct=True)
-        panel_fpr_easy(df, cfg, raw_pct=True)
+        panels_fpr_by_source(df, cfg, raw_pct=True)
         panel_construction_time(df, cfg, raw_pct=True)
         panel_query_throughput(df, cfg, raw_pct=True)
         panel_index_accesses_saved(df, cfg, raw_pct=True)
@@ -726,13 +735,18 @@ def generate_quantization_figures(
 \end{subfigure}
 \begin{subfigure}[b]{0.24\linewidth}
     \centering
-    \includegraphics[width=\linewidth]{figures/quantization-false-positive-rate-hard.png}
-    \caption{FPR, hard negatives}
+    \includegraphics[width=\linewidth]{figures/quantization-false-positive-rate-heldout.png}
+    \caption{FPR, held-out negatives}
 \end{subfigure}
 \begin{subfigure}[b]{0.24\linewidth}
     \centering
-    \includegraphics[width=\linewidth]{figures/quantization-false-positive-rate-easy.png}
-    \caption{FPR, easy negatives}
+    \includegraphics[width=\linewidth]{figures/quantization-false-positive-rate-withheld.png}
+    \caption{FPR, withheld negatives}
+\end{subfigure}
+\begin{subfigure}[b]{0.24\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/quantization-false-positive-rate-singleton.png}
+    \caption{FPR, singleton negatives}
 \end{subfigure}
 \begin{subfigure}[b]{0.24\linewidth}
     \centering
