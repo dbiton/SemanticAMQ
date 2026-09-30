@@ -256,9 +256,22 @@ def _with_construct_method(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _std_errorbars(ax: plt.Axes, x: pd.Series, agg: pd.DataFrame, color: str,
+                   log_floor: bool = False, zorder: int = 3) -> None:
+    """+-1 std error bars around agg["mean"]. log_floor clips the lower bar at
+    mean/10 so it stays positive on a log axis."""
+    if not (agg["std"] > 0).any():
+        return
+    lower = agg["std"]
+    if log_floor:
+        lower = np.minimum(lower, agg["mean"] * 0.9)
+    ax.errorbar(x, agg["mean"], yerr=[lower, agg["std"]], fmt="none", ecolor=color,
+                elinewidth=0.5, capsize=1.5, capthick=0.5, zorder=zorder)
+
+
 def _draw_references(ax: plt.Axes, df: pd.DataFrame, cfg: Config, value_col: str,
                      band: bool = True, log_floor: bool = False) -> pd.Series:
-    """One static-rebuild line (and faint +-1 std band) per construction
+    """One static-rebuild line (with +-1 std error bars) per construction
     method present; returns their positions for axis scaling."""
     ref = df[(df["sweep"] == "position") & (df["metric"] == "static_reference") & (df["k"] == cfg.k_fixed)]
     positions = []
@@ -267,12 +280,8 @@ def _draw_references(ax: plt.Axes, df: pd.DataFrame, cfg: Config, value_col: str
         agg = mean_std(sub, ["position"], value_col).sort_values("position")
         ax.plot(agg["position"], agg["mean"], color=style["color"], linestyle=style["linestyle"],
                 linewidth=0.9, zorder=4)
-        if band and (agg["std"] > 0).any():
-            lower = agg["mean"] - agg["std"]
-            if log_floor:
-                lower = np.maximum(lower, agg["mean"] / 10.0)
-            ax.fill_between(agg["position"], lower, agg["mean"] + agg["std"], color=style["color"],
-                            alpha=0.04, linewidth=0, zorder=1)
+        if band:
+            _std_errorbars(ax, agg["position"], agg, style["color"], log_floor=log_floor, zorder=4)
         positions.append(agg["position"])
     return pd.concat(positions) if positions else pd.Series(dtype=float)
 
@@ -292,10 +301,7 @@ def panel_fpr_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             continue
         ax.plot(sub["position"], sub["mean"], color=METHOD_COLORS[method], marker=METHOD_MARKERS[method],
                 markersize=3.5, linewidth=1.0, zorder=3, label=METHOD_LABELS[method])
-        if (sub["std"] > 0).any():
-            lower = np.maximum(sub["mean"] - sub["std"], sub["mean"] / 10.0)
-            upper = sub["mean"] + sub["std"]
-            ax.fill_between(sub["position"], lower, upper, color=METHOD_COLORS[method], alpha=0.04, linewidth=0, zorder=2)
+        _std_errorbars(ax, sub["position"], sub, METHOD_COLORS[method], log_floor=True)
 
     ref_positions = _draw_references(ax, df, cfg, "fpr", band=True, log_floor=True)
 
@@ -328,9 +334,7 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             continue
         ax.plot(sub["position"], sub["mean"], color=METHOD_COLORS[method], marker=METHOD_MARKERS[method], 
                 markersize=3.5, linewidth=1.0, zorder=3)
-        if (sub["std"] > 0).any():
-            lower, upper = sub["mean"] - sub["std"], sub["mean"] + sub["std"]
-            ax.fill_between(sub["position"], lower, upper, color=METHOD_COLORS[method], alpha=0.04, linewidth=0, zorder=2)
+        _std_errorbars(ax, sub["position"], sub, METHOD_COLORS[method])
 
     ref_positions = _draw_references(ax, df, cfg, "log10_j_tau", band=True)
 
@@ -360,9 +364,7 @@ def panel_n_balls_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             continue
         ax.plot(sub["position"], sub["mean"], color=METHOD_COLORS[method], marker=METHOD_MARKERS[method],
                 markersize=3.5, linewidth=1.0, zorder=3)
-        if (sub["std"] > 0).any():
-            lower, upper = sub["mean"] - sub["std"], sub["mean"] + sub["std"]
-            ax.fill_between(sub["position"], lower, upper, color=METHOD_COLORS[method], alpha=0.04, linewidth=0, zorder=2)
+        _std_errorbars(ax, sub["position"], sub, METHOD_COLORS[method])
 
     ref_positions = _draw_references(ax, df, cfg, "n_balls", band=False)
 
@@ -400,11 +402,7 @@ def panel_insertion_throughput(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             continue
         ax.plot(sub["k"], sub["mean"], color=METHOD_COLORS[method], marker=METHOD_MARKERS[method], 
                 markersize=3.5, linewidth=1.0, zorder=3, label=METHOD_LABELS[method])
-
-        if (sub["std"] > 0).any():
-            lower = np.maximum(sub["mean"] - sub["std"], sub["mean"] / 10.0)
-            upper = sub["mean"] + sub["std"]
-            ax.fill_between(sub["k"], lower, upper, color=METHOD_COLORS[method], alpha=0.12, linewidth=0, zorder=2)
+        _std_errorbars(ax, sub["k"], sub, METHOD_COLORS[method], log_floor=True)
 
     _apply_paper_axes_style(ax, log_x=True, log_y=True)
 
