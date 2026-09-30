@@ -44,6 +44,7 @@ _KNOWN_LABELS = {
     "CoveringLSHFallbackFilter": "Covering LSH",
     "PacukLSHFilter": "Pacuk LSH",
     "SankowskiWygockiFilter": "Sankowski-Wygocki",
+    "VAPlusFilter": "VA+-file",
 }
 _KNOWN_MARKERS = {
     "HNSWFilter": "P",

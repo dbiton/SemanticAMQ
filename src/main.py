@@ -40,6 +40,7 @@ from filters.quantized_vector_filter import QuantizedVectorFilter
 from filters.mlp_filter import MLPFilter
 from filters.pacuk_lsh_filter import PacukLSHFilter
 from filters.sankowski_wygocki_filter import SankowskiWygockiFilter
+from filters.va_plus_filter import VAPlusFilter
 from util.dataset_paths import dataset_filenames, HDF5_DATASET_KEY
 from util.fetch_datasets import load_embeds, load_meta
 from vector_source import VectorSource
@@ -182,7 +183,7 @@ def streaming_csv(dataset: str) -> str:
 # dial worth comparing multiple settings of side by side.
 equal_memory_filters = [
     HNSWFilter, IVFFilter, DSHFilter, QuantizedVectorFilter, MLPFilter,
-    PacukLSHFilter, SankowskiWygockiFilter,
+    PacukLSHFilter, SankowskiWygockiFilter, VAPlusFilter,
 ]
 
 def calculate_nn_distance_threshold(
