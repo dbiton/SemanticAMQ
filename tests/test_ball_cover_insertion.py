@@ -14,6 +14,7 @@ from src.filters.ball_cover.least_inflation_insert import LeastInflationInsert
 from src.filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
 from src.filters.ball_cover.doubling_insert import DoublingInsert
 from src.filters.ball_cover.pooled_insert import PooledInsert
+from src.filters.ball_cover.cap_merge_insert import CapMergeInsert
 
 DIM = 8
 
@@ -24,7 +25,8 @@ def get_insertion_strategies():
         'least_inflation': LeastInflationInsert(),
         'exhaustive_merge': ExhaustiveMergeInsert(),
         'doubling': DoublingInsert(),
-        'pooled': PooledInsert()
+        'pooled': PooledInsert(),
+        'cap_merge': CapMergeInsert(),
     }
 
 
@@ -319,6 +321,192 @@ class TestDoublingStrategy(unittest.TestCase):
             self.assertEqual(len(missing), 0, f"false negative(s) at indices {missing.tolist()}")
 
         self.assertLessEqual(len(f.all_spheres), max_spheres)
+
+
+# ---------------------------------------------------------------------------
+# Every strategy, through construct() and a stream, on unit-norm data -- the
+# regime the streaming evaluation runs in (and the one CapMergeInsert's cap
+# geometry depends on).
+# ---------------------------------------------------------------------------
+
+def _unit_clusters(n: int, dim: int = 16, n_clusters: int = 12, spread: float = 0.35, seed: int = 0) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    anchors = rng.standard_normal((n_clusters, dim))
+    anchors /= np.linalg.norm(anchors, axis=1, keepdims=True)
+    x = anchors[rng.integers(0, n_clusters, n)] + spread / np.sqrt(dim) * rng.standard_normal((n, dim))
+    return (x / np.linalg.norm(x, axis=1, keepdims=True)).astype(np.float32)
+
+
+def _streaming_filter(name: str, dim: int = 16, max_spheres: int = None, max_memory: int = None) -> BallCoverFilter:
+    return BallCoverFilter(dim=dim, insert_method=get_insertion_strategies()[name], max_spheres=max_spheres,
+                           max_memory=max_memory, insert_memory_percent=20.0 if name == 'pooled' else 0.0,
+                           quantize=Quantize.NONE)
+
+
+def _recalled(f: BallCoverFilter, vecs: np.ndarray) -> np.ndarray:
+    return np.asarray(f.query(np.ascontiguousarray(vecs, dtype=np.float32), 0.0), dtype=bool)
+
+
+class TestEveryStrategyOnAStream(unittest.TestCase):
+
+    def test_long_stream_keeps_every_vector_covered(self):
+        X = _unit_clusters(900, seed=40)
+        for name in get_insertion_strategies():
+            with self.subTest(strategy=name):
+                f = _streaming_filter(name, max_spheres=24)
+                f.construct(X[:300])
+                for i in range(300, len(X)):
+                    f.insert(X[i:i + 1])
+                    if i % 150 == 0 or i == len(X) - 1:
+                        missing = np.flatnonzero(~_recalled(f, X[:i + 1]))
+                        self.assertEqual(len(missing), 0, f"{name}: {len(missing)} vectors lost at {i}")
+
+    def test_peak_bytes_never_exceed_max_memory(self):
+        """The byte rule the streaming evaluation ranks strategies under: a
+        strategy's balls *and* its own bookkeeping fit max_memory after every
+        insert(), not just after construct() (see
+        InsertInterface.max_spheres_for_budget)."""
+        X = _unit_clusters(700, seed=41)
+        budget = 40 * BallCoverFilter(dim=16, max_memory=1).bytes_per_ball()
+        for name in get_insertion_strategies():
+            with self.subTest(strategy=name):
+                f = _streaming_filter(name, max_memory=budget)
+                f.construct(X[:200])
+                peak = f.get_bytesize()
+                for i in range(200, len(X), 3):
+                    f.insert(X[i:i + 3])
+                    peak = max(peak, f.get_bytesize())
+                self.assertLessEqual(peak, budget, name)
+                self.assertTrue(_recalled(f, X).all(), name)
+
+    def test_capacity_holds_between_inserts(self):
+        X = _unit_clusters(600, seed=42)
+        for name in get_insertion_strategies():
+            with self.subTest(strategy=name):
+                f = _streaming_filter(name, max_spheres=20)
+                f.construct(X[:100])
+                for i in range(100, len(X), 7):
+                    f.insert(X[i:i + 7])
+                    # DoublingInsert overshoots max_spheres by design, up to
+                    # its rebuild threshold; everything else stays within it.
+                    cap = DoublingInsert()._rebuild_threshold(f) - 1 if name == 'doubling' else f.max_spheres
+                    self.assertLessEqual(len(f.all_spheres), cap, name)
+
+    def test_empty_batch_changes_nothing(self):
+        X = _unit_clusters(300, seed=43)
+        for name in get_insertion_strategies():
+            with self.subTest(strategy=name):
+                f = _streaming_filter(name, max_spheres=20)
+                f.construct(X[:150])
+                f.insert(X[150:200])
+                before = (f.all_centers.copy(), f.all_radiuses.copy())
+                f.insert(np.empty((0, 16), dtype=np.float32))
+                np.testing.assert_array_equal(f.all_centers, before[0], err_msg=name)
+                np.testing.assert_array_equal(f.all_radiuses, before[1], err_msg=name)
+
+    def test_exact_duplicates(self):
+        """One vector inserted many times -- a batch of copies, then again
+        between other vectors -- stays covered. Strategies that decide one
+        vector at a time spend at most one ball on the batch; DoublingInsert
+        and PooledInsert test coverage once per batch, so every copy in it
+        becomes a singleton until the next rebuild (wasteful, not unsound)."""
+        X = _unit_clusters(400, seed=44)
+        dup = X[350]
+        for name in get_insertion_strategies():
+            with self.subTest(strategy=name):
+                f = _streaming_filter(name, max_spheres=24)
+                f.construct(X[:200])
+                n_before = len(f.all_spheres)
+                f.insert(np.repeat(dup[None, :], 25, axis=0))
+                cap = DoublingInsert()._rebuild_threshold(f) - 1 if name == 'doubling' else f.max_spheres
+                self.assertLessEqual(len(f.all_spheres), cap, name)
+                if name not in ('doubling', 'pooled'):
+                    self.assertLessEqual(len(f.all_spheres), min(n_before + 1, cap), name)
+                for i in range(200, 260):
+                    f.insert(X[i:i + 1])
+                    f.insert(dup[None, :])
+                self.assertTrue(_recalled(f, np.vstack([X[:260], dup[None, :]])).all(), name)
+
+    def test_batch_larger_than_capacity(self):
+        X = _unit_clusters(500, seed=45)
+        for name in get_insertion_strategies():
+            with self.subTest(strategy=name):
+                f = _streaming_filter(name, max_spheres=16)
+                f.construct(X[:40])
+                f.insert(X[40:])  # 460 vectors into a 16-ball filter, one call
+                self.assertTrue(_recalled(f, X).all(), name)
+                cap = DoublingInsert()._rebuild_threshold(f) - 1 if name == 'doubling' else f.max_spheres
+                self.assertLessEqual(len(f.all_spheres), cap, name)
+
+    def test_float64_and_non_contiguous_input(self):
+        X = _unit_clusters(600, seed=46)
+        X64 = np.asfortranarray(X.astype(np.float64))[::2]  # float64, strided, non-C-contiguous
+        self.assertFalse(X64.flags['C_CONTIGUOUS'])
+        for name in get_insertion_strategies():
+            with self.subTest(strategy=name):
+                f = _streaming_filter(name, max_spheres=20)
+                f.construct(X64[:100])
+                for i in range(100, len(X64), 25):
+                    f.insert(X64[i:i + 25])
+                self.assertTrue(_recalled(f, X64).all(), name)
+
+
+class TestCapMergeInsert(unittest.TestCase):
+
+    def test_off_sphere_vector_falls_back_to_euclidean_balls(self):
+        """The cap geometry assumes every member lies on construct()'s sphere;
+        one inserted vector off it must switch merging back to enclosing
+        balls without losing anything already covered."""
+        X = _unit_clusters(500, seed=47)
+        f = _streaming_filter('cap_merge', max_spheres=20)
+        f.construct(X[:200])
+        self.assertGreater(f.insert_method._rho, 0.0)
+        f.insert(X[200:300])
+        far = 3.0 * X[300:301]
+        f.insert(far)
+        self.assertEqual(f.insert_method._rho, 0.0)
+        f.insert(X[301:])
+        self.assertTrue(_recalled(f, np.vstack([X, far])).all())
+        self.assertLessEqual(len(f.all_spheres), 20)
+
+    def test_member_norms_within_the_sphere_tolerance_stay_covered(self):
+        """Caps are computed for member norms anywhere in [rho - eps, rho + eps];
+        norms spread across the tolerance (not just float32 rounding) must
+        not open a gap at a cap's rim."""
+        X = _unit_clusters(900, seed=50)
+        scale = np.random.default_rng(51).uniform(1 - 4e-4, 1 + 4e-4, size=(len(X), 1))
+        X = (X * scale).astype(np.float32)
+        f = _streaming_filter('cap_merge', max_spheres=16)
+        f.construct(X[:200])
+        self.assertGreater(f.insert_method._rho, 0.0)
+        for i in range(200, len(X), 5):
+            f.insert(X[i:i + 5])
+        self.assertGreater(f.insert_method._rho, 0.0)   # still in cap mode
+        self.assertGreater(f.insert_method._eps, 1e-4)
+        # Exact margins, without query()'s coverage epsilon to hide a rim gap.
+        C, r = f.all_centers.astype(np.float64), f.all_radiuses.astype(np.float64)
+        margin = (np.linalg.norm(X.astype(np.float64)[:, None, :] - C[None], axis=2) - r[None]).min(axis=1)
+        self.assertLessEqual(float(margin.max()), 1e-6)
+
+    def test_covered_insert_is_a_geometric_no_op(self):
+        X = _unit_clusters(400, seed=48)
+        f = _streaming_filter('cap_merge', max_spheres=20)
+        f.construct(X[:300])
+        f.insert(X[300:350])
+        centers, radii = f.all_centers.copy(), f.all_radiuses.copy()
+        f.insert(np.repeat(X[:10], 3, axis=0))  # every one already covered
+        np.testing.assert_array_equal(f.all_centers, centers)
+        np.testing.assert_array_equal(f.all_radiuses, radii)
+
+    def test_merged_centers_sit_outside_the_sphere(self):
+        """Merged balls go to norm 1/cos(theta), not inside the sphere where
+        an enclosing ball's center sits."""
+        X = _unit_clusters(800, seed=49)
+        f = _streaming_filter('cap_merge', max_spheres=16)
+        f.construct(X[:100])
+        f.insert(X[100:])
+        norms = np.linalg.norm(f.all_centers, axis=1)
+        self.assertTrue(np.all(norms >= 1.0 - 1e-5), norms.min())
 
 
 if __name__ == "__main__":

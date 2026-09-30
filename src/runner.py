@@ -35,6 +35,13 @@ from filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
 from filters.ball_cover.min_heap_insert import MinHeapInsert
 from filters.ball_cover.doubling_insert import DoublingInsert
 from filters.ball_cover.pooled_insert import PooledInsert
+from filters.ball_cover.cap_merge_insert import CapMergeInsert
+from filters.ball_cover.gonzales_construct import GonzalesConstruct
+from filters.ball_cover.merge_construct import MergeConstruct
+from filters.ball_cover.kmeans_construct import KMeansConstruct
+from filters.ball_cover.minimax_construct import MinimaxConstruct
+from filters.ball_cover.split_construct import SplitConstruct
+from filters.ball_cover.sphere_merge_construct import SphereMergeConstruct
 from hyperspheres_volume import estimate_hypersphere_volume
 from vector_source import VectorSource
 
@@ -51,6 +58,27 @@ _INSERT_STRATEGIES = {
     "min_heap": MinHeapInsert,
     "doubling": DoublingInsert,
     "pooled": PooledInsert,
+    "cap_merge": CapMergeInsert,
+}
+
+# Construction methods by name, as factories -- shared by
+# compare_construct_methods.py and stream_rebuild_worker's construct_method.
+CONSTRUCT_METHODS = {
+    "gonzalez": GonzalesConstruct,
+    "merge": MergeConstruct,
+    # seed_multiplier=8: the default that best preserves merge's own quality
+    # (log10_J close to plain merge's, unlike 2x/4x) while still giving a
+    # meaningful construction-time win at scale -- see the profiling note in
+    # merge_construct.py's docstring.
+    "merge_seeded": lambda: MergeConstruct(seed_multiplier=8),
+    "kmeans": KMeansConstruct,
+    "minimax": MinimaxConstruct,
+    # minimax's own centers, moved onto the data's sphere before the radii are
+    # measured (exact_cover.sphere_centers) -- isolates what the sphere
+    # projection alone is worth, at minimax's cost.
+    "minimax_sphere": lambda: MinimaxConstruct(sphere=True),
+    "split": SplitConstruct,
+    "sphere_merge": SphereMergeConstruct,
 }
 
 VectorInput = Union[np.ndarray, VectorSource]
@@ -1223,6 +1251,9 @@ def stream_rebuild_worker(
     sweep: Optional[str] = None,
     fold_offset: Optional[int] = None,
     bootstrap_n: Optional[int] = None,
+    construct_method: Optional[str] = None,
+    stream_order: Optional[str] = None,
+    insert_memory_percent: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Simulates one rebuild policy over vectors_stream (a blocklist fold's
     reference set B, in arrival order -- see main.generate_streaming),
@@ -1230,7 +1261,21 @@ def stream_rebuild_worker(
       "streaming": BallCoverFilter.insert() per arrival, never rebuilt.
       "periodic": like "streaming", rebuilt from scratch every T arrivals.
       "oracle": rebuilt from scratch at every checkpoint.
-    sweep/fold_offset are pass-through tag columns only.
+    sweep/fold_offset/stream_order are pass-through tag columns only.
+
+    construct_method names a CONSTRUCT_METHODS entry (default: the filter's
+    own, GonzalesConstruct) and is used for every construct() the policy
+    makes: the oracle's rebuilds, and the streaming/periodic bootstrap.
+
+    Memory is held to one budget for every method: max_memory is the static
+    filter's footprint at k balls, and BallCoverFilter sizes each insert
+    strategy's ball count so that its peak get_bytesize() between insert()
+    calls fits it (see InsertInterface.max_spheres_for_budget).
+    peak_memory_bytes is that peak as measured over the stream so far, next
+    to budget_bytes. max_insert_s is the slowest single insert() so far, the
+    spike a rebuilding strategy trades for its amortized cost, and
+    insert_time_s the insert-only total (cumulative_time_s also counts the
+    bootstrap construct()).
 
     vectors_query is the fold's [positives, hard, easy] query stream (see
     main.BlocklistWorkload.query_vectors), with n_hard/n_easy the trailing
@@ -1254,13 +1299,28 @@ def stream_rebuild_worker(
         raise ValueError(f"n_hard+n_easy ({n_hard + n_easy}) exceeds n_queries ({n_q})")
     n_pos = n_q - n_hard - n_easy
     metric, method = _rebuild_policy_tags(policy, insertion_level)
-    # we reserve 20% memory pool for pooled insertion, other methods construct at 100% capacity
-    insert_memory_percent = 20.0 if insertion_level == "pooled" else 0.0
+    # By default pooled reserves a 20% pool and every other method constructs
+    # at full capacity; insert_memory_percent overrides that for any method.
+    if insert_memory_percent is None:
+        insert_memory_percent = 20.0 if insertion_level == "pooled" else 0.0
     bootstrap_n = min(bootstrap_n if bootstrap_n is not None else k, n)
     checkpoint_set = sorted(set(c for c in checkpoints if bootstrap_n < c <= n))
     missing = [c for c in checkpoint_set if c not in actual_at_checkpoint]
     if missing:
         raise ValueError(f"actual_at_checkpoint has no ground truth for checkpoint(s) {missing}")
+    if construct_method is not None and construct_method not in CONSTRUCT_METHODS:
+        raise ValueError(f"Unknown construct_method {construct_method!r}; expected one of "
+                         f"{sorted(CONSTRUCT_METHODS)}")
+    budget_bytes = _ball_cover_max_memory(dim, k)
+
+    def _new_filter(insert_method: Any = None, **kwargs: Any) -> BallCoverFilter:
+        if construct_method is not None:
+            kwargs["construct_method"] = CONSTRUCT_METHODS[construct_method]()
+        return BallCoverFilter(dim=dim, max_memory=budget_bytes, insert_method=insert_method, **kwargs)
+
+    peak_memory_bytes = 0
+    max_insert_s = 0.0
+    insert_time_s = 0.0
 
     def _checkpoint_row(filt: BallCoverFilter, pos: int, cumulative_time_s: float) -> Dict[str, Any]:
         """Measures one checkpoint. Raises rather than recording a false
@@ -1279,20 +1339,33 @@ def stream_rebuild_worker(
             )
         # Same [positives, hard, easy] layout as quantization_worker's query
         # stream -- hard then easy negatives are the trailing n_hard+n_easy.
+        # fpr_pos: positives by cluster membership that are farther than tau
+        # from what has arrived, i.e. held-out cluster-mates the cover takes.
+        pos_rates = _confusion_rates(predicted[:n_pos], actual[:n_pos])
         hard_rates = _confusion_rates(predicted[n_pos:n_pos + n_hard], actual[n_pos:n_pos + n_hard])
         easy_rates = _confusion_rates(predicted[n_pos + n_hard:], actual[n_pos + n_hard:])
         radii = filt.all_radiuses
+        n_inserted = pos - bootstrap_n
+        streamed = policy != "oracle" and n_inserted > 0
         return {
             "dataset": dataset, "policy": policy, "T": T, "k": k, "seed": seed,
             "position": pos - bootstrap_n, "tau": tau,
             "fpr": rates["fpr"], "fnr": rates["fnr"],
-            "fpr_hard": hard_rates["fpr"], "fpr_easy": easy_rates["fpr"],
+            "fpr_pos": pos_rates["fpr"], "fpr_hard": hard_rates["fpr"], "fpr_easy": easy_rates["fpr"],
             "n_queries": n_q, "n_duplicates": int(actual.sum()),
             "log10_j_tau": _log10_J(radii, dim, tau=tau),
             "n_balls": len(radii),
             "memory_bytes": filt.get_bytesize(),
+            "peak_memory_bytes": max(peak_memory_bytes, filt.get_bytesize()),
+            "budget_bytes": budget_bytes,
             "cumulative_time_s": cumulative_time_s,
             "amortized_cost_s": cumulative_time_s / pos,
+            "insert_time_s": insert_time_s if streamed else float("nan"),
+            "amortized_insert_s": insert_time_s / n_inserted if streamed else float("nan"),
+            "max_insert_s": max_insert_s if streamed else float("nan"),
+            "construct_method": construct_method or "gonzalez",
+            "stream_order": stream_order,
+            "insert_memory_percent": insert_memory_percent,
             "metric": metric, "method": method, "sweep": sweep, "fold_offset": fold_offset,
         }
 
@@ -1301,7 +1374,7 @@ def stream_rebuild_worker(
 
     if policy == "oracle":
         for c in checkpoint_set:
-            filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
+            filt = _new_filter()
             t0 = time.perf_counter()
             filt.construct(stream_arr[:c])
             cumulative_time_s += time.perf_counter() - t0
@@ -1317,14 +1390,16 @@ def stream_rebuild_worker(
             f"{sorted(_INSERT_STRATEGIES)}"
         )
     rebuild_every = T if (policy == "periodic" and T is not None) else None
-    filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k),
-            insert_method=_INSERT_STRATEGIES[insertion_level](), insert_memory_percent=insert_memory_percent)
-    # Bootstrap via one shared construct() (identical across insertion_level)
-    # so every checkpoint from bootstrap_n onward compares each method's own
-    # decision rule.
+    filt = _new_filter(insert_method=_INSERT_STRATEGIES[insertion_level](),
+                       insert_memory_percent=insert_memory_percent)
+    # Bootstrap with construct() on the same vectors and construct_method for
+    # every insertion_level, so every checkpoint from bootstrap_n onward
+    # compares each method's own decision rule -- at its own ball count, since
+    # each strategy's bookkeeping takes its share of the one byte budget.
     t0 = time.perf_counter()
     filt.construct(stream_arr[:bootstrap_n])
     cumulative_time_s += time.perf_counter() - t0
+    peak_memory_bytes = filt.get_bytesize()
 
     ci = 0
     for t in range(bootstrap_n, n):
@@ -1334,7 +1409,11 @@ def stream_rebuild_worker(
             filt.construct(stream_arr[:pos])
         else:
             filt.insert(stream_arr[t][np.newaxis, :])
-        cumulative_time_s += time.perf_counter() - t0
+        dt = time.perf_counter() - t0
+        cumulative_time_s += dt
+        insert_time_s += dt
+        max_insert_s = max(max_insert_s, dt)
+        peak_memory_bytes = max(peak_memory_bytes, filt.get_bytesize())
 
         if ci < len(checkpoint_set) and pos == checkpoint_set[ci]:
             rows.append(_checkpoint_row(filt, pos, cumulative_time_s))

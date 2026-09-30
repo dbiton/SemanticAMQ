@@ -12,6 +12,7 @@ from src.filters.ball_cover.least_inflation_insert import LeastInflationInsert
 from src.filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
 from src.filters.ball_cover.doubling_insert import DoublingInsert
 from src.filters.ball_cover.pooled_insert import PooledInsert
+from src.filters.ball_cover.cap_merge_insert import CapMergeInsert
 from src.filters.quantized_vector_filter import (
     QuantizedVectorFilter, ErrorBudgetMode, QuantizationLevel, _footprint_bytes,
 )
@@ -32,6 +33,7 @@ def _strategies():
         'nearest': NearestInsert, 'least_inflation': LeastInflationInsert,
         'merge': ExhaustiveMergeInsert, 'min_heap': MinHeapInsert,
         'doubling': DoublingInsert, 'pooled': PooledInsert,
+        'cap_merge': CapMergeInsert,
     }
 
 

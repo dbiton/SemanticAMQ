@@ -1,6 +1,6 @@
 import numpy as np
 import faiss
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from filters.filter import Filter
 from filters.ball_cover.ball_interfaces import InsertInterface
 
@@ -36,7 +36,8 @@ class DoublingInsert(InsertInterface):
         self.growth_budget_fraction = growth_budget_fraction
 
 
-    def initialize_buffers(self, filter: Filter, spheres_indices: np.ndarray, centers: np.ndarray, radii: np.ndarray) -> None:
+    def initialize_buffers(self, filter: Filter, spheres_indices: np.ndarray, centers: np.ndarray, radii: np.ndarray,
+                           vectors: Optional[np.ndarray] = None) -> None:
         pass
 
 
@@ -112,11 +113,26 @@ class DoublingInsert(InsertInterface):
         return centers, radii
 
 
+    def _threshold_for(self, max_spheres: int) -> int:
+        return max(max_spheres + 1, int(round(max_spheres * (1.0 + self.growth_budget_fraction))))
+
+
     def _rebuild_threshold(self, filter: Filter) -> int:
-        return max(
-            filter.max_spheres + 1,
-            int(round(filter.max_spheres * (1.0 + self.growth_budget_fraction))),
-        )
+        return self._threshold_for(filter.max_spheres)
+
+
+    def max_spheres_for_budget(self, usable_bytes: int, bytes_per_ball: int) -> int:
+        """Between insert() calls the filter holds up to threshold - 1 balls
+        (a call that reaches the threshold rebuilds before returning), so
+        that peak is what has to fit -- max_spheres itself is only the
+        post-rebuild size, at 1 / (1 + growth_budget_fraction) of it."""
+        fit = usable_bytes // bytes_per_ball
+        max_spheres = max(1, int(fit / (1.0 + self.growth_budget_fraction)))
+        while max_spheres > 1 and self._threshold_for(max_spheres) - 1 > fit:
+            max_spheres -= 1
+        while self._threshold_for(max_spheres + 1) - 1 <= fit:
+            max_spheres += 1
+        return max_spheres
 
 
     def _rebuild(self, filter: Filter) -> None:

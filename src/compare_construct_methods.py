@@ -41,15 +41,9 @@ import pandas as pd
 faiss.omp_set_num_threads(1)
 
 from logging_config import configure_logging
-from runner import _log10_J, _tau_volume_bounds_log10
+from runner import CONSTRUCT_METHODS, _log10_J, _tau_volume_bounds_log10
 from filters.ball_cover.ball_cover_filter import BallCoverFilter
 from filters.ball_cover.ball_interfaces import ConstructInterface
-from filters.ball_cover.gonzales_construct import GonzalesConstruct
-from filters.ball_cover.merge_construct import MergeConstruct
-from filters.ball_cover.kmeans_construct import KMeansConstruct
-from filters.ball_cover.minimax_construct import MinimaxConstruct
-from filters.ball_cover.split_construct import SplitConstruct
-from filters.ball_cover.sphere_merge_construct import SphereMergeConstruct
 from util.dataset_paths import dataset_filenames
 from vector_source import VectorSource
 
@@ -62,23 +56,9 @@ TAU = 0.1
 # generate_budget's; the bottom extends it into the budgets where every ball
 # is wide, which is where the construction method matters most.
 K_FRACTIONS = (0.005, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2)
-METHODS = {
-    "gonzalez": GonzalesConstruct,
-    "merge": MergeConstruct,
-    # seed_multiplier=8: the default that best preserves merge's own quality
-    # (log10_J close to plain merge's, unlike 2x/4x) while still giving a
-    # meaningful construction-time win at scale -- see the profiling note in
-    # merge_construct.py's docstring and this session's report.
-    "merge_seeded": lambda: MergeConstruct(seed_multiplier=8),
-    "kmeans": KMeansConstruct,
-    "minimax": MinimaxConstruct,
-    # minimax's own centers, moved onto the data's sphere before the radii are
-    # measured (exact_cover.sphere_centers) -- isolates what the sphere
-    # projection alone is worth, at minimax's cost.
-    "minimax_sphere": lambda: MinimaxConstruct(sphere=True),
-    "split": SplitConstruct,
-    "sphere_merge": SphereMergeConstruct,
-}
+# The name -> factory registry lives in runner, which stream_rebuild_worker's
+# construct_method shares.
+METHODS = CONSTRUCT_METHODS
 # main.BLOCKLIST_DATASETS' registry names, repeated here so importing this
 # module (which every worker does) doesn't import main and its ML stack.
 DATASETS = ("WildChat", "CCNews", "WikiAnswers", "Quora", "ChatGPTParaphrases")

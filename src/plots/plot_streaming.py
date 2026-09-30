@@ -18,7 +18,7 @@ DPI = 300
 EMIT_PDF = False
 DEMO = False
 
-METHODS = ["nearest", "least_inflation", "pooled", "merge", "min_heap"]
+METHODS = ["nearest", "least_inflation", "pooled", "merge", "min_heap", "cap_merge"]
 
 METHOD_LABELS = {
     "nearest": "Nearest-center absorb",
@@ -26,14 +26,22 @@ METHOD_LABELS = {
     "pooled": "Pooled Gonzales re-cluster",
     "merge": "Exhaustive cheapest-pair merge",
     "min_heap": "Heap-based cheapest-pair merge",
+    "cap_merge": "Mass-weighted cap merge",
 }
 
+# Okabe-Ito for the first five; cap_merge's #882255 (Tol's wine) was checked
+# with the dataviz skill's validate_palette.js (--mode light --pairs all) on
+# all six: it adds no warning of its own. The set's worst all-pairs CVD
+# separation stays #009E73<->#CC79A7 (dE 7.6, the 6-8 band that needs
+# secondary encoding -- the per-method markers), and #E69F00/#CC79A7 sit
+# below 3:1 on white, as before.
 METHOD_COLORS = {
-    "nearest": "#0072B2", 
-    "least_inflation": "#E69F00", 
-    "pooled": "#CC79A7", 
-    "merge": "#009E73", 
+    "nearest": "#0072B2",
+    "least_inflation": "#E69F00",
+    "pooled": "#CC79A7",
+    "merge": "#009E73",
     "min_heap": "#D55E00",
+    "cap_merge": "#882255",
 }
 
 METHOD_MARKERS = {
@@ -42,6 +50,14 @@ METHOD_MARKERS = {
     "pooled": "s",          # Square
     "merge": "D",           # Diamond
     "min_heap": "v",        # Triangle Down
+    "cap_merge": "P",       # Filled plus
+}
+
+# Static-rebuild references, one per construction method (the rows'
+# construct_method): neutral ink, told apart by dash pattern.
+REFERENCE_STYLES = {
+    "gonzalez": {"color": "black", "linestyle": "--", "label": "Static rebuild, Gonzalez (oracle)"},
+    "sphere_merge": {"color": "#52514e", "linestyle": "-.", "label": "Static rebuild, sphere merge (oracle)"},
 }
 
 _REQUIRED_COLUMNS = [
@@ -231,14 +247,41 @@ def _add_k_annotation(ax: plt.Axes, k_val: int, loc: str = "bottom-left") -> Non
                 va="bottom", ha="left", zorder=10)
 
 
+def _with_construct_method(df: pd.DataFrame) -> pd.DataFrame:
+    """Rows from before construct_method existed were all Gonzalez-built."""
+    df = df.copy()
+    if "construct_method" not in df.columns:
+        df["construct_method"] = "gonzalez"
+    df["construct_method"] = df["construct_method"].fillna("gonzalez")
+    return df
+
+
+def _draw_references(ax: plt.Axes, df: pd.DataFrame, cfg: Config, value_col: str,
+                     band: bool = True, log_floor: bool = False) -> pd.Series:
+    """One static-rebuild line (and faint +-1 std band) per construction
+    method present; returns their positions for axis scaling."""
+    ref = df[(df["sweep"] == "position") & (df["metric"] == "static_reference") & (df["k"] == cfg.k_fixed)]
+    positions = []
+    for construct_method, sub in ref.groupby("construct_method"):
+        style = REFERENCE_STYLES.get(construct_method, {"color": "black", "linestyle": ":"})
+        agg = mean_std(sub, ["position"], value_col).sort_values("position")
+        ax.plot(agg["position"], agg["mean"], color=style["color"], linestyle=style["linestyle"],
+                linewidth=0.9, zorder=4)
+        if band and (agg["std"] > 0).any():
+            lower = agg["mean"] - agg["std"]
+            if log_floor:
+                lower = np.maximum(lower, agg["mean"] / 10.0)
+            ax.fill_between(agg["position"], lower, agg["mean"] + agg["std"], color=style["color"],
+                            alpha=0.04, linewidth=0, zorder=1)
+        positions.append(agg["position"])
+    return pd.concat(positions) if positions else pd.Series(dtype=float)
+
+
 # Panel (a): FPR vs. stream position
 
 def panel_fpr_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)]
     agg = mean_std(sel, ["method", "position"], "fpr")
-
-    ref = df[(df["sweep"] == "position") & (df["metric"] == "static_reference") & (df["k"] == cfg.k_fixed)]
-    ref_agg = mean_std(ref, ["position"], "fpr")
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots(figsize=(3.2, 2.4))
@@ -254,16 +297,10 @@ def panel_fpr_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             upper = sub["mean"] + sub["std"]
             ax.fill_between(sub["position"], lower, upper, color=METHOD_COLORS[method], alpha=0.04, linewidth=0, zorder=2)
 
-    if not ref_agg.empty:
-        ref_agg = ref_agg.sort_values("position")
-        ax.plot(ref_agg["position"], ref_agg["mean"], color="black", linestyle="--", linewidth=0.9, zorder=4)
-        if (ref_agg["std"] > 0).any():
-            lower = np.maximum(ref_agg["mean"] - ref_agg["std"], ref_agg["mean"] / 10.0)
-            upper = ref_agg["mean"] + ref_agg["std"]
-            ax.fill_between(ref_agg["position"], lower, upper, color="black", alpha=0.04, linewidth=0, zorder=1)
+    ref_positions = _draw_references(ax, df, cfg, "fpr", band=True, log_floor=True)
 
     _apply_paper_axes_style(ax, log_x=False, log_y=True)
-    _set_scaled_linear_x_axis(ax, pd.concat([agg["position"], ref_agg["position"]]), "Stream Position")
+    _set_scaled_linear_x_axis(ax, pd.concat([agg["position"], ref_positions]), "Stream Position")
     _add_k_annotation(ax, cfg.k_fixed, loc="bottom-left")
     ax.set_ylabel("FPR")
     style_axes(ax)
@@ -276,14 +313,11 @@ def panel_fpr_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     min_log = df["log10_j_tau"].replace(-np.inf, np.nan).min()
+    df = df.copy()
+    df["log10_j_tau"] = df["log10_j_tau"].replace(-np.inf, min_log + 1e-6)
 
-    sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)].copy()
-    sel["log10_j_tau"] = sel["log10_j_tau"].replace(-np.inf, min_log + 1e-6)
+    sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)]
     agg = mean_std(sel, ["method", "position"], "log10_j_tau")
-
-    ref = df[(df["sweep"] == "position") & (df["metric"] == "static_reference") & (df["k"] == cfg.k_fixed)].copy()
-    ref["log10_j_tau"] = ref["log10_j_tau"].replace(-np.inf, min_log + 1e-6)
-    ref_agg = mean_std(ref, ["position"], "log10_j_tau")
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots(figsize=(3.2, 2.4))
@@ -298,15 +332,10 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             lower, upper = sub["mean"] - sub["std"], sub["mean"] + sub["std"]
             ax.fill_between(sub["position"], lower, upper, color=METHOD_COLORS[method], alpha=0.04, linewidth=0, zorder=2)
 
-    if not ref_agg.empty:
-        ref_agg = ref_agg.sort_values("position")
-        ax.plot(ref_agg["position"], ref_agg["mean"], color="black", linestyle="--", linewidth=0.9, zorder=4)
-        if (ref_agg["std"] > 0).any():
-            lower, upper = ref_agg["mean"] - ref_agg["std"], ref_agg["mean"] + ref_agg["std"]
-            ax.fill_between(ref_agg["position"], lower, upper, color="black", alpha=0.04, linewidth=0, zorder=1)
+    ref_positions = _draw_references(ax, df, cfg, "log10_j_tau", band=True)
 
     _apply_paper_axes_style(ax, log_x=False, log_y=False)
-    _set_scaled_linear_x_axis(ax, pd.concat([agg["position"], ref_agg["position"]]), "Stream Position")
+    _set_scaled_linear_x_axis(ax, pd.concat([agg["position"], ref_positions]), "Stream Position")
     _add_k_annotation(ax, cfg.k_fixed, loc="bottom-left")
     ax.set_ylabel(r"$\log_{10} J_\tau(\mathcal{C})$")
     style_axes(ax)
@@ -322,9 +351,6 @@ def panel_n_balls_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)]
     agg = mean_std(sel, ["method", "position"], "n_balls")
 
-    ref = df[(df["sweep"] == "position") & (df["metric"] == "static_reference") & (df["k"] == cfg.k_fixed)]
-    ref_agg = mean_std(ref, ["position"], "n_balls")
-
     apply_style(cfg.dpi)
     fig, ax = plt.subplots(figsize=(3.2, 2.4))
 
@@ -338,12 +364,10 @@ def panel_n_balls_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             lower, upper = sub["mean"] - sub["std"], sub["mean"] + sub["std"]
             ax.fill_between(sub["position"], lower, upper, color=METHOD_COLORS[method], alpha=0.04, linewidth=0, zorder=2)
 
-    if not ref_agg.empty:
-        ref_agg = ref_agg.sort_values("position")
-        ax.plot(ref_agg["position"], ref_agg["mean"], color="black", linestyle="--", linewidth=0.9, zorder=4)
+    ref_positions = _draw_references(ax, df, cfg, "n_balls", band=False)
 
     _apply_paper_axes_style(ax, log_x=False, log_y=False)
-    _set_scaled_linear_x_axis(ax, pd.concat([agg["position"], ref_agg["position"]]), "Stream Position")
+    _set_scaled_linear_x_axis(ax, pd.concat([agg["position"], ref_positions]), "Stream Position")
     _add_k_annotation(ax, cfg.k_fixed, loc="bottom-left")
     ax.set_ylabel("Number of Balls")
     style_axes(ax)
@@ -463,10 +487,11 @@ def save_method_legend(cfg: Config) -> None:
                for m in METHODS]
     labels = [METHOD_LABELS[m] for m in METHODS]
 
-    handles.append(plt.Line2D([0], [0], color="black", linestyle="--", linewidth=1.0))
-    labels.append("Static rebuild (oracle)")
+    for style in REFERENCE_STYLES.values():
+        handles.append(plt.Line2D([0], [0], color=style["color"], linestyle=style["linestyle"], linewidth=1.0))
+        labels.append(style["label"])
 
-    fig.legend(handles, labels, loc="center", ncol=3, frameon=False, fontsize=7.8)
+    fig.legend(handles, labels, loc="center", ncol=4, frameon=False, fontsize=7.8)
     fig.patch.set_alpha(0.0)
     save_figure(fig, "streaming-method-legend.png", cfg.outdir, cfg.dpi, cfg.emit_pdf, transparent=True)
 
@@ -485,21 +510,31 @@ def print_summary(df: pd.DataFrame, cfg: Config) -> None:
 def generate_streaming_figures(df: Optional[pd.DataFrame] = None, outdir: str = OUTDIR,
                                k_fixed: Optional[int] = K_FIXED,
                                dpi: int = DPI, emit_pdf: bool = EMIT_PDF) -> None:
-    if df is None:
-        df = load_data()
-    else:
-        _validate_schema(df)
+    """One figure set per bootstrap construction method: the default
+    (Gonzalez) bootstrap's set at `outdir` itself, any other's under
+    `outdir`/bootstrap-<method>/. Every set draws the static-rebuild
+    reference of each construction method present, so each method's gap
+    can be read against both oracles."""
+    df = _with_construct_method(load_data() if df is None else df)
+    refs = df[df["metric"] == "static_reference"]
+    streamed = df[df["metric"] != "static_reference"]
+    bootstraps = sorted(streamed["construct_method"].unique(), key=lambda m: (m != "gonzalez", m))
 
-    cfg = resolve_config(df, k_fixed=k_fixed, dpi=dpi, emit_pdf=emit_pdf, outdir=outdir)
+    for bootstrap in bootstraps:
+        sub = pd.concat([streamed[streamed["construct_method"] == bootstrap], refs], ignore_index=True)
+        _validate_schema(sub)
+        out = outdir if bootstrap == "gonzalez" else os.path.join(outdir, f"bootstrap-{bootstrap}")
+        cfg = resolve_config(sub, k_fixed=k_fixed, dpi=dpi, emit_pdf=emit_pdf, outdir=out)
 
-    panel_fpr_vs_position(df, cfg)
-    panel_geometric_objective(df, cfg)
-    panel_n_balls_vs_position(df, cfg)
-    panel_insertion_throughput(df, cfg)
-    panel_vectors_vs_balls(df, cfg)
-    panel_filter_size(df, cfg)
-    save_method_legend(cfg)
-    print_summary(df, cfg)
+        panel_fpr_vs_position(sub, cfg)
+        panel_geometric_objective(sub, cfg)
+        panel_n_balls_vs_position(sub, cfg)
+        if ((sub["sweep"] == "k") & (sub["metric"] == "checkpoint")).any():
+            panel_insertion_throughput(sub, cfg)
+        panel_vectors_vs_balls(sub, cfg)
+        panel_filter_size(sub, cfg)
+        save_method_legend(cfg)
+        print_summary(sub, cfg)
 
     snippet = r"""
 \begin{subfigure}[b]{\linewidth}
