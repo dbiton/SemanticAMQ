@@ -20,7 +20,8 @@ from scipy.sparse import csr_matrix
 faiss.omp_set_num_threads(1)  # belt-and-suspenders alongside the env vars above
 
 from logging_config import configure_logging
-from runner import (Runner, CONSTRUCT_METHODS, QUANTIZATION_SWEEP, QUERY_SOURCES,
+from runner import (Runner, BALL_COVER_CONSTRUCT, BALL_COVER_QUANTIZE, CONSTRUCT_METHODS,
+                    QUANTIZATION_SWEEP, QUERY_SOURCES,
                     system_tau_ground_truth_worker)
 from plots.plot_quantization import generate_quantization_figures
 from plots.plot_query_performance import generate_query_performance_figures
@@ -368,7 +369,7 @@ def generate_equal_memory(runner: Runner) -> None:
     # -- submitted once per variant below, each becoming its own labelled
     # line ("BallCoverFilter (TQ4)" etc. -- see runner.equal_memory_worker's
     # Config naming) rather than picking one variant to stand in for it.
-    ball_cover_quantizations = [Quantize.TQ4]
+    ball_cover_quantizations = [BALL_COVER_QUANTIZE]
 
     workloads = blocklist_workloads(num_vectors, n_folds=n_folds)
     if not workloads:
@@ -764,17 +765,30 @@ def _cluster_cache_exists(dataset: str, n: int, eps: float, xgroup: bool) -> boo
     return os.path.exists(_cluster_cache_path(dataset, n, eps, xgroup))
 
 
+_READ_WINDOW = 65_536  # rows per contiguous HDF5 read in _read_rows (~100 MB at d=384)
+
+
 def _read_rows(dataset: str, idx: np.ndarray) -> np.ndarray:
     """Just the requested rows of a dataset's embeddings, straight from HDF5.
 
-    h5py fancy indexing needs a sorted, unique selection, so the request is
+    Read as contiguous windows of _READ_WINDOW rows, keeping the requested rows
+    of each, rather than by h5py fancy indexing: that builds one selection per
+    point and scales superlinearly -- 582s for a fold's 80K scattered rows
+    against 1.6s for all 808K Quora rows read contiguously. The request is
     sorted for the read and then mapped back to the caller's order.
     """
     order = np.argsort(idx, kind="stable")
     sorted_idx = idx[order]
     uniq, inverse = np.unique(sorted_idx, return_inverse=True)
     with h5py.File(dataset_filenames[dataset], "r") as f:
-        block = f[HDF5_DATASET_KEY][uniq]
+        dset = f[HDF5_DATASET_KEY]
+        block = np.empty((len(uniq), dset.shape[1]), dtype=np.float32)
+        a = 0
+        while a < len(uniq):
+            lo = int(uniq[a])
+            b = int(np.searchsorted(uniq, lo + _READ_WINDOW))
+            block[a:b] = dset[lo:int(uniq[b - 1]) + 1][uniq[a:b] - lo]
+            a = b
     out = np.empty((len(idx), block.shape[1]), dtype=np.float32)
     out[order] = block[inverse]
     return np.ascontiguousarray(out)
@@ -1588,7 +1602,8 @@ def generate_streaming(runner: Runner) -> None:
     # streamed filter's bootstrap and its static-rebuild oracle, so every
     # method's gap can be read against either reference. Gonzalez is the
     # filter's default; sphere_merge is the best construction method measured
-    # (generate_construct_methods). The k sweep keeps the default only.
+    # (generate_construct_methods). The k sweep uses sphere_merge only
+    # (runner.BALL_COVER_CONSTRUCT), unquantized like the position sweep.
     construct_methods  = ["gonzalez", "sphere_merge"]
     # The fixed absolute tau generate_budget/generate_quantization/
     # generate_equal_memory use, so every blocklist-workload evaluation sits
@@ -1654,7 +1669,7 @@ def generate_streaming(runner: Runner) -> None:
             for method in methods:
                 for k_val in [2 ** p for p in range(4, max_p + 1)]:
                     runner.submit('stream_rebuild', k=k_val, policy="streaming", insertion_level=method,
-                                  sweep="k", **common)
+                                  sweep="k", construct_method=BALL_COVER_CONSTRUCT, **common)
 
 
 def save_streaming(job_results: List[Tuple[str, Any]], default_k: int = 16) -> Tuple[pd.DataFrame, int]:
