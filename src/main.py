@@ -187,35 +187,6 @@ equal_memory_filters = [
     PacukLSHFilter, SankowskiWygockiFilter, VAPlusFilter,
 ]
 
-def calculate_nn_distance_threshold(
-    construct_vectors: np.ndarray,
-    percentage: float,
-    sample_size: int = 5_000,
-    seed: int = 42,
-) -> float:
-    """The `percentage`-th percentile of nearest-*other*-neighbor distance
-    within a sample of construct_vectors -- ties the threshold to the actual
-    test compute_static_actual_results performs, unlike a random-pairwise
-    percentile: at large construct-set sizes a point's nearest neighbor is
-    much closer than a random pair, so a random-pairwise percentile silently
-    pushes the duplicate rate toward 100%, collapsing FPR/FNR to degenerate
-    values."""
-    n = len(construct_vectors)
-    if n < 2:
-        return 0.0
-
-    vecs = np.ascontiguousarray(construct_vectors, dtype=np.float32)
-    rng = np.random.default_rng(seed)
-    sample_idx = rng.choice(n, size=sample_size, replace=False) if sample_size < n else np.arange(n)
-
-    index = faiss.IndexFlatL2(vecs.shape[1])
-    index.add(vecs)
-    # k=2: rank 0 is the point itself (distance 0); rank 1 is the *other* nearest neighbor.
-    sq_dist, _ = index.search(vecs[sample_idx], 2)
-    nn_dist = np.sqrt(np.clip(sq_dist[:, 1], 0, None))
-    return float(np.percentile(nn_dist, percentage))
-
-
 def advancing_fold_starts(pool_len: int, k_folds: int, fold_stride: int, window_len: int) -> List[int]:
     """Non-wrapping K-fold-like sweep: fold f's window starts f*fold_stride
     into the pool and is window_len vectors wide, never wrapping back to the
@@ -1344,7 +1315,7 @@ def generate_query_performance() -> pd.DataFrame:
     dim                   = 384
     percentage_construct  = 20
     k_values              = [16, 32, 64, 128, 256, 512, 1024]
-    query_tau             = 0.35
+    query_tau             = 0.1
     seeds                 = [0, 1, 2]
     single_query_limit    = 2000
     output_csv            = "results/query_performance.csv"
@@ -1451,8 +1422,9 @@ def generate_scaling(runner: Runner) -> None:
     # magnitude in 6 lines.
     batch_sizes      = [1, 4, 16, 64, 256, 1024]
     # Throughput is threshold-independent here (query() scores every ball
-    # before comparing), so this only has to be a valid tau, not a tuned one.
-    tau_mid          = 0.35
+    # before comparing), so this only has to be a valid tau, not a tuned one;
+    # 0.1 anyway, the operating point of every other evaluation.
+    tau_mid          = 0.1
     # Fractions of each fold's blocklist query stream (held-out + withheld +
     # singleton -- see BlocklistWorkload.query_vectors) consumed by the
     # query and insert sweeps. Both draw from the same stream since neither
