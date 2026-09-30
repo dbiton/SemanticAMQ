@@ -689,17 +689,25 @@ class BallCoverFilter(Filter):
         self._all_centers = None # clear temporary centers view
 
 
-    def query(self, vectors: np.ndarray, distance_threshold: float) -> list[bool]:
+    def surface_distance(self, vectors: np.ndarray) -> np.ndarray:
+        """Per query, the smallest (distance to a ball's center - its radius)
+        over every ball; inf with no balls. query() accepts exactly the rows
+        where this is <= distance_threshold + _COVERAGE_EPSILON, so a caller
+        sweeping many thresholds over one cover can search once."""
         if not self._constructed:
             raise ValueError("BallCoverFilter has not been constructed.")
 
         if self._num_spheres == 0 or len(vectors) == 0:
-            return [False] * len(vectors)
+            return np.full(len(vectors), np.inf)
 
         Q = np.ascontiguousarray(vectors, dtype=np.float32)
         d2, labels = self.all_centers_index.search(Q, self._num_spheres)
         surface = np.where(labels >= 0, np.sqrt(np.maximum(d2, 0.0)) - self._all_radiuses[np.maximum(labels, 0)], np.inf)
-        return (surface.min(axis=1) <= distance_threshold + self._COVERAGE_EPSILON).tolist()
+        return surface.min(axis=1)
+
+
+    def query(self, vectors: np.ndarray, distance_threshold: float) -> list[bool]:
+        return (self.surface_distance(vectors) <= distance_threshold + self._COVERAGE_EPSILON).tolist()
 
 
     def insert(self, vectors: np.ndarray) -> None:
