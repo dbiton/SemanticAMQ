@@ -25,7 +25,6 @@ class Quantize(Enum):
          8   SQ8      scalar 8-bit                      384   3 KB
          8   TQ8      rotation + TurboQuant 8-bit        384   seed only
          6   SQ6      scalar 6-bit                      288   3 KB
-         5   TQ5      rotation + TurboQuant 5-bit        248   seed only
          4   SQ4      scalar 4-bit                      192   3 KB
          4   TQ4      rotation + TurboQuant 4-bit        192   seed only
          3   TQ3      rotation + TurboQuant 3-bit       144   60 B + seed
@@ -37,7 +36,7 @@ class Quantize(Enum):
          1   PQ8_R1   PQ, 8-bit subquantizers (m=48)     48   384 KB
          1   RABITQ   rotation + RaBitQ                  56   seed only
 
-    TQ1/TQ2/TQ4/TQ5/TQ8 fill out the rest of faiss's TurboQuant family
+    TQ1/TQ2/TQ4/TQ8 fill out the rest of faiss's TurboQuant family
     alongside TQ3 (see _ENCODINGS): evaluation-only for now (added to
     runner.QUANTIZATION_SWEEP but deliberately not to
     plot_quantization.QUANTIZE_SWEEP, so they generate rows without yet
@@ -47,17 +46,17 @@ class Quantize(Enum):
     family, not because it has been shown to pay off at every one of these
     bit rates (a synthetic probe suggested it might not always help, e.g.
     at 8-bit -- see the results this sweep produces before trusting that).
-    TQ5 has no MSE-trained ("tqmse") faiss variant, unlike the others --
-    QT_5bit_tq is the plain (quantile-based) TurboQuant encoder, which also
-    stores each center's exact norm (the 8 bytes above 5 * 384 / 8 = 240) and
-    folds it into search(); see _Encoding.norm_offset for what query() does
-    about that.
+    There is deliberately no 5-bit rung: faiss offers 5-bit TurboQuant only
+    as the plain QT_5bit_tq, which folds each vector's stored exact norm into
+    search() -- scoring ||q - decode(c)||^2 plus a per-center constant, not
+    a distance to any point -- and it produced false negatives in the
+    equal-memory sweep, so it was removed.
 
     Every ball also stores its radius as fp16, so a ball costs center + 2
     bytes -- see bytes_per_ball().
 
     CAVEAT on RABITQ: every other row is exact ADC -- search() returns
-    ||q - decode(c)||, TQ5 once query() removes its norm offset -- so the
+    ||q - decode(c)|| -- so the
     one-sided inflation in _add_spheres is a proof. RaBitQ instead scores through its own estimator, which is not tied
     to sa_decode's output: measured against exact distances over 3.6M
     (query, center) pairs on real embeddings it under-estimated every single
@@ -78,7 +77,6 @@ class Quantize(Enum):
     SQ8 = "SQ8"
     TQ8 = "TQ8"
     SQ6 = "SQ6"
-    TQ5 = "TQ5"
     SQ4 = "SQ4"
     TQ4 = "TQ4"
     TQ3 = "TQ3"
@@ -99,16 +97,6 @@ class _Encoding:
     qtype: Optional[int] = None    # ScalarQuantizer.QT_* -- kind == "sq"
     nbits: int = 0                 # bits per subquantizer -- kind == "pq"
     rotate: bool = False           # see _ROTATION_SEED
-    # faiss's plain (non-"tqmse") TurboQuant scalar quantizers, QT_<n>bit_tq,
-    # store each vector's exact norm in 8 extra code bytes and score
-    # ||q||^2 - 2<q, decode(c)> + ||c||^2 -- i.e. ||q - decode(c)||^2 plus a
-    # per-center constant ||c||^2 - ||decode(c)||^2. That is not a distance to
-    # any point, so the triangle-inequality argument query() rests on fails:
-    # measured on WildChat, search() over-estimated ||q - decode(c)|| by up to
-    # 0.145, and an over-estimate is a false negative. query() subtracts the
-    # constant back out (see _search_offsets), which makes such an encoding
-    # exact ADC like the rest.
-    norm_offset: bool = False
 
 
 # An orthonormal rotation in front of the quantizer. Orthonormal is the
@@ -147,12 +135,10 @@ _ENCODINGS = {
     Quantize.SQ8: _Encoding(rate=8, kind="sq", qtype=faiss.ScalarQuantizer.QT_8bit),
     # The rest of faiss's TurboQuant family, alongside TQ3 -- see the
     # Quantize docstring for why these are evaluation-only (swept but not
-    # plotted) for now. All MSE-trained ("tqmse") except TQ5, which faiss
-    # only offers as the plain quantile-based QT_5bit_tq.
+    # plotted) for now. All MSE-trained ("tqmse"); see the Quantize
+    # docstring for why the plain 5-bit QT_5bit_tq is not among them.
     Quantize.TQ8: _Encoding(rate=8, kind="sq", qtype=faiss.ScalarQuantizer.QT_8bit_tqmse, rotate=True),
     Quantize.SQ6: _Encoding(rate=6, kind="sq", qtype=faiss.ScalarQuantizer.QT_6bit),
-    Quantize.TQ5: _Encoding(rate=5, kind="sq", qtype=faiss.ScalarQuantizer.QT_5bit_tq, rotate=True,
-                            norm_offset=True),
     Quantize.SQ4: _Encoding(rate=4, kind="sq", qtype=faiss.ScalarQuantizer.QT_4bit),
     Quantize.TQ4: _Encoding(rate=4, kind="sq", qtype=faiss.ScalarQuantizer.QT_4bit_tqmse, rotate=True),
     # QT_3bit_tqmse is the MSE-trained TurboQuant variant; there is no plain
@@ -517,25 +503,6 @@ class BallCoverFilter(Filter):
         return np.linalg.norm(centers - decoded, axis=1).astype(np.float32)
 
 
-    def _search_offsets(self) -> np.ndarray:
-        """Per-ball constant search() adds on top of ||q - decode(c)||^2,
-        indexed by sphere id (see _Encoding.norm_offset). Measured from the
-        index on every call rather than stored: searching from the origin
-        returns the codec's own stored-norm term ||c||^2, and decode gives
-        ||decode(c)||^2, so the offset is a function of each ball's code and
-        costs no bytes beyond it."""
-        offsets = np.zeros(len(self._all_radiuses), dtype=np.float32)
-        if self._num_spheres == 0:
-            return offsets
-        origin = np.zeros((1, self.dim), dtype=np.float32)
-        d2, labels = self.all_centers_index.search(origin, self._num_spheres)
-        valid = labels[0] >= 0
-        ids = labels[0][valid]
-        decoded = self.all_centers_index.reconstruct_batch(ids)
-        offsets[ids] = d2[0][valid] - np.einsum("ij,ij->i", decoded, decoded)
-        return offsets
-
-
     def _train_quantizer(self, centers: np.ndarray) -> faiss.IndexIDMap2:
         """Fits the one codebook this filter will ever use, on the ball
         centers themselves, and *returns* the index. Called exactly once, by
@@ -731,8 +698,6 @@ class BallCoverFilter(Filter):
 
         Q = np.ascontiguousarray(vectors, dtype=np.float32)
         d2, labels = self.all_centers_index.search(Q, self._num_spheres)
-        if _ENCODINGS[self.quantize].norm_offset:
-            d2 = d2 - self._search_offsets()[np.maximum(labels, 0)]
         surface = np.where(labels >= 0, np.sqrt(np.maximum(d2, 0.0)) - self._all_radiuses[np.maximum(labels, 0)], np.inf)
         return (surface.min(axis=1) <= distance_threshold + self._COVERAGE_EPSILON).tolist()
 

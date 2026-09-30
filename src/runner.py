@@ -670,16 +670,17 @@ QUANTIZATION_SWEEP = (
     # weaker guarantee than the other ten rungs; see the CAVEAT on
     # Quantize.RABITQ. Stays constructible, just not swept by default.
     Quantize.PQ4_R1, Quantize.PQ8_R1,
-    # The rest of faiss's TurboQuant family alongside TQ3 (TQ1/TQ2/TQ4/TQ5/
-    # TQ8 -- see the Quantize docstring). Evaluation-only: swept here so
+    # The rest of faiss's TurboQuant family alongside TQ3 (TQ1/TQ2/TQ4/TQ8
+    # -- see the Quantize docstring). Evaluation-only: swept here so
     # results/quantization.csv carries their rows, but deliberately left out
     # of plot_quantization.QUANTIZE_SWEEP (a separate, hand-kept list, not
     # imported from here -- see that file's comment) so no figure changes
     # until they've actually been looked at. All exact ADC like the rest of
-    # the scalar-quantizer rungs -- TQ5 only once BallCoverFilter.query()
-    # removes its codec's norm offset (see _Encoding.norm_offset); before
-    # that it broke the zero-false-negative invariant this worker asserts.
-    Quantize.TQ1, Quantize.TQ2, Quantize.TQ4, Quantize.TQ5, Quantize.TQ8,
+    # the scalar-quantizer rungs. (There is no TQ5: faiss's only 5-bit
+    # TurboQuant, QT_5bit_tq, is not exact ADC and broke the
+    # zero-false-negative invariant this worker asserts -- see the Quantize
+    # docstring.)
+    Quantize.TQ1, Quantize.TQ2, Quantize.TQ4, Quantize.TQ8,
 )
 
 

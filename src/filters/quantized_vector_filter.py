@@ -3,7 +3,7 @@ the vectors" counterpart to BallCoverFilter's "compress the geometry". Keeps
 every construct vector, quantized to whichever scheme on a fixed fidelity
 ladder fits the memory budget, finest first: float16, then the same
 TurboQuant/scalar-quantizer rungs BallCoverFilter's own Quantize ladder sweeps
-(8, 6, 5, 4, 3, 2 bits/dim -- see filters.ball_cover.ball_cover_filter.Quantize
+(8, 6, 4, 3, 2 bits/dim -- see filters.ball_cover.ball_cover_filter.Quantize
 for the full bits-per-dim table this mirrors), then RaBitQ (~1 bit/dim, no
 codebook) as the coarsest fallback. The finer, evenly-spaced steps (vs. the
 old FP16/8-bit/4-bit/RaBitQ ladder's big jumps) give a smoother
@@ -39,7 +39,6 @@ class QuantizationLevel(Enum):
     FP16 = "fp16"
     TQ8 = "tq8"
     SQ6 = "sq6"
-    TQ5 = "tq5"
     TQ4 = "tq4"
     TQ3 = "tq3"
     TQ2 = "tq2"
@@ -55,15 +54,14 @@ class ErrorBudgetMode(Enum):
 # Finest -> coarsest. Walked in this order by _choose_level.
 _LADDER: Tuple[QuantizationLevel, ...] = (
     QuantizationLevel.FP16, QuantizationLevel.TQ8, QuantizationLevel.SQ6,
-    QuantizationLevel.TQ5, QuantizationLevel.TQ4, QuantizationLevel.TQ3,
-    QuantizationLevel.TQ2, QuantizationLevel.RABITQ,
+    QuantizationLevel.TQ4, QuantizationLevel.TQ3, QuantizationLevel.TQ2,
+    QuantizationLevel.RABITQ,
 )
 
 _SQ_QTYPES = {
     QuantizationLevel.FP16: faiss.ScalarQuantizer.QT_fp16,
     QuantizationLevel.TQ8: faiss.ScalarQuantizer.QT_8bit_tqmse,
     QuantizationLevel.SQ6: faiss.ScalarQuantizer.QT_6bit,
-    QuantizationLevel.TQ5: faiss.ScalarQuantizer.QT_5bit_tq,
     QuantizationLevel.TQ4: faiss.ScalarQuantizer.QT_4bit_tqmse,
     QuantizationLevel.TQ3: faiss.ScalarQuantizer.QT_3bit_tqmse,
     QuantizationLevel.TQ2: faiss.ScalarQuantizer.QT_2bit_tqmse,
@@ -73,16 +71,9 @@ _SQ_QTYPES = {
 # TurboQuant rung; SQ6 is a plain min/max scalar quantizer like the old
 # ladder's SQ8/SQ4 were, so it doesn't). See _make_rotation.
 _ROTATED_LEVELS = {
-    QuantizationLevel.TQ8, QuantizationLevel.TQ5, QuantizationLevel.TQ4,
-    QuantizationLevel.TQ3, QuantizationLevel.TQ2,
+    QuantizationLevel.TQ8, QuantizationLevel.TQ4, QuantizationLevel.TQ3,
+    QuantizationLevel.TQ2,
 }
-
-# Rungs whose faiss codec folds each vector's stored exact norm into
-# search(): QT_5bit_tq scores ||q - x_hat||^2 + (||x||^2 - ||x_hat||^2), not
-# ||q - x_hat||^2, so it is not exact w.r.t. decode() and the eps_i argument
-# fails unless query() subtracts that per-vector constant back out (see
-# _search_offsets and BallCoverFilter's _Encoding.norm_offset).
-_NORM_OFFSET_LEVELS = {QuantizationLevel.TQ5}
 
 _BYTES_FP32 = 4
 # Plain sign-bit RaBitQ (nb_bits=1) -- exactly "1 bit per dimension", and
@@ -340,12 +331,9 @@ class QuantizedVectorFilter(Filter):
         thresh_sq = (float(tau) + self._eps_per_vector()) ** 2
 
         if self._sq_index is not None:
-            # faiss's ScalarQuantizer ADC is exact w.r.t. decode() -- for the
-            # norm-offset rungs only once _search_offsets() is removed -- so
-            # this is safe for the zero-false-negative acceptance rule.
+            # faiss's ScalarQuantizer ADC is exact w.r.t. decode(), so this
+            # is safe for the zero-false-negative acceptance rule.
             d2, ids = self._sq_index.search(q, self._n)
-            if self.level in _NORM_OFFSET_LEVELS:
-                d2 = d2 - self._search_offsets()[np.maximum(ids, 0)]
             hit = (d2 <= thresh_sq[ids]).any(axis=1)
         else:
             # RaBitQ's own search is a fast *probabilistic* estimator, not
@@ -357,20 +345,6 @@ class QuantizedVectorFilter(Filter):
             hit = (d2 <= thresh_sq[None, :]).any(axis=1)
 
         return hit.tolist()
-
-
-    def _search_offsets(self) -> np.ndarray:
-        """Per-vector constant search() adds on top of ||q - decode(x)||^2
-        (see _NORM_OFFSET_LEVELS), measured on every call rather than stored:
-        searching from the origin returns the codec's stored ||x||^2, and
-        decode gives ||decode(x)||^2, so it costs no bytes beyond the codes."""
-        origin = np.zeros((1, self.dim), dtype=np.float32)
-        d2, ids = self._sq_index.search(origin, self._n)
-        decoded = self._sq_index.reconstruct_n(0, self._n)
-        offsets = np.zeros(self._n, dtype=np.float32)
-        valid = ids[0] >= 0
-        offsets[ids[0][valid]] = d2[0][valid] - np.einsum("ij,ij->i", decoded, decoded)[ids[0][valid]]
-        return offsets
 
 
     def get_bytesize(self) -> int:

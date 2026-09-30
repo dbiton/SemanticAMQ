@@ -57,7 +57,7 @@ class ExhaustiveMergeInsert(InsertInterface):
         # re-encoded at the end: re-adding an untouched ball re-encodes an
         # already-decoded center, and on a lossy encoding that charges its
         # re-encoding drift to the radius again on every call -- 200 no-op
-        # inserts grew TQ5 radii by up to 18.8.
+        # inserts grew 5-bit TurboQuant radii by up to 18.8.
         orig_ids = filter.all_spheres.astype(np.int64)
         src = np.full(capacity, -1, dtype=np.int64)
         src[:n] = np.arange(n)

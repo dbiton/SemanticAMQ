@@ -51,7 +51,7 @@ EMIT_PDF = False
 QUANTIZE_SWEEP = (
     Quantize.FP32, Quantize.FP16,
     Quantize.SQ8, Quantize.TQ8,
-    Quantize.SQ6, Quantize.TQ5,
+    Quantize.SQ6,
     Quantize.SQ4, Quantize.TQ4,
     Quantize.TQ3,
     Quantize.TQ2, Quantize.PQ4_R2, Quantize.PQ8_R2,
@@ -67,7 +67,6 @@ STAGE_LABELS = {
     Quantize.SQ8.value: "SQ8 (8b)",
     Quantize.TQ8.value: "TQ8 (8b)",
     Quantize.SQ6.value: "SQ6 (6b)",
-    Quantize.TQ5.value: "TQ5 (5b)",
     Quantize.SQ4.value: "SQ4 (4b)",
     Quantize.TQ4.value: "TQ4 (4b)",
     Quantize.TQ3.value: "TQ3 (3b)",
@@ -84,10 +83,10 @@ STAGE_LABELS = {
 # panels had before per-quantize breakdown existed.
 BASELINE_STAGE = Quantize.FP32.value
 
-# tab20 has 20 qualitative colors, enough for the 15 swept variants with room
+# tab20 has 20 qualitative colors, enough for the 14 swept variants with room
 # to spare; zip() stops at the shorter of the two, so re-adding a rung is
 # safe as long as it stays under 20. (tab10 was enough before TQ1/TQ2/TQ4/
-# TQ5/TQ8 joined the sweep -- at 15 stages it silently left the last 5
+# TQ8 joined the sweep -- beyond 10 stages it silently left the rest
 # without a color, which is a KeyError waiting at STAGE_COLORS[stage].)
 _STAGE_PALETTE = plt.get_cmap("tab20").colors
 STAGE_COLORS = dict(zip(STAGES, _STAGE_PALETTE))

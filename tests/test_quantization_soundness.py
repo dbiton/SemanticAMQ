@@ -14,7 +14,7 @@ from src.filters.ball_cover.doubling_insert import DoublingInsert
 from src.filters.ball_cover.pooled_insert import PooledInsert
 from src.filters.ball_cover.cap_merge_insert import CapMergeInsert
 from src.filters.quantized_vector_filter import (
-    QuantizedVectorFilter, ErrorBudgetMode, QuantizationLevel, _footprint_bytes,
+    QuantizedVectorFilter, ErrorBudgetMode, _LADDER, _footprint_bytes,
 )
 
 DIM = 64
@@ -24,8 +24,8 @@ EPS = BallCoverFilter._COVERAGE_EPSILON
 # query() must score exactly ||q - decode(c)||. RaBitQ scores through its own
 # estimator instead (see the CAVEAT on Quantize.RABITQ), so it is left out.
 EXACT_ENCODINGS = [q for q in Quantize if q not in (Quantize.NONE, Quantize.RABITQ)]
-# Lossy encodings the streaming tests run on, one per codec family, plus TQ5.
-STREAMING_ENCODINGS = [Quantize.FP32, Quantize.SQ4, Quantize.TQ3, Quantize.TQ5, Quantize.PQ4_R1]
+# Lossy encodings the streaming tests run on, one per codec family.
+STREAMING_ENCODINGS = [Quantize.FP32, Quantize.SQ4, Quantize.TQ3, Quantize.PQ4_R1]
 
 
 def _strategies():
@@ -57,9 +57,9 @@ def _exact_margin(f: BallCoverFilter, queries: np.ndarray) -> np.ndarray:
 
 class TestQueryIsExactADC(unittest.TestCase):
     """query() must accept exactly the queries the decoded geometry says it
-    should. faiss's plain TurboQuant codec (TQ5's QT_5bit_tq) folds each
-    center's stored norm into search(), which over-estimated distances and
-    dropped true duplicates until query() subtracted that offset back out."""
+    should. faiss's plain TurboQuant codec (the removed TQ5's QT_5bit_tq)
+    folded each center's stored norm into search(), which over-estimated
+    distances and dropped true duplicates."""
 
     def test_query_matches_decoded_geometry(self):
         X = _clustered(3000)
@@ -77,14 +77,6 @@ class TestQueryIsExactADC(unittest.TestCase):
                                     f"{quantize.value} tau={tau}: rejected {np.sum(~got[must_accept])} covered queries")
                     self.assertFalse(got[must_reject].any(),
                                      f"{quantize.value} tau={tau}: accepted {np.sum(got[must_reject])} uncovered queries")
-
-    def test_tq5_search_needs_the_offset_removed(self):
-        """Guards the premise of the fix: if a faiss upgrade ever makes
-        QT_5bit_tq exact, _Encoding.norm_offset should come off TQ5."""
-        f = BallCoverFilter(dim=DIM, max_spheres=400, quantize=Quantize.TQ5)
-        f.construct(_clustered(3000))
-        offsets = f._search_offsets()[f.all_spheres]
-        self.assertGreater(np.abs(offsets).max(), 1e-3)
 
 
 class TestStreamingInsertSoundness(unittest.TestCase):
@@ -133,28 +125,32 @@ class TestStreamingInsertSoundness(unittest.TestCase):
                     self.assertEqual(sorted(before.values()), sorted(after.values()))
 
 
-class TestQuantizedVectorFilterTQ5(unittest.TestCase):
-    """QuantizedVectorFilter shares QT_5bit_tq with BallCoverFilter's TQ5 and
-    relied on the same (false) exact-ADC assumption."""
+class TestQuantizedVectorFilterLevels(unittest.TestCase):
+    """Every rung of QuantizedVectorFilter's ladder, each forced by a budget
+    that fits it exactly, must recall every near-duplicate -- the eps_i
+    argument rests on each rung's search() being exact w.r.t. decode()."""
 
-    def test_tq5_level_has_no_false_negatives(self):
-        dim = 128  # TQ5 (80 B + 8 B norm) undercuts SQ6 (96 B) only from here up
+    def test_every_level_has_no_false_negatives(self):
+        dim = 128
         X = _clustered(1500, dim=dim)
-        mode = ErrorBudgetMode.PER_VECTOR
-        budget = _footprint_bytes(QuantizationLevel.TQ5, len(X), dim, mode, 8)
-        f = QuantizedVectorFilter(dim=dim, distance_threshold=0.1, max_memory=budget, error_budget_mode=mode)
-        f.construct(X)
-        self.assertEqual(f.level, QuantizationLevel.TQ5)
+        tau = 0.1
         # Near-duplicates strictly inside tau: QVF has no coverage epsilon, so
         # a query exactly at tau + eps_i is decided by float noise on every
         # level -- a separate, level-independent issue this test stays clear of.
-        tau = 0.1
         rng = np.random.default_rng(3)
         step = rng.standard_normal(X.shape)
         step *= rng.uniform(0.2, 0.9, (len(X), 1)) * tau / np.linalg.norm(step, axis=1, keepdims=True)
         near = (X + step).astype(np.float32)
-        got = np.asarray(f.query(near, tau=tau))
-        self.assertTrue(got.all(), f"{np.sum(~got)} of {len(near)} near-duplicates rejected")
+        for mode in ErrorBudgetMode:
+            for level in _LADDER:
+                with self.subTest(level=level.value, mode=mode.value):
+                    budget = _footprint_bytes(level, len(X), dim, mode, 8)
+                    f = QuantizedVectorFilter(dim=dim, distance_threshold=tau, max_memory=budget,
+                                              error_budget_mode=mode)
+                    f.construct(X)
+                    self.assertEqual(f.level, level)
+                    got = np.asarray(f.query(near, tau=tau))
+                    self.assertTrue(got.all(), f"{np.sum(~got)} of {len(got)} near-duplicates rejected")
 
 
 if __name__ == '__main__':
