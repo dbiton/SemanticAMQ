@@ -28,11 +28,7 @@ out or drawn as a variant of an existing hue:
 
 - minimax_sphere is minimax with a post-pass, so it wears minimax's aqua with
   a dotted line and a thin-diamond marker -- same family, visibly a variant.
-- sphere_merge takes the orange slot. merge_seeded, which held it, is
-  computed and written to the CSVs like every method in METHODS but faceted
-  out here, as kmeans already was: at this workload's scale it is dominated
-  by plain merge (slower at n=10K, and it leaves up to a quarter of its
-  budget as empty balls -- see project memory).
+- sphere_merge takes the orange slot.
 
 Panel (a) is Euclidean cover volume, which the two sphere methods make
 *worse* while their FPR improves: moving a center onto the data's sphere
@@ -61,8 +57,6 @@ METHOD_ORDER = ["gonzalez", "merge", "minimax", "minimax_sphere", "sphere_merge"
 METHOD_LABELS = {
     "gonzalez": "Gonzalez (default)",
     "merge": "Bottom-up merge",
-    "kmeans": "k-means++ + Lloyd",
-    "merge_seeded": "Bottom-up merge (Gonzalez-seeded)",
     "minimax": "Gonzalez + minimax search",
     "minimax_sphere": "Minimax, centers on sphere",
     "sphere_merge": "Weighted merge, on sphere",
@@ -71,8 +65,6 @@ METHOD_LABELS = {
 METHOD_COLORS = {
     "gonzalez": "#52514e",
     "merge": "#2a78d6",
-    "kmeans": "#eb6834",
-    "merge_seeded": "#eb6834",
     "minimax": "#1baf7a",
     "minimax_sphere": "#1baf7a",
     "sphere_merge": "#eb6834",
@@ -80,9 +72,9 @@ METHOD_COLORS = {
 }
 # Shape as well as hue, so identity survives grayscale and CVD, and the
 # low-contrast aqua line still reads.
-METHOD_MARKERS = {"gonzalez": "o", "merge": "s", "kmeans": "^", "merge_seeded": "^",
+METHOD_MARKERS = {"gonzalez": "o", "merge": "s",
                   "minimax": "D", "minimax_sphere": "d", "sphere_merge": "P", "split": "v"}
-METHOD_LINESTYLES = {"gonzalez": (0, (3, 1.5)), "merge": "-", "kmeans": "-", "merge_seeded": "-",
+METHOD_LINESTYLES = {"gonzalez": (0, (3, 1.5)), "merge": "-",
                      "minimax": "-", "minimax_sphere": (0, (1, 1)), "sphere_merge": "-", "split": "-"}
 
 _XLABEL = r"Ball budget $k$ (% of $|B|$)"

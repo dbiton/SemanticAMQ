@@ -10,7 +10,6 @@ from src.filters.ball_cover.ball_cover_filter import BallCoverFilter
 from src.filters.ball_cover.ball_interfaces import ConstructInterface
 from src.filters.ball_cover.gonzales_construct import GonzalesConstruct
 from src.filters.ball_cover.merge_construct import MergeConstruct
-from src.filters.ball_cover.kmeans_construct import KMeansConstruct
 from src.filters.ball_cover.minimax_construct import MinimaxConstruct
 from src.filters.ball_cover.split_construct import SplitConstruct
 from src.filters.ball_cover.sphere_merge_construct import SphereMergeConstruct
@@ -20,9 +19,8 @@ DIM = 8
 
 def get_constructors():
     """Every construct strategy; GonzalesConstruct is the live default."""
-    return [GonzalesConstruct(), MergeConstruct(), MergeConstruct(seed_multiplier=4),
-            KMeansConstruct(), MinimaxConstruct(), MinimaxConstruct(sphere=True), SplitConstruct(),
-            SphereMergeConstruct()]
+    return [GonzalesConstruct(), MergeConstruct(), MinimaxConstruct(), MinimaxConstruct(sphere=True),
+            SplitConstruct(), SphereMergeConstruct()]
 
 
 def run_construct(construct_method: ConstructInterface, budget: int, vecs: np.ndarray):

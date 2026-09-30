@@ -38,7 +38,6 @@ from filters.ball_cover.pooled_insert import PooledInsert
 from filters.ball_cover.cap_merge_insert import CapMergeInsert
 from filters.ball_cover.gonzales_construct import GonzalesConstruct
 from filters.ball_cover.merge_construct import MergeConstruct
-from filters.ball_cover.kmeans_construct import KMeansConstruct
 from filters.ball_cover.minimax_construct import MinimaxConstruct
 from filters.ball_cover.split_construct import SplitConstruct
 from filters.ball_cover.sphere_merge_construct import SphereMergeConstruct
@@ -66,12 +65,6 @@ _INSERT_STRATEGIES = {
 CONSTRUCT_METHODS = {
     "gonzalez": GonzalesConstruct,
     "merge": MergeConstruct,
-    # seed_multiplier=8: the default that best preserves merge's own quality
-    # (log10_J close to plain merge's, unlike 2x/4x) while still giving a
-    # meaningful construction-time win at scale -- see the profiling note in
-    # merge_construct.py's docstring.
-    "merge_seeded": lambda: MergeConstruct(seed_multiplier=8),
-    "kmeans": KMeansConstruct,
     "minimax": MinimaxConstruct,
     # minimax's own centers, moved onto the data's sphere before the radii are
     # measured (exact_cover.sphere_centers) -- isolates what the sphere

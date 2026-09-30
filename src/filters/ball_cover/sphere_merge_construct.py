@@ -70,8 +70,8 @@ class SphereMergeConstruct(MergeConstruct):
     n=10K, k=1000; 0.74-1.0x at n=8000, k=5-20%). It grows faster with n,
     though: the merge phase's candidate search is all-pairs over the live
     balls, O(n^2 * dim) in its first rounds, against minimax's O(n * k * dim).
-    Seeding the merge from m >> k cells instead of single points, as
-    MergeConstruct's seed_multiplier does, measured to lose most of the FPR
+    Seeding the merge from m >> k Gonzalez cells instead of single points
+    (a MergeConstruct option since removed) measured to lose most of the FPR
     gain -- the first, exact nearest-pair merges are what the method needs.
 
     Radii come from exact_cover's re-search, as in every method here. On

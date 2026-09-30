@@ -1,12 +1,10 @@
 import numpy as np
 import faiss
-from types import SimpleNamespace
 from typing import Optional, Tuple
 from filters.filter import Filter
 from filters.ball_cover.ball_interfaces import ConstructInterface
-from filters.ball_cover.gonzales_construct import GonzalesConstruct
 from filters.ball_cover.min_heap_insert import MinHeapInsert
-from filters.ball_cover.exact_cover import exact_cover, nearest_centers, segments, segment_max
+from filters.ball_cover.exact_cover import exact_cover, segments, segment_max
 
 
 class MergeConstruct(ConstructInterface):
@@ -32,33 +30,10 @@ class MergeConstruct(ConstructInterface):
     A merged ball's radius is re-measured against its member vectors, which
     streaming can't do. The enclosing ball of two balls is only an upper
     bound on its members' spread, and letting that bound compound across
-    rounds would bias every later cost toward whichever balls merged early.
+    rounds would bias every later cost toward whichever balls merged early."""
 
-    With `seed_multiplier` set, the merge-down loop starts not from one ball
-    per distinct point but from an oversampled GonzalesConstruct run of
-    m = seed_multiplier * k centers (capped at n), each with its exact
-    per-cluster radius. Early rounds on the unseeded path pay for all-pairs
-    candidate search (IndexFlatL2 over the current ball set) at a working
-    set close to n several times before it shrinks geometrically; starting
-    from m << n balls skips most of that, at the cost of merging from a
-    coarser, already-committed partition instead of every original point.
-
-    Profiled 2026-09-28 on WikiAnswers at k=1000: seed_multiplier in
-    {2, 4, 8} all cut construction time sharply at n=100K (421s unseeded ->
-    45s / 99s / 161s), but quality (log10_J at tau=0.1) only holds up at the
-    high end -- 2x and 4x land worse than even GonzalesConstruct, while 8x
-    stays close to the unseeded merge (and far better than Gonzalez). At
-    small n/k (n=10K, k=1000, ratio 10) every seeded variant is both slower
-    and lower quality than unseeded merge: GonzalesConstruct's own O(n*m)
-    seed-selection cost isn't amortized when there's little geometric
-    shrinkage left to skip. compare_construct_methods.py's "merge_seeded"
-    entry uses seed_multiplier=8 as the default that best preserves quality;
-    it converges toward unseeded merge automatically as k grows relative to
-    n (m = min(seed_multiplier*k, n) saturates at n)."""
-
-    def __init__(self, candidates: int = 16, seed_multiplier: Optional[float] = None) -> None:
+    def __init__(self, candidates: int = 16) -> None:
         self.candidates = candidates
-        self.seed_multiplier = seed_multiplier
 
 
     def construct_filter(self, filter: Filter, vectors: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -71,25 +46,13 @@ class MergeConstruct(ConstructInterface):
         if n <= k:
             return X.copy(), np.zeros(n, dtype=np.float32)
 
-        if self.seed_multiplier is None:
-            # Exact duplicates start as one ball. The row bytes are the key,
-            # so this is O(n log n) with no distance computation at all.
-            rows = X.view(np.dtype((np.void, X.dtype.itemsize * dim))).ravel()
-            _, first, owner = np.unique(rows, return_index=True, return_inverse=True)
-            centers = X[first].astype(np.float64)
-            radii = np.zeros(len(first), dtype=np.float64)
-            owner = owner.ravel().astype(np.int64)
-        else:
-            m = min(round(self.seed_multiplier * k), n)
-            seeds, _ = GonzalesConstruct().construct_filter(SimpleNamespace(max_construct_spheres=m), X)
-            if len(seeds) <= k:
-                return exact_cover(X, seeds)
-            d2, owner = nearest_centers(X, seeds)
-            order, starts, counts = segments(owner, len(seeds))
-            r2 = segment_max(d2[order], starts, counts)
-            centers = seeds.astype(np.float64)
-            radii = np.sqrt(r2).astype(np.float64)
-            owner = owner.astype(np.int64)
+        # Exact duplicates start as one ball. The row bytes are the key,
+        # so this is O(n log n) with no distance computation at all.
+        rows = X.view(np.dtype((np.void, X.dtype.itemsize * dim))).ravel()
+        _, first, owner = np.unique(rows, return_index=True, return_inverse=True)
+        centers = X[first].astype(np.float64)
+        radii = np.zeros(len(first), dtype=np.float64)
+        owner = owner.ravel().astype(np.int64)
 
         while len(centers) > k:
             p, q = self._mutual_cheapest_pairs(centers, radii, dim, len(centers) - k)

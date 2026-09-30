@@ -1,7 +1,7 @@
 """BallCoverFilter construction methods compared on the blocklist workload:
-GonzalesConstruct (the default) against MergeConstruct, KMeansConstruct,
-MinimaxConstruct (plain and with sphere-projected centers), SplitConstruct
-and SphereMergeConstruct.
+GonzalesConstruct (the default) against MergeConstruct, MinimaxConstruct
+(plain and with sphere-projected centers), SplitConstruct and
+SphereMergeConstruct.
 
 Same construction and query sets as generate_budget / generate_quantization
 (main.blocklist_workloads), with ground truth defined as distance to the

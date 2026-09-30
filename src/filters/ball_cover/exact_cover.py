@@ -4,8 +4,8 @@ from typing import Tuple
 
 
 # Shared by the construct methods that choose centers some other way than
-# farthest-first (MergeConstruct, KMeansConstruct, MinimaxConstruct,
-# SplitConstruct, SphereMergeConstruct).
+# farthest-first (MergeConstruct, MinimaxConstruct, SplitConstruct,
+# SphereMergeConstruct).
 # exact_cover() is GonzalesConstruct's radius step unchanged -- an exact
 # IndexFlatL2 re-search plus a per-cluster max -- because that step, not the
 # center selection, is what the zero-false-negative guarantee rests on. See
