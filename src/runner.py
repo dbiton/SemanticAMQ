@@ -74,6 +74,21 @@ CONSTRUCT_METHODS = {
     "sphere_merge": SphereMergeConstruct,
 }
 
+# Ball-Cover as the paper presents it, used by every evaluation that does not
+# sweep one of these itself: sphere_merge is the best construction measured
+# (generate_construct_methods), TQ4 the headline center encoding. The
+# quantization sweep keeps the construction and varies the encoding; the
+# construct_method and streaming sweeps stay unquantized.
+BALL_COVER_CONSTRUCT = "sphere_merge"
+BALL_COVER_QUANTIZE = Quantize.TQ4
+
+
+def _ball_cover(dim: int, k: int) -> BallCoverFilter:
+    """BallCoverFilter holding exactly k balls, in the paper's configuration."""
+    return BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k, BALL_COVER_QUANTIZE),
+                           quantize=BALL_COVER_QUANTIZE,
+                           construct_method=CONSTRUCT_METHODS[BALL_COVER_CONSTRUCT]())
+
 VectorInput = Union[np.ndarray, VectorSource]
 _QUERY_BATCH = 32
 
@@ -139,6 +154,7 @@ class _BallCoverFilterEvalAdapter:
                  max_spheres: Optional[int] = None, insert_mem_percent: Optional[float] = 0.0, **extra_kwargs: Any) -> None:
         self.distance_threshold = distance_threshold
         quantize = extra_kwargs.get("quantize", Quantize.FP32)
+        extra_kwargs.setdefault("construct_method", CONSTRUCT_METHODS[BALL_COVER_CONSTRUCT]())
         if max_spheres is not None:
             max_memory = _ball_cover_max_memory(dim, max_spheres, quantize)
         self._filt = BallCoverFilter(dim=dim, max_memory=max_memory, max_spheres=max_spheres, 
@@ -777,7 +793,8 @@ def quantization_worker(
     max_memory = _ball_cover_max_memory(dim, k, Quantize.FP32)
     t0 = time.perf_counter()
     try:
-        filt = BallCoverFilter(dim=dim, max_memory=max_memory, quantize=quantize)
+        filt = BallCoverFilter(dim=dim, max_memory=max_memory, quantize=quantize,
+                               construct_method=CONSTRUCT_METHODS[BALL_COVER_CONSTRUCT]())
         filt.construct(construct_arr)
     except Exception as e:
         logger.warning(
@@ -887,8 +904,9 @@ def construct_method_worker(
     [held-out, withheld, singleton] query stream
     (BlocklistWorkload.query_vectors), sized by n_heldout/n_withheld/
     n_singleton, so fpr splits by source as budget_worker's does (see
-    _per_source_rates), and a Gonzalez row's fpr matches results/budget.csv's
-    at the same fold and k_fraction. seed is the fold, reported as "fold".
+    _per_source_rates). Covers are unquantized, so a row is not comparable
+    with results/budget.csv's, which is built at BALL_COVER_QUANTIZE. seed is
+    the fold, reported as "fold".
 
     A nonzero FNR is a bug in the construction method, not a data point, so
     it raises (the Runner logs and skips the job) instead of returning."""
@@ -1013,7 +1031,7 @@ def system_tau_worker(
     index = faiss.IndexFlatL2(dim)
     index.add(construct_arr)
 
-    filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
+    filt = _ball_cover(dim, k)
     filt.construct(construct_arr)
     radii = filt.all_radiuses
     centers = filt.all_centers
@@ -1132,7 +1150,7 @@ def _blocklist_cover_rows(
 
     for kf in k_fractions:
         k = min(max(1, round(kf * len(B))), len(B))
-        filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
+        filt = _ball_cover(dim, k)
         filt.construct(B)
         radii = filt.all_radiuses
         centers = np.ascontiguousarray(filt.all_centers, dtype=np.float32)
@@ -1270,7 +1288,7 @@ def query_performance_worker(
     single-query mode is capped at single_query_limit, batched is uncapped."""
     construct_arr = _to_construct_array(vectors_construct)
 
-    filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
+    filt = _ball_cover(dim, k)
     filt.construct(construct_arr)
 
     rows: List[Dict[str, Any]] = []
@@ -1333,7 +1351,7 @@ def scaling_query_worker(
             f"max(n_query_vectors, n_insert_vectors)) or lower n_query_vectors."
         )
 
-    filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
+    filt = _ball_cover(dim, k)
     filt.construct(construct_arr)
 
     stream = query_arr[:n_query_vectors]
@@ -1371,7 +1389,7 @@ def scaling_insert_worker(
             f"max(n_query_vectors, n_insert_vectors)) or lower n_insert_vectors."
         )
 
-    filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
+    filt = _ball_cover(dim, k)
     filt.construct(construct_arr)
 
     stream = insert_arr[:n_insert_vectors]
@@ -1401,7 +1419,7 @@ def scaling_construction_worker(
     construct_arr = _to_construct_array(vectors_construct)[:n]
 
     start = time.perf_counter()
-    filt = BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k))
+    filt = _ball_cover(dim, k)
     filt.construct(construct_arr)
     elapsed = time.perf_counter() - start
 
