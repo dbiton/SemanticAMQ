@@ -116,7 +116,8 @@ def _precision_recall_f1(predicted: Any, actual: Any) -> Tuple[float, float, flo
 
 _DIRECT_TAU_FILTERS = {
     "FirstNFilter", "BallCoverFilter", "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", 
-    "DSHFilter", "HNSWFilter", "IVFFilter", "QuantizedVectorFilter", "MLPFilter"
+    "DSHFilter", "HNSWFilter", "IVFFilter", "QuantizedVectorFilter", "MLPFilter",
+    "PacukLSHFilter", "SankowskiWygockiFilter",
 }
 
 
@@ -238,6 +239,49 @@ _POST_CONSTRUCTION_CONFIG_DIALS = {
 # _tune_post_construction scores the whole grid off each pass.
 _ACCEPT_RADIUS_SCALES = (1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0)
 
+# The floor-projection zero-FN LSH filters (PacukLSHFilter,
+# SankowskiWygockiFilter; see filters._floor_lsh) expand every point to
+# tables x 3^L cells -- written at build time with replicate="store", probed
+# per query with replicate="probe". Longer signatures narrow the buckets (lower
+# structural FPR) at 3^L the keys or lookups, so L is their accuracy/memory
+# dial, just as K is DSHFilter's. Candidates past this many cells per point are
+# never generated: in store mode they could not fit any equal-memory budget
+# anyway, and in probe mode each query's Python-level Bloom lookups grow with it.
+# Also keeps every candidate under FloorLSHFilter._MAX_CELLS_PER_POINT, whose
+# ValueError the dial loop below does not catch.
+_FLOOR_LSH_MAX_CELLS = 3 ** 8
+_FLOOR_LSH_REPLICATE = ("store", "probe")
+
+
+def _pacuk_lsh_candidates(dim: int, distance_threshold: float) -> List[Dict[str, Any]]:
+    """num_hashes (one table, 3^L cells) x replicate mode."""
+    return [
+        {"num_hashes": num_hashes, "replicate": replicate}
+        for num_hashes in range(1, 32) if 3 ** num_hashes <= _FLOOR_LSH_MAX_CELLS
+        for replicate in _FLOOR_LSH_REPLICATE
+    ]
+
+
+def _sankowski_wygocki_candidates(dim: int, distance_threshold: float) -> List[Dict[str, Any]]:
+    """block_dim x num_families x hashes_per_block x replicate mode. block_dim
+    sets the table count ((d'/k)^L tables); block_dim=dim is a single table
+    over one random rotation, where a second family would only duplicate
+    hashes_per_block, so it gets num_families=1 only."""
+    candidates = []
+    for block_dim in (16, 32, 64, 128, dim):
+        num_blocks = -(-dim // block_dim)
+        for num_families in ((1,) if num_blocks == 1 else (1, 2)):
+            num_tables = num_blocks ** num_families
+            hashes_per_block = 1
+            while num_tables * 3 ** (hashes_per_block * num_families) <= _FLOOR_LSH_MAX_CELLS:
+                for replicate in _FLOOR_LSH_REPLICATE:
+                    candidates.append({
+                        "block_dim": block_dim, "num_families": num_families,
+                        "hashes_per_block": hashes_per_block, "replicate": replicate,
+                    })
+                hashes_per_block += 1
+    return candidates
+
 # Filters whose configuration changes memory layout at construction time: one build per candidate.
 # A value may be a static list of kwargs (LSBFFilter) or a callable
 # (dim, distance_threshold) -> list of kwargs, for a dial whose candidates
@@ -283,6 +327,11 @@ _CONSTRUCTION_TIME_CONFIG_DIALS = {
         for k in (4, 8, 16, 24, 32, 48, 64)
         for z in DSHFilter.z_grid(distance_threshold)
     ],
+    # Same treatment as DSHFilter: every candidate is built at the budget and
+    # scored by F1 on calibration; ones whose keys don't fit raise
+    # InsufficientMemoryError before hashing anything, so they cost nothing.
+    "PacukLSHFilter": _pacuk_lsh_candidates,
+    "SankowskiWygockiFilter": _sankowski_wygocki_candidates,
 }
 
 

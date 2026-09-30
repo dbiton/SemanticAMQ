@@ -38,6 +38,8 @@ from filters.hnsw_filter import HNSWFilter
 from filters.ivf_filter import IVFFilter
 from filters.quantized_vector_filter import QuantizedVectorFilter
 from filters.mlp_filter import MLPFilter
+from filters.pacuk_lsh_filter import PacukLSHFilter
+from filters.sankowski_wygocki_filter import SankowskiWygockiFilter
 from util.dataset_paths import dataset_filenames, HDF5_DATASET_KEY
 from util.fetch_datasets import load_embeds, load_meta
 from vector_source import VectorSource
@@ -178,7 +180,10 @@ def streaming_csv(dataset: str) -> str:
 # generate_equal_memory's ball_cover_quantizations), rather than listed here
 # as a single entry -- unlike every other filter here, it has a `quantize`
 # dial worth comparing multiple settings of side by side.
-equal_memory_filters = [HNSWFilter, IVFFilter, DSHFilter, QuantizedVectorFilter, MLPFilter]
+equal_memory_filters = [
+    HNSWFilter, IVFFilter, DSHFilter, QuantizedVectorFilter, MLPFilter,
+    PacukLSHFilter, SankowskiWygockiFilter,
+]
 
 def calculate_nn_distance_threshold(
     construct_vectors: np.ndarray,
@@ -1810,22 +1815,34 @@ def generate_and_plot_all() -> None:
     runner = Runner(num_workers=MAX_WORKERS)
 
     try:
-        generate_equal_memory(runner)
+        generate_blocklist(runner)
     except Exception:
         logger.exception("An error occurred")
     try:
-        generate_construct_methods(runner)
+        generate_budget(runner)
     except Exception:
         logger.exception("An error occurred")
-    '''
     try:
-        generate_scaling(runner)
+        generate_quantization(runner)
     except Exception:
         logger.exception("An error occurred")
     try:
         generate_streaming(runner)
     except Exception:
         logger.exception("An error occurred")
+    try:
+        generate_construct_methods(runner)
+    except Exception:
+        logger.exception("An error occurred")
+    try:
+        generate_scaling(runner)
+    except Exception:
+        logger.exception("An error occurred")
+    try:
+        generate_equal_memory(runner)
+    except Exception:
+        logger.exception("An error occurred")
+    '''
     try:
         generate_system_tau(runner)
     except Exception:

@@ -42,6 +42,8 @@ _KNOWN_LABELS = {
     "LSBFFilter": "LSBF",
     "DSBFFilter": "DSBF",
     "CoveringLSHFallbackFilter": "Covering LSH",
+    "PacukLSHFilter": "Pacuk LSH",
+    "SankowskiWygockiFilter": "Sankowski-Wygocki",
 }
 _KNOWN_MARKERS = {
     "HNSWFilter": "P",
@@ -53,7 +55,7 @@ _KNOWN_MARKERS = {
 # distinguishable-within-family sets, so a method's family reads from color
 # alone and its identity within that family still reads from hue. Each list
 # has more entries than there are current consumers (5 BallCoverFilter
-# variants, 5 other methods) for headroom -- see _derive_style_maps for what
+# variants, 7 other methods) for headroom -- see _derive_style_maps for what
 # happens if a family ever does run out (loops back rather than crashing).
 _COLD_PALETTE_COLORS = ["#023E8A", "#0077B6", "#00B4D8", "#48CAE4", "#3A0CA3", "#7209B7", "#4CC9F0", "#5A189A"]
 _HOT_PALETTE_COLORS = ["#9D0208", "#E85D04", "#FAA307", "#DC2F02", "#6A040F", "#F48C06", "#FFBA08", "#D00000"]
