@@ -738,9 +738,10 @@ class BallCoverFilter(Filter):
 
     def surface_distance(self, vectors: np.ndarray) -> np.ndarray:
         """Per query, the smallest (distance to a ball's center - its radius)
-        over every ball; inf with no balls. query() accepts exactly the rows
-        where this is <= distance_threshold + _COVERAGE_EPSILON, so a caller
-        sweeping many thresholds over one cover can search once."""
+        over every ball; inf with no balls. query() accepts the rows where
+        this is <= distance_threshold + _COVERAGE_EPSILON (up to float32
+        rounding far from any center -- see _scan), so a caller sweeping many
+        thresholds over one cover can scan once."""
         if not self._constructed:
             raise ValueError("BallCoverFilter has not been constructed.")
 
@@ -748,13 +749,153 @@ class BallCoverFilter(Filter):
             return np.full(len(vectors), np.inf)
 
         Q = np.ascontiguousarray(vectors, dtype=np.float32)
-        d2, labels = self.all_centers_index.search(Q, self._num_spheres)
-        surface = np.where(labels >= 0, np.sqrt(np.maximum(d2, 0.0)) - self._all_radiuses[np.maximum(labels, 0)], np.inf)
-        return surface.min(axis=1)
+        if _ENCODINGS[self.quantize].kind == "rabitq":
+            return self._estimator_surface_distance(Q)
+        return self._scan(Q, distance_threshold=None)
 
 
     def query(self, vectors: np.ndarray, distance_threshold: float) -> list[bool]:
-        return (self.surface_distance(vectors) <= distance_threshold + self._COVERAGE_EPSILON).tolist()
+        if not self._constructed:
+            raise ValueError("BallCoverFilter has not been constructed.")
+
+        if self._num_spheres == 0 or len(vectors) == 0:
+            return [False] * len(vectors)
+
+        if _ENCODINGS[self.quantize].kind == "rabitq":
+            return (self.surface_distance(vectors) <= distance_threshold + self._COVERAGE_EPSILON).tolist()
+        Q = np.ascontiguousarray(vectors, dtype=np.float32)
+        return self._scan(Q, distance_threshold=distance_threshold).tolist()
+
+
+    # Balls decoded per block of _scan, and queries per GEMM: bounds the
+    # scratch at (block x dim) decoded floats plus (chunk x block) distances,
+    # ~22 MB in all, whatever the cover size. That scratch is transient --
+    # only the codes persist, which is what get_bytesize() charges.
+    _SCAN_BLOCK = 4096
+    _SCAN_QUERY_CHUNK = 1024
+
+    # _scan computes ||q - c||^2 as ||q||^2 + ||c||^2 - 2<q, c> in float32,
+    # which cancels for near-identical vectors. Its rounding error is at most
+    # about (2d + 4) * 2^-24 * (||q||^2 + ||c||^2) -- 9e-5 for unit vectors at
+    # d=384 -- so every (query, ball) pair whose float32 value lands within
+    # that bound of the decision boundary is re-measured directly in float64.
+    # Accept decisions are therefore exact up to float64 rounding, not up to
+    # float32 cancellation -- the failure the 1e-3 _COVERAGE_EPSILON was
+    # otherwise the only guard against at tau = 0. The bound scales with the
+    # norms, so it holds for un-normalized vectors too (where refinement
+    # just fires more often).
+    #
+    # surface_distance has no boundary to test against, so it instead
+    # re-measures every pair with d^2 < _SCAN_NEAR_D2 * s^2 / 4, where s =
+    # ||q||^2 + max ||c||^2 (so 1e-2 for unit vectors). Past that, sqrt()
+    # damps the same error to under 1e-3 even at the worst-case bound
+    # (typically ~5e-5), and that floor scales with the data, not against it.
+    _SCAN_NEAR_D2 = 1e-2
+
+
+    def _scan(self, Q: np.ndarray, distance_threshold: Optional[float]) -> np.ndarray:
+        """Scores every query against every ball by exact L2 distance to the
+        decoded center, in blocks: decode a block of codes, one GEMM against
+        the queries, compare. Returns the accept mask when distance_threshold
+        is given, otherwise surface_distance's per-query minimum.
+
+        Replaces faiss's search(Q, k=num_spheres), which kept a k-wide result
+        heap per query only for the caller to take one minimum, and scored
+        TQ codes through a per-element scalar path: 180 q/s per core at 16K
+        TQ4 balls. The distances are the same ones query() always used -- to
+        decode(c), not an estimate -- so the triangle-inequality argument is
+        unchanged, and the boundary refinement above makes them more precise
+        than faiss's float32 GEMM path was.
+
+        Works in the quantizer's rotated basis: rotating the queries once
+        costs one GEMM per batch, where un-rotating the centers would cost
+        one per block. The rotation is orthonormal, so distances agree.
+
+        With a threshold, the test is d^2 <= (r + tau + eps)^2, which needs no
+        sqrt, and a query drops out of the remaining blocks as soon as any
+        ball accepts it."""
+        ids, codes = self._stored_codes()
+        radii = self._all_radiuses[ids]
+        rotation = self._rotation()
+        Qr = np.ascontiguousarray(rotation.apply(Q) if rotation is not None else Q, dtype=np.float32)
+        q_norms = np.einsum("ij,ij->i", Qr, Qr)
+        rel_error = (2 * self.dim + 4) * 2.0 ** -24
+
+        if distance_threshold is None:
+            out = np.full(len(Q), np.inf, dtype=np.float32)
+        else:
+            out = np.zeros(len(Q), dtype=bool)
+            reach = radii.astype(np.float64) + float(distance_threshold) + self._COVERAGE_EPSILON
+            # A negative reach admits nothing, which squaring would lose.
+            reach_sq = np.where(reach >= 0.0, reach * reach, -1.0)
+
+        for start in range(0, len(ids), self._SCAN_BLOCK):
+            stop = min(start + self._SCAN_BLOCK, len(ids))
+            C = self._decode_rotated(codes[start:stop])
+            c_norms = np.einsum("ij,ij->i", C, C)
+            pending = np.arange(len(Q)) if distance_threshold is None else np.flatnonzero(~out)
+            for q0 in range(0, len(pending), self._SCAN_QUERY_CHUNK):
+                rows = pending[q0:q0 + self._SCAN_QUERY_CHUNK]
+                scale = q_norms[rows] + c_norms.max()
+                d2 = Qr[rows] @ C.T
+                d2 *= -2.0
+                d2 += q_norms[rows, None]
+                d2 += c_norms[None, :]
+                if distance_threshold is None:
+                    near = self._SCAN_NEAR_D2 * scale * scale / 4.0
+                    out[rows] = np.minimum(out[rows], self._block_surface(
+                        d2, Qr[rows], C, radii[start:stop], near))
+                else:
+                    out[rows] |= self._block_accepts(
+                        d2, Qr[rows], C, reach_sq[start:stop], rel_error * scale)
+            if distance_threshold is not None and out.all():
+                break
+        return out
+
+
+    @staticmethod
+    def _exact_d2(Qb: np.ndarray, C: np.ndarray, i: np.ndarray, j: np.ndarray) -> np.ndarray:
+        diff = Qb[i].astype(np.float64) - C[j].astype(np.float64)
+        return np.einsum("ij,ij->i", diff, diff)
+
+
+    def _block_accepts(self, d2: np.ndarray, Qb: np.ndarray, C: np.ndarray,
+                       reach_sq: np.ndarray, slack: np.ndarray) -> np.ndarray:
+        """Rows of d2 with some ball in reach. A pair more than its row's
+        `slack` inside the boundary is a hit outright; one within `slack`
+        of it either way is re-measured in float64. Overwrites d2."""
+        reach32 = reach_sq.astype(np.float32)
+        slack = slack.astype(np.float32)[:, None]
+        d2 += slack
+        hit = (d2 <= reach32[None, :]).any(axis=1)
+        undecided = np.flatnonzero(~hit)
+        if len(undecided):
+            i, j = np.nonzero(d2[undecided] - 2.0 * slack[undecided] < reach32[None, :])
+            if len(i):
+                i = undecided[i]
+                ok = self._exact_d2(Qb, C, i, j) <= reach_sq[j]
+                hit[i[ok]] = True
+        return hit
+
+
+    def _block_surface(self, d2: np.ndarray, Qb: np.ndarray, C: np.ndarray,
+                       radii: np.ndarray, near: np.ndarray) -> np.ndarray:
+        dist = np.sqrt(np.maximum(d2, 0.0))
+        i, j = np.nonzero(d2 < near.astype(np.float32)[:, None])
+        if len(i):
+            dist[i, j] = np.sqrt(self._exact_d2(Qb, C, i, j))
+        return (dist - radii[None, :]).min(axis=1)
+
+
+    def _estimator_surface_distance(self, Q: np.ndarray) -> np.ndarray:
+        """RABITQ only: faiss's own search, which scores through RaBitQ's
+        distance estimator rather than ||q - decode(c)|| (see the Quantize
+        docstring). Kept as it was so RABITQ rows keep measuring the
+        estimator the paper describes; _scan would quietly turn them into
+        exact-decode rows."""
+        d2, labels = self.all_centers_index.search(Q, self._num_spheres)
+        surface = np.where(labels >= 0, np.sqrt(np.maximum(d2, 0.0)) - self._all_radiuses[np.maximum(labels, 0)], np.inf)
+        return surface.min(axis=1)
 
 
     def insert(self, vectors: np.ndarray) -> None:

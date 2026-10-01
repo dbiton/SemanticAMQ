@@ -305,6 +305,79 @@ class TestBallCoverQuantization(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Blocked scan -- query()/surface_distance() against faiss's own search
+# ---------------------------------------------------------------------------
+
+def _unit(n: int, dim: int, seed: int) -> np.ndarray:
+    v = _rand(n, dim=dim, seed=seed)
+    return v / np.linalg.norm(v, axis=1, keepdims=True)
+
+
+class TestBallCoverScan(unittest.TestCase):
+
+    TAUS = (0.0, 0.05, 0.1, 0.3, 0.6)
+
+    def _check_against_search(self, f: BallCoverFilter, queries: np.ndarray) -> None:
+        # Reference: float64 distance to every decoded center.
+        C = f.all_centers.astype(np.float64)
+        exact = (np.sqrt(((queries[:, None, :].astype(np.float64) - C[None]) ** 2).sum(-1))
+                 - f.all_radiuses[None, :]).min(axis=1)
+        surface = f.surface_distance(queries)
+        np.testing.assert_allclose(surface, exact, atol=1e-5)
+        # faiss's own search(k=all), which query() used to run, agrees to
+        # within the coverage slack its float32 cancellation needed.
+        np.testing.assert_allclose(f._estimator_surface_distance(queries), exact,
+                                   atol=f._COVERAGE_EPSILON)
+        for tau in self.TAUS:
+            boundary = tau + f._COVERAGE_EPSILON
+            got = np.asarray(f.query(queries, distance_threshold=tau))
+            # Only queries within rounding of the boundary may go either way.
+            settled = np.abs(exact - boundary) > 1e-5
+            np.testing.assert_array_equal(got[settled], (exact <= boundary)[settled],
+                                          err_msg=f"{f.quantize} tau={tau}")
+
+    def test_matches_faiss_search_under_every_encoding(self):
+        for dim in (DIM, 384):
+            vecs = _unit(1200, dim, seed=29)
+            queries = np.vstack([vecs[:200], _neighbors(vecs[:100], 0.2, n=2), _unit(200, dim, seed=30)])
+            for q in Quantize:
+                if q in (Quantize.RABITQ, Quantize.PQ8_R1, Quantize.PQ8_R2):
+                    continue   # RaBitQ keeps faiss search; PQ8 needs >= 256 balls
+                f = BallCoverFilter(dim, max_spheres=120, insert_method=None, quantize=q)
+                f.construct(vecs)
+                with self.subTest(dim=dim, quantize=q):
+                    self._check_against_search(f, queries)
+
+    def test_many_blocks_and_chunks_match_one(self):
+        vecs = _unit(800, 64, seed=31)
+        queries = np.vstack([vecs[:300], _unit(300, 64, seed=32)])
+        f = BallCoverFilter(64, max_spheres=150, insert_method=None, quantize=Quantize.TQ4)
+        f.construct(vecs)
+        whole_q = [f.query(queries, tau) for tau in self.TAUS]
+        whole_s = f.surface_distance(queries)
+        f._SCAN_BLOCK, f._SCAN_QUERY_CHUNK = 7, 5
+        for tau, expected in zip(self.TAUS, whole_q):
+            self.assertEqual(f.query(queries, tau), expected, tau)
+        np.testing.assert_allclose(f.surface_distance(queries), whole_s, atol=1e-5)
+
+    def test_exact_duplicates_accepted_at_tau_zero(self):
+        # Zero-radius balls queried by the very vectors they hold: the
+        # ||q||^2 + ||c||^2 - 2<q,c> form cancels here, and only the float64
+        # re-measure keeps these from depending on float32 rounding.
+        vecs = _unit(500, 384, seed=33) * 3.0   # larger norms, larger cancellation
+        f = BallCoverFilter(384, max_spheres=500, insert_method=None)
+        f.construct(vecs)
+        self.assertAlmostEqual(float(f.all_radiuses.max()), 0.0, places=6)
+        self.assertTrue(all(f.query(vecs, distance_threshold=0.0)))
+        self.assertLess(float(np.abs(f.surface_distance(vecs)).max()), 1e-5)
+
+    def test_no_balls_rejects_everything(self):
+        f = _static(5)
+        f.construct(np.empty((0, DIM), dtype=np.float32))
+        self.assertEqual(f.query(_rand(3), distance_threshold=1.0), [False] * 3)
+
+
+# ---------------------------------------------------------------------------
 # Edge cases
 # ---------------------------------------------------------------------------
 
