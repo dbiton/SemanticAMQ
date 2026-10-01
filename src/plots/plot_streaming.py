@@ -58,6 +58,7 @@ METHOD_MARKERS = {
 REFERENCE_STYLES = {
     "gonzalez": {"color": "black", "linestyle": "--", "label": "Static rebuild, Gonzalez (oracle)"},
     "sphere_merge": {"color": "#52514e", "linestyle": "-.", "label": "Static rebuild, sphere merge (oracle)"},
+    "minimax_sphere": {"color": "#52514e", "linestyle": "-.", "label": "Static rebuild, minimax on sphere (oracle)"},
 }
 
 _REQUIRED_COLUMNS = [
