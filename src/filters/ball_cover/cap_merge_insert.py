@@ -260,8 +260,7 @@ class CapMergeInsert(InsertInterface):
         ids = filter.all_spheres.astype(np.int64)
         L = len(ids)
         n = L + extra + 8
-        C = filter._all_centers[ids] if filter._all_centers is not None else \
-            filter.all_centers_index.reconstruct_batch(ids)
+        C = filter.all_centers
         self._ids = np.full(n, -1, dtype=np.int64)
         self._U = np.empty((n, filter.dim), dtype=np.float32)
         self._s = np.zeros(n)

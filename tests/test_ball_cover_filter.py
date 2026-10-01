@@ -285,6 +285,20 @@ class TestBallCoverQuantization(unittest.TestCase):
             self.assertTrue(all(f.query(vecs, distance_threshold=0.0)), q)
             self.assertTrue(all(f.query(_neighbors(vecs, TAU, n=2), distance_threshold=TAU)), q)
 
+    def test_bulk_decode_matches_reconstruct(self):
+        # all_centers decodes the stored codes in one pass; it must sit where
+        # faiss's own per-id reconstruct puts each ball. dim=32 takes the
+        # Hadamard rotation and dim=384 the dense one.
+        for dim in (DIM, 384):
+            vecs = _rand(600, dim=dim, seed=28)
+            for q in (Quantize.FP32, Quantize.SQ4, Quantize.TQ4, Quantize.PQ4_R2):
+                f = BallCoverFilter(dim, max_spheres=40, insert_method=None, quantize=q)
+                f.construct(vecs)
+                ids = f.all_spheres.astype(np.int64)
+                np.testing.assert_allclose(
+                    f.all_centers, f.all_centers_index.reconstruct_batch(ids), atol=1e-5,
+                    err_msg=f"{q} at dim={dim}")
+
     def test_encoding_shrinks_bytes_per_ball(self):
         full = _static(5).bytes_per_ball()
         self.assertLess(_static(5, quantize=Quantize.SQ8).bytes_per_ball(), full)

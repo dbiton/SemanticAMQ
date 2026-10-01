@@ -220,8 +220,8 @@ class BallCoverFilter(Filter):
         if self._all_centers is None:
             self._all_centers = np.empty((len(self._all_radiuses), self.dim), dtype=np.float32)
             if self._num_spheres > 0:
-                sphere_indices = np.ascontiguousarray(self.all_spheres, dtype=np.int64)
-                self._all_centers[self.all_spheres] = self.all_centers_index.reconstruct_batch(sphere_indices)
+                ids, codes = self._stored_codes()
+                self._all_centers[ids] = self._decode(codes)
         return self._all_centers[self.all_spheres]
 
     @property
@@ -303,8 +303,9 @@ class BallCoverFilter(Filter):
             # center let MinHeapInsert treat a vector within r + err of it as
             # covered while query() scored it against a center up to err
             # farther away -- 27.7% false negatives at TQ1 on WildChat.
-            self._all_centers[new_sphere_indices] = self.all_centers_index.reconstruct_batch(
-                new_sphere_indices.astype(np.int64))
+            # add_with_ids appends, so the new balls are the last rows.
+            _, codes = self._stored_codes()
+            self._all_centers[new_sphere_indices] = self._decode(codes[-num_new_spheres:])
 
         return new_sphere_indices
 
@@ -461,6 +462,52 @@ class BallCoverFilter(Filter):
         if isinstance(leaf, faiss.IndexPreTransform):
             return faiss.downcast_index(leaf.index)
         return leaf
+
+
+    def _rotation(self) -> Optional[faiss.VectorTransform]:
+        """The orthonormal rotation in front of the quantizer, or None."""
+        coder = self._coder()
+        if isinstance(coder, faiss.IndexPreTransform):
+            return faiss.downcast_VectorTransform(coder.chain.at(0))
+        return None
+
+
+    def _stored_codes(self) -> tuple:
+        """(ids, codes) for every stored ball, in the index's storage order:
+        row i of `codes` is ball ids[i]. `codes` is a zero-copy view of the
+        leaf's code array, so it is only valid until the index next changes.
+
+        Reading the codes directly is what makes decoding cheap.
+        IndexIDMap2.reconstruct_batch decodes one id at a time, and through a
+        rotation that means one 384x384 matrix-vector product per ball: 850 ms
+        for 16K TQ4 balls, against ~6 ms to decode the same codes in bulk."""
+        leaf = self._leaf_index()
+        n, size = int(leaf.ntotal), int(leaf.code_size)
+        ids = faiss.vector_to_array(self.all_centers_index.id_map).astype(np.int64)
+        if n == 0:
+            return ids, np.empty((0, size), dtype=np.uint8)
+        codes = np.asarray(faiss.rev_swig_ptr(leaf.codes.data(), n * size)).reshape(n, size)
+        return ids, codes
+
+
+    def _decode_rotated(self, codes: np.ndarray) -> np.ndarray:
+        """Decoded centers in the quantizer's own basis -- past the rotation,
+        where there is one. The rotation is orthonormal, so distances
+        measured here between rotated queries and these centers equal
+        distances between raw queries and the decoded centers."""
+        if _ENCODINGS[self.quantize].kind == "flat":
+            return codes.view(np.float32)
+        return self._leaf_index().sa_decode(np.ascontiguousarray(codes))
+
+
+    def _decode(self, codes: np.ndarray) -> np.ndarray:
+        """Decoded centers in the input basis: decode(c), as reconstruct
+        returns it, but in one batched pass."""
+        decoded = self._decode_rotated(codes)
+        rotation = self._rotation()
+        if rotation is not None and len(decoded):
+            decoded = rotation.reverse_transform(decoded)
+        return np.ascontiguousarray(decoded, dtype=np.float32)
 
 
     def bytes_per_ball(self, index: Optional[faiss.IndexIDMap2] = None) -> int:
