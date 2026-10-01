@@ -38,6 +38,7 @@ from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize
 from filters.dsh_filter import DSHFilter
 from filters.hnsw_filter import HNSWFilter
 from filters.ivf_filter import IVFFilter
+from filters.ivf_radii_filter import IVFRadiiFilter
 from filters.quantized_vector_filter import QuantizedVectorFilter
 from filters.mlp_filter import MLPFilter
 from filters.pacuk_lsh_filter import PacukLSHFilter
@@ -185,7 +186,7 @@ def streaming_csv(dataset: str) -> str:
 # dial worth comparing multiple settings of side by side.
 equal_memory_filters = [
     HNSWFilter, IVFFilter, DSHFilter, QuantizedVectorFilter, MLPFilter,
-    PacukLSHFilter, SankowskiWygockiFilter, VAPlusFilter,
+    PacukLSHFilter, SankowskiWygockiFilter, VAPlusFilter, IVFRadiiFilter,
 ]
 
 def advancing_fold_starts(pool_len: int, k_folds: int, fold_stride: int, window_len: int) -> List[int]:
