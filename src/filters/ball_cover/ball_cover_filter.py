@@ -764,7 +764,41 @@ class BallCoverFilter(Filter):
         if _ENCODINGS[self.quantize].kind == "rabitq":
             return (self.surface_distance(vectors) <= distance_threshold + self._COVERAGE_EPSILON).tolist()
         Q = np.ascontiguousarray(vectors, dtype=np.float32)
+        if len(Q) < self._SCAN_MIN_BATCH:
+            return self._range_accepts(Q, distance_threshold).tolist()
         return self._scan(Q, distance_threshold=distance_threshold).tolist()
+
+
+    # Below this many queries, _scan's per-call decode of every code is not
+    # amortized and _range_accepts is faster. Measured on 16K-ball WildChat
+    # covers, one pinned core: a lone query runs at 197 vs 165 q/s (TQ4), 864
+    # vs 390 (PQ8@1), 1,187 vs 658 (FP32); from 4 queries up _scan wins or
+    # ties for every encoding.
+    _SCAN_MIN_BATCH = 4
+
+
+    def _range_accepts(self, Q: np.ndarray, distance_threshold: float) -> np.ndarray:
+        """query() for a handful of queries: faiss range_search at the
+        largest reach any ball has, then each hit checked against its own
+        ball's reach -- the same d^2 <= (r + tau + eps)^2 test _scan applies.
+        Exact for the same reason _scan is: faiss scores ||q - decode(c)||^2
+        directly here (SQ/PQ ADC, and IndexFlat below 20 queries), with no
+        GEMM cancellation, and needs no k-wide heap."""
+        reach = self._all_radiuses[self.all_spheres] + float(distance_threshold) + self._COVERAGE_EPSILON
+        max_reach = float(reach.max())
+        if not np.isfinite(max_reach):
+            return np.ones(len(Q), dtype=bool)
+        if max_reach < 0.0:
+            return np.zeros(len(Q), dtype=bool)
+        # faiss keeps d^2 strictly below the radius; one ulp up keeps "<=".
+        radius = float(np.nextafter(np.float32(max_reach * max_reach), np.float32(np.inf)))
+        lims, d2, labels = self.all_centers_index.range_search(Q, radius)
+        ball_reach = self._all_radiuses[labels].astype(np.float64) + float(distance_threshold) + self._COVERAGE_EPSILON
+        hit = (ball_reach >= 0.0) & (d2 <= ball_reach * ball_reach)
+        accepted = np.zeros(len(Q), dtype=bool)
+        owner = np.repeat(np.arange(len(Q)), np.diff(lims).astype(np.int64))
+        accepted[owner[hit]] = True
+        return accepted
 
 
     # Balls decoded per block of _scan, and queries per GEMM: bounds the

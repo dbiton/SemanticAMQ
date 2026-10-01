@@ -360,6 +360,19 @@ class TestBallCoverScan(unittest.TestCase):
             self.assertEqual(f.query(queries, tau), expected, tau)
         np.testing.assert_allclose(f.surface_distance(queries), whole_s, atol=1e-5)
 
+    def test_small_batches_match_scan(self):
+        # Batches below _SCAN_MIN_BATCH take range_search instead of _scan.
+        for q in (Quantize.FP32, Quantize.TQ4, Quantize.PQ4_R2):
+            vecs = _unit(800, 64, seed=34)
+            queries = np.vstack([vecs[:60], _neighbors(vecs[:30], 0.15, n=1), _unit(60, 64, seed=35)])
+            f = BallCoverFilter(64, max_spheres=150, insert_method=None, quantize=q)
+            f.construct(vecs)
+            self.assertGreater(f._SCAN_MIN_BATCH, 1)
+            for tau in self.TAUS:
+                scanned = f._scan(queries, tau).tolist()
+                one_by_one = [f.query(queries[i:i + 1], tau)[0] for i in range(len(queries))]
+                self.assertEqual(one_by_one, scanned, (q, tau))
+
     def test_exact_duplicates_accepted_at_tau_zero(self):
         # Zero-radius balls queried by the very vectors they hold: the
         # ||q||^2 + ||c||^2 - 2<q,c> form cancels here, and only the float64
