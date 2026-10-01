@@ -45,6 +45,7 @@ _KNOWN_LABELS = {
     "PacukLSHFilter": "Pacuk LSH",
     "SankowskiWygockiFilter": "Sankowski-Wygocki",
     "VAPlusFilter": "VA+-file",
+    "IVFRadiiFilter": "IVF radii",
 }
 _KNOWN_MARKERS = {
     "HNSWFilter": "P",

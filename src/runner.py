@@ -132,7 +132,7 @@ def _precision_recall_f1(predicted: Any, actual: Any) -> Tuple[float, float, flo
 _DIRECT_TAU_FILTERS = {
     "FirstNFilter", "BallCoverFilter", "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", 
     "DSHFilter", "HNSWFilter", "IVFFilter", "QuantizedVectorFilter", "MLPFilter",
-    "PacukLSHFilter", "SankowskiWygockiFilter", "VAPlusFilter",
+    "PacukLSHFilter", "SankowskiWygockiFilter", "VAPlusFilter", "IVFRadiiFilter",
 }
 
 
