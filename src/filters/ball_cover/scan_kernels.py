@@ -35,6 +35,15 @@ from numba import njit
 _DELTA = 2.0 ** -22
 _ABS = 1e-36
 
+# The two entry points are compiled eagerly, for these exact argument types,
+# when this module is imported -- and BallCoverFilter imports it at module
+# level -- so no timed query() pays for compilation. Loading them from
+# numba's on-disk cache takes ~0.5 s per process; compiling them from scratch
+# takes ~1.7 s, once per machine. Callers must pass C-contiguous, writable
+# arrays of exactly these dtypes.
+_NIBBLE_SIGNATURE = "boolean[::1](uint8[:, ::1], float32[:, ::1], float64[:, ::1], float32[::1], float64, float64)"
+_FLAT_SIGNATURE = "boolean[::1](float32[:, ::1], float32[:, ::1], float32[::1], float64, float64)"
+
 
 @njit(nogil=True, cache=True)
 def _reach_bounds(radii, tau, eps):
@@ -70,7 +79,7 @@ def _nibble_exact(codes, i, q, T):
     return x
 
 
-@njit(nogil=True, cache=True)
+@njit(_NIBBLE_SIGNATURE, nogil=True, cache=True)
 def nibble_accepts(codes, Qr, T, radii, tau, eps):
     """query() over 4-bit scalar-quantizer codes.
 
@@ -149,7 +158,7 @@ def _flat_exact(C, i, q):
 _FLAT_GROUP = 16
 
 
-@njit(nogil=True, cache=True)
+@njit(_FLAT_SIGNATURE, nogil=True, cache=True)
 def flat_accepts(C, Qr, radii, tau, eps):
     """query() over raw float32 centers: C is (n, d) float32, the rest as in
     nibble_accepts. Each term (q_j - c_j)^2 is formed in float64 straight

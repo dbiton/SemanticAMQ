@@ -13,6 +13,7 @@ from filters.ball_cover.least_inflation_insert import LeastInflationInsert
 from filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
 from filters.ball_cover.doubling_insert import DoublingInsert
 from filters.ball_cover.pooled_insert import PooledInsert
+from filters.ball_cover import scan_kernels
 
 
 class Quantize(Enum):
@@ -859,7 +860,6 @@ class BallCoverFilter(Filter):
         """query() through scan_kernels: exact distance to every decoded
         center, abandoning a ball once a partial sum is provably past its
         reach -- see scan_kernels for the bound that keeps this exact."""
-        from filters.ball_cover import scan_kernels
         ids, codes = self._stored_codes()
         radii = self._all_radiuses[ids]
         tau, eps = float(distance_threshold), float(self._COVERAGE_EPSILON)
