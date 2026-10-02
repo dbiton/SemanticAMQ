@@ -808,9 +808,9 @@ class BallCoverFilter(Filter):
     # each nibble, which is what scan_kernels.nibble_accepts reads.
     _NIBBLE_QTYPES = (faiss.ScalarQuantizer.QT_4bit, faiss.ScalarQuantizer.QT_4bit_tqmse)
 
-    # Batches below these sizes go to scan_kernels instead of _scan /
-    # _range_accepts. Measured on the five blocklist covers (random query
-    # mix, one pinned P-core), kernel q/s over the old path's:
+    # Which batches go to scan_kernels instead of _scan / _range_accepts.
+    # Measured on the five blocklist covers (random query mix, one pinned
+    # P-core), kernel q/s over the old path's:
     #   TQ4, 16K balls: 14-23x at 1 query, 1.7-4.3x at 32, 1.2-3.4x at 64
     #   TQ4,  2K balls:  6-9x  at 1 query, 1.3-2.5x at 32, 0.96-1.8x at 64
     #   FP32, 16K balls: 1.1-4.5x at 1-4 queries, 0.73-2.9x at 8
@@ -818,7 +818,20 @@ class BallCoverFilter(Filter):
     #                    wins on a cache-sized cover, hence the ball floor.
     # FP32 gains less because a float32 center is 8x the bytes of a TQ4
     # code, so abandoning early saves memory traffic rather than arithmetic.
+    #
+    # Past 64 queries _scan amortizes its decode and its GEMM gets
+    # efficient, but the kernel's work per ball does not grow with the
+    # cover while _scan's does. With the cover stored largest first, at
+    # whole-batch sizes (20K queries) the kernel runs
+    #   TQ4,  2K balls: 0.79-0.88x on four corpora, 1.56x on CC-News
+    #   TQ4,  4K balls: 1.00-1.57x (WildChat, CC-News, WikiAnswers)
+    #   TQ4,  8K balls: 1.36-2.06x, but 0.92x on CC-News
+    #   TQ4, 16K balls: 1.40-2.92x, but 0.88x on CC-News
+    # so a 4-bit cover of _NIBBLE_KERNEL_ANY_BATCH_BALLS or more takes the
+    # kernel at every batch size. CC-News, whose large radii abandon late,
+    # is the one corpus that loses there.
     _NIBBLE_KERNEL_MAX_BATCH = 64
+    _NIBBLE_KERNEL_ANY_BATCH_BALLS = 4096
     _FLAT_KERNEL_MAX_BATCH = 8
     _FLAT_KERNEL_MIN_BALLS = 4096
 
@@ -835,7 +848,8 @@ class BallCoverFilter(Filter):
     def _use_kernel(self, num_queries: int) -> bool:
         kind = self._kernel_kind()
         if kind == "nibble":
-            return num_queries < self._NIBBLE_KERNEL_MAX_BATCH
+            return (num_queries < self._NIBBLE_KERNEL_MAX_BATCH
+                    or self._num_spheres >= self._NIBBLE_KERNEL_ANY_BATCH_BALLS)
         if kind == "flat":
             return (num_queries < self._FLAT_KERNEL_MAX_BATCH
                     and self._num_spheres >= self._FLAT_KERNEL_MIN_BALLS)

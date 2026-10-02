@@ -500,14 +500,16 @@ class TestBallCoverKernels(unittest.TestCase):
             np.testing.assert_array_equal(f._stored_codes()[0], f.all_spheres)
 
     def test_query_dispatch_matches_scan(self):
-        # query() itself, on both sides of every kernel cutoff; the FP32
-        # ball floor is lifted so a small cover reaches the kernel too.
+        # query() itself, on both sides of every kernel cutoff; with the
+        # ball floors lifted a small cover takes the kernel wherever a large
+        # one would (FP32 small batches, 4-bit batches of any size).
         vecs = _unit(800, 32, seed=48)
         queries = np.vstack([vecs[:100], _unit(100, 32, seed=49)])
         for q in self.KERNEL_ENCODINGS:
-            for floor in (0, BallCoverFilter._FLAT_KERNEL_MIN_BALLS):
+            for floor in (0, None):
                 f = BallCoverFilter(32, max_spheres=150, insert_method=None, quantize=q)
-                f._FLAT_KERNEL_MIN_BALLS = floor
+                if floor is not None:
+                    f._FLAT_KERNEL_MIN_BALLS = f._NIBBLE_KERNEL_ANY_BATCH_BALLS = floor
                 f.construct(vecs)
                 for bs in (1, 3, 7, 8, 63, 64, 200):
                     got = np.concatenate([f.query(queries[s:s + bs], 0.05) for s in range(0, len(queries), bs)])
