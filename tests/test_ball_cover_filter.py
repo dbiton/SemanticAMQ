@@ -390,6 +390,96 @@ class TestBallCoverScan(unittest.TestCase):
         self.assertEqual(f.query(_rand(3), distance_threshold=1.0), [False] * 3)
 
 
+class TestBallCoverKernels(unittest.TestCase):
+    """scan_kernels, which answer small FP32 / 4-bit batches. Called through
+    _kernel_accepts directly so every batch size and ball count reaches them,
+    whatever query()'s cutoffs are."""
+
+    KERNEL_ENCODINGS = (Quantize.FP32, Quantize.TQ4, Quantize.SQ4)
+    TAUS = (-0.01, 0.0, 0.05, 0.1, 0.3, 0.6)
+
+    def _check(self, f: BallCoverFilter, queries: np.ndarray) -> None:
+        # Reference: float64 distance to every decoded center. Only queries
+        # within rounding of some ball's boundary may go either way.
+        C = f.all_centers.astype(np.float64)
+        d = np.sqrt(((queries[:, None, :].astype(np.float64) - C[None]) ** 2).sum(-1))
+        for tau in self.TAUS:
+            reach = f.all_radiuses.astype(np.float64) + tau + f._COVERAGE_EPSILON
+            expected = ((reach >= 0) & (d <= reach)).any(axis=1)
+            settled = np.where(reach >= 0, np.abs(d - reach), np.inf).min(axis=1) > 1e-5
+            got = f._kernel_accepts(queries, tau)
+            np.testing.assert_array_equal(got[settled], expected[settled],
+                                          err_msg=f"{f.quantize} dim={f.dim} tau={tau}")
+            # And query-for-query what _scan decides, boundary pairs included.
+            np.testing.assert_array_equal(got, f._scan(queries, tau), err_msg=f"{f.quantize} tau={tau}")
+
+    def test_matches_exact_reference(self):
+        # dim 21 and 20 exercise padding to whole 64-bit code words and the
+        # FP32 kernel's tail; scale 3 un-normalizes the vectors.
+        for dim, scale in ((32, 1.0), (384, 1.0), (64, 3.0), (21, 1.0), (20, 2.0)):
+            vecs = _unit(900, dim, seed=41) * scale
+            queries = np.vstack([vecs[:150], _neighbors(vecs[:100], 0.2 * scale, n=2),
+                                 _unit(150, dim, seed=42) * scale])
+            for q in self.KERNEL_ENCODINGS:
+                f = BallCoverFilter(dim, max_spheres=120, insert_method=None, quantize=q)
+                f.construct(vecs)
+                with self.subTest(dim=dim, scale=scale, quantize=q):
+                    self._check(f, queries)
+
+    def test_nibble_table_is_sa_decode(self):
+        rng = np.random.default_rng(43)
+        for q in (Quantize.TQ4, Quantize.SQ4):
+            for dim in (32, 21, 384):
+                f = BallCoverFilter(dim, max_spheres=60, insert_method=None, quantize=q)
+                f.construct(_unit(400, dim, seed=44))
+                leaf = f._leaf_index()
+                nb = int(leaf.code_size)
+                codes = rng.integers(0, 256, (50, nb), dtype=np.uint8)
+                nibbles = np.empty((50, 2 * nb), dtype=np.int64)
+                nibbles[:, 0::2], nibbles[:, 1::2] = codes & 15, codes >> 4
+                table = f._nibble_table(2 * nb)
+                decoded = table[np.arange(2 * nb)[None, :], nibbles]
+                with self.subTest(quantize=q, dim=dim):
+                    np.testing.assert_array_equal(decoded[:, :dim].astype(np.float32), leaf.sa_decode(codes))
+                    self.assertFalse(decoded[:, dim:].any())
+
+    def test_exact_duplicates_accepted_at_tau_zero(self):
+        # Zero-radius FP32 balls queried by the very vectors they hold, at a
+        # larger norm; and 4-bit balls queried by their own decoded centers.
+        vecs = _unit(500, 384, seed=45) * 3.0
+        f = BallCoverFilter(384, max_spheres=500, insert_method=None)
+        f.construct(vecs)
+        self.assertAlmostEqual(float(f.all_radiuses.max()), 0.0, places=6)
+        self.assertTrue(f._kernel_accepts(vecs, 0.0).all())
+        for q in (Quantize.TQ4, Quantize.SQ4):
+            f = BallCoverFilter(384, max_spheres=500, insert_method=None, quantize=q)
+            f.construct(vecs)
+            self.assertTrue(f._kernel_accepts(np.ascontiguousarray(f.all_centers), 0.0).all(), q)
+
+    def test_infinite_radius_accepts_everything(self):
+        # fp16 radii past 65504 are stored as +inf (see _fp16_ceil).
+        for q in self.KERNEL_ENCODINGS:
+            f = BallCoverFilter(DIM, max_spheres=20, insert_method=None, quantize=q)
+            f.construct(_unit(200, DIM, seed=46))
+            f._all_radiuses[f.all_spheres[3]] = np.inf
+            self.assertTrue(f._kernel_accepts(_rand(30, seed=47) * 100.0, 0.0).all(), q)
+
+    def test_query_dispatch_matches_scan(self):
+        # query() itself, on both sides of every kernel cutoff; the FP32
+        # ball floor is lifted so a small cover reaches the kernel too.
+        vecs = _unit(800, 32, seed=48)
+        queries = np.vstack([vecs[:100], _unit(100, 32, seed=49)])
+        for q in self.KERNEL_ENCODINGS:
+            for floor in (0, BallCoverFilter._FLAT_KERNEL_MIN_BALLS):
+                f = BallCoverFilter(32, max_spheres=150, insert_method=None, quantize=q)
+                f._FLAT_KERNEL_MIN_BALLS = floor
+                f.construct(vecs)
+                for bs in (1, 3, 7, 8, 63, 64, 200):
+                    got = np.concatenate([f.query(queries[s:s + bs], 0.05) for s in range(0, len(queries), bs)])
+                    with self.subTest(quantize=q, floor=floor, batch=bs):
+                        np.testing.assert_array_equal(got, f._scan(queries, 0.05))
+
+
 # ---------------------------------------------------------------------------
 # Edge cases
 # ---------------------------------------------------------------------------

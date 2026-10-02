@@ -764,9 +764,82 @@ class BallCoverFilter(Filter):
         if _ENCODINGS[self.quantize].kind == "rabitq":
             return (self.surface_distance(vectors) <= distance_threshold + self._COVERAGE_EPSILON).tolist()
         Q = np.ascontiguousarray(vectors, dtype=np.float32)
+        if self._use_kernel(len(Q)):
+            return self._kernel_accepts(Q, distance_threshold).tolist()
         if len(Q) < self._SCAN_MIN_BATCH:
             return self._range_accepts(Q, distance_threshold).tolist()
         return self._scan(Q, distance_threshold=distance_threshold).tolist()
+
+
+    # 4-bit scalar quantizers whose decode is a per-dimension table lookup on
+    # each nibble, which is what scan_kernels.nibble_accepts reads.
+    _NIBBLE_QTYPES = (faiss.ScalarQuantizer.QT_4bit, faiss.ScalarQuantizer.QT_4bit_tqmse)
+
+    # Batches below these sizes go to scan_kernels instead of _scan /
+    # _range_accepts. Measured on the five blocklist covers (random query
+    # mix, one pinned P-core), kernel q/s over the old path's:
+    #   TQ4, 16K balls: 14-23x at 1 query, 1.7-4.3x at 32, 1.2-3.4x at 64
+    #   TQ4,  2K balls:  6-9x  at 1 query, 1.3-2.5x at 32, 0.96-1.8x at 64
+    #   FP32, 16K balls: 1.1-4.5x at 1-4 queries, 0.73-2.9x at 8
+    #   FP32,  2K balls: 0.8-1.7x at 1 query -- faiss's vectorized flat scan
+    #                    wins on a cache-sized cover, hence the ball floor.
+    # FP32 gains less because a float32 center is 8x the bytes of a TQ4
+    # code, so abandoning early saves memory traffic rather than arithmetic.
+    _NIBBLE_KERNEL_MAX_BATCH = 64
+    _FLAT_KERNEL_MAX_BATCH = 8
+    _FLAT_KERNEL_MIN_BALLS = 4096
+
+
+    def _kernel_kind(self) -> Optional[str]:
+        spec = _ENCODINGS[self.quantize]
+        if spec.kind == "flat":
+            return "flat"
+        if spec.kind == "sq" and spec.qtype in self._NIBBLE_QTYPES:
+            return "nibble"
+        return None
+
+
+    def _use_kernel(self, num_queries: int) -> bool:
+        kind = self._kernel_kind()
+        if kind == "nibble":
+            return num_queries < self._NIBBLE_KERNEL_MAX_BATCH
+        if kind == "flat":
+            return (num_queries < self._FLAT_KERNEL_MAX_BATCH
+                    and self._num_spheres >= self._FLAT_KERNEL_MIN_BALLS)
+        return False
+
+
+    def _nibble_table(self, rows: int) -> np.ndarray:
+        """(rows, 16) float64: row j, column v is what the quantizer decodes
+        nibble v of dimension j to, read off sa_decode itself (one probe code
+        per nibble value) so it is decode(c) by definition, not a
+        re-derivation of faiss's formula. Rows past dim stay zero. Rebuilt
+        per call from the trained codebook get_bytesize() already charges,
+        rather than cached, so nothing decoded outlives the call."""
+        leaf = self._leaf_index()
+        probe = np.repeat((np.arange(16, dtype=np.uint8) * 17)[:, None], int(leaf.code_size), axis=1)
+        table = np.zeros((rows, 16), dtype=np.float64)
+        table[:self.dim] = leaf.sa_decode(probe).T
+        return table
+
+
+    def _kernel_accepts(self, Q: np.ndarray, distance_threshold: float) -> np.ndarray:
+        """query() through scan_kernels: exact distance to every decoded
+        center, abandoning a ball once a partial sum is provably past its
+        reach -- see scan_kernels for the bound that keeps this exact."""
+        from filters.ball_cover import scan_kernels
+        ids, codes = self._stored_codes()
+        radii = self._all_radiuses[ids]
+        tau, eps = float(distance_threshold), float(self._COVERAGE_EPSILON)
+        rotation = self._rotation()
+        Qr = np.ascontiguousarray(rotation.apply(Q) if rotation is not None else Q, dtype=np.float32)
+        if self._kernel_kind() == "flat":
+            return scan_kernels.flat_accepts(codes.view(np.float32), Qr, radii, tau, eps)
+        if codes.shape[1] % 8:
+            # The kernel reads codes a 64-bit word at a time; padding bytes
+            # meet zero table rows, which add exactly nothing.
+            codes = np.pad(codes, ((0, 0), (0, -codes.shape[1] % 8)))
+        return scan_kernels.nibble_accepts(codes, Qr, self._nibble_table(2 * codes.shape[1]), radii, tau, eps)
 
 
     # Below this many queries, _scan's per-call decode of every code is not
