@@ -1,0 +1,84 @@
+import numpy as np
+from abc import ABC, abstractmethod
+from typing import Iterator, Tuple, List, Optional
+from filters.filter import Filter
+from filters.cap_cover.cap_geometry import nearest_directions
+
+
+class ConstructInterface(ABC):
+    @abstractmethod
+    def construct_filter(self, filter: 'Filter', vectors: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """(directions, angles): unit cap directions and their angular radii,
+        covering every row of `vectors` (unit rows, in the filter's working
+        basis). The filter re-measures every angle after encoding, so an
+        angle here only has to be an honest cover of the *unencoded*
+        directions."""
+        pass
+
+    def iter_candidates(self, filter: 'Filter', vectors: np.ndarray, ks: List[int]
+                        ) -> Iterator[Tuple[int, np.ndarray, np.ndarray, np.ndarray]]:
+        """(k, directions, angles, labels) for each cap count in `ks`,
+        largest first, for a filter choosing among encodings of different
+        sizes. `labels` assigns every vector to a cap holding it within that
+        cap's angle. Candidates may be cheaper than construct_filter's
+        covers (unrefined); finish() turns the chosen one into a final
+        cover. The default builds each from scratch with construct_filter;
+        a method with a natural hierarchy (SphereMergeConstruct) overrides
+        this to share the work."""
+        saved = filter.max_construct_caps
+        try:
+            for k in sorted(set(int(k) for k in ks), reverse=True):
+                filter.max_construct_caps = k
+                U, theta = self.construct_filter(filter, vectors)
+                _, labels = nearest_directions(vectors, U) if len(U) else (None, np.zeros(len(vectors), int))
+                yield k, U, theta, labels
+        finally:
+            filter.max_construct_caps = saved
+
+    def finish(self, filter: 'Filter', vectors: np.ndarray, directions: np.ndarray,
+               angles: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """The final cover from a candidate iter_candidates() produced."""
+        return directions, angles
+
+    @abstractmethod
+    def get_bytesize(self) -> int:
+        pass
+
+
+class InsertInterface(ABC):
+    @abstractmethod
+    def initialize_buffers(self, filter: 'Filter', caps_indices: np.ndarray, directions: np.ndarray,
+                           angles: np.ndarray, vectors: Optional[np.ndarray] = None) -> None:
+        """Called by construct() once the caps are stored. `directions` are the
+        decoded unit directions query() scores against and `vectors` the
+        construct vectors (unit rows, working basis) -- the only time a
+        strategy sees the members of the caps it inherits. Not retained by
+        the filter."""
+        pass
+
+    @abstractmethod
+    def ensure_capacity(self, required_cap: int) -> None:
+        pass
+
+    @abstractmethod
+    def reset_buffers(self, capacity: int) -> None:
+        pass
+
+    @abstractmethod
+    def insert(self, filter: 'Filter', vectors: np.ndarray) -> None:
+        """`vectors` are unit rows in the filter's working basis."""
+        pass
+
+    @abstractmethod
+    def remove(self, filter: 'Filter', vectors: np.ndarray) -> List[bool]:
+        pass
+
+    @abstractmethod
+    def get_bytesize(self, filter: 'Filter') -> int:
+        pass
+
+    def max_caps_for_budget(self, usable_bytes: int, bytes_per_cap: int) -> int:
+        """How many caps CapCoverFilter may keep when `usable_bytes` must hold
+        them and this strategy's own state at its peak between insert()
+        calls (BallCoverFilter's InsertInterface.max_spheres_for_budget)."""
+        return usable_bytes // bytes_per_cap
