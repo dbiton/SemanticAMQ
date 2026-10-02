@@ -464,6 +464,41 @@ class TestBallCoverKernels(unittest.TestCase):
             f._all_radiuses[f.all_spheres[3]] = np.inf
             self.assertTrue(f._kernel_accepts(_rand(30, seed=47) * 100.0, 0.0).all(), q)
 
+    def test_storage_is_largest_first_and_otherwise_invisible(self):
+        vecs = _unit(1500, 64, seed=50)
+        queries = np.vstack([vecs[:200], _unit(200, 64, seed=51)])
+        for q in (Quantize.FP32, Quantize.TQ4, Quantize.PQ4_R2, Quantize.RABITQ):
+            built = []
+            for reorder in (True, False):
+                f = BallCoverFilter(64, max_spheres=200, insert_method=None, quantize=q)
+                if not reorder:
+                    f._store_largest_first = lambda: None
+                f.construct(vecs)
+                built.append(f)
+            f, plain = built
+            ids, _ = f._stored_codes()
+            with self.subTest(quantize=q):
+                self.assertTrue((np.diff(f._all_radiuses[ids]) <= 0).all())
+                self.assertFalse(np.array_equal(ids, plain._stored_codes()[0]))
+                # Same balls under the same ids, wherever they are stored.
+                np.testing.assert_array_equal(f.all_spheres, plain.all_spheres)
+                np.testing.assert_array_equal(f.all_radiuses, plain.all_radiuses)
+                np.testing.assert_allclose(f.all_centers, plain.all_centers, atol=1e-6)
+                np.testing.assert_allclose(f.all_centers_index.reconstruct_batch(f.all_spheres.astype(np.int64)),
+                                           f.all_centers, atol=1e-5)
+                for tau in (0.0, 0.1):
+                    self.assertEqual(f.query(queries, tau), plain.query(queries, tau))
+                np.testing.assert_allclose(f.surface_distance(queries), plain.surface_distance(queries), atol=1e-5)
+
+    def test_streaming_filters_keep_construction_order(self):
+        # Insert strategies decide from all_centers, whose un-rotation
+        # rounds by storage position, so reordering would change their covers.
+        vecs = _unit(1500, 64, seed=53)
+        for insert in (NearestInsert(), MinHeapInsert()):
+            f = BallCoverFilter(64, max_spheres=200, insert_method=insert, quantize=Quantize.TQ4)
+            f.construct(vecs)
+            np.testing.assert_array_equal(f._stored_codes()[0], f.all_spheres)
+
     def test_query_dispatch_matches_scan(self):
         # query() itself, on both sides of every kernel cutoff; the FP32
         # ball floor is lifted so a small cover reaches the kernel too.

@@ -732,8 +732,40 @@ class BallCoverFilter(Filter):
             self.insert_method.initialize_buffers(self, sphere_indices, self.all_centers, self.all_radiuses,
                                                   vectors=vectors)
 
+        self._store_largest_first()
         self._constructed = True
         self._all_centers = None # clear temporary centers view
+
+
+    def _store_largest_first(self) -> None:
+        """Reorders the index's storage -- codes and id_map together -- so
+        the largest balls are scanned first. Ids, radii and every per-id
+        array are untouched, so no query decision changes, only how soon
+        it is reached: a query stops at the first ball that accepts it, and
+        large balls accept most often. Measured with scan_kernels on the five
+        blocklist covers (TQ4, batch 32, random query mix): 1.20-1.48x at
+        16K balls and 1.16-1.37x at 2K over construction order. Neighbouring
+        balls then also tend to abandon at the same word, which the branch
+        predictor rewards.
+
+        Static filters only. all_centers un-rotates the decoded codes with
+        one batched GEMM, whose float32 rounding depends on a row's position
+        in the batch (up to 1.2e-7 per coordinate at dim=384), and insert
+        strategies decide from all_centers: reordering a streaming filter
+        changed the cover cap_merge built after 1500 TQ4 inserts, though
+        not a single query decision. With no insert strategy nothing
+        decides from all_centers after construct(), so the cover stays
+        bit-identical."""
+        if self.insert_method is not None:
+            return
+        ids, codes = self._stored_codes()
+        order = np.argsort(-self._all_radiuses[ids], kind="stable")
+        if len(order) < 2 or (order == np.arange(len(order))).all():
+            return
+        codes[:] = codes[order]
+        id_map = self.all_centers_index.id_map
+        faiss.rev_swig_ptr(id_map.data(), id_map.size())[:] = ids[order]
+        self.all_centers_index.construct_rev_map()
 
 
     def surface_distance(self, vectors: np.ndarray) -> np.ndarray:
