@@ -1339,9 +1339,11 @@ def scaling_query_worker(
     size k, querying in batches of `batch_size`. Every batch_size times the
     same n_query_vectors, so the panel's lines are directly comparable.
 
-    tau_mid does not affect the measurement: query() scores every ball and
-    only then compares against the threshold, so the work is identical at
-    any tau. It is here because query() requires one, not as a variable."""
+    tau_mid is part of the measurement: query() abandons a ball once a
+    partial distance passes r + tau, and stops a query at the first ball
+    that accepts it (see BallCoverFilter._kernel_accepts and _scan), so a
+    larger tau means more work per ball and earlier exits. Throughput is
+    therefore reported at this one threshold, not for every tau."""
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
     if len(query_arr) < n_query_vectors:
