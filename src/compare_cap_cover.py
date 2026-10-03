@@ -6,6 +6,7 @@
     python src/compare_cap_cover.py tau TAG CONFIG[,CONFIG...] [same options as run]
     python src/compare_cap_cover.py stream TAG CONFIG[,CONFIG...] [same options as run]
     python src/compare_cap_cover.py summary TAG[,TAG...] [--base CONFIG]
+    python src/compare_cap_cover.py timing TAG CONFIG CORPUS:FOLD:KF [...] [--cpu 14] [--num-vectors N]
 
 `prepare` cuts each corpus's blocklist folds exactly as main.generate_budget
 does (main._fold_selections on the cached cluster labels, ground truth by
@@ -16,7 +17,9 @@ function, so no evaluation CSV is touched. `run` builds every CONFIG on every
 one row per filter to results/cap_cover/<TAG>.csv. `tau` builds each filter
 once and queries it at several thresholds (tau_job), one row per tau;
 `stream` bootstraps on half of B and inserts the rest (stream_job), one row
-per checkpoint.
+per checkpoint. `timing` builds and queries each cell sequentially in this
+process, pinned to one CPU (timing_job): construction time and queries/s in
+batches of 32 and one at a time, appended to results/cap_cover/<TAG>.csv.
 
 Every filter gets the same byte budget: what Ball-Cover at TQ4 (192 B center
 + 2 B radius, 128 B codebook) needs for round(k_fraction * |B|) balls -- the
@@ -61,41 +64,56 @@ def _configs():
         return lambda budget: BallCoverFilter(DIM, construct_method=construct(), max_memory=budget,
                                               insert_method=None, quantize=q)
 
-    def cap_auto(**merge):
-        return lambda budget: CapCoverFilter.auto(DIM, budget, construct_method=CapSphereMerge(**merge))
+    # The merge every config below measured before 2026-10-03's volume
+    # objective (src/filters/cap_cover/sphere_merge_construct.py): cost
+    # sum m (theta + 0.1)^8, mass-weighted. Configs named before then keep
+    # it, so their rows reproduce.
+    old_merge = dict(cost="power", exponent=8.0, mass_weight=1.0)
+
+    def cap_auto(selection="proxy", merge=old_merge, **kw):
+        return lambda budget: CapCoverFilter.auto(DIM, budget, selection=selection,
+                                                  construct_method=CapSphereMerge(**merge), **kw)
 
     configs = {
         # The paper's Ball-Cover (runner._ball_cover).
         "ball_paper": ball(lambda: BallMinimax(sphere=True), BQ.TQ4),
-        # auto() selects with the held-out veto by default since 2026-10-03;
-        # cap_auto rows written before that (final_kf*, v10k_*, final10k_*,
-        # c80_*) used the reach proxy alone, which cap_auto_proxy keeps.
+        # auto()'s defaults, whatever they are when the row was written:
+        # since 2026-10-03 (volume objective) the least-volume encoding over
+        # a merge by accept-region volume; before that the held-out veto
+        # (veto2_*: cap_auto_hold25 = cap_auto_veto), and before that the
+        # reach proxy alone (final_kf*, v10k_*, final10k_*, c80_*).
         "cap_auto": lambda budget: CapCoverFilter.auto(DIM, budget),
-        "cap_auto_proxy": lambda budget: CapCoverFilter.auto(DIM, budget, selection="proxy"),
+        "cap_auto_veto": cap_auto("holdout"),
+        "cap_auto_proxy": cap_auto(),
         # Reach-proxy selection over an unweighted (mass_weight 0) merge.
-        "cap_auto0_proxy": lambda budget: CapCoverFilter.auto(DIM, budget, selection="proxy",
-                                                              construct_method=CapSphereMerge(mass_weight=0.0)),
+        "cap_auto0_proxy": cap_auto(merge=dict(old_merge, mass_weight=0.0)),
         # Merge cost in Ball-Cover's units (sin of the cap angle).
-        "cap_auto_sine": cap_auto(cost_space="sine"),
+        "cap_auto_sine": cap_auto(merge=dict(old_merge, cost_space="sine")),
         # Encoding chosen for another tau than the one queried (tau study).
-        "cap_auto_sel05": lambda budget: CapCoverFilter.auto(DIM, budget, selection_tau=0.05),
-        "cap_auto_sel20": lambda budget: CapCoverFilter.auto(DIM, budget, selection_tau=0.2),
+        "cap_auto_sel05": cap_auto(selection_tau=0.05),
+        "cap_auto_sel20": cap_auto(selection_tau=0.2),
         # Encoding chosen on held-out members instead of the reach proxy.
-        "cap_auto_hold25": lambda budget: CapCoverFilter.auto(DIM, budget, selection="holdout"),
-        "cap_auto_hold50": lambda budget: CapCoverFilter.auto(DIM, budget, selection="holdout",
-                                                              holdout_fraction=0.5),
-        "cap_auto_hold25z0": lambda budget: CapCoverFilter.auto(DIM, budget, selection="holdout",
-                                                                holdout_z=0.0),
-        "cap_auto_hold25z5": lambda budget: CapCoverFilter.auto(DIM, budget, selection="holdout",
-                                                                holdout_z=5.0),
-        "cap_auto_hold25z8": lambda budget: CapCoverFilter.auto(DIM, budget, selection="holdout",
-                                                                holdout_z=8.0),
+        "cap_auto_hold25": cap_auto("holdout"),
+        "cap_auto_hold50": cap_auto("holdout", holdout_fraction=0.5),
+        "cap_auto_hold25z0": cap_auto("holdout", holdout_z=0.0),
+        "cap_auto_hold25z5": cap_auto("holdout", holdout_z=5.0),
+        "cap_auto_hold25z8": cap_auto("holdout", holdout_z=8.0),
     }
+    # Volume objective (2026-10-03): unweighted merges by accept-region
+    # measure on S^p (p = 383, the sphere itself, unless named), least-
+    # volume encoding unless named.
+    for p in (8, 32, 128):
+        configs[f"cap_auto_p{p}"] = cap_auto("volume", dict(exponent=float(p)))
+    configs["cap_auto_pow8"] = cap_auto("volume", dict(old_merge, mass_weight=0.0))
+    configs["cap_auto_vproxy"] = cap_auto("proxy", {})
+    # Exact minimum enclosing caps for the widest share of multi-member caps.
+    for frac in (0.1, 1.0):
+        configs[f"cap_auto_mec{int(frac * 100)}"] = cap_auto("volume", dict(exact_caps=frac))
     # SphereMergeConstruct's large-n paths forced at |B| = 8000, with the
     # defaults they were measured under (min_batch 0, 12 probes; v10k_*,
     # split_*, knn20*_ CSVs): cell-probed neighbour lists (knn_exact_max),
     # member searches restricted to them (exact_pairs), and both.
-    old = dict(min_batch=0.0, knn_probes=12)
+    old = dict(old_merge, min_batch=0.0, knn_probes=12)
     for name, kw in (("local", dict(knn_exact_max=0, exact_pairs=0)), ("knn", dict(knn_exact_max=0)),
                      ("cand", dict(exact_pairs=0)), ("mb1", dict(min_batch=0.01)),
                      ("local_mb1", dict(knn_exact_max=0, exact_pairs=0, min_batch=0.01)),
@@ -103,7 +121,7 @@ def _configs():
                      # knn_exact_max = 16384 runs approximately: above 20%.
                      ("knn20", dict(knn_exact_max=1600, exact_pairs=0)),
                      ("knn20p24", dict(knn_exact_max=1600, exact_pairs=0, knn_probes=24))):
-        configs[f"cap_auto_{name}"] = cap_auto(**{**old, **kw})
+        configs[f"cap_auto_{name}"] = cap_auto(merge={**old, **kw})
     for q in ("TQ4", "TQ3", "TQ2", "TQ1"):
         configs[f"ball_sm_{q}"] = ball(BallSphereMerge, BQ[q])
     # Streaming (stream_job): bootstrap with construct(), then insert().
@@ -113,25 +131,66 @@ def _configs():
         configs[f"sball_cm_{q}"] = (lambda q: lambda budget: BallCoverFilter(
             DIM, construct_method=BallSphereMerge(), max_memory=budget, insert_method=BallCapMerge(),
             quantize=BQ[q]))(q)
-    configs["scap_auto"] = lambda budget: CapCoverFilter.auto(DIM, budget,
-                                                              insert_method=CapMergeInsert(fit_codes=False))
+    # Streaming configs named before the volume objective keep its merge
+    # and insert costs (mass-weighted (theta + 0.1)^8) and proxy selection.
+    old_insert = dict(cost="power", exponent=8.0, mass_weight=1.0)
+
+    def scap(q=None, merge=old_merge, insert=old_insert, selection="proxy", fit=True):
+        def make(budget):
+            kw = dict(max_memory=budget, construct_method=CapSphereMerge(**merge),
+                      insert_method=CapMergeInsert(fit_codes=fit, **insert))
+            if q is None:
+                return CapCoverFilter.auto(DIM, selection=selection, **kw)
+            return CapCoverFilter(DIM, quantize=CQ[q], **kw)
+        return make
+
+    configs["scap_auto"] = scap(fit=False)
     for q in ("TQ2", "TQ3", "TQ4", "TQ8"):
-        configs[f"scap_{q}"] = (lambda q: lambda budget: CapCoverFilter(
-            DIM, quantize=CQ[q], max_memory=budget, insert_method=CapMergeInsert(fit_codes=False)))(q)
+        configs[f"scap_{q}"] = scap(q, fit=False)
     # Merged caps' codes fitted to their two parts (CapMergeInsert.fit_codes,
     # the default since measured).
     for q in ("TQ2", "TQ3", "TQ4"):
-        configs[f"scap_fit_{q}"] = (lambda q: lambda budget: CapCoverFilter(
-            DIM, quantize=CQ[q], max_memory=budget, insert_method=CapMergeInsert(fit_codes=True)))(q)
-    configs["scap_fit_auto"] = lambda budget: CapCoverFilter.auto(DIM, budget,
-                                                                  insert_method=CapMergeInsert(fit_codes=True))
+        configs[f"scap_fit_{q}"] = scap(q)
+    configs["scap_fit_auto"] = scap()
+    # The volume objective's defaults throughout (2026-10-03).
+    configs["scapv_auto"] = scap(merge={}, insert={}, selection="volume")
+    for q in ("TQ2", "TQ3", "TQ4"):
+        configs[f"scapv_{q}"] = scap(q, merge={}, insert={})
+    # Query-agnostic insert costs other than the sphere's own volume: the
+    # volume on S^8 (degenerate: FPR 1.0 on ChatGPT-paraphrases, see
+    # CapMergeInsert), and the unweighted small-angle form (theta + 0.1)^8.
+    for q in ("TQ2", "TQ4"):
+        configs[f"scapv8_{q}"] = scap(q, merge={}, insert=dict(exponent=8.0))
+        configs[f"scapvp_{q}"] = scap(q, merge={}, insert=dict(cost="power", exponent=8.0))
     # main.generate_streaming's budget: the unquantized (FP32) static filter
     # at k balls, 8x this module's.
     fp32 = lambda budget: (budget - 128) // 194 * (1536 + 2) + 128
-    for name in ("sball_cm_FP32", "sball_cm_FP16", "sball_cm_TQ4", "scap_fit_auto", "scap_fit_TQ4"):
+    for name in ("sball_cm_FP32", "sball_cm_FP16", "sball_cm_TQ4", "scap_fit_auto", "scap_fit_TQ4",
+                 "scapv_auto", "scapv_TQ4"):
         configs[f"{name}_b32"] = (lambda make: lambda budget: make(fp32(budget)))(configs[name])
     for q in ("SPQ6", "SPQ9", "SPQ12", "SPQ16", "SPQ24", "SPQ36", "SPQ48", "SPQ64", "TQ2", "TQ3", "TQ4", "TQ8"):
-        configs[f"cap_{q}"] = (lambda q: lambda budget: CapCoverFilter(DIM, quantize=CQ[q], max_memory=budget))(q)
+        configs[f"cap_{q}"] = (lambda q: lambda budget: CapCoverFilter(
+            DIM, quantize=CQ[q], max_memory=budget, construct_method=CapSphereMerge(**old_merge)))(q)
+    # Fixed encodings under the volume objective's merge, including seeded
+    # PQ in a basis trained on the caps (PSPQ*).
+    for q in CQ:
+        configs[f"capv_{q.value}"] = (lambda q: lambda budget: CapCoverFilter(DIM, quantize=q, max_memory=budget))(q)
+        configs[f"capvm_{q.value}"] = (lambda q: lambda budget: CapCoverFilter(
+            DIM, quantize=q, max_memory=budget, basis_fit="members"))(q)
+    from filters.cap_cover.cap_cover_filter import AUTO_CANDIDATES
+    basis = tuple(q for q in CQ if q.value.startswith("PSPQ"))
+    configs["cap_autob"] = lambda budget: CapCoverFilter.auto(DIM, budget, candidates=AUTO_CANDIDATES + basis)
+    configs["cap_autobm"] = lambda budget: CapCoverFilter.auto(DIM, budget, candidates=AUTO_CANDIDATES + basis,
+                                                               basis_fit="members")
+    # One encoding per filter (before mixed encodings), and the mix with the
+    # VA+-style KLT codes as candidates too.
+    configs["cap_auto_uni"] = lambda budget: CapCoverFilter.auto(DIM, budget, mixed=False)
+    configs["cap_auto_free"] = lambda budget: CapCoverFilter.auto(DIM, budget, mixed="free")
+    configs["cap_auto_coarsen"] = lambda budget: CapCoverFilter.auto(DIM, budget, mixed="coarsen")
+    klt = tuple(q for q in CQ if q.value.startswith("KSQ"))
+    configs["cap_autok"] = lambda budget: CapCoverFilter.auto(DIM, budget, candidates=AUTO_CANDIDATES + klt)
+    configs["cap_autok_coarsen"] = lambda budget: CapCoverFilter.auto(DIM, budget, candidates=AUTO_CANDIDATES + klt,
+                                                                      mixed="coarsen")
     # Query-agnostic covers (no member-count weights): Gonzalez + minimax
     # Lloyd rounds, and sphere-merge with mass_weight 0.
     from filters.cap_cover.minimax_construct import MinimaxConstruct as CapMinimax
@@ -140,7 +199,8 @@ def _configs():
             DIM, quantize=CQ[q], max_memory=budget, construct_method=CapMinimax()))(q)
     for q in ("SPQ12", "SPQ24", "SPQ48", "SPQ64", "TQ2", "TQ3", "TQ4", "TQ8"):
         configs[f"cap_sm0_{q}"] = (lambda q: lambda budget: CapCoverFilter(
-            DIM, quantize=CQ[q], max_memory=budget, construct_method=CapSphereMerge(mass_weight=0.0)))(q)
+            DIM, quantize=CQ[q], max_memory=budget,
+            construct_method=CapSphereMerge(**dict(old_merge, mass_weight=0.0))))(q)
     return configs
 
 
@@ -263,7 +323,7 @@ def run_job(folds_dir: str, config: str, corpus: str, fold: int, kf: float) -> d
     row = dict(config=config, corpus=corpus, fold=fold, kf=kf, k_ball=k, budget=budget,
                bytes=int(f.get_bytesize()),
                n_regions=int(getattr(f, "_num_caps", getattr(f, "_num_spheres", -1))),
-               encoding=getattr(getattr(f, "quantize", None), "value", ""),
+               encoding=getattr(f, "encoding_label", getattr(getattr(f, "quantize", None), "value", "")),
                override=str(getattr(f, "selection_override", None) or ""),
                fpr=float(predicted[neg].mean()), construct_s=construct_s, query_s=query_s,
                **accept_volume(f, TAU), **proxies)
@@ -303,7 +363,7 @@ def tau_job(folds_dir: str, config: str, corpus: str, fold: int, kf: float, taus
             raise ValueError(f"{config} {corpus} fold {fold} kf {kf} tau {tau}: {fn} false negatives")
         neg = ~actual
         row = dict(config=config, corpus=corpus, fold=fold, kf=kf, tau=tau, k_ball=k, budget=budget,
-                   encoding=getattr(getattr(f, "quantize", None), "value", ""),
+                   encoding=getattr(f, "encoding_label", getattr(getattr(f, "quantize", None), "value", "")),
                    positives=int(actual.sum()), fpr=float(predicted[neg].mean()))
         start = 0
         for source, n in (("heldout", int(z["n_heldout"])), ("withheld", int(z["n_withheld"])),
@@ -365,10 +425,44 @@ def stream_job(folds_dir: str, config: str, corpus: str, fold: int, kf: float, b
         neg = ~actual
         rows.append(dict(config=config, corpus=corpus, fold=fold, kf=kf, k_ball=k, budget=budget, position=stop,
                          n_regions=int(getattr(f, "_num_caps", getattr(f, "_num_spheres", -1))),
-                         encoding=getattr(getattr(f, "quantize", None), "value", ""),
+                         encoding=getattr(f, "encoding_label", getattr(getattr(f, "quantize", None), "value", "")),
                          peak_bytes=int(peak), fpr=float(predicted[neg].mean()),
-                         insert_s=insert_s, total_s=time.perf_counter() - start))
+                         insert_s=insert_s, total_s=time.perf_counter() - start, **accept_volume(f, TAU)))
     return rows
+
+
+def timing_job(folds_dir: str, config: str, corpus: str, fold: int, kf: float) -> dict:
+    """One cell timed in this process: construct(), then 2048 of the fold's
+    queries (a fixed shuffle) in batches of 32 and the first 256 one at a
+    time, best of two passes each. Time it pinned to one quiet core."""
+    z = np.load(os.path.join(folds_dir, f"{corpus}_{fold}.npz"))
+    B, Q, actual = z["B"], z["Q"], z["actual"]
+    k = max(1, round(kf * len(B)))
+    budget = ball_budget(k)
+    f = _configs()[config](budget)
+    start = time.perf_counter()
+    f.construct(B)
+    construct_s = time.perf_counter() - start
+    predicted = np.asarray(f.query(Q, TAU), dtype=bool)
+    if (~predicted & actual).any():
+        raise ValueError(f"{config} {corpus} fold {fold} kf {kf}: false negatives")
+    Qs = Q[np.random.default_rng(0).permutation(len(Q))][:2048]
+    f.query(Qs[:32], TAU)
+
+    def rate(queries, batch):
+        best = 0.0
+        for _ in range(2):
+            t = time.perf_counter()
+            for s in range(0, len(queries), batch):
+                f.query(queries[s:s + batch], TAU)
+            best = max(best, len(queries) / (time.perf_counter() - t))
+        return best
+
+    return dict(config=config, corpus=corpus, fold=fold, kf=kf, n=len(B), budget=budget,
+                regions=int(getattr(f, "_num_caps", getattr(f, "_num_spheres", -1))),
+                encoding=getattr(f, "encoding_label", getattr(getattr(f, "quantize", None), "value", "")),
+                construct_s=construct_s, qps32=rate(Qs, 32), qps1=rate(Qs[:256], 1),
+                fpr=float(predicted[~actual].mean()), **accept_volume(f, TAU))
 
 
 def _parse_cpus(spec: str):
@@ -446,6 +540,12 @@ def main_cli() -> None:
         r.add_argument("--corpora", default=",".join(CORPORA))
         r.add_argument("--cpus", default="16-27")
         r.add_argument("--num-vectors", type=int, default=10_000)
+    t = sub.add_parser("timing")
+    t.add_argument("tag")
+    t.add_argument("config")
+    t.add_argument("cells", nargs="+")
+    t.add_argument("--cpu", type=int, default=14)
+    t.add_argument("--num-vectors", type=int, default=10_000)
     s = sub.add_parser("summary")
     s.add_argument("tags")
     s.add_argument("--base", default="cap_auto")
@@ -463,6 +563,15 @@ def main_cli() -> None:
             print(df.pivot_table(index="config", columns="tau", values="fpr").round(4))
         else:
             print(df.pivot_table(index="config", columns="position", values="fpr").round(4))
+    elif a.cmd == "timing":
+        import psutil
+        psutil.Process().cpu_affinity([a.cpu])
+        path = os.path.join(OUT_DIR, f"{a.tag}.csv")
+        for cell in a.cells:
+            corpus, fold, kf = cell.split(":")
+            row = timing_job(os.path.join(OUT_DIR, f"folds_{a.num_vectors}"), a.config, corpus, int(fold), float(kf))
+            print({k: (round(v, 3) if isinstance(v, float) else v) for k, v in row.items()}, flush=True)
+            pd.DataFrame([row]).to_csv(path, mode="a", header=not os.path.exists(path), index=False)
     else:
         df = pd.concat([pd.read_csv(os.path.join(OUT_DIR, f"{t}.csv")) for t in a.tags.split(",")])
         summary(df, a.base)

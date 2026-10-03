@@ -144,6 +144,49 @@ class TestCapCoverSoundness(unittest.TestCase):
                 self.assertIn(f.quantize, AUTO_CANDIDATES)
                 _assert_no_fn(self, f, X)
 
+    def test_auto_selects_least_volume(self):
+        X = _clustered(n_clusters=60, per=10, dim=96, spread=0.4)
+        f = CapCoverFilter.auto(96, 4000, mixed=False)
+        self.assertEqual(f.selection, "volume")
+        f.construct(X)
+        self.assertEqual(f.quantize.value, min(f.selection_scores, key=f.selection_scores.get))
+        _assert_no_fn(self, f, X)
+
+    def test_auto_mixed_encodings(self):
+        X = _clustered(n_clusters=60, per=10, dim=96, spread=0.4)
+        rng = np.random.default_rng(7)
+        Q = np.vstack([_near(X, 0.6, n=2), _unit(rng.standard_normal((300, 96)))]).astype(np.float32)
+        mixed_seen = False
+        for budget in (1500, 4000, 12000):
+            with self.subTest(budget=budget):
+                f = CapCoverFilter.auto(96, budget)
+                f.construct(X)
+                levels = f._cap_level[f.all_caps]
+                mixed_seen |= len(np.unique(levels)) > 1
+                self.assertLessEqual(f.get_bytesize(), budget)
+                # Bytes are what each cap's own encoding costs.
+                expect = (f._code_sizes[levels] + 1).sum() + f._codebook_bytes() + sum(
+                    f._quantizer_bytes(int(l)) + f._GROUP_BYTES for l in np.unique(levels) if l != f._uniform)
+                self.assertEqual(f.get_bytesize(), expect)
+                _assert_no_fn(self, f, X)
+                self.assertTrue((f.surface_angle(X) <= 1e-9).all())
+                for tau in (0.0, TAU, 0.6):
+                    got = np.asarray(f.query(Q, tau))
+                    self.assertTrue(np.array_equal(got, TestCapCoverScan._reference(f, Q, tau)))
+                    single = np.concatenate([f.query(Q[s:s + 1], tau) for s in range(0, 120)])
+                    self.assertTrue(np.array_equal(single, got[:120]))
+        self.assertTrue(mixed_seen, "no budget mixed encodings")
+
+    def test_auto_with_basis_candidates(self):
+        X = _clustered(n_clusters=60, per=10, dim=96, spread=0.4)
+        basis = (Quantize.PSPQ6, Quantize.PSPQ9, Quantize.PSPQ12, Quantize.DPQ6, Quantize.DPQ9, Quantize.DPQ12)
+        for budget in (6000, 20000):
+            with self.subTest(budget=budget):
+                f = CapCoverFilter.auto(96, budget, candidates=AUTO_CANDIDATES + basis)
+                f.construct(X)
+                self.assertLessEqual(f.get_bytesize(), budget)
+                _assert_no_fn(self, f, X)
+
     def test_auto_holdout_selection(self):
         X = _clustered(n_clusters=60, per=10, dim=96, spread=0.4)
         for budget in (1500, 4000):
@@ -194,6 +237,29 @@ class TestCapCoverBudget(unittest.TestCase):
                 self.assertLessEqual(f.get_bytesize(), 3000)
                 self.assertGreater(f._num_caps, 0)
 
+    def test_basis_encodings_charge_their_basis(self):
+        X = _clustered(dim=96)
+        for q, rank in ((Quantize.PSPQ12, 64), (Quantize.DPQ12, 64), (Quantize.DPQ9, 48)):
+            with self.subTest(q=q):
+                f = CapCoverFilter(96, max_memory=12000, quantize=q)
+                f.construct(X)
+                self.assertLessEqual(f.get_bytesize(), 12000)
+                # rank TQ4 rows of 48 B at d = 96, plus the TQ4 table and seeds.
+                self.assertGreaterEqual(f._codebook_bytes(), rank * 48)
+                _assert_no_fn(self, f, X)
+
+    def test_dual_code_flag_picks_tighter_family(self):
+        X = unit_rows(_clustered(dim=96, spread=0.4))
+        f = CapCoverFilter(96, max_caps=10 ** 6, quantize=Quantize.DPQ12)
+        f.construct(X)
+        sq = f._quantizers[f._uniform]
+        D = f.to_working(X)
+        cb, cf = sq.basis.compute_codes(D), sq.full.compute_codes(D)
+        both = np.minimum(angle_between(D, unit_rows(sq.basis.decode(cb))),
+                          angle_between(D, unit_rows(sq.full.decode(cf))))
+        got = angle_between(D, unit_rows(sq.decode(sq.compute_codes(D))))
+        np.testing.assert_allclose(got, both, rtol=0, atol=1e-12)
+
     def test_cap_costs_match_ball_at_same_encoding(self):
         f = CapCoverFilter(384, quantize=Quantize.TQ4, insert_method=NearestInsert())
         self.assertEqual(f.bytes_per_cap(), 192 + 2)
@@ -211,7 +277,7 @@ class TestCapCoverScan(unittest.TestCase):
 
     ENCODINGS = (Quantize.TQ1, Quantize.TQ2, Quantize.TQ3, Quantize.TQ4, Quantize.TQ8, Quantize.SPQ12,
                  Quantize.SPQ16, Quantize.SPQ24, Quantize.SPQ36, Quantize.SPQ48, Quantize.SPQ64,
-                 Quantize.FP32, Quantize.FP16)
+                 Quantize.FP32, Quantize.FP16, Quantize.PSPQ6, Quantize.PSPQ9, Quantize.DPQ6, Quantize.DPQ9)
 
     def test_block_decoder_matches_quantizer(self):
         X = _clustered()
@@ -233,7 +299,7 @@ class TestCapCoverScan(unittest.TestCase):
         Qw = f.to_working(Q)
         n = np.linalg.norm(Qw, axis=1)
         beta, feasible = f._beta(n, tau)
-        D = f.decode(f._codes[f.all_caps])
+        D = f.decode_caps(f.all_caps)
         theta = f.all_angles
         ang = angle_between(unit_rows(Qw)[:, None, :], D[None, :, :])
         hit = (ang <= theta[None, :] + beta[:, None]) | (theta[None, :] + beta[:, None] >= np.pi)
@@ -251,9 +317,11 @@ class TestCapCoverScan(unittest.TestCase):
                     f.construct(X)
                     got = np.asarray(f.query(Q, tau))
                     self.assertTrue(np.array_equal(got, self._reference(f, Q, tau)))
-                    # Batches of any size decide the same.
-                    small = np.concatenate([f.query(Q[s:s + 7], tau) for s in range(0, len(Q), 7)])
-                    self.assertTrue(np.array_equal(small, got))
+                    # Batches of any size decide the same (1-3 queries:
+                    # accept_direct, for 12-bit seeded PQ).
+                    for size in (1, 3, 7):
+                        small = np.concatenate([f.query(Q[s:s + size], tau) for s in range(0, len(Q), size)])
+                        self.assertTrue(np.array_equal(small, got))
 
     def test_table_scan_matches_float64_rule(self):
         """The codeword-table scan, forced for every seeded-PQ encoding
@@ -353,6 +421,17 @@ class TestCapCoverInsert(unittest.TestCase):
         f, X = self._stream(CapMergeInsert(mass_weight=1.0, cost="power", exponent=8.0))
         _assert_no_fn(self, f, X)
 
+    def test_cap_merge_insert_dual_codes_no_false_negatives(self):
+        X = _clustered(n_clusters=40, per=10, dim=96)
+        X = X[np.random.default_rng(3).permutation(len(X))]
+        budget = 40 * 60 + 4000
+        f = CapCoverFilter(96, max_memory=budget, quantize=Quantize.DPQ12, insert_method=CapMergeInsert())
+        f.construct(X[:150])
+        for s in range(150, len(X), 50):
+            f.insert(X[s:s + 50])
+            self.assertLessEqual(f.get_bytesize(), budget)
+        _assert_no_fn(self, f, X)
+
     def test_cap_merge_insert_fitted_codes_no_false_negatives(self):
         f, X = self._stream(CapMergeInsert(fit_codes=True))
         self.assertLessEqual(f._num_caps, f.max_caps)
@@ -361,7 +440,8 @@ class TestCapCoverInsert(unittest.TestCase):
     def test_fit_cap_code_never_worse_than_own_code(self):
         rng = np.random.default_rng(4)
         X = _clustered(dim=96)
-        for q in (Quantize.TQ2, Quantize.TQ4, Quantize.SPQ24, Quantize.SPQ64, Quantize.FP16):
+        for q in (Quantize.TQ2, Quantize.TQ4, Quantize.SPQ24, Quantize.SPQ64, Quantize.FP16, Quantize.PSPQ12,
+                  Quantize.DPQ12):
             with self.subTest(q=q):
                 f = CapCoverFilter(96, max_caps=40, quantize=q)
                 f.construct(X)
