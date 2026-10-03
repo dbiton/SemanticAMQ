@@ -13,6 +13,7 @@ from filters.ball_cover.least_inflation_insert import LeastInflationInsert
 from filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
 from filters.ball_cover.doubling_insert import DoublingInsert
 from filters.ball_cover.pooled_insert import PooledInsert
+from filters.ball_cover import scan_kernels
 
 
 class Quantize(Enum):
@@ -220,8 +221,8 @@ class BallCoverFilter(Filter):
         if self._all_centers is None:
             self._all_centers = np.empty((len(self._all_radiuses), self.dim), dtype=np.float32)
             if self._num_spheres > 0:
-                sphere_indices = np.ascontiguousarray(self.all_spheres, dtype=np.int64)
-                self._all_centers[self.all_spheres] = self.all_centers_index.reconstruct_batch(sphere_indices)
+                ids, codes = self._stored_codes()
+                self._all_centers[ids] = self._decode(codes)
         return self._all_centers[self.all_spheres]
 
     @property
@@ -303,8 +304,9 @@ class BallCoverFilter(Filter):
             # center let MinHeapInsert treat a vector within r + err of it as
             # covered while query() scored it against a center up to err
             # farther away -- 27.7% false negatives at TQ1 on WildChat.
-            self._all_centers[new_sphere_indices] = self.all_centers_index.reconstruct_batch(
-                new_sphere_indices.astype(np.int64))
+            # add_with_ids appends, so the new balls are the last rows.
+            _, codes = self._stored_codes()
+            self._all_centers[new_sphere_indices] = self._decode(codes[-num_new_spheres:])
 
         return new_sphere_indices
 
@@ -461,6 +463,52 @@ class BallCoverFilter(Filter):
         if isinstance(leaf, faiss.IndexPreTransform):
             return faiss.downcast_index(leaf.index)
         return leaf
+
+
+    def _rotation(self) -> Optional[faiss.VectorTransform]:
+        """The orthonormal rotation in front of the quantizer, or None."""
+        coder = self._coder()
+        if isinstance(coder, faiss.IndexPreTransform):
+            return faiss.downcast_VectorTransform(coder.chain.at(0))
+        return None
+
+
+    def _stored_codes(self) -> tuple:
+        """(ids, codes) for every stored ball, in the index's storage order:
+        row i of `codes` is ball ids[i]. `codes` is a zero-copy view of the
+        leaf's code array, so it is only valid until the index next changes.
+
+        Reading the codes directly is what makes decoding cheap.
+        IndexIDMap2.reconstruct_batch decodes one id at a time, and through a
+        rotation that means one 384x384 matrix-vector product per ball: 850 ms
+        for 16K TQ4 balls, against ~6 ms to decode the same codes in bulk."""
+        leaf = self._leaf_index()
+        n, size = int(leaf.ntotal), int(leaf.code_size)
+        ids = faiss.vector_to_array(self.all_centers_index.id_map).astype(np.int64)
+        if n == 0:
+            return ids, np.empty((0, size), dtype=np.uint8)
+        codes = np.asarray(faiss.rev_swig_ptr(leaf.codes.data(), n * size)).reshape(n, size)
+        return ids, codes
+
+
+    def _decode_rotated(self, codes: np.ndarray) -> np.ndarray:
+        """Decoded centers in the quantizer's own basis -- past the rotation,
+        where there is one. The rotation is orthonormal, so distances
+        measured here between rotated queries and these centers equal
+        distances between raw queries and the decoded centers."""
+        if _ENCODINGS[self.quantize].kind == "flat":
+            return codes.view(np.float32)
+        return self._leaf_index().sa_decode(np.ascontiguousarray(codes))
+
+
+    def _decode(self, codes: np.ndarray) -> np.ndarray:
+        """Decoded centers in the input basis: decode(c), as reconstruct
+        returns it, but in one batched pass."""
+        decoded = self._decode_rotated(codes)
+        rotation = self._rotation()
+        if rotation is not None and len(decoded):
+            decoded = rotation.reverse_transform(decoded)
+        return np.ascontiguousarray(decoded, dtype=np.float32)
 
 
     def bytes_per_ball(self, index: Optional[faiss.IndexIDMap2] = None) -> int:
@@ -685,15 +733,48 @@ class BallCoverFilter(Filter):
             self.insert_method.initialize_buffers(self, sphere_indices, self.all_centers, self.all_radiuses,
                                                   vectors=vectors)
 
+        self._store_largest_first()
         self._constructed = True
         self._all_centers = None # clear temporary centers view
 
 
+    def _store_largest_first(self) -> None:
+        """Reorders the index's storage -- codes and id_map together -- so
+        the largest balls are scanned first. Ids, radii and every per-id
+        array are untouched, so no query decision changes, only how soon
+        it is reached: a query stops at the first ball that accepts it, and
+        large balls accept most often. Measured with scan_kernels on the five
+        blocklist covers (TQ4, batch 32, random query mix): 1.20-1.48x at
+        16K balls and 1.16-1.37x at 2K over construction order. Neighbouring
+        balls then also tend to abandon at the same word, which the branch
+        predictor rewards.
+
+        Static filters only. all_centers un-rotates the decoded codes with
+        one batched GEMM, whose float32 rounding depends on a row's position
+        in the batch (up to 1.2e-7 per coordinate at dim=384), and insert
+        strategies decide from all_centers: reordering a streaming filter
+        changed the cover cap_merge built after 1500 TQ4 inserts, though
+        not a single query decision. With no insert strategy nothing
+        decides from all_centers after construct(), so the cover stays
+        bit-identical."""
+        if self.insert_method is not None:
+            return
+        ids, codes = self._stored_codes()
+        order = np.argsort(-self._all_radiuses[ids], kind="stable")
+        if len(order) < 2 or (order == np.arange(len(order))).all():
+            return
+        codes[:] = codes[order]
+        id_map = self.all_centers_index.id_map
+        faiss.rev_swig_ptr(id_map.data(), id_map.size())[:] = ids[order]
+        self.all_centers_index.construct_rev_map()
+
+
     def surface_distance(self, vectors: np.ndarray) -> np.ndarray:
         """Per query, the smallest (distance to a ball's center - its radius)
-        over every ball; inf with no balls. query() accepts exactly the rows
-        where this is <= distance_threshold + _COVERAGE_EPSILON, so a caller
-        sweeping many thresholds over one cover can search once."""
+        over every ball; inf with no balls. query() accepts the rows where
+        this is <= distance_threshold + _COVERAGE_EPSILON (up to float32
+        rounding far from any center -- see _scan), so a caller sweeping many
+        thresholds over one cover can scan once."""
         if not self._constructed:
             raise ValueError("BallCoverFilter has not been constructed.")
 
@@ -701,13 +782,273 @@ class BallCoverFilter(Filter):
             return np.full(len(vectors), np.inf)
 
         Q = np.ascontiguousarray(vectors, dtype=np.float32)
-        d2, labels = self.all_centers_index.search(Q, self._num_spheres)
-        surface = np.where(labels >= 0, np.sqrt(np.maximum(d2, 0.0)) - self._all_radiuses[np.maximum(labels, 0)], np.inf)
-        return surface.min(axis=1)
+        if _ENCODINGS[self.quantize].kind == "rabitq":
+            return self._estimator_surface_distance(Q)
+        return self._scan(Q, distance_threshold=None)
 
 
     def query(self, vectors: np.ndarray, distance_threshold: float) -> list[bool]:
-        return (self.surface_distance(vectors) <= distance_threshold + self._COVERAGE_EPSILON).tolist()
+        if not self._constructed:
+            raise ValueError("BallCoverFilter has not been constructed.")
+
+        if self._num_spheres == 0 or len(vectors) == 0:
+            return [False] * len(vectors)
+
+        if _ENCODINGS[self.quantize].kind == "rabitq":
+            return (self.surface_distance(vectors) <= distance_threshold + self._COVERAGE_EPSILON).tolist()
+        Q = np.ascontiguousarray(vectors, dtype=np.float32)
+        if self._use_kernel(len(Q)):
+            return self._kernel_accepts(Q, distance_threshold).tolist()
+        if len(Q) < self._SCAN_MIN_BATCH:
+            return self._range_accepts(Q, distance_threshold).tolist()
+        return self._scan(Q, distance_threshold=distance_threshold).tolist()
+
+
+    # 4-bit scalar quantizers whose decode is a per-dimension table lookup on
+    # each nibble, which is what scan_kernels.nibble_accepts reads.
+    _NIBBLE_QTYPES = (faiss.ScalarQuantizer.QT_4bit, faiss.ScalarQuantizer.QT_4bit_tqmse)
+
+    # Which batches go to scan_kernels instead of _scan / _range_accepts.
+    # Measured on the five blocklist covers (random query mix, one pinned
+    # P-core), kernel q/s over the old path's:
+    #   TQ4, 16K balls: 14-23x at 1 query, 1.7-4.3x at 32, 1.2-3.4x at 64
+    #   TQ4,  2K balls:  6-9x  at 1 query, 1.3-2.5x at 32, 0.96-1.8x at 64
+    #   FP32, 16K balls: 1.1-4.5x at 1-4 queries, 0.73-2.9x at 8
+    #   FP32,  2K balls: 0.8-1.7x at 1 query -- faiss's vectorized flat scan
+    #                    wins on a cache-sized cover, hence the ball floor.
+    # FP32 gains less because a float32 center is 8x the bytes of a TQ4
+    # code, so abandoning early saves memory traffic rather than arithmetic.
+    #
+    # Past 64 queries _scan amortizes its decode and its GEMM gets
+    # efficient, but the kernel's work per ball does not grow with the
+    # cover while _scan's does. With the cover stored largest first, at
+    # whole-batch sizes (20K queries) the kernel runs
+    #   TQ4,  2K balls: 0.79-0.88x on four corpora, 1.56x on CC-News
+    #   TQ4,  4K balls: 1.00-1.57x (WildChat, CC-News, WikiAnswers)
+    #   TQ4,  8K balls: 1.36-2.06x, but 0.92x on CC-News
+    #   TQ4, 16K balls: 1.40-2.92x, but 0.88x on CC-News
+    # so a 4-bit cover of _NIBBLE_KERNEL_ANY_BATCH_BALLS or more takes the
+    # kernel at every batch size. CC-News, whose large radii abandon late,
+    # is the one corpus that loses there.
+    _NIBBLE_KERNEL_MAX_BATCH = 64
+    _NIBBLE_KERNEL_ANY_BATCH_BALLS = 4096
+    _FLAT_KERNEL_MAX_BATCH = 8
+    _FLAT_KERNEL_MIN_BALLS = 4096
+
+
+    def _kernel_kind(self) -> Optional[str]:
+        spec = _ENCODINGS[self.quantize]
+        if spec.kind == "flat":
+            return "flat"
+        if spec.kind == "sq" and spec.qtype in self._NIBBLE_QTYPES:
+            return "nibble"
+        return None
+
+
+    def _use_kernel(self, num_queries: int) -> bool:
+        kind = self._kernel_kind()
+        if kind == "nibble":
+            return (num_queries < self._NIBBLE_KERNEL_MAX_BATCH
+                    or self._num_spheres >= self._NIBBLE_KERNEL_ANY_BATCH_BALLS)
+        if kind == "flat":
+            return (num_queries < self._FLAT_KERNEL_MAX_BATCH
+                    and self._num_spheres >= self._FLAT_KERNEL_MIN_BALLS)
+        return False
+
+
+    def _nibble_table(self, rows: int) -> np.ndarray:
+        """(rows, 16) float64: row j, column v is what the quantizer decodes
+        nibble v of dimension j to, read off sa_decode itself (one probe code
+        per nibble value) so it is decode(c) by definition, not a
+        re-derivation of faiss's formula. Rows past dim stay zero. Rebuilt
+        per call from the trained codebook get_bytesize() already charges,
+        rather than cached, so nothing decoded outlives the call."""
+        leaf = self._leaf_index()
+        probe = np.repeat((np.arange(16, dtype=np.uint8) * 17)[:, None], int(leaf.code_size), axis=1)
+        table = np.zeros((rows, 16), dtype=np.float64)
+        table[:self.dim] = leaf.sa_decode(probe).T
+        return table
+
+
+    def _kernel_accepts(self, Q: np.ndarray, distance_threshold: float) -> np.ndarray:
+        """query() through scan_kernels: exact distance to every decoded
+        center, abandoning a ball once a partial sum is provably past its
+        reach -- see scan_kernels for the bound that keeps this exact."""
+        ids, codes = self._stored_codes()
+        radii = self._all_radiuses[ids]
+        tau, eps = float(distance_threshold), float(self._COVERAGE_EPSILON)
+        rotation = self._rotation()
+        Qr = np.ascontiguousarray(rotation.apply(Q) if rotation is not None else Q, dtype=np.float32)
+        if self._kernel_kind() == "flat":
+            return scan_kernels.flat_accepts(codes.view(np.float32), Qr, radii, tau, eps)
+        if codes.shape[1] % 8:
+            # The kernel reads codes a 64-bit word at a time; padding bytes
+            # meet zero table rows, which add exactly nothing.
+            codes = np.pad(codes, ((0, 0), (0, -codes.shape[1] % 8)))
+        return scan_kernels.nibble_accepts(codes, Qr, self._nibble_table(2 * codes.shape[1]), radii, tau, eps)
+
+
+    # Below this many queries, _scan's per-call decode of every code is not
+    # amortized and _range_accepts is faster. Measured on 16K-ball WildChat
+    # covers, one pinned core: a lone query runs at 197 vs 165 q/s (TQ4), 864
+    # vs 390 (PQ8@1), 1,187 vs 658 (FP32); from 4 queries up _scan wins or
+    # ties for every encoding.
+    _SCAN_MIN_BATCH = 4
+
+
+    def _range_accepts(self, Q: np.ndarray, distance_threshold: float) -> np.ndarray:
+        """query() for a handful of queries: faiss range_search at the
+        largest reach any ball has, then each hit checked against its own
+        ball's reach -- the same d^2 <= (r + tau + eps)^2 test _scan applies.
+        Exact for the same reason _scan is: faiss scores ||q - decode(c)||^2
+        directly here (SQ/PQ ADC, and IndexFlat below 20 queries), with no
+        GEMM cancellation, and needs no k-wide heap."""
+        reach = self._all_radiuses[self.all_spheres] + float(distance_threshold) + self._COVERAGE_EPSILON
+        max_reach = float(reach.max())
+        if not np.isfinite(max_reach):
+            return np.ones(len(Q), dtype=bool)
+        if max_reach < 0.0:
+            return np.zeros(len(Q), dtype=bool)
+        # faiss keeps d^2 strictly below the radius; one ulp up keeps "<=".
+        radius = float(np.nextafter(np.float32(max_reach * max_reach), np.float32(np.inf)))
+        lims, d2, labels = self.all_centers_index.range_search(Q, radius)
+        ball_reach = self._all_radiuses[labels].astype(np.float64) + float(distance_threshold) + self._COVERAGE_EPSILON
+        hit = (ball_reach >= 0.0) & (d2 <= ball_reach * ball_reach)
+        accepted = np.zeros(len(Q), dtype=bool)
+        owner = np.repeat(np.arange(len(Q)), np.diff(lims).astype(np.int64))
+        accepted[owner[hit]] = True
+        return accepted
+
+
+    # Balls decoded per block of _scan, and queries per GEMM: bounds the
+    # scratch at (block x dim) decoded floats plus (chunk x block) distances,
+    # ~22 MB in all, whatever the cover size. That scratch is transient --
+    # only the codes persist, which is what get_bytesize() charges.
+    _SCAN_BLOCK = 4096
+    _SCAN_QUERY_CHUNK = 1024
+
+    # _scan computes ||q - c||^2 as ||q||^2 + ||c||^2 - 2<q, c> in float32,
+    # which cancels for near-identical vectors. Its rounding error is at most
+    # about (2d + 4) * 2^-24 * (||q||^2 + ||c||^2) -- 9e-5 for unit vectors at
+    # d=384 -- so every (query, ball) pair whose float32 value lands within
+    # that bound of the decision boundary is re-measured directly in float64.
+    # Accept decisions are therefore exact up to float64 rounding, not up to
+    # float32 cancellation -- the failure the 1e-3 _COVERAGE_EPSILON was
+    # otherwise the only guard against at tau = 0. The bound scales with the
+    # norms, so it holds for un-normalized vectors too (where refinement
+    # just fires more often).
+    #
+    # surface_distance has no boundary to test against, so it instead
+    # re-measures every pair with d^2 < _SCAN_NEAR_D2 * s^2 / 4, where s =
+    # ||q||^2 + max ||c||^2 (so 1e-2 for unit vectors). Past that, sqrt()
+    # damps the same error to under 1e-3 even at the worst-case bound
+    # (typically ~5e-5), and that floor scales with the data, not against it.
+    _SCAN_NEAR_D2 = 1e-2
+
+
+    def _scan(self, Q: np.ndarray, distance_threshold: Optional[float]) -> np.ndarray:
+        """Scores every query against every ball by exact L2 distance to the
+        decoded center, in blocks: decode a block of codes, one GEMM against
+        the queries, compare. Returns the accept mask when distance_threshold
+        is given, otherwise surface_distance's per-query minimum.
+
+        Replaces faiss's search(Q, k=num_spheres), which kept a k-wide result
+        heap per query only for the caller to take one minimum, and scored
+        TQ codes through a per-element scalar path: 180 q/s per core at 16K
+        TQ4 balls. The distances are the same ones query() always used -- to
+        decode(c), not an estimate -- so the triangle-inequality argument is
+        unchanged, and the boundary refinement above makes them more precise
+        than faiss's float32 GEMM path was.
+
+        Works in the quantizer's rotated basis: rotating the queries once
+        costs one GEMM per batch, where un-rotating the centers would cost
+        one per block. The rotation is orthonormal, so distances agree.
+
+        With a threshold, the test is d^2 <= (r + tau + eps)^2, which needs no
+        sqrt, and a query drops out of the remaining blocks as soon as any
+        ball accepts it."""
+        ids, codes = self._stored_codes()
+        radii = self._all_radiuses[ids]
+        rotation = self._rotation()
+        Qr = np.ascontiguousarray(rotation.apply(Q) if rotation is not None else Q, dtype=np.float32)
+        q_norms = np.einsum("ij,ij->i", Qr, Qr)
+        rel_error = (2 * self.dim + 4) * 2.0 ** -24
+
+        if distance_threshold is None:
+            out = np.full(len(Q), np.inf, dtype=np.float32)
+        else:
+            out = np.zeros(len(Q), dtype=bool)
+            reach = radii.astype(np.float64) + float(distance_threshold) + self._COVERAGE_EPSILON
+            # A negative reach admits nothing, which squaring would lose.
+            reach_sq = np.where(reach >= 0.0, reach * reach, -1.0)
+
+        for start in range(0, len(ids), self._SCAN_BLOCK):
+            stop = min(start + self._SCAN_BLOCK, len(ids))
+            C = self._decode_rotated(codes[start:stop])
+            c_norms = np.einsum("ij,ij->i", C, C)
+            pending = np.arange(len(Q)) if distance_threshold is None else np.flatnonzero(~out)
+            for q0 in range(0, len(pending), self._SCAN_QUERY_CHUNK):
+                rows = pending[q0:q0 + self._SCAN_QUERY_CHUNK]
+                scale = q_norms[rows] + c_norms.max()
+                d2 = Qr[rows] @ C.T
+                d2 *= -2.0
+                d2 += q_norms[rows, None]
+                d2 += c_norms[None, :]
+                if distance_threshold is None:
+                    near = self._SCAN_NEAR_D2 * scale * scale / 4.0
+                    out[rows] = np.minimum(out[rows], self._block_surface(
+                        d2, Qr[rows], C, radii[start:stop], near))
+                else:
+                    out[rows] |= self._block_accepts(
+                        d2, Qr[rows], C, reach_sq[start:stop], rel_error * scale)
+            if distance_threshold is not None and out.all():
+                break
+        return out
+
+
+    @staticmethod
+    def _exact_d2(Qb: np.ndarray, C: np.ndarray, i: np.ndarray, j: np.ndarray) -> np.ndarray:
+        diff = Qb[i].astype(np.float64) - C[j].astype(np.float64)
+        return np.einsum("ij,ij->i", diff, diff)
+
+
+    def _block_accepts(self, d2: np.ndarray, Qb: np.ndarray, C: np.ndarray,
+                       reach_sq: np.ndarray, slack: np.ndarray) -> np.ndarray:
+        """Rows of d2 with some ball in reach. A pair more than its row's
+        `slack` inside the boundary is a hit outright; one within `slack`
+        of it either way is re-measured in float64. Overwrites d2."""
+        reach32 = reach_sq.astype(np.float32)
+        slack = slack.astype(np.float32)[:, None]
+        d2 += slack
+        hit = (d2 <= reach32[None, :]).any(axis=1)
+        undecided = np.flatnonzero(~hit)
+        if len(undecided):
+            i, j = np.nonzero(d2[undecided] - 2.0 * slack[undecided] < reach32[None, :])
+            if len(i):
+                i = undecided[i]
+                ok = self._exact_d2(Qb, C, i, j) <= reach_sq[j]
+                hit[i[ok]] = True
+        return hit
+
+
+    def _block_surface(self, d2: np.ndarray, Qb: np.ndarray, C: np.ndarray,
+                       radii: np.ndarray, near: np.ndarray) -> np.ndarray:
+        dist = np.sqrt(np.maximum(d2, 0.0))
+        i, j = np.nonzero(d2 < near.astype(np.float32)[:, None])
+        if len(i):
+            dist[i, j] = np.sqrt(self._exact_d2(Qb, C, i, j))
+        return (dist - radii[None, :]).min(axis=1)
+
+
+    def _estimator_surface_distance(self, Q: np.ndarray) -> np.ndarray:
+        """RABITQ only: faiss's own search, which scores through RaBitQ's
+        distance estimator rather than ||q - decode(c)|| (see the Quantize
+        docstring). Kept as it was so RABITQ rows keep measuring the
+        estimator the paper describes; _scan would quietly turn them into
+        exact-decode rows."""
+        d2, labels = self.all_centers_index.search(Q, self._num_spheres)
+        surface = np.where(labels >= 0, np.sqrt(np.maximum(d2, 0.0)) - self._all_radiuses[np.maximum(labels, 0)], np.inf)
+        return surface.min(axis=1)
 
 
     def insert(self, vectors: np.ndarray) -> None:
