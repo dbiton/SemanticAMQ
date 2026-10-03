@@ -2,7 +2,7 @@ import numpy as np
 from typing import List, Optional
 from filters.filter import Filter
 from filters.cap_cover.cap_interfaces import InsertInterface
-from filters.cap_cover.cap_geometry import angle_between, enclosing_cap, nearest_directions
+from filters.cap_cover.cap_geometry import angle_between, enclosing_cap, log_cap_measure, nearest_directions
 
 
 class CapMergeInsert(InsertInterface):
@@ -12,9 +12,22 @@ class CapMergeInsert(InsertInterface):
     are dropped (their members are held), so a merge can free several
     slots.
 
-    Cost: the increase of sum_i m_i^w (theta_i + t)^p, m = member count
-    (construct's share plus every vector inserted into the cap since) --
-    exponent 8, mass weight 1, offset 0.1 as in SphereMergeConstruct.
+    Cost: the increase of the caps' summed accept-region measure,
+    sum_j sigma_p(theta_j + t), as SphereMergeConstruct's (p = `exponent`,
+    default dim - 1; t = cost_offset). mass_weight w > 0 weights each cap
+    by m^w, m its member count (construct's share plus every vector
+    inserted into it since), and cost="power" takes (theta + t)^p: w = 1,
+    p = 8 is the earlier cost. Measured (compare_cap_cover.py stream,
+    |B| = 8000, kf = 0.1, bootstrap on half of B in fold order, 25 cells,
+    streamv_*.csv against stream_cap_*.csv; the bootstrap merge unweighted
+    and by volume too), FPR at the end of the stream: -0.012 at TQ4
+    (20 of 25 cells better), +0.016 at TQ2 and +0.024 with the encoding
+    chosen at bootstrap -- all of it ChatGPT-paraphrases (+0.10 at TQ2,
+    where paraphrase clusters lose the member-count weights: the
+    unweighted (theta + 0.1)^8 does the same, .865 against .766 weighted),
+    -0.03..+0.015 on the other corpora. The measure on S^8 (exponent=8)
+    saturates near pi, so merging two wide caps into one around the whole
+    sphere costs little: FPR 1.0 on every ChatGPT-paraphrases fold at TQ2.
 
     Geometry: Ball-Cover's version had to recover each ball's cap from a
     center and radius; here the caps are stored as such. Two caps merge into
@@ -34,18 +47,22 @@ class CapMergeInsert(InsertInterface):
     -0.039 with the encoding auto-chosen at bootstrap (19 of 20 that
     differ), -0.008 at TQ4.
 
-    Search: each cap caches its cheapest partner and that pair's cost (8 B
-    per cap with the count, at uint16 ids -- charged by get_bytesize() and
-    paid for in caps by max_caps_for_budget()). A cached cost only ever
-    becomes a lower bound -- its partner is merged away or gains mass, and
-    every cost grows with mass for mass_weight >= 1 -- so such caps are
-    marked stale and re-scanned together once one reaches the top: the pair
-    picked is the one a full k x k scan would pick, at O(k * d) per insert.
+    Search: each cap caches its cheapest partner and that pair's cost (6 B
+    per cap at uint16 ids, 8 B with the member count a weighted cost needs
+    -- charged by get_bytesize() and paid for in caps by
+    max_caps_for_budget()). A cached cost only ever becomes a lower bound
+    -- its partner is merged away, or gains mass and every cost grows with
+    mass for mass_weight >= 1 -- so such caps are marked stale and
+    re-scanned together once one reaches the top: the pair picked is the
+    one a full k x k scan would pick, at O(k * d) per insert.
 
     remove() is not supported."""
 
-    def __init__(self, exponent: float = 8.0, mass_weight: float = 1.0, cost_offset: float = 0.1,
-                 fit_codes: bool = True) -> None:
+    def __init__(self, exponent: Optional[float] = None, mass_weight: float = 0.0, cost_offset: float = 0.1,
+                 fit_codes: bool = True, cost: str = "volume") -> None:
+        if cost not in ("volume", "power"):
+            raise ValueError(f"cost must be 'volume' or 'power', got {cost!r}")
+        self.cost = cost
         self.exponent = exponent
         self.mass_weight = mass_weight
         self.cost_offset = cost_offset
@@ -61,7 +78,9 @@ class CapMergeInsert(InsertInterface):
         return 2 if 2 * (max_caps + 1) < np.iinfo(np.uint16).max else 4
 
     def _state_bytes(self, max_caps: int) -> int:
-        return np.dtype(np.uint16).itemsize + self._id_bytes(max_caps) + np.dtype(np.float32).itemsize
+        # The member count only matters to a mass-weighted cost.
+        count = np.dtype(np.uint16).itemsize if self.mass_weight else 0
+        return count + self._id_bytes(max_caps) + np.dtype(np.float32).itemsize
 
     def max_caps_for_budget(self, usable_bytes: int, bytes_per_cap: int) -> int:
         k = usable_bytes // (bytes_per_cap + self._state_bytes(1))
@@ -95,7 +114,7 @@ class CapMergeInsert(InsertInterface):
                            angles: np.ndarray, vectors: Optional[np.ndarray] = None) -> None:
         self.reset_buffers(len(filter._angle_codes))
         ids = np.asarray(caps_indices, dtype=np.int64)
-        if vectors is not None and len(vectors) and len(ids):
+        if self.mass_weight and vectors is not None and len(vectors) and len(ids):
             _, owner = nearest_directions(vectors, directions)
             counts = np.bincount(owner, minlength=len(ids))
             self._mass[ids] = np.clip(counts, 1, np.iinfo(np.uint16).max)
@@ -161,13 +180,27 @@ class CapMergeInsert(InsertInterface):
         dots = (U.astype(np.float32) @ self._U[:self._L].astype(np.float32).T).astype(np.float64)
         return 2.0 * np.arcsin(np.minimum(1.0, 0.5 * np.sqrt(np.maximum(2.0 - 2.0 * dots, 0.0))))
 
+    def _size(self, psi):
+        """log of a cap's cost at accept angle psi, as
+        SphereMergeConstruct._size: its measure on S^p (default p = dim - 1)
+        or p ln psi."""
+        if self.cost == "power":
+            return (8.0 if self.exponent is None else self.exponent) * np.log(psi)
+        p = self._U.shape[1] - 1.0 if self.exponent is None else self.exponent
+        return log_cap_measure(np.minimum(psi, np.pi), p + 1.0)
+
     def _pair_costs(self, ta, tb, phi, ma, mb):
-        """log of the increase of sum m^w (theta + t)^p a merge causes."""
+        """log of the increase of sum m^w size(theta + t) a merge causes."""
         tab = np.minimum(np.maximum(np.maximum(ta, tb), 0.5 * (phi + ta + tb)), np.pi)
-        w, p, t = self.mass_weight, self.exponent, self.cost_offset
-        log_a = w * np.log(ma) + p * np.log(ta + t)
-        log_b = w * np.log(mb) + p * np.log(tb + t)
-        log_c = w * np.log(ma + mb) + p * np.log(tab + t)
+        w, t = self.mass_weight, self.cost_offset
+        ta, tb, tab = np.broadcast_arrays(ta, tb, tab)
+        log_a = self._size(ta + t)
+        log_b = self._size(tb + t)
+        log_c = self._size(tab + t)
+        if w:
+            log_a = log_a + w * np.log(ma)
+            log_b = log_b + w * np.log(mb)
+            log_c = log_c + w * np.log(ma + mb)
         rest = np.exp(log_a - log_c) + np.exp(log_b - log_c)
         return log_c + np.log(np.maximum(1.0 - rest, 1e-12))
 
@@ -233,6 +266,8 @@ class CapMergeInsert(InsertInterface):
         the caps whose partner is y become lower bounds (mass_weight >= 1);
         below 1 a cost can fall with mass, so they are re-scanned outright."""
         self._m[y] += dm
+        if not self.mass_weight:
+            return    # no cost depends on the count
         L = self._L
         dependents = self._alive[:L] & (self._best[:L] == y)
         if self.mass_weight >= 1.0:

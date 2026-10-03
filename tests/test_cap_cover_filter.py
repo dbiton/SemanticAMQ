@@ -2,7 +2,8 @@ import unittest
 import numpy as np
 from filters.cap_cover.cap_cover_filter import CapCoverFilter, Quantize, AUTO_CANDIDATES
 from filters.cap_cover.cap_geometry import (angle_between, unit_rows, enclosing_cap, exact_cap_cover,
-                                            knn_directions, log10_cap_measure)
+                                            knn_directions, log10_cap_measure, log_cap_measure,
+                                            min_enclosing_cap)
 from filters.cap_cover.gonzales_construct import GonzalesConstruct
 from filters.cap_cover.minimax_construct import MinimaxConstruct
 from filters.cap_cover.sphere_merge_construct import SphereMergeConstruct
@@ -66,6 +67,34 @@ class TestCapGeometry(unittest.TestCase):
         # Far below float64's range at d = 384, still finite and ordered.
         tiny = log10_cap_measure(np.array([0.01, 0.05, 0.1]), 384)
         self.assertTrue(np.all(np.isfinite(tiny)) and np.all(np.diff(tiny) > 0) and tiny[0] < -700)
+
+    def test_log_cap_measure_matches_series(self):
+        rng = np.random.default_rng(0)
+        for dim in (9, 48, 384, 32.5):
+            psi = np.concatenate([rng.uniform(1e-6, 0.05, 500), rng.uniform(0.05, np.pi, 2000)])
+            np.testing.assert_allclose(log_cap_measure(psi, dim), log10_cap_measure(psi, dim) * np.log(10.0),
+                                       rtol=0, atol=1e-4)
+
+    def test_min_enclosing_cap(self):
+        rng = np.random.default_rng(1)
+        # Points at angle 0.4 from a pole along +-10 orthonormal tangent
+        # directions (their hull holds the pole's axis), plus interior
+        # points: the exact cap is the pole at 0.4.
+        basis, _ = np.linalg.qr(rng.standard_normal((DIM, 11)))
+        pole, tangent = basis[:, 0], basis[:, 1:].T
+        ring = np.vstack([tangent, -tangent])
+        P = np.cos(0.4) * pole[None, :] + np.sin(0.4) * ring
+        inner = unit_rows(np.cos(0.2) * pole[None, :] + np.sin(0.2) * ring[:10])
+        P = np.vstack([P, inner])
+        start = unit_rows((pole + 0.3 * ring[0])[None])[0]
+        u = min_enclosing_cap(P, start)
+        self.assertAlmostEqual(float(angle_between(P, np.broadcast_to(u, P.shape)).max()), 0.4, places=6)
+        # On clustered members it is never looser than their mean direction.
+        X = unit_rows(_clustered(n_clusters=1, per=200, spread=0.6))
+        mean = unit_rows(X.mean(axis=0)[None])[0]
+        u = min_enclosing_cap(X, mean)
+        self.assertLessEqual(angle_between(X, np.broadcast_to(u, X.shape)).max(),
+                             angle_between(X, np.broadcast_to(mean, X.shape)).max() + 1e-12)
 
     def test_exact_cap_cover_covers(self):
         X = unit_rows(_clustered())
@@ -282,7 +311,7 @@ class TestCapCoverScalableConstruction(unittest.TestCase):
         f = CapCoverFilter(DIM, max_caps=40, quantize=Quantize.FP32, construct_method=sm)
         for _, cover in sm.iter_candidates(f, X, [40]):
             cover = sm.finish(f, X, cover)
-        U, theta, labels, nbr = cover
+        U, theta, labels, nbr = cover.directions, cover.angles, cover.labels, cover.neighbors
         self.assertTrue((angle_between(X, U[labels]) <= theta[labels] + 1e-12).all())
         self.assertEqual(len(nbr), len(U))
         self.assertTrue(((nbr >= -1) & (nbr < len(U))).all())
@@ -316,6 +345,12 @@ class TestCapCoverInsert(unittest.TestCase):
     def test_cap_merge_insert_no_false_negatives(self):
         f, X = self._stream(CapMergeInsert())
         self.assertLessEqual(f._num_caps, f.max_caps)
+        _assert_no_fn(self, f, X)
+
+    def test_cap_merge_insert_state_bytes(self):
+        self.assertEqual(CapMergeInsert()._state_bytes(1000), 2 + 4)
+        self.assertEqual(CapMergeInsert(mass_weight=1.0, cost="power", exponent=8.0)._state_bytes(1000), 2 + 2 + 4)
+        f, X = self._stream(CapMergeInsert(mass_weight=1.0, cost="power", exponent=8.0))
         _assert_no_fn(self, f, X)
 
     def test_cap_merge_insert_fitted_codes_no_false_negatives(self):

@@ -5,23 +5,49 @@ from filters.filter import Filter
 from filters.cap_cover.cap_interfaces import ConstructInterface, Cover
 from filters.cap_cover.minimax_construct import badoiu_clarkson, reseed_empty
 from filters.cap_cover.cap_geometry import (KNN_EXACT_MAX, angle_between, knn_directions, labelled_cap_cover,
-                                            nearest_directions, nearest_in_candidates, pair_dots,
-                                            remap_neighbors, segments, segment_max, unit_rows)
+                                            log_cap_measure, min_enclosing_cap, nearest_directions,
+                                            nearest_in_candidates,
+                                            pair_dots, remap_neighbors, segments, segment_max, unit_rows)
 
 
 class SphereMergeConstruct(ConstructInterface):
     """Ball-Cover's SphereMergeConstruct on caps: bottom-up merging of caps
-    by an FPR-shaped cost, then global minimax refinement.
+    by the accept region they add, then global minimax refinement.
 
     Every distinct vector starts as a zero-angle cap. In rounds, every cap
     is scored against its `candidates` nearest directions, and the pairs that
     are each other's cheapest merge are merged -- at most `merge_fraction` of
     the merges still needed per round. A merge costs the increase of
-    sum_i m_i^w (theta_i + t)^p (m = member count): a sum over points, so
-    every member pays for the width of the cap it lives in, and tight caps go
-    where the members (and so the queries) are dense. Ball-Cover measured the
-    optimum flat around p = 8, w = 1, t = tau; on caps, merge_fraction
-    0.05-0.25 and 1-3 refine rounds also measured flat.
+    sum_j sigma_p(theta_j + t): sigma_p(psi) the share of S^p a cap of angle
+    psi covers (cost="volume"; p = `exponent`, default dim - 1, the sphere
+    queries live on; t = cost_offset ~ the accept rule's expansion at
+    tau = 0.1), so each merge adds the least accept region it can, whatever
+    the queries. At p = dim - 1 the widest caps dominate the sum and the
+    cost ranks pairs by their merged angle; p = 32 and 128 merged exactly as
+    383 at |B| = 8000. Optional member-count weights m_j^w (`mass_weight`)
+    and the small-angle form (theta + t)^p (cost="power") give the earlier
+    cost, sum_i m_i (theta_i + 0.1)^8, calibrated on how Ball-Cover's balls
+    capture queries; merge_fraction 0.05-0.25 and 1-3 refine rounds
+    measured flat under it.
+
+    Measured (src/compare_cap_cover.py, |B| = 8000, 5 corpora x 5 folds,
+    CapCoverFilter.auto, results/cap_cover/v1_*.csv): dropping the weights
+    (cap_auto0_proxy) moves FPR by -0.009..+0.000 at every k = 0.5-20% of
+    |B|; the volume cost on top (cap_auto_vproxy) by -0.010..+0.001, with
+    log10 accept volume -0.1..-5.4 lower against the weighted cost. The
+    volume on S^8 (exponent=8) with least-volume selection: FPR -0.035 /
+    -0.020 / -0.010 / -0.032 against p = 383 at k = 0.5/1/2/5%, at log10
+    volume 2.5 / 2.4 / 1.4 / 0.9 higher; within +-0.0003 FPR and 0.2-0.5
+    lower volume at 10-20%. The default stays the sphere's own measure:
+    choosing p by FPR would tune the objective on queries.
+
+    Exact minimum enclosing caps (`exact_caps`: the widest share of the
+    caps with two or more members re-centered by
+    cap_geometry.min_enclosing_cap in finish()) measured flat: the
+    Badoiu-Clarkson caps are 0.004-0.018 rad looser on average on the 40
+    widest (up to 0.14 on CC-News at k = 5%), but on CC-News fold 0 at
+    k = 1/5% FPR moved -0.003..-0.007 and log10 volume +-0.08: the stored
+    angle around the decoded direction is set by the encoding error.
 
     A merged cap starts as the smallest cap enclosing its two parts and is
     then re-centered on its own members with `recenter_steps`
@@ -70,11 +96,16 @@ class SphereMergeConstruct(ConstructInterface):
     directions, 600 and 1600 caps: 12 wins / 13 losses), better on
     WildChat (0.19 vs 0.21 at 600)."""
 
-    def __init__(self, exponent: float = 8.0, mass_weight: float = 1.0, merge_fraction: float = 0.25,
+    def __init__(self, exponent: Optional[float] = None, mass_weight: float = 0.0, merge_fraction: float = 0.25,
                  recenter_steps: int = 8, bc_steps: int = 64, cost_offset: float = 0.1,
                  candidates: int = 16, refine_rounds: int = 1, refresh: float = 0.7,
                  min_batch: float = 0.01, knn_exact_max: int = KNN_EXACT_MAX, knn_probes: int = 24,
-                 exact_pairs: int = 1 << 27, cost_space: str = "angle") -> None:
+                 exact_pairs: int = 1 << 27, cost_space: str = "angle", cost: str = "volume",
+                 exact_caps: float = 0.0) -> None:
+        if cost not in ("volume", "power"):
+            raise ValueError(f"cost must be 'volume' or 'power', got {cost!r}")
+        self.cost = cost
+        self.exact_caps = exact_caps
         self.exponent = exponent
         self.mass_weight = mass_weight
         self.merge_fraction = merge_fraction
@@ -104,6 +135,7 @@ class SphereMergeConstruct(ConstructInterface):
         largest k is exactly construct_filter's before finish()."""
         X = np.ascontiguousarray(vectors, dtype=np.float64)
         n, dim = X.shape
+        self._dim = dim
         if weights is None:
             rows = X.view(np.dtype((np.void, X.dtype.itemsize * dim))).ravel()
             _, first, owner = np.unique(rows, return_index=True, return_inverse=True)
@@ -147,8 +179,9 @@ class SphereMergeConstruct(ConstructInterface):
                 order, starts, counts = segments(labels, len(U))
                 U = badoiu_clarkson(X[order], labels[order], U, starts, counts, self.bc_steps)
                 U = reseed_empty(X, U, counts, labels)
-            U, angles, labels, _ = labelled_cap_cover(X, U)
-            return Cover(U, angles, labels)
+            U, angles, labels, kept = labelled_cap_cover(X, U)
+            self._exact_recenter(X, U, angles, labels)
+            return Cover(U, angles, labels, kept=kept)
 
         nbr = cover.neighbors
         if nbr is None:
@@ -165,24 +198,55 @@ class SphereMergeConstruct(ConstructInterface):
                     cand = _adopt(cand, np.flatnonzero(counts == 0), labels[far])
             labels = nearest_in_candidates(X, U, cand, labels)
         U, angles, labels, kept = labelled_cap_cover(X, U, labels)
-        return Cover(U, angles, labels, remap_neighbors(cand[:, 1:], kept, len(cand)))
+        self._exact_recenter(X, U, angles, labels)
+        return Cover(U, angles, labels, remap_neighbors(cand[:, 1:], kept, len(cand)), kept)
+
+    def _exact_recenter(self, X, U, angles, labels) -> None:
+        """Moves the widest `exact_caps` share of the caps with two or more
+        members onto their exact minimum enclosing caps
+        (cap_geometry.min_enclosing_cap), in place, where that is tighter."""
+        if self.exact_caps <= 0:
+            return
+        order, starts, counts = segments(labels, len(U))
+        multi = np.flatnonzero(counts >= 2)
+        multi = multi[np.argsort(-angles[multi], kind="stable")][:int(np.ceil(self.exact_caps * len(multi)))]
+        for j in multi:
+            P = X[order[starts[j]:starts[j] + counts[j]]]
+            u = min_enclosing_cap(P, U[j])
+            t = float(angle_between(P, np.broadcast_to(u, P.shape)).max())
+            if t < angles[j]:
+                U[j], angles[j] = u, t
 
     # ------------------------------------------------------------- merging
     def _knn(self, U):
         return knn_directions(U, self.candidates, exact_max=self.knn_exact_max, probes=self.knn_probes)
 
+    def _size(self, psi: np.ndarray) -> np.ndarray:
+        """log of what a cap of accept angle psi costs: its measure on S^p
+        (cost="volume", p = exponent, default dim - 1: the share of the
+        sphere it accepts), or p ln psi (cost="power"), the small-angle
+        form of the same."""
+        if self.cost == "power":
+            return (8.0 if self.exponent is None else self.exponent) * np.log(psi)
+        p = self._dim - 1.0 if self.exponent is None else self.exponent
+        return log_cap_measure(np.minimum(psi, np.pi), p + 1.0)
+
     def _edge_costs(self, lo, hi, phi, theta, mass) -> np.ndarray:
-        """log of the increase of sum_i m_i^w (theta_i + t)^p a merge causes,
-        the merged angle taken from the enclosing cap."""
+        """log of the increase of sum_i m_i^w size(theta_i + t) a merge
+        causes, the merged angle taken from the enclosing cap."""
         ta, tb = theta[lo], theta[hi]
         merged = np.minimum(np.maximum(np.maximum(ta, tb), 0.5 * (phi + ta + tb)), np.pi)
         if self.cost_space == "sine":
             # Ball-Cover's units: the Euclidean MEB radius of a cap is sin(theta).
             ta, tb, merged = np.sin(np.minimum(ta, np.pi / 2)), np.sin(np.minimum(tb, np.pi / 2)),                 np.sin(np.minimum(merged, np.pi / 2))
-        w, p, t = self.mass_weight, self.exponent, self.cost_offset
-        log_a = w * np.log(mass[lo]) + p * np.log(ta + t)
-        log_b = w * np.log(mass[hi]) + p * np.log(tb + t)
-        log_c = w * np.log(mass[lo] + mass[hi]) + p * np.log(merged + t)
+        w, t, size = self.mass_weight, self.cost_offset, self._size
+        log_a = size(ta + t)
+        log_b = size(tb + t)
+        log_c = size(merged + t)
+        if w:
+            log_a = log_a + w * np.log(mass[lo])
+            log_b = log_b + w * np.log(mass[hi])
+            log_c = log_c + w * np.log(mass[lo] + mass[hi])
         rest = np.exp(log_a - log_c) + np.exp(log_b - log_c)
         return log_c + np.log(np.maximum(1.0 - rest, 1e-12))
 

@@ -9,11 +9,14 @@ class Cover(NamedTuple):
     """Caps (directions[j], angles[j]) covering a set of unit rows: row i
     lies in cap labels[i] within its angle. neighbors[j] (-1 padded) lists
     caps near cap j: where the filter looks for a member's nearest caps
-    instead of searching them all. None: search them all."""
+    instead of searching them all. None: search them all. kept[j], set by
+    a finish() that drops caps, is the index cap j had in the candidate it
+    was finished from."""
     directions: np.ndarray
     angles: np.ndarray
     labels: np.ndarray
     neighbors: Optional[np.ndarray] = None
+    kept: Optional[np.ndarray] = None
 
 
 class ConstructInterface(ABC):
