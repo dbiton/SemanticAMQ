@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional, Sequence, Tuple, Union
 from filters.filter import Filter, InsufficientMemoryError
-from filters.cap_cover.cap_interfaces import ConstructInterface, InsertInterface
+from filters.cap_cover.cap_interfaces import ConstructInterface, Cover, InsertInterface
 from filters.cap_cover.cap_geometry import (angle_between, nearest_directions, segments, segment_max,
                                             unit_rows)
 
@@ -50,6 +50,8 @@ class Quantize(Enum):
     # _SeededPQ): sub-vectors of `sub` dims, each the nearest of 2^bits
     # Gaussian codewords drawn from a fixed seed, so the codebook costs
     # nothing to store. Below 1 bit/dim, where TurboQuant has no rung.
+    SPQ6 = "SPQ6"       # sub 96, 12 bits: ~1.2 rad (not in AUTO_CANDIDATES)
+    SPQ9 = "SPQ9"       # sub 64, 12 bits: ~1.12 rad (not in AUTO_CANDIDATES)
     SPQ12 = "SPQ12"     # sub 48, 12 bits: ~1.06 rad
     SPQ16 = "SPQ16"     # sub 24,  8 bits: ~1.00 rad
     SPQ24 = "SPQ24"     # sub 24, 12 bits: ~0.85 rad
@@ -78,6 +80,8 @@ _ENCODINGS = {
     Quantize.TQ3: _Encoding(rate=3, qtype=faiss.ScalarQuantizer.QT_3bit_tqmse, rotate=True),
     Quantize.TQ2: _Encoding(rate=2, qtype=faiss.ScalarQuantizer.QT_2bit_tqmse, rotate=True),
     Quantize.TQ1: _Encoding(rate=1, qtype=faiss.ScalarQuantizer.QT_1bit_tqmse, rotate=True),
+    Quantize.SPQ6: _Encoding(rate=0.125, rotate=True, sub=96, bits=12),
+    Quantize.SPQ9: _Encoding(rate=0.1875, rotate=True, sub=64, bits=12),
     Quantize.SPQ12: _Encoding(rate=0.25, rotate=True, sub=48, bits=12),
     Quantize.SPQ16: _Encoding(rate=1 / 3, rotate=True, sub=24, bits=8),
     Quantize.SPQ24: _Encoding(rate=0.5, rotate=True, sub=24, bits=12),
@@ -109,6 +113,12 @@ class _SeededPQ:
         self.code_size = (self.m * bits + 7) // 8
         cb = np.random.default_rng(seed + 1000 * sub + bits).standard_normal((1 << bits, sub))
         self.codebook = (cb / np.linalg.norm(cb, axis=1, keepdims=True)).astype(np.float32)
+        self._index = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_index"] = None    # rebuilt from the codebook on demand
+        return state
 
     def train(self, X: np.ndarray) -> None:
         pass
@@ -116,11 +126,21 @@ class _SeededPQ:
     def codebook_bytes(self) -> int:
         return self._SEED_BYTES
 
+    def _nearest_codewords(self, S: np.ndarray, top: int) -> np.ndarray:
+        """(n x top) indices of the codewords of largest inner product with
+        each row of S (one slice per row), best first: faiss's blocked GEMM
+        with a running top-k, rather than an (n x 2^bits) score matrix."""
+        if self._index is None:
+            self._index = faiss.IndexFlatIP(self.sub)
+            self._index.add(self.codebook)
+        _, idx = self._index.search(np.ascontiguousarray(S, dtype=np.float32), top)
+        return idx.astype(np.int64)
+
     def compute_codes(self, X: np.ndarray) -> np.ndarray:
         X = np.ascontiguousarray(X, dtype=np.float32).reshape(len(X), self.m, self.sub)
         idx = np.empty((len(X), self.m), dtype=np.int64)
         for j in range(self.m):
-            idx[:, j] = np.argmax(X[:, j, :] @ self.codebook.T, axis=1)
+            idx[:, j] = self._nearest_codewords(X[:, j, :], 1)[:, 0]
         return self._pack(idx)
 
     def _pack(self, idx: np.ndarray) -> np.ndarray:
@@ -142,10 +162,7 @@ class _SeededPQ:
         Us = np.ascontiguousarray(U, dtype=np.float32).reshape(k, m, s)
         cand = np.empty((k, m, T), dtype=np.int64)
         for j in range(m):
-            sc = Us[:, j, :] @ self.codebook.T
-            top = np.argpartition(-sc, T - 1, axis=1)[:, :T]
-            cand[:, j, :] = np.take_along_axis(top, np.argsort(-np.take_along_axis(sc, top, axis=1), axis=1),
-                                               axis=1)
+            cand[:, j, :] = self._nearest_codewords(Us[:, j, :], T)
         choice = np.zeros((k, m), dtype=np.int64)
         labels = np.asarray(labels, dtype=np.int64)
         n = len(X)
@@ -287,23 +304,46 @@ class CapCoverFilter(Filter):
     AUTO_CANDIDATES). construct() then builds covers at each candidate's cap
     count from one merge (ConstructInterface.iter_candidates), scores each
     by sum over caps of phi^p (p = selection_exponent, phi at
-    selection_tau, exact per encoding) and keeps the best: within ~0.004
-    FPR of the best encoding chosen in hindsight. A proxy over member angles
-    (what the merge cost uses) did 5x worse; giving each cap its own
-    encoding scored no better at 3-4x the construction time.
+    selection_tau, exact per encoding) and keeps the best (_choose). A
+    proxy over member angles (what the merge cost uses) did 5x worse;
+    giving each cap its own encoding scored no better at 3-4x the
+    construction time. The proxy errs coarse at small budgets: against
+    the best fixed encoding per cell (|B| = 8000, folds 0-2) it is +0.015 /
+    +0.014 / +0.008 FPR at k = 1/2/5% of |B| (CC-News: SPQ12 where SPQ24
+    or SPQ16 is 0.04-0.08 better), within +-0.003 elsewhere. The default
+    selection="holdout" (_choose_holdout) keeps the proxy's pick unless
+    held-out members show a finer encoding significantly better: -0.003 /
+    -0.008 / -0.015 / -0.006 FPR against the proxy alone at k = 0.5/1/2/5%
+    (25 cells each, no cell worse by more than 0.0012), unchanged at
+    10-20%, within 0.001 of the hindsight-best encoding at 2-5%, for ~1.7x
+    the construction time. Letting it override toward coarser encodings
+    measured +0.003..+0.011 at 10-15% (ChatGPT-paraphrases); choosing on
+    held-out members alone, without the proxy, +0.024 on paraphrase
+    corpora at 1% (held-out cluster-mates are all accepted there, and
+    their differences are noise). Sub-12-byte rungs (SPQ6, SPQ9) win only
+    3 of 30 cells at k <= 1% even in hindsight.
 
     Angles are stored in 8 bits over the filter's own [min, max] when no
     insert strategy can grow one past max (else 16 bits over [0, pi]).
 
-    Measured (src/compare_cap_cover.py, blocklist workload, |B| = 8000, 5
-    corpora x 5 folds, tau = 0.1, equal bytes = Ball-Cover TQ4 at k =
-    k_fraction * |B| balls): auto() against the best of five Ball-Cover
+    Measured (src/compare_cap_cover.py, blocklist workload, 5 corpora x 5
+    folds, tau = 0.1, equal bytes = Ball-Cover TQ4 at k = k_fraction * |B|
+    balls). |B| = 8000: auto() against the best of five Ball-Cover
     configurations *per cell* (sphere_merge at TQ1-TQ4, minimax_sphere at
-    TQ4) has mean FPR .61/.40/.30/.17/.12/.10/.09 against
-    .93/.71/.45/.27/.15/.11/.10 at k = 0.5/1/2/5/10/15/20%, winning
-    20/25/25/25/20/22/16 of the 25 cells (losses <= 0.03, WildChat and
-    ChatGPT-paraphrases at k >= 10%). One P-core, 10K vectors: construct
-    7-26 s, 4.6K-22K queries/s in batches of 32.
+    TQ4) has mean FPR .609/.394/.289/.166/.121/.098/.087 against
+    .927/.705/.445/.272/.147/.111/.097 at k = 0.5/1/2/5/10/15/20%, winning
+    25/25/25/25/20/22/16 of the 25 cells (losses <= 0.028, WildChat and
+    ChatGPT-paraphrases at k >= 10%: WildChat's withheld-cluster queries
+    crowd a region where Ball's sphere_merge cover is tighter -- 0.076 vs
+    0.088 with exact directions on fold 1 -- and ChatGPT's want TQ3 where
+    the proxy picks TQ2). The advantage holds for query tau 0.05-0.2 at
+    k <= 5% (every cell). |B| = 80K (proxy selection): .772/.614/.441/.249/
+    .171/.136/.114; Ball-Cover's paper configuration .963/.897/.780 at
+    k = 0.5/1/2% (fold-paired -0.19/-0.28/-0.34; its larger k and every
+    sphere_merge configuration exceed the benchmark's 5-minute job limit
+    on this machine). One P-core, batches of 32: 10K vectors construct in
+    2.8-15.9 s and answer 4.3K-42K queries/s; 100K (|B| = 80K) in 23-88 s
+    (proxy; 166-190 s with the held-out veto) at 1.0K-5.6K queries/s.
 
     Working basis. Rotating encodings quantize in a seeded orthonormal
     basis; members and queries are rotated in float64 and every cap angle is
@@ -311,10 +351,20 @@ class CapCoverFilter(Filter):
     scores against. Strategies only ever see working-basis unit vectors;
     angles are rotation-invariant, so none of them needs to know.
 
-    query() scans the caps in blocks: one float32 GEMM of unit queries
-    against unit decoded directions, compared with cos(theta + beta); pairs
-    within float32's error bound of that boundary are re-decided exactly in
-    float64, so decisions match a float64 evaluation of the rule."""
+    query() scans the caps in blocks: decode a block (compiled for seeded-PQ
+    and TurboQuant codes, see scan_kernels), one float32 GEMM of the unit
+    queries against the decoded vectors, compared in one compiled pass with
+    |raw| cos(theta + beta); pairs within float32's error bound of that
+    boundary are re-decided exactly in float64, so decisions match a
+    float64 evaluation of the rule. Nothing decoded persists between calls.
+    One P-core, batches of 32: 2.5x the throughput of the numpy scan at
+    |B| = 80K (701 -> 1720 q/s on 21K SPQ36 caps), 1.9x at 8K (3.1K caps).
+    Seeded-PQ codes with small codebooks skip decoding: per chunk of
+    queries, a table of each slice against each codeword, summed per cap
+    (_scan_tables, where _tables_pay; 3.2x on SPQ16). Exact pruning (cell
+    bounds, partial dot products) cannot help much here: a coarse cap's
+    decoded direction sits up to ~1 rad off its members, so caps that
+    neighbour in the data do not neighbour in decoded space."""
 
     # Added to tau, as BallCoverFilter's own _COVERAGE_EPSILON: ground truth
     # is computed by faiss in float32 (|q - x|^2 <= tau^2), whose cancellation
@@ -328,7 +378,9 @@ class CapCoverFilter(Filter):
     # one that already covers it (BallCoverFilter._COVERAGE_NEIGHBORS).
     _COVERAGE_NEIGHBORS = 16
 
-    _SCAN_BLOCK = 4096
+    # Caps decoded per block of the scan (1.5 MB of float32 at d = 384, so
+    # the GEMM reads them from L2), and queries per GEMM.
+    _SCAN_BLOCK = 1024
     _SCAN_QUERY_CHUNK = 1024
 
     def __init__(
@@ -347,6 +399,10 @@ class CapCoverFilter(Filter):
         fit_rounds: int = 1,
         selection_tau: float = 0.1,
         selection_exponent: float = 8.0,
+        selection: str = "proxy",
+        holdout_fraction: float = 0.25,
+        holdout_queries: int = 2000,
+        holdout_z: float = 3.0,
     ) -> None:
         super().__init__(dim, max_memory=max_memory)
         if construct_method is None:
@@ -379,7 +435,15 @@ class CapCoverFilter(Filter):
         self._angle_lo, self._angle_hi = 0.0, float(np.pi)
         self.selection_tau = selection_tau
         self.selection_exponent = selection_exponent
+        if selection not in ("proxy", "holdout"):
+            raise ValueError(f"selection must be 'proxy' or 'holdout', got {selection!r}")
+        self.selection = selection
+        self.holdout_fraction = holdout_fraction
+        self.holdout_queries = holdout_queries
+        self.holdout_z = holdout_z
         self.selection_scores = None    # encoding -> score, set by construct() when choosing
+        self.holdout_scores = None      # encoding -> held-out acceptance (selection="holdout")
+        self.selection_override = None  # (proxy's pick, override, b, c) when the held-out test overrode
         # Choosing compares encodings in one working basis, so every
         # candidate gets the rotation then (harmless where not needed).
         rotate = any(_ENCODINGS[q].rotate for q in self.levels) or len(self.levels) > 1
@@ -411,8 +475,10 @@ class CapCoverFilter(Filter):
     @classmethod
     def auto(cls, dim: int, max_memory: int, **kwargs) -> "CapCoverFilter":
         """A filter that picks its encoding(s) from AUTO_CANDIDATES for the
-        budget at construct()."""
+        budget at construct(): by the reach proxy with the held-out veto
+        (selection="holdout", see _choose_holdout) unless told otherwise."""
         candidates = [q for q in AUTO_CANDIDATES if dim % max(_ENCODINGS[q].sub, 1) == 0]
+        kwargs.setdefault("selection", "holdout")
         return cls(dim, quantize=candidates, max_memory=max_memory, **kwargs)
 
     # ------------------------------------------------------------ properties
@@ -578,6 +644,71 @@ class CapCoverFilter(Filter):
             return codes.view(np.float32).reshape(len(codes), self.dim)
         return np.ascontiguousarray(sq.decode(codes), dtype=np.float32)
 
+    def fit_cap_code(self, u: np.ndarray, parts: np.ndarray, part_angles: np.ndarray,
+                     candidates: int = 8, passes: int = 2, max_moves: int = 64) -> np.ndarray:
+        """A code (1 x code_size) for a cap on direction u that must hold the
+        caps (parts[i], part_angles[i]): chosen to minimize the angle it
+        would store, max_i angle(decode, parts[i]) + part_angles[i], rather
+        than lying nearest u -- what CapMergeInsert stores for a merge.
+        Seeded PQ: a coordinate search over each slice's `candidates`
+        codewords nearest u's; TurboQuant: greedy one-level moves of single
+        coordinates. Other encodings: u's own code. Never worse than u's own
+        code, which is where both searches start."""
+        u = np.asarray(u, dtype=np.float64)
+        P = np.asarray(parts, dtype=np.float64)
+        t = np.asarray(part_angles, dtype=np.float64)
+        sq = self._quantizers[self._uniform]
+        own = self.encode(u[None, :])
+
+        def stored(cos):
+            return (np.arccos(np.clip(cos, -1.0, 1.0)) + t[:, None]).max(axis=0)
+
+        if isinstance(sq, _SeededPQ):
+            m, s, T = sq.m, sq.sub, min(candidates, 1 << sq.bits)
+            cand = sq._nearest_codewords(u.reshape(m, s), T)                    # (m, T)
+            cw = sq.codebook[cand].astype(np.float64)                           # (m, T, s)
+            norm = np.sqrt(np.einsum("mts,mts->mt", cw, cw))
+            G = np.einsum("mts,pms->pmt", cw, P.reshape(len(P), m, s))          # (p, m, T)
+            n2 = norm[:, 0] ** 2
+            choice = np.zeros(m, dtype=np.int64)
+            dots, sq_norm = G[:, np.arange(m), choice].sum(axis=1), n2.sum()
+            for _ in range(passes):
+                for j in range(m):
+                    base = dots - G[:, j, choice[j]]
+                    base_n = sq_norm - norm[j, choice[j]] ** 2
+                    trial_n = base_n + norm[j] ** 2                              # (T,)
+                    score = stored((base[:, None] + G[:, j, :]) / np.sqrt(trial_n)[None, :])
+                    choice[j] = int(np.argmin(score))
+                    dots, sq_norm = base + G[:, j, choice[j]], base_n + norm[j, choice[j]] ** 2
+            return sq._pack(cand[np.arange(m), choice][None, :])
+        if self._is_turboquant():
+            bits = int(round(_ENCODINGS[self.quantize].rate))
+            levels = np.sort(faiss.vector_to_array(sq.trained)[:1 << bits].astype(np.float64))
+            C = sq.decode(own).astype(np.float64)[0]
+            idx = np.clip(np.searchsorted(levels, C - 1e-12), 0, len(levels) - 1)
+            dots, sq_norm = P @ C, float(C @ C)
+            current = float(stored((dots / np.sqrt(sq_norm))[:, None])[0])
+            for _ in range(max_moves):
+                best = (current, None, None)
+                for step in (-1, 1):
+                    j = np.clip(idx + step, 0, len(levels) - 1)
+                    delta = levels[j] - C
+                    trial_n = sq_norm + delta * (2.0 * C + delta)
+                    score = stored((dots[:, None] + P * delta[None, :]) / np.sqrt(np.maximum(trial_n, 1e-300))[None, :])
+                    score[delta == 0] = np.inf
+                    i = int(np.argmin(score))
+                    if score[i] < best[0]:
+                        best = (float(score[i]), i, j[i])
+                if best[1] is None:
+                    break
+                current, i, ji = best
+                delta = levels[ji] - C[i]
+                dots += P[:, i] * delta
+                sq_norm += delta * (2.0 * C[i] + delta)
+                C[i], idx[i] = levels[ji], ji
+            return np.ascontiguousarray(sq.compute_codes(C[None, :].astype(np.float32)), dtype=np.uint8)
+        return own
+
     def decode_directions(self, directions: np.ndarray, level: Optional[int] = None) -> np.ndarray:
         """Where each unit direction would point once stored at `level`."""
         return self.decode(self.encode(directions, level), level)
@@ -703,7 +834,8 @@ class CapCoverFilter(Filter):
 
     # ------------------------------------------------------------- construct
     def _tight_angles(self, X: np.ndarray, U: np.ndarray, decoded: np.ndarray,
-                      baseline: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+                      baseline: np.ndarray, home: np.ndarray,
+                      neighbors: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
         """The smallest angles around the *decoded* directions that still
         cover every member: BallCoverFilter._tight_radii on the sphere.
 
@@ -711,8 +843,11 @@ class CapCoverFilter(Filter):
         settled farthest-from-their-nearest-cap first, so the caps a member
         might hide in grow before it is tested. No cap is pushed past its
         bound baseline + angle(u, decode(u)), the angle _add_caps would have
-        stored; each member's construction cap is its always-legal fallback,
-        by the triangle inequality.
+        stored; each member's construction cap home[i] (whose cap (U, baseline)
+        holds it) is its always-legal fallback, by the triangle inequality.
+        A member looks among its _COVERAGE_NEIGHBORS nearest decoded
+        directions, or, given the cover's `neighbors`, among its home cap and
+        that cap's neighbours.
 
         Returns (angles, owner): owner[i] is a cap holding member i."""
         n_caps = len(decoded)
@@ -721,16 +856,21 @@ class CapCoverFilter(Filter):
         if n_caps == 0 or len(X) == 0:
             return angles, owner
         bound = np.asarray(baseline, dtype=np.float64) + angle_between(U, decoded)
+        home = np.asarray(home, dtype=np.int64)
 
-        k = min(self._COVERAGE_NEIGHBORS, n_caps)
-        _, labels = nearest_directions(X, decoded, k)
-        labels = labels.reshape(len(X), k)
-        dist = np.empty(labels.shape)
+        if neighbors is None:
+            k = min(self._COVERAGE_NEIGHBORS, n_caps)
+            _, labels = nearest_directions(X, decoded, k)
+            labels = labels.reshape(len(X), k)
+        else:
+            labels = np.concatenate([home[:, None], neighbors[home]], axis=1)
+        dist = np.full(labels.shape, np.inf)
         for s in range(0, len(X), 2048):
             rows = slice(s, s + 2048)
-            dist[rows] = angle_between(X[rows, None, :], decoded[labels[rows]])
+            lab = labels[rows]
+            d = angle_between(X[rows, None, :], decoded[np.maximum(lab, 0)])
+            dist[rows] = np.where(lab >= 0, d, np.inf)
 
-        _, home = nearest_directions(X, U)
         home_d = angle_between(X, decoded[home])
         # A construct method whose cap does not hold its own nearest member
         # is repaired here rather than trusted: the fallback must be legal.
@@ -773,53 +913,163 @@ class CapCoverFilter(Filter):
         theta = segment_max(angle_between(X, decoded[labels])[order], starts, counts)
         return np.sqrt(np.maximum((theta + alpha) ** 2 - delta ** 2, 1e-300))[counts > 0]
 
-    def _choose(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _choose(self, X: np.ndarray, weights: np.ndarray) -> Cover:
         """Scores a cover per candidate encoding at that encoding's cap count
         (one merge, see ConstructInterface.iter_candidates) by how far its
         caps reach along the data -- sum over caps of phi^p -- keeps the
         best, fixes the filter's encoding to it, and returns its finished
         cover. Candidates come largest cap count first, and the scan stops
         once the score has risen twice in a row: it is unimodal along the
-        ladder (more, coarser caps against fewer, finer ones)."""
+        ladder (more, coarser caps against fewer, finer ones).
+
+        Levels whose budget buys a cap per distinct member or more all get
+        that same cover, on which a finer code always reaches less (phi
+        grows with delta at fixed theta): only the finest of them is
+        scored."""
         ks = []
         for level in range(len(self.levels)):
             self._set_uniform(level)
-            ks.append(self.max_construct_caps)
+            ks.append(min(self.max_construct_caps, len(X)))
         levels_at = {}
         for level, k in enumerate(ks):
             levels_at.setdefault(k, []).append(level)
+        if len(X) in levels_at:
+            levels_at[len(X)] = [max(levels_at[len(X)], key=lambda lv: self._code_sizes[lv])]
         p = self.selection_exponent
         scores, best, worse = {}, None, 0
-        for k, U, theta, labels in self.construct_method.iter_candidates(self, X, ks):
-            U = unit_rows(U)
+        for k, cover in self.construct_method.iter_candidates(self, X, ks, weights):
+            cover = cover._replace(directions=unit_rows(cover.directions))
             improved = False
             for level in levels_at[k]:
                 self._set_uniform(level)
-                phi = self._reach(X, U, labels)
+                phi = self._reach(X, cover.directions, cover.labels)
                 score = float(np.logaddexp.reduce(p * np.log(phi))) if len(phi) else -np.inf
                 scores[self.levels[level].value] = score
                 if best is None or score < best[0]:
-                    best, improved = (score, level, U, theta), True
+                    best, improved = (score, level, cover), True
             worse = 0 if improved else worse + 1
             if worse >= 2:
                 break
         self.selection_scores = scores
-        _, level, U, theta = best
+        _, level, cover = best
         self._set_uniform(level)
-        return self.construct_method.finish(self, X, U, theta)
+        return self.construct_method.finish(self, X, cover)
+
+    def _choose_holdout(self, X: np.ndarray, weights: np.ndarray) -> Cover:
+        """_choose with a held-out veto. The reach proxy's cover is built
+        as _choose builds it; then candidate covers are built per encoding
+        on all but `holdout_fraction` of the distinct members, at that share
+        of each encoding's cap count, with codes fitted as construct() fits
+        them and angles from the training members, and each encoding gets
+        the set of held-out members farther than selection_tau from every
+        training member that its caps would accept at selection_tau. The
+        finer encoding accepting the fewest replaces the proxy's only if it
+        beats it in a paired test on those members (b - c >= holdout_z sqrt(b + c),
+        b and c the members only one of the two accepts) -- held-out members
+        are cluster-mates, often all accepted at small k, where differences
+        are noise -- and its cover is then built on all members. Without
+        an override the result is exactly _choose's."""
+        cover = self._choose(X, weights)
+        chosen = self._uniform
+        rng = np.random.default_rng(0x5EED)
+        hold = rng.random(len(X)) < self.holdout_fraction
+        if hold.sum() < 50 or (~hold).sum() < 50:
+            return cover
+        Xt, wt, V = X[~hold], weights[~hold], X[hold]
+        alpha = 2.0 * np.arcsin(min(1.0, 0.5 * self.selection_tau))
+        ip, _ = nearest_directions(V, Xt)
+        far = V[np.flatnonzero(2.0 - 2.0 * ip.astype(np.float64) > self.selection_tau ** 2)]
+        if len(far) > self.holdout_queries:
+            far = far[rng.choice(len(far), self.holdout_queries, replace=False)]
+        if len(far) < 50:
+            self._set_uniform(chosen)
+            return cover
+        far32 = np.ascontiguousarray(far, dtype=np.float32)
+        ks_full, ks = [], []
+        for level in range(len(self.levels)):
+            self._set_uniform(level)
+            ks_full.append(min(self.max_construct_caps, len(X)))
+            ks.append(max(1, min(round(self.max_construct_caps * len(Xt) / len(X)), len(Xt))))
+        levels_at = {}
+        for level, k in enumerate(ks):
+            levels_at.setdefault(k, []).append(level)
+        if len(Xt) in levels_at:
+            levels_at[len(Xt)] = [max(levels_at[len(Xt)], key=lambda lv: self._code_sizes[lv])]
+        hits = {}
+        for k, cand in self.construct_method.iter_candidates(self, Xt, ks, wt):
+            U, labels = unit_rows(cand.directions), cand.labels
+            for level in levels_at[k]:
+                self._set_uniform(level)
+                self._train_quantizers(U)
+                sq = self._quantizers[level]
+                if hasattr(sq, "fit_codes"):
+                    codes = sq.fit_codes(U, Xt, labels, self.fit_candidates, self.fit_passes)
+                elif self._is_turboquant():
+                    codes = _fit_scalar_codes(sq, U, Xt, labels, self.fit_passes)
+                else:
+                    codes = self.encode(U)
+                D = self.decode(codes)
+                order, starts, counts = segments(labels, len(U))
+                theta = segment_max(angle_between(Xt, D[labels])[order], starts, counts)
+                thr = np.cos(np.minimum(theta + alpha, np.pi)).astype(np.float32)
+                D32 = D.astype(np.float32)
+                hit = np.zeros(len(far32), dtype=bool)
+                for s in range(0, len(D32), 4096):
+                    hit |= (far32 @ D32[s:s + 4096].T >= thr[None, s:s + 4096]).any(axis=1)
+                hits[level] = hit
+        self.holdout_scores = {self.levels[lv].value: float(h.mean()) for lv, h in hits.items()}
+        # The proxy's pick may have no held-out row (its count rounded onto
+        # a coarser level's): then the comparison is to the nearest scored.
+        base = chosen if chosen in hits else min(hits, key=lambda lv: abs(self._code_sizes[lv]
+                                                                       - self._code_sizes[chosen]))
+        # Only finer encodings may override: the proxy's known bias is toward
+        # coarse codes, and held-out cluster-mates favour more caps than the
+        # query mix does (coarser overrides measured +0.003..+0.011 at
+        # kf = 10-15% on ChatGPT-paraphrases).
+        finer = [lv for lv in hits if self._code_sizes[lv] >= self._code_sizes[base]]
+        rival = min(finer, key=lambda lv: (hits[lv].sum(), abs(lv - base)))
+        b = int((hits[base] & ~hits[rival]).sum())
+        c = int((hits[rival] & ~hits[base]).sum())
+        if rival == base or b - c < self.holdout_z * np.sqrt(max(b + c, 1)):
+            self._set_uniform(chosen)
+            return cover
+        self._set_uniform(rival)
+        self.selection_override = (self.levels[chosen].value, self.levels[rival].value, b, c)
+        for _, cand in self.construct_method.iter_candidates(self, X, [ks_full[rival]], weights):
+            return self.construct_method.finish(self, X, cand)
+
+    @staticmethod
+    def _distinct_rows(vectors: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(rows, inverse, counts): the distinct rows of `vectors` in order of
+        first appearance, vectors == rows[inverse], counts[j] copies of row
+        j. A cover is a function of the distinct members; only a construct
+        method that weighs members by their copies (SphereMergeConstruct's
+        mass) needs the counts."""
+        V = np.ascontiguousarray(vectors, dtype=np.float32)
+        keys = V.view(np.dtype((np.void, V.dtype.itemsize * V.shape[1]))).ravel()
+        _, first, inverse, counts = np.unique(keys, return_index=True, return_inverse=True,
+                                              return_counts=True)
+        order = np.argsort(first, kind="stable")
+        rank = np.empty(len(order), dtype=np.int64)
+        rank[order] = np.arange(len(order))
+        return V[first[order]], rank[inverse.ravel()], counts[order]
 
     def construct(self, vectors: np.ndarray) -> None:
         if len(vectors) == 0:
             self._reset_buffers(0)
             self._constructed = True
             return
-        X = self._prepare_members(vectors)
+        distinct, inverse, copies = self._distinct_rows(vectors)
+        X = self._prepare_members(distinct)
         if len(self.levels) > 1:
-            U, theta = self._choose(X)
+            cover = self._choose_holdout(X, copies) if self.selection == "holdout" else self._choose(X, copies)
         else:
-            U, theta = self.construct_method.construct_filter(self, X)
-        U = unit_rows(U)
-        theta = np.asarray(theta, dtype=np.float64)
+            for _, cover in self.construct_method.iter_candidates(self, X, [self.max_construct_caps], copies):
+                cover = self.construct_method.finish(self, X, cover)
+                break
+        U = unit_rows(cover.directions)
+        theta = np.asarray(cover.angles, dtype=np.float64)
+        home, neighbors = np.asarray(cover.labels, dtype=np.int64), cover.neighbors
         self._reset_buffers(len(U))
         self._train_quantizers(U)
         codebook = self._codebook_bytes()
@@ -833,16 +1083,16 @@ class CapCoverFilter(Filter):
             # around the new directions, and repeat: each round's members
             # are the ones the last round's caps actually hold. A second
             # round measured within 0.002 FPR of one.
-            _, owner = nearest_directions(X, U)
+            owner = home
             for _ in range(max(1, self.fit_rounds)):
                 if hasattr(sq, "fit_codes"):
                     codes = sq.fit_codes(U, X, owner, self.fit_candidates, self.fit_passes)
                 else:
                     codes = _fit_scalar_codes(sq, U, X, owner, self.fit_passes)
-                angles, owner = self._tight_angles(X, U, self.decode(codes), theta)
+                angles, owner = self._tight_angles(X, U, self.decode(codes), theta, home, neighbors)
         else:
             codes = self.encode(U)
-            angles, _ = self._tight_angles(X, U, self.decode(codes), theta)
+            angles, _ = self._tight_angles(X, U, self.decode(codes), theta, home, neighbors)
         ids, decoded = self._add_caps(U, theta, codes=codes)
         self._angle_lo, self._angle_hi = 0.0, float(np.pi)
         if self._narrow_angles() and len(angles):
@@ -852,7 +1102,8 @@ class CapCoverFilter(Filter):
         # between its intended and its decoded direction.
         self.encoding_error = angle_between(U, decoded)
         if self.insert_method:
-            self.insert_method.initialize_buffers(self, ids, self.all_directions, self.all_angles, vectors=X)
+            self.insert_method.initialize_buffers(self, ids, self.all_directions, self.all_angles,
+                                                  vectors=X[inverse])
         self._constructed = True
         self._dirs = None
 
@@ -882,47 +1133,86 @@ class CapCoverFilter(Filter):
             return [False] * len(vectors)
         return self._scan(vectors, float(distance_threshold)).tolist()
 
+    def _block_decoder(self):
+        """decode(codes, out, norms): the float32 vectors `codes` decode to
+        (exactly _decode_raw's) into `out`, with their float64 norms."""
+        from filters.cap_cover import scan_kernels
+        sq, cs = self._quantizers[self._uniform], self.code_size()
+        if isinstance(sq, _SeededPQ):
+            return lambda codes, out, norms: scan_kernels.decode_codebook(
+                np.ascontiguousarray(codes[:, :cs]), sq.codebook, sq.bits, sq.m, out, norms)
+        if self._is_turboquant():
+            bits = int(round(_ENCODINGS[self.quantize].rate))
+            levels = faiss.vector_to_array(sq.trained)[:1 << bits].astype(np.float32)
+            return lambda codes, out, norms: scan_kernels.decode_levels(
+                np.ascontiguousarray(codes[:, :cs]), levels, bits, self.dim, out, norms)
+
+        def generic(codes, out, norms):
+            out[:] = self._decode_raw(codes, self._uniform)
+            norms[:] = np.sqrt(np.einsum("ij,ij->i", out.astype(np.float64), out.astype(np.float64)))
+        return generic
+
     def _scan(self, vectors: np.ndarray, tau: float) -> np.ndarray:
+        from filters.cap_cover import scan_kernels
         Qw = self.to_working(vectors)
         nq = np.sqrt(np.einsum("ij,ij->i", Qw, Qw))
         beta, feasible = self._beta(nq, tau)
         Qn = Qw / np.maximum(nq, 1e-300)[:, None]
         Qn32 = Qn.astype(np.float32)
-        cb, sb = np.cos(beta).astype(np.float32), np.sin(beta).astype(np.float32)
         out = np.zeros(len(Qw), dtype=bool)
-        slack = np.float32(self._slack())
-
+        slack = self._slack()
         ids = self.all_caps
+        sq = self._quantizers[self._uniform]
+        if isinstance(sq, _SeededPQ) and self._tables_pay(sq, len(ids)):
+            return self._scan_tables(sq, ids, Qn, Qn32, beta, feasible, slack, out)
+        decode = self._block_decoder()
+        raw = np.empty((self._SCAN_BLOCK, self.dim), dtype=np.float32)
+        norms = np.empty(self._SCAN_BLOCK)
+
         for start in range(0, len(ids), self._SCAN_BLOCK):
             pending = np.flatnonzero(~out & feasible)
             if len(pending) == 0:
                 break
             block = ids[start:start + self._SCAN_BLOCK]
+            nb = len(block)
+            decode(self._codes[block], raw[:nb], norms[:nb])
             theta = self._angle_value(self._angle_codes[block])
-            raw = self._decode_raw(self._codes[block], self._uniform)
-            C32 = raw / np.sqrt(np.einsum("ij,ij->i", raw, raw))[:, None]
-            ct, st = np.cos(theta).astype(np.float32), np.sin(theta).astype(np.float32)
-            wide_cols = theta + beta[pending].max() >= np.pi
             for q0 in range(0, len(pending), self._SCAN_QUERY_CHUNK):
                 rows = pending[q0:q0 + self._SCAN_QUERY_CHUNK]
-                S = Qn32[rows] @ C32.T
-                T = np.outer(cb[rows], ct)
-                T -= np.outer(sb[rows], st)
-                if wide_cols.any():
-                    # theta + beta >= pi holds every unit vector.
-                    wide = theta[None, wide_cols] + beta[rows, None] >= np.pi
-                    sub = T[:, wide_cols]
-                    sub[wide] = -2.0
-                    T[:, wide_cols] = sub
-                hit = (S >= T + slack).any(axis=1)
-                undecided = np.flatnonzero(~hit)
-                if len(undecided):
-                    i, j = np.nonzero(np.abs(S[undecided] - T[undecided]) < slack)
-                    if len(i):
-                        i = undecided[i]
-                        exact = angle_between(Qn[rows[i]], unit_rows(raw[j])) <= theta[j] + beta[rows[i]]
-                        hit[i[exact]] = True
-                out[rows] |= hit
+                S = Qn32[rows] @ raw[:nb].T
+                scan_kernels.accept_block(S, rows, raw[:nb], norms[:nb], theta, beta, Qn, slack, out)
+        return out
+
+    # Queries per set of per-query codeword tables (scan_kernels.accept_tables).
+    _TABLE_QUERY_CHUNK = 32
+
+    @staticmethod
+    def _tables_pay(sq: "_SeededPQ", n_caps: int) -> bool:
+        """Whether scoring seeded-PQ codes through per-query codeword tables
+        beats decoding them, measured on one P-core in batches of 32:
+        8-bit codebooks always (tables fit L2; 3.2x on 3.1K SPQ16 caps,
+        1.2x on 2.4K SPQ64 caps); 12-bit ones only with few slices and many
+        caps (1.16x on 12K SPQ12 caps at |B| = 80K; a tie on 21K SPQ36 caps,
+        0.6x on 3.1K SPQ24 caps), where a batch's tables outgrow L2."""
+        if sq.bits <= 8:
+            return True
+        return sq.m <= 8 and n_caps >= 8192
+
+    def _scan_tables(self, sq, ids, Qn, Qn32, beta, feasible, slack, out) -> np.ndarray:
+        """_scan for seeded-PQ codes without decoding: per chunk of queries,
+        a table of every slice against every codeword, summed per cap by
+        scan_kernels.accept_tables, which decides exactly as accept_block."""
+        from filters.cap_cover import scan_kernels
+        codes = np.ascontiguousarray(self._codes[ids][:, :self.code_size()])
+        theta = self._angle_value(self._angle_codes[ids])
+        sq_norms = np.einsum("ij,ij->i", sq.codebook.astype(np.float64), sq.codebook.astype(np.float64))
+        pending = np.flatnonzero(feasible)
+        for q0 in range(0, len(pending), self._TABLE_QUERY_CHUNK):
+            rows = pending[q0:q0 + self._TABLE_QUERY_CHUNK]
+            Qs = Qn32[rows].reshape(len(rows), sq.m, sq.sub)
+            T = np.ascontiguousarray(np.matmul(sq.codebook[None], Qs.transpose(1, 2, 0)))
+            scan_kernels.accept_tables(codes, sq.bits, sq.m, T, sq_norms, sq.codebook, theta, rows, beta, Qn,
+                                       slack, out)
         return out
 
     def surface_angle(self, vectors: np.ndarray) -> np.ndarray:

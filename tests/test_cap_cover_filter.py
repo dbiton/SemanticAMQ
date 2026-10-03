@@ -1,7 +1,8 @@
 import unittest
 import numpy as np
 from filters.cap_cover.cap_cover_filter import CapCoverFilter, Quantize, AUTO_CANDIDATES
-from filters.cap_cover.cap_geometry import angle_between, unit_rows, enclosing_cap, exact_cap_cover
+from filters.cap_cover.cap_geometry import (angle_between, unit_rows, enclosing_cap, exact_cap_cover,
+                                            knn_directions, log10_cap_measure)
 from filters.cap_cover.gonzales_construct import GonzalesConstruct
 from filters.cap_cover.minimax_construct import MinimaxConstruct
 from filters.cap_cover.sphere_merge_construct import SphereMergeConstruct
@@ -54,6 +55,18 @@ class TestCapGeometry(unittest.TestCase):
             self.assertLessEqual(angle_between(u[None], ua[None])[0] + ta, t + 1e-9)
             self.assertLessEqual(angle_between(u[None], ub[None])[0] + tb, t + 1e-9)
 
+    def test_log10_cap_measure(self):
+        from scipy.special import betainc
+        psi = np.array([1e-3, 0.1, 0.5, 1.0, 1.4, np.pi / 2, 2.0, 3.0])
+        # On S^2 a cap's share of the sphere is (1 - cos psi) / 2 = sin^2(psi / 2) exactly.
+        np.testing.assert_allclose(log10_cap_measure(psi, 3), np.log10(np.sin(psi / 2) ** 2), rtol=1e-12)
+        mid = psi[(psi > 0.3) & (psi <= np.pi / 2)]
+        np.testing.assert_allclose(log10_cap_measure(mid, 48),
+                                   np.log10(betainc(23.5, 0.5, np.sin(mid) ** 2) / 2), rtol=1e-10)
+        # Far below float64's range at d = 384, still finite and ordered.
+        tiny = log10_cap_measure(np.array([0.01, 0.05, 0.1]), 384)
+        self.assertTrue(np.all(np.isfinite(tiny)) and np.all(np.diff(tiny) > 0) and tiny[0] < -700)
+
     def test_exact_cap_cover_covers(self):
         X = unit_rows(_clustered())
         U, theta = exact_cap_cover(X, X[::7])
@@ -102,6 +115,22 @@ class TestCapCoverSoundness(unittest.TestCase):
                 self.assertIn(f.quantize, AUTO_CANDIDATES)
                 _assert_no_fn(self, f, X)
 
+    def test_auto_holdout_selection(self):
+        X = _clustered(n_clusters=60, per=10, dim=96, spread=0.4)
+        for budget in (1500, 4000):
+            with self.subTest(budget=budget):
+                proxy = CapCoverFilter.auto(96, budget, selection="proxy")
+                proxy.construct(X)
+                f = CapCoverFilter.auto(96, budget, selection="holdout")
+                f.construct(X)
+                self.assertLessEqual(f.get_bytesize(), budget)
+                _assert_no_fn(self, f, X)
+                if f.selection_override is None:
+                    # No override: exactly the proxy's filter.
+                    self.assertEqual(f.quantize, proxy.quantize)
+                    self.assertTrue(np.array_equal(f._codes[f.all_caps], proxy._codes[proxy.all_caps]))
+                    self.assertTrue(np.array_equal(f.all_angles, proxy.all_angles))
+
     def test_query_rule_for_non_unit_queries(self):
         X = _clustered()
         f = CapCoverFilter(DIM, max_caps=40, quantize=Quantize.TQ4)
@@ -148,6 +177,125 @@ class TestCapCoverBudget(unittest.TestCase):
             self.assertTrue((f._angle_value(f._angle_code(theta)) >= theta).all())
 
 
+class TestCapCoverScan(unittest.TestCase):
+    """query()'s compiled scan against the float64 rule it implements."""
+
+    ENCODINGS = (Quantize.TQ1, Quantize.TQ2, Quantize.TQ3, Quantize.TQ4, Quantize.TQ8, Quantize.SPQ12,
+                 Quantize.SPQ16, Quantize.SPQ24, Quantize.SPQ36, Quantize.SPQ48, Quantize.SPQ64,
+                 Quantize.FP32, Quantize.FP16)
+
+    def test_block_decoder_matches_quantizer(self):
+        X = _clustered()
+        for q in self.ENCODINGS:
+            with self.subTest(q=q):
+                f = CapCoverFilter(DIM, max_caps=40, quantize=q)
+                f.construct(X)
+                codes = f._codes[f.all_caps]
+                raw = np.empty((len(codes), DIM), dtype=np.float32)
+                norms = np.empty(len(codes))
+                f._block_decoder()(codes, raw, norms)
+                ref = f._decode_raw(codes, f._uniform)
+                self.assertTrue(np.array_equal(raw, ref))
+                np.testing.assert_allclose(norms, np.linalg.norm(ref.astype(np.float64), axis=1), rtol=1e-12)
+
+    @staticmethod
+    def _reference(f, Q, tau):
+        """The accept rule in float64, straight from the stored caps."""
+        Qw = f.to_working(Q)
+        n = np.linalg.norm(Qw, axis=1)
+        beta, feasible = f._beta(n, tau)
+        D = f.decode(f._codes[f.all_caps])
+        theta = f.all_angles
+        ang = angle_between(unit_rows(Qw)[:, None, :], D[None, :, :])
+        hit = (ang <= theta[None, :] + beta[:, None]) | (theta[None, :] + beta[:, None] >= np.pi)
+        return hit.any(axis=1) & feasible
+
+    def test_scan_matches_float64_rule(self):
+        X = _clustered()
+        rng = np.random.default_rng(5)
+        Q = np.vstack([_near(X, 0.6, n=2), _unit(rng.standard_normal((200, DIM))), X[:50] * 1.07,
+                       X[:50] * 0.9]).astype(np.float32)
+        for q in self.ENCODINGS:
+            for tau in (0.0, TAU, 0.6, 1.5):
+                with self.subTest(q=q, tau=tau):
+                    f = CapCoverFilter(DIM, max_caps=30, quantize=q)
+                    f.construct(X)
+                    got = np.asarray(f.query(Q, tau))
+                    self.assertTrue(np.array_equal(got, self._reference(f, Q, tau)))
+                    # Batches of any size decide the same.
+                    small = np.concatenate([f.query(Q[s:s + 7], tau) for s in range(0, len(Q), 7)])
+                    self.assertTrue(np.array_equal(small, got))
+
+    def test_table_scan_matches_float64_rule(self):
+        """The codeword-table scan, forced for every seeded-PQ encoding
+        (query() takes it only where it pays, see _tables_pay)."""
+        X = _clustered()
+        rng = np.random.default_rng(6)
+        Q = np.vstack([_near(X, 0.6, n=2), _unit(rng.standard_normal((200, DIM))), X[:50] * 1.07]).astype(np.float32)
+        for q in (Quantize.SPQ12, Quantize.SPQ16, Quantize.SPQ24, Quantize.SPQ36, Quantize.SPQ48, Quantize.SPQ64):
+            for tau in (0.0, TAU, 0.6, 1.5):
+                with self.subTest(q=q, tau=tau):
+                    f = CapCoverFilter(DIM, max_caps=30, quantize=q)
+                    f.construct(X)
+                    Qw = f.to_working(Q)
+                    n = np.linalg.norm(Qw, axis=1)
+                    beta, feasible = f._beta(n, tau)
+                    Qn = Qw / n[:, None]
+                    got = f._scan_tables(f._quantizers[f._uniform], f.all_caps, Qn, Qn.astype(np.float32), beta,
+                                         feasible, f._slack(), np.zeros(len(Q), dtype=bool))
+                    self.assertTrue(np.array_equal(got, self._reference(f, Q, tau)))
+
+
+class TestCapCoverScalableConstruction(unittest.TestCase):
+    """SphereMergeConstruct's large-n paths, forced at test size."""
+
+    def test_knn_directions_cell_search(self):
+        U = unit_rows(_clustered(n_clusters=60, per=30, dim=DIM, spread=0.4))
+        exact, exact_dots = knn_directions(U, 8, exact_max=10 ** 9)
+        approx, dots = knn_directions(U, 8, exact_max=0, probes=8)
+        self.assertEqual(approx.shape, exact.shape)
+        self.assertFalse((approx == np.arange(len(U))[:, None]).any())
+        valid = approx >= 0
+        np.testing.assert_allclose(dots[valid], np.einsum("ij,ij->i", U[np.nonzero(valid)[0]], U[approx[valid]]),
+                                   rtol=0, atol=1e-12)
+        recall = np.mean([len(np.intersect1d(a, e)) / len(e) for a, e in zip(approx, exact)])
+        self.assertGreater(recall, 0.9)
+
+    def test_local_paths_no_false_negatives(self):
+        X = _clustered(n_clusters=40, per=10, dim=96)
+        local = dict(knn_exact_max=0, exact_pairs=0)
+        for budget in (1500, 4000, 12000):
+            with self.subTest(budget=budget):
+                f = CapCoverFilter.auto(96, budget, construct_method=SphereMergeConstruct(**local))
+                f.construct(X)
+                self.assertLessEqual(f.get_bytesize(), budget)
+                _assert_no_fn(self, f, X)
+        for q in (Quantize.TQ2, Quantize.SPQ24):
+            with self.subTest(q=q):
+                f = CapCoverFilter(96, max_caps=50, quantize=q, construct_method=SphereMergeConstruct(**local))
+                f.construct(X)
+                _assert_no_fn(self, f, X)
+
+    def test_finish_cover_is_labelled(self):
+        X = unit_rows(_clustered(n_clusters=30, per=12))
+        sm = SphereMergeConstruct(exact_pairs=0, knn_exact_max=0)
+        f = CapCoverFilter(DIM, max_caps=40, quantize=Quantize.FP32, construct_method=sm)
+        for _, cover in sm.iter_candidates(f, X, [40]):
+            cover = sm.finish(f, X, cover)
+        U, theta, labels, nbr = cover
+        self.assertTrue((angle_between(X, U[labels]) <= theta[labels] + 1e-12).all())
+        self.assertEqual(len(nbr), len(U))
+        self.assertTrue(((nbr >= -1) & (nbr < len(U))).all())
+
+    def test_duplicates_count_once_as_caps(self):
+        X = _clustered(n_clusters=20, per=6)
+        Xd = np.vstack([X, X[:40], X[:40]])
+        f = CapCoverFilter(DIM, max_caps=10 ** 6, quantize=Quantize.TQ4)
+        f.construct(Xd)
+        self.assertEqual(f._num_caps, len(X))
+        _assert_no_fn(self, f, X)
+
+
 class TestCapCoverInsert(unittest.TestCase):
 
     def _stream(self, insert):
@@ -169,6 +317,25 @@ class TestCapCoverInsert(unittest.TestCase):
         f, X = self._stream(CapMergeInsert())
         self.assertLessEqual(f._num_caps, f.max_caps)
         _assert_no_fn(self, f, X)
+
+    def test_cap_merge_insert_fitted_codes_no_false_negatives(self):
+        f, X = self._stream(CapMergeInsert(fit_codes=True))
+        self.assertLessEqual(f._num_caps, f.max_caps)
+        _assert_no_fn(self, f, X)
+
+    def test_fit_cap_code_never_worse_than_own_code(self):
+        rng = np.random.default_rng(4)
+        X = _clustered(dim=96)
+        for q in (Quantize.TQ2, Quantize.TQ4, Quantize.SPQ24, Quantize.SPQ64, Quantize.FP16):
+            with self.subTest(q=q):
+                f = CapCoverFilter(96, max_caps=40, quantize=q)
+                f.construct(X)
+                for _ in range(10):
+                    P = unit_rows(rng.standard_normal((2, 96)) * 0.3 + f.to_working(X[:1]))
+                    t = rng.uniform(0.0, 0.4, 2)
+                    u, _ = enclosing_cap(P[0], t[0], P[1], t[1])
+                    reach = lambda codes: (angle_between(f.decode(codes), P) + t).max()
+                    self.assertLessEqual(reach(f.fit_cap_code(u, P, t)), reach(f.encode(u[None])) + 1e-12)
 
 
 if __name__ == "__main__":

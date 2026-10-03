@@ -25,6 +25,15 @@ class CapMergeInsert(InsertInterface):
     held -- the triangle inequality on the sphere, never an estimate. A new
     cap for vector x stores angle(x, decode(x)).
 
+    Codes: a merged cap's code is fitted to hold its two parts within the
+    least stored angle (fit_codes, CapCoverFilter.fit_cap_code) rather than
+    taken nearest the enclosing cap's direction: every merge re-encodes, so
+    the saving compounds over a stream. Measured (compare_cap_cover.py
+    stream, |B| = 8000, kf = 0.1, bootstrap on half of B in fold order, 25
+    cells), FPR at the end of the stream: -0.071 at TQ2 (25/25 cells),
+    -0.039 with the encoding auto-chosen at bootstrap (19 of 20 that
+    differ), -0.008 at TQ4.
+
     Search: each cap caches its cheapest partner and that pair's cost (8 B
     per cap with the count, at uint16 ids -- charged by get_bytesize() and
     paid for in caps by max_caps_for_budget()). A cached cost only ever
@@ -35,10 +44,12 @@ class CapMergeInsert(InsertInterface):
 
     remove() is not supported."""
 
-    def __init__(self, exponent: float = 8.0, mass_weight: float = 1.0, cost_offset: float = 0.1) -> None:
+    def __init__(self, exponent: float = 8.0, mass_weight: float = 1.0, cost_offset: float = 0.1,
+                 fit_codes: bool = True) -> None:
         self.exponent = exponent
         self.mass_weight = mass_weight
         self.cost_offset = cost_offset
+        self.fit_codes = fit_codes
         self._mass = np.zeros(0, dtype=np.uint16)
         self._partner = np.zeros(0, dtype=np.int64)    # cap id, -1 = stale
         self._cost = np.zeros(0, dtype=np.float32)     # partner's cost, or a lower bound if stale
@@ -288,7 +299,10 @@ class CapMergeInsert(InsertInterface):
         u, theta = enclosing_cap(ua, ta, ub, tb)
         m = self._m[a] + self._m[b]
         self._kill(filter, np.array([a, b]))
-        sid, dec = filter._add_caps(u[None, :], np.array([theta]))
+        # The merged cap's code, fitted to hold the two parts within the
+        # least stored angle (CapCoverFilter.fit_cap_code), or u's own.
+        codes = filter.fit_cap_code(u, np.stack([ua, ub]), np.array([ta, tb])) if self.fit_codes else None
+        sid, dec = filter._add_caps(u[None, :], np.array([theta]), codes=codes)
         sid, dec = int(sid[0]), dec[0]
         # Around the decoded direction, from the parts' own caps: tighter
         # than _add_caps' theta + angle(u, dec), and as sound.

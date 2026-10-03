@@ -56,33 +56,55 @@ def badoiu_clarkson(Xs: np.ndarray, labels: np.ndarray, U: np.ndarray, starts: n
                     counts: np.ndarray, steps: int) -> np.ndarray:
     """`steps` Badoiu-Clarkson steps c <- c + (farthest - c) / (t + 1) on every
     cluster at once, membership fixed, Xs and labels in segments() order.
-    Returns each cluster's best *unit direction* seen, by its cap angle."""
+    Returns each cluster's best *unit direction* seen, by its cap angle.
+
+    The farthest member is ranked by float32 inner product and only its
+    angle is measured in float64: the step needs a farthest member, not the
+    exact one, and the caller re-measures every angle it keeps."""
     C = np.asarray(U, dtype=np.float64).copy()
     best = unit_rows(C)
     best_t = np.full(len(C), np.inf)
-    nonempty = counts > 0
+    # A one-member cluster's cap is its member, exactly: no steps needed.
+    single = np.flatnonzero(counts == 1)
+    best[single] = unit_rows(Xs[starts[single]])
+    multi = counts > 1
+    if not multi.any():
+        return best
+    if len(single):
+        rows = np.flatnonzero(multi[labels])
+        Xs, labels = Xs[rows], labels[rows]
+        counts = np.where(multi, counts, 0)
+        starts = np.zeros(len(counts), dtype=np.int64)
+        np.cumsum(counts[:-1], out=starts[1:])
+    nonempty = np.flatnonzero(counts > 0)
+    Xs32 = np.ascontiguousarray(Xs, dtype=np.float32)
     for t in range(1, steps + 1):
         Un = unit_rows(C)
-        ang = angle_between(Xs, Un[labels])
-        theta = segment_max(ang, starts, counts)
-        improved = nonempty & (theta < best_t)
-        best[improved] = Un[improved]
-        best_t[improved] = theta[improved]
-        hits = np.flatnonzero(ang >= theta[labels])
+        ip = np.einsum("ij,ij->i", Xs32, Un.astype(np.float32)[labels])
+        least = np.minimum.reduceat(ip, starts[nonempty])
+        low = np.full(len(C), np.inf, dtype=np.float32)
+        low[nonempty] = least
+        hits = np.flatnonzero(ip <= low[labels])
         cluster, first = np.unique(labels[hits], return_index=True)
         far = hits[first]
+        theta = angle_between(Xs[far], Un[cluster])
+        improved = theta < best_t[cluster]
+        best[cluster[improved]] = Un[cluster[improved]]
+        best_t[cluster[improved]] = theta[improved]
         C[cluster] += (Xs[far] - C[cluster]) / (t + 1.0)
     return best
 
 
-def reseed_empty(X: np.ndarray, U: np.ndarray, counts: np.ndarray, labels: np.ndarray) -> np.ndarray:
+def reseed_empty(X: np.ndarray, U: np.ndarray, counts: np.ndarray, labels: np.ndarray,
+                 return_rows: bool = False):
     """Directions that lost every member move onto the members farthest from
-    their own directions."""
+    their own directions (with return_rows, also returns those members' rows,
+    aligned with the empty caps in index order)."""
     empty = np.flatnonzero(counts == 0)
     if len(empty) == 0:
-        return U
+        return (U, np.empty(0, dtype=np.int64)) if return_rows else U
     d = angle_between(X, U[labels])
     far = np.argpartition(-d, len(empty) - 1)[:len(empty)]
     U = U.copy()
     U[empty] = X[far]
-    return U
+    return (U, far) if return_rows else U
