@@ -16,6 +16,12 @@ from numba import njit
 #     that slice's codeword.
 # Each decoder also returns every row's norm, accumulated in float64.
 #
+# Set storage (CapCoverFilter's static groups): a code's first w bits (w a
+# multiple of 8, 0 = none) are not in `codes` but in keys[r], decoded per
+# call from the group's Elias-Fano sequence (ef_decode); every reader starts
+# its bit accumulator with them, then reads the rest of the code from
+# codes[r].
+#
 # Exactness. The GEMM scores q . raw_j in float32, so the rule
 # q . raw_j >= |raw_j| cos(theta_j + beta_q) is decided outright only when
 # the score clears the threshold by more than slack * |raw_j|, slack the
@@ -25,12 +31,15 @@ from numba import njit
 
 
 @njit(nogil=True, cache=True)
-def decode_levels(codes, levels, bits, dim, out, norms):
+def decode_levels(codes, keys, w, levels, bits, dim, out, norms):
     """TurboQuant codes -> out[r, i] = levels[code of dimension i]."""
     mask = (1 << bits) - 1
     for r in range(codes.shape[0]):
         acc = 0
         nacc = 0
+        if w > 0:
+            acc = keys[r]
+            nacc = w
         b = 0
         ss = 0.0
         for i in range(dim):
@@ -47,13 +56,16 @@ def decode_levels(codes, levels, bits, dim, out, norms):
 
 
 @njit(nogil=True, cache=True)
-def decode_codebook(codes, codebook, bits, m, out, norms):
+def decode_codebook(codes, keys, w, codebook, bits, m, out, norms):
     """Seeded-PQ codes -> out[r, j * sub : (j + 1) * sub] = codebook[code j]."""
     mask = (1 << bits) - 1
     sub = codebook.shape[1]
     for r in range(codes.shape[0]):
         acc = 0
         nacc = 0
+        if w > 0:
+            acc = keys[r]
+            nacc = w
         b = 0
         ss = 0.0
         for j in range(m):
@@ -72,6 +84,38 @@ def decode_codebook(codes, codebook, bits, m, out, norms):
 
 
 @njit(nogil=True, cache=True)
+def ef_decode(low, high, n, l, out):
+    """Elias-Fano sequence -> out[:n], non-decreasing: element i's low l
+    bits are bits [i l, (i + 1) l) of `low`, and its high part is p - i for
+    the position p of the i-th set bit of `high` (little-endian bit
+    streams, as CapCoverFilter._ef_encode writes them)."""
+    lmask = (1 << l) - 1
+    i = 0
+    lacc = 0
+    lnacc = 0
+    lb = 0
+    for byte in range(high.shape[0]):
+        v = np.int64(high[byte])
+        t = 0
+        while v != 0 and i < n:
+            while (v & 1) == 0:
+                v >>= 1
+                t += 1
+            while lnacc < l:
+                lacc |= np.int64(low[lb]) << lnacc
+                lb += 1
+                lnacc += 8
+            out[i] = ((byte * 8 + t - i) << l) | (lacc & lmask)
+            lacc >>= l
+            lnacc -= l
+            i += 1
+            v >>= 1
+            t += 1
+        if i == n:
+            break
+
+
+@njit(nogil=True, cache=True)
 def _exact_angle(q, raw, norm):
     """angle(q, raw / norm) in float64 by the chord formula (angle_between)."""
     s = 0.0
@@ -85,7 +129,7 @@ def _exact_angle(q, raw, norm):
 
 
 @njit(nogil=True, cache=True)
-def accept_tables(codes, bits, m, T, sq_norms, codebook, theta, rows, beta, Qn, slack, out):
+def accept_tables(codes, keys, w, bits, m, T, sq_norms, codebook, theta, rows, beta, Qn, slack, out):
     """query() over seeded-PQ codes without decoding: T[s, c, i] holds query
     i's slice s against codeword c (float32), so q . raw_j is the sum of m
     table rows -- one row read per slice for the whole batch of queries --
@@ -113,6 +157,9 @@ def accept_tables(codes, bits, m, T, sq_norms, codebook, theta, rows, beta, Qn, 
             break
         a = 0
         nacc = 0
+        if w > 0:
+            a = keys[j]
+            nacc = w
         b = 0
         ss = 0.0
         for s in range(m):
@@ -157,7 +204,7 @@ def accept_tables(codes, bits, m, T, sq_norms, codebook, theta, rows, beta, Qn, 
 
 
 @njit(nogil=True, cache=True, fastmath={"reassoc", "contract"})
-def accept_direct(codes, bits, m, codebook, sq_norms, theta, rows, beta, Qn, slack, out):
+def accept_direct(codes, keys, w, bits, m, codebook, sq_norms, theta, rows, beta, Qn, slack, out):
     """query() over seeded-PQ codes for a few queries at a time, with no
     decode and no table: per query, each cap's slices are scored against
     the query's slices straight from the codebook (float64 sums of float32
@@ -197,6 +244,9 @@ def accept_direct(codes, bits, m, codebook, sq_norms, theta, rows, beta, Qn, sla
                 break
             a = 0
             nacc = 0
+            if w > 0:
+                a = keys[j]
+                nacc = w
             bb = 0
             n2 = 0.0
             for s in range(m):
@@ -239,7 +289,7 @@ def accept_direct(codes, bits, m, codebook, sq_norms, theta, rows, beta, Qn, sla
 
 
 @njit(nogil=True, cache=True, fastmath={"reassoc", "contract"})
-def accept_direct_levels(codes, levels, bits, dim, theta, rows, beta, Qn, slack, out):
+def accept_direct_levels(codes, keys, w, levels, bits, dim, theta, rows, beta, Qn, slack, out):
     """accept_direct for TurboQuant codes: per query, each cap's q . raw and
     |raw|^2 accumulate in one pass over its codes (levels[code] per
     dimension, float64 sums), with no decoded block written out. Decides
@@ -262,6 +312,9 @@ def accept_direct_levels(codes, levels, bits, dim, theta, rows, beta, Qn, slack,
                 break
             acc = 0
             nacc = 0
+            if w > 0:
+                acc = keys[j]
+                nacc = w
             bb = 0
             dot = 0.0
             n2 = 0.0
@@ -284,6 +337,9 @@ def accept_direct_levels(codes, levels, bits, dim, theta, rows, beta, Qn, slack,
             if dot > thr - margin:
                 acc = 0
                 nacc = 0
+                if w > 0:
+                    acc = keys[j]
+                    nacc = w
                 bb = 0
                 for t in range(dim):
                     while nacc < bits:
@@ -329,3 +385,170 @@ def accept_block(S, rows, raw, norms, theta, beta, Qn, slack, out):
                 if _exact_angle(Qn[q], raw[j], n) <= theta[j] + b:
                     out[q] = True
                     break
+
+
+@njit(nogil=True, cache=True)
+def accept_table1(codes, keys, w, bits, m, T, rest, sq_norms, codebook, theta, rows, beta, Qn, slack, out):
+    """accept_direct through per-query codeword tables, for a few queries
+    at a time: T[i, s, c] is query i's slice s against codeword c (float64),
+    so each cap costs m table reads instead of m * sub multiply-adds, and
+    rest[i, s] = sum over slices t >= s of max_c T[i, t, c] bounds what the
+    rest of a code can still add: a cap is given up once the dot so far plus
+    that bound is below its threshold by more than the margin. Decides each
+    pair as accept_block does; boundary pairs are decoded and re-measured in
+    float64."""
+    sub = codebook.shape[1]
+    dim = m * sub
+    mask = (1 << bits) - 1
+    idx = np.empty(m, dtype=np.int64)
+    raw = np.empty(dim, dtype=np.float32)
+    nc = codes.shape[0]
+    for i in range(rows.shape[0]):
+        q = rows[i]
+        if out[q]:
+            continue
+        b = beta[q]
+        cb = np.cos(b)
+        sb = np.sin(b)
+        Ti = T[i]
+        ri = rest[i]
+        for j in range(nc):
+            if theta[j] + b >= np.pi:
+                out[q] = True
+                break
+            a = 0
+            nacc = 0
+            if w > 0:
+                a = keys[j]
+                nacc = w
+            bb = 0
+            n2 = 0.0
+            for s in range(m):
+                while nacc < bits:
+                    a |= np.int64(codes[j, bb]) << nacc
+                    bb += 1
+                    nacc += 8
+                idx[s] = a & mask
+                a >>= bits
+                nacc -= bits
+                n2 += sq_norms[idx[s]]
+            n = np.sqrt(n2)
+            thr = n * (cb * np.cos(theta[j]) - sb * np.sin(theta[j]))
+            margin = slack * n
+            dot = 0.0
+            dropped = False
+            for s in range(m):
+                dot += Ti[s, idx[s]]
+                if (s & 3) == 3 and dot + ri[s + 1] < thr - margin:
+                    dropped = True
+                    break
+            if dropped:
+                continue
+            if dot >= thr + margin:
+                out[q] = True
+                break
+            if dot > thr - margin:
+                for s in range(m):
+                    for t in range(sub):
+                        raw[s * sub + t] = codebook[idx[s], t]
+                if _exact_angle(Qn[q], raw, n) <= theta[j] + b:
+                    out[q] = True
+                    break
+
+
+@njit(nogil=True, cache=True)
+def accept_lut_levels(codes, keys, w, gbits, groups, T, N, levels, bits, dim, theta, rows, beta, Qn, slack, out):
+    """accept_direct_levels through per-query group tables, for a few
+    queries at a time: TurboQuant codes read `gbits` bits (g = gbits / bits
+    dimensions) at a time, T[i, k, v] = query i's dimensions of group k
+    times the levels code v decodes them to, and N[v] the levels' summed
+    squares, so a cap costs 2 * groups table reads instead of dim decodes
+    and multiply-adds. Decides each pair as accept_block does; boundary
+    pairs are decoded and re-measured in float64."""
+    gmask = (1 << gbits) - 1
+    mask = (1 << bits) - 1
+    raw = np.empty(dim, dtype=np.float32)
+    nc = codes.shape[0]
+    for i in range(rows.shape[0]):
+        q = rows[i]
+        if out[q]:
+            continue
+        b = beta[q]
+        cb = np.cos(b)
+        sb = np.sin(b)
+        Ti = T[i]
+        for j in range(nc):
+            if theta[j] + b >= np.pi:
+                out[q] = True
+                break
+            acc = 0
+            nacc = 0
+            if w > 0:
+                acc = keys[j]
+                nacc = w
+            bb = 0
+            dot = 0.0
+            n2 = 0.0
+            for k in range(groups):
+                while nacc < gbits:
+                    acc |= np.int64(codes[j, bb]) << nacc
+                    bb += 1
+                    nacc += 8
+                v = acc & gmask
+                acc >>= gbits
+                nacc -= gbits
+                dot += Ti[k, v]
+                n2 += N[v]
+            n = np.sqrt(n2)
+            thr = n * (cb * np.cos(theta[j]) - sb * np.sin(theta[j]))
+            margin = slack * n
+            if dot >= thr + margin:
+                out[q] = True
+                break
+            if dot > thr - margin:
+                acc = 0
+                nacc = 0
+                if w > 0:
+                    acc = keys[j]
+                    nacc = w
+                bb = 0
+                for t in range(dim):
+                    while nacc < bits:
+                        acc |= np.int64(codes[j, bb]) << nacc
+                        bb += 1
+                        nacc += 8
+                    raw[t] = levels[acc & mask]
+                    acc >>= bits
+                    nacc -= bits
+                if _exact_angle(Qn[q], raw, n) <= theta[j] + b:
+                    out[q] = True
+                    break
+
+
+@njit(nogil=True, cache=True, fastmath=True)
+def nearest_codeword(S, CBt, out):
+    """out[r] = the codeword (a column of CBt, sub x 2^bits) of largest inner
+    product with row r of S (one slice of a direction per row): one row's
+    2^bits scores stay in L1, where faiss's flat search over 6-48-dim
+    slices runs well below GEMM speed (1.3-4.5x slower on one core). Ties
+    and near-ties within float32 round-off may resolve differently from
+    faiss (measured on 0-0.05% of directions); construct() uses it only to
+    plan (CapCoverFilter._level_psi), never for the codes it stores."""
+    K = CBt.shape[1]
+    sub = S.shape[1]
+    acc = np.empty(K, np.float32)
+    for r in range(S.shape[0]):
+        x0 = S[r, 0]
+        for c in range(K):
+            acc[c] = x0 * CBt[0, c]
+        for t in range(1, sub):
+            x = S[r, t]
+            for c in range(K):
+                acc[c] += x * CBt[t, c]
+        best = 0
+        bv = acc[0]
+        for c in range(1, K):
+            if acc[c] > bv:
+                bv = acc[c]
+                best = c
+        out[r] = best

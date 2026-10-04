@@ -59,6 +59,17 @@ def _configs():
     from filters.ball_cover.minimax_construct import MinimaxConstruct as BallMinimax
     from filters.cap_cover.cap_cover_filter import CapCoverFilter, Quantize as CQ
     from filters.cap_cover.sphere_merge_construct import SphereMergeConstruct as CapSphereMerge
+    from filters.cap_cover.cap_cover_filter import AUTO_CANDIDATES
+
+    def auto5(budget=None, **kw):
+        """auto() as configs named before 2026-10-04's defaults (DENSE10_LADDER,
+        mix_finer=1) built it: the AUTO_CANDIDATES ladder, coarsen's ceiling not
+        raised -- so their rows reproduce. Set storage and the single-query
+        tables are on (pass set_codes=False / single_tables=False for v5)."""
+        kw = {"candidates": AUTO_CANDIDATES, "mix_finer": 0, **kw}
+        if budget is not None:
+            kw["max_memory"] = budget
+        return CapCoverFilter.auto(DIM, **kw)
 
     def ball(construct, q):
         return lambda budget: BallCoverFilter(DIM, construct_method=construct(), max_memory=budget,
@@ -71,7 +82,7 @@ def _configs():
     old_merge = dict(cost="power", exponent=8.0, mass_weight=1.0)
 
     def cap_auto(selection="proxy", merge=old_merge, **kw):
-        return lambda budget: CapCoverFilter.auto(DIM, budget, selection=selection,
+        return lambda budget: auto5(budget, selection=selection,
                                                   construct_method=CapSphereMerge(**merge), **kw)
 
     configs = {
@@ -140,7 +151,7 @@ def _configs():
             kw = dict(max_memory=budget, construct_method=CapSphereMerge(**merge),
                       insert_method=CapMergeInsert(fit_codes=fit, **insert))
             if q is None:
-                return CapCoverFilter.auto(DIM, selection=selection, **kw)
+                return auto5(selection=selection, **kw)
             return CapCoverFilter(DIM, quantize=CQ[q], **kw)
         return make
 
@@ -179,17 +190,49 @@ def _configs():
             DIM, quantize=q, max_memory=budget, basis_fit="members"))(q)
     from filters.cap_cover.cap_cover_filter import AUTO_CANDIDATES
     basis = tuple(q for q in CQ if q.value.startswith("PSPQ"))
-    configs["cap_autob"] = lambda budget: CapCoverFilter.auto(DIM, budget, candidates=AUTO_CANDIDATES + basis)
-    configs["cap_autobm"] = lambda budget: CapCoverFilter.auto(DIM, budget, candidates=AUTO_CANDIDATES + basis,
+    configs["cap_autob"] = lambda budget: auto5(budget, candidates=AUTO_CANDIDATES + basis)
+    configs["cap_autobm"] = lambda budget: auto5(budget, candidates=AUTO_CANDIDATES + basis,
                                                                basis_fit="members")
     # One encoding per filter (before mixed encodings), and the mix with the
     # VA+-style KLT codes as candidates too.
-    configs["cap_auto_uni"] = lambda budget: CapCoverFilter.auto(DIM, budget, mixed=False)
-    configs["cap_auto_free"] = lambda budget: CapCoverFilter.auto(DIM, budget, mixed="free")
-    configs["cap_auto_coarsen"] = lambda budget: CapCoverFilter.auto(DIM, budget, mixed="coarsen")
+    configs["cap_auto_uni"] = lambda budget: auto5(budget, mixed=False)
+    configs["cap_auto_free"] = lambda budget: auto5(budget, mixed="free")
+    configs["cap_auto_coarsen"] = lambda budget: auto5(budget, mixed="coarsen")
+    # Denser seeded-PQ ladders (2026-10-04): 10/12-bit rungs between the
+    # default ones, 8-bit (table-scored) rungs at their byte sizes, or both.
+    from filters.cap_cover.cap_cover_filter import DENSE_LADDER as dense
+    b8 = (CQ.SPQ24B8, CQ.SPQ32B8, CQ.SPQ48B8)
+    for name, extra in (("dense", dense), ("b8", b8), ("ladder", dense + b8)):
+        configs[f"cap_auto_{name}"] = (lambda extra: lambda budget: auto5(
+            budget, candidates=AUTO_CANDIDATES + extra))(extra)
+    # Coarsen with the ceiling raised by 1 or 2 rungs (the top band may take
+    # finer codes), on the default, the dense and the full ladder.
+    for s in (1, 2):
+        configs[f"cap_auto_f{s}"] = (lambda s: lambda budget: auto5(budget, mix_finer=s))(s)
+        for name, extra in (("dense", dense), ("ladder", dense + b8)):
+            configs[f"cap_auto_{name}_f{s}"] = (lambda s, extra: lambda budget: auto5(
+                budget, candidates=AUTO_CANDIDATES + extra, mix_finer=s))(s, extra)
+    from filters.cap_cover.cap_cover_filter import DENSE10_LADDER as dense10
+    configs["cap_auto_dense10_f1"] = lambda budget: auto5(budget, candidates=AUTO_CANDIDATES + dense10,
+                                                                        mix_finer=1)
+    # Groups stored in a fixed order (before set storage, 2026-10-04).
+    configs["cap_auto_noset"] = lambda budget: auto5(budget, set_codes=False)
+    # Boot rungs (seeded PQ in a basis rebuilt from the cover's own whole-
+    # space caps) at the finished cover's plan.
+    from filters.cap_cover.cap_cover_filter import BOOT_CANDIDATES as boot
+    configs["cap_auto_boot"] = lambda budget: auto5(budget, candidates=AUTO_CANDIDATES + boot)
+    configs["cap_auto_free_boot"] = lambda budget: auto5(budget, candidates=AUTO_CANDIDATES + boot,
+                                                                       mixed="free")
+    configs["cap_auto_dense_f1_boot"] = lambda budget: auto5(
+        budget, candidates=AUTO_CANDIDATES + dense + boot, mix_finer=1)
+    # Rows of cap_auto_boot / cap_auto_free_boot before boot_equal (boot8_*,
+    # b80_*, fb80_*) let a cap take a cheaper boot code; *_booteq only one
+    # of its planned code's size (the default since).
+    configs["cap_auto_booteq"] = configs["cap_auto_boot"]
+    configs["cap_auto_free_booteq"] = configs["cap_auto_free_boot"]
     klt = tuple(q for q in CQ if q.value.startswith("KSQ"))
-    configs["cap_autok"] = lambda budget: CapCoverFilter.auto(DIM, budget, candidates=AUTO_CANDIDATES + klt)
-    configs["cap_autok_coarsen"] = lambda budget: CapCoverFilter.auto(DIM, budget, candidates=AUTO_CANDIDATES + klt,
+    configs["cap_autok"] = lambda budget: auto5(budget, candidates=AUTO_CANDIDATES + klt)
+    configs["cap_autok_coarsen"] = lambda budget: auto5(budget, candidates=AUTO_CANDIDATES + klt,
                                                                       mixed="coarsen")
     # Query-agnostic covers (no member-count weights): Gonzalez + minimax
     # Lloyd rounds, and sphere-merge with mass_weight 0.
@@ -325,6 +368,7 @@ def run_job(folds_dir: str, config: str, corpus: str, fold: int, kf: float) -> d
                n_regions=int(getattr(f, "_num_caps", getattr(f, "_num_spheres", -1))),
                encoding=getattr(f, "encoding_label", getattr(getattr(f, "quantize", None), "value", "")),
                override=str(getattr(f, "selection_override", None) or ""),
+               boot_plan=str(getattr(f, "boot_plan", None) or ""),
                fpr=float(predicted[neg].mean()), construct_s=construct_s, query_s=query_s,
                **accept_volume(f, TAU), **proxies)
     start = 0

@@ -164,8 +164,11 @@ class TestCapCoverSoundness(unittest.TestCase):
                 levels = f._cap_level[f.all_caps]
                 mixed_seen |= len(np.unique(levels)) > 1
                 self.assertLessEqual(f.get_bytesize(), budget)
-                # Bytes are what each cap's own encoding costs.
-                expect = (f._code_sizes[levels] + 1).sum() + f._codebook_bytes() + sum(
+                # Bytes are what each encoding group costs in set storage
+                # (at most its caps' own code and angle bytes).
+                groups = sum(f._group_bytes(int(l), int(n)) for l, n in zip(*np.unique(levels, return_counts=True)))
+                self.assertLessEqual(groups, (f._code_sizes[levels] + 1).sum())
+                expect = groups + f._codebook_bytes() + sum(
                     f._quantizer_bytes(int(l)) + f._GROUP_BYTES for l in np.unique(levels) if l != f._uniform)
                 self.assertEqual(f.get_bytesize(), expect)
                 _assert_no_fn(self, f, X)
@@ -187,6 +190,41 @@ class TestCapCoverSoundness(unittest.TestCase):
                 self.assertLessEqual(f.get_bytesize(), budget)
                 _assert_no_fn(self, f, X)
 
+    def test_boot_basis_encodings(self):
+        """Boot levels (_BootPQ): chosen on low-rank data, no false
+        negatives, within budget, decisions as the float64 rule, and the
+        basis rebuilt from the stored whole-space codes decodes bit for bit
+        as stored (what a decoder of the stored filter would do)."""
+        from filters.cap_cover.cap_cover_filter import BOOT_CANDIDATES, _BootPQ
+        rng = np.random.default_rng(11)
+        basis = np.linalg.qr(rng.standard_normal((96, 12)))[0].T
+        X = _unit(_clustered(n_clusters=80, per=8, dim=12, spread=0.3) @ basis + 0.05 * rng.standard_normal((640, 96)))
+        Q = np.vstack([_near(X, 0.6, n=1), _unit(rng.standard_normal((200, 96)))]).astype(np.float32)
+        chosen = False
+        for budget in (6000, 12000):
+            with self.subTest(budget=budget):
+                # Earlier defaults and cheaper boot codes allowed, so the
+                # plan takes boot levels on this data.
+                f = CapCoverFilter.auto(96, budget, candidates=AUTO_CANDIDATES + BOOT_CANDIDATES, mix_finer=0,
+                                        boot_equal=False)
+                f.construct(X)
+                self.assertLessEqual(f.get_bytesize(), budget)
+                _assert_no_fn(self, f, X)
+                for tau in (TAU, 0.6):
+                    self.assertTrue(np.array_equal(np.asarray(f.query(Q, tau)), TestCapCoverScan._reference(f, Q, tau)))
+                levels = f._cap_level[f.all_caps]
+                boot = [int(l) for l in np.unique(levels) if f._is_boot(int(l))]
+                chosen |= bool(boot)
+                if boot:
+                    whole = f.all_caps[~np.isin(levels, boot)]
+                    anchors = f._decode_levels(f._stored_codes(whole), f._cap_level[whole])
+                    for l in boot:
+                        sq = _BootPQ(96, f._quantizers[l].rank, f._quantizers[l].sub, f._quantizers[l].bits)
+                        sq.train(anchors)
+                        codes = f._stored_codes(f.all_caps[levels == l])[:, :f.code_size(l)]
+                        self.assertTrue(np.array_equal(sq.decode(codes), f._quantizers[l].decode(codes)))
+        self.assertTrue(chosen, "no boot level chosen on low-rank data")
+
     def test_auto_holdout_selection(self):
         X = _clustered(n_clusters=60, per=10, dim=96, spread=0.4)
         for budget in (1500, 4000):
@@ -200,7 +238,7 @@ class TestCapCoverSoundness(unittest.TestCase):
                 if f.selection_override is None:
                     # No override: exactly the proxy's filter.
                     self.assertEqual(f.quantize, proxy.quantize)
-                    self.assertTrue(np.array_equal(f._codes[f.all_caps], proxy._codes[proxy.all_caps]))
+                    self.assertTrue(np.array_equal(f._stored_codes(f.all_caps), proxy._stored_codes(proxy.all_caps)))
                     self.assertTrue(np.array_equal(f.all_angles, proxy.all_angles))
 
     def test_query_rule_for_non_unit_queries(self):
@@ -260,6 +298,65 @@ class TestCapCoverBudget(unittest.TestCase):
         got = angle_between(D, unit_rows(sq.decode(sq.compute_codes(D))))
         np.testing.assert_allclose(got, both, rtol=0, atol=1e-12)
 
+    def test_auto_defaults(self):
+        from filters.cap_cover.cap_cover_filter import DENSE10_LADDER
+        f = CapCoverFilter.auto(DIM, 20000)
+        self.assertEqual(f.mix_finer, 1)
+        self.assertTrue(set(DENSE10_LADDER + AUTO_CANDIDATES) <= set(f.levels))
+        self.assertTrue(f._set_storage())
+
+    def test_fast_nearest_codeword_matches_faiss(self):
+        """compute_codes(fast=True) (scan_kernels.nearest_codeword, used to
+        plan) picks faiss's codeword but for near-ties."""
+        from filters.cap_cover.cap_cover_filter import _SeededPQ
+        X = unit_rows(np.random.default_rng(4).standard_normal((300, 96))).astype(np.float32)
+        for sub, bits in ((24, 12), (8, 10), (12, 8)):
+            pq = _SeededPQ(96, sub, bits)
+            same = (pq.compute_codes(X, fast=True) == pq.compute_codes(X)).all(axis=1).mean()
+            self.assertGreaterEqual(same, 0.99)
+
+    def test_elias_fano_round_trip(self):
+        from filters.cap_cover.cap_cover_filter import _ef_encode, _ef_layout
+        from filters.cap_cover import scan_kernels
+        rng = np.random.default_rng(3)
+        for n, w in ((1, 8), (5, 8), (300, 8), (300, 16), (2000, 16), (5000, 8), (70000, 16), (900, 24)):
+            with self.subTest(n=n, w=w):
+                keys = np.sort(rng.integers(0, 1 << w, n))
+                l, low, high = _ef_encode(keys, w)
+                self.assertEqual((l, len(low), len(high)), _ef_layout(n, w))
+                out = np.empty(n, dtype=np.int64)
+                scan_kernels.ef_decode(low, high, n, l, out)
+                self.assertTrue(np.array_equal(out, keys))
+
+    def test_set_storage_keeps_codes_and_decisions(self):
+        """Set storage only reorders the caps and moves each code's first
+        bits into an Elias-Fano sequence: the same caps, the same decisions,
+        fewer bytes, and get_bytesize() charges what the groups hold."""
+        X = _clustered(n_clusters=60, per=10, dim=96, spread=0.4)
+        rng = np.random.default_rng(8)
+        Q = np.vstack([X, _unit(rng.standard_normal((300, 96)))]).astype(np.float32)
+        for q in (Quantize.SPQ12, Quantize.SPQ16, Quantize.SPQ48, Quantize.TQ2, Quantize.FP16):
+            with self.subTest(q=q):
+                plain = CapCoverFilter(96, max_caps=400, quantize=q, set_codes=False)
+                plain.construct(X)
+                f = CapCoverFilter(96, max_caps=400, quantize=q)
+                f.construct(X)
+                self.assertIsNotNone(f._packed)
+                key = lambda g: sorted(map(bytes, np.concatenate(
+                    [g._stored_codes(g.all_caps), g._angle_codes[g.all_caps].astype(np.uint8)[:, None]], axis=1)))
+                self.assertEqual(key(f), key(plain))
+                for tau in (TAU, 0.6):
+                    for size in (1, 32, len(Q)):
+                        got = np.concatenate([f.query(Q[s:s + size], tau) for s in range(0, len(Q), size)])
+                        self.assertTrue(np.array_equal(got, np.asarray(plain.query(Q, tau))))
+                self.assertLessEqual(f.get_bytesize(), plain.get_bytesize())
+        # Mixed encodings under a budget: within it, no false negatives.
+        for budget in (1500, 6000):
+            f = CapCoverFilter.auto(96, budget)
+            f.construct(X)
+            self.assertLessEqual(f.get_bytesize(), budget)
+            _assert_no_fn(self, f, X)
+
     def test_cap_costs_match_ball_at_same_encoding(self):
         f = CapCoverFilter(384, quantize=Quantize.TQ4, insert_method=NearestInsert())
         self.assertEqual(f.bytes_per_cap(), 192 + 2)
@@ -285,11 +382,11 @@ class TestCapCoverScan(unittest.TestCase):
             with self.subTest(q=q):
                 f = CapCoverFilter(DIM, max_caps=40, quantize=q)
                 f.construct(X)
-                codes = f._codes[f.all_caps]
+                codes, keys, w, _ = f._level_codes(f._uniform, f.all_caps)
                 raw = np.empty((len(codes), DIM), dtype=np.float32)
                 norms = np.empty(len(codes))
-                f._block_decoder()(codes, raw, norms)
-                ref = f._decode_raw(codes, f._uniform)
+                f._block_decoder()(codes, keys, w, raw, norms)
+                ref = f._decode_raw(f._stored_codes(f.all_caps), f._uniform)
                 self.assertTrue(np.array_equal(raw, ref))
                 np.testing.assert_allclose(norms, np.linalg.norm(ref.astype(np.float64), axis=1), rtol=1e-12)
 
@@ -323,6 +420,28 @@ class TestCapCoverScan(unittest.TestCase):
                         small = np.concatenate([f.query(Q[s:s + size], tau) for s in range(0, len(Q), size)])
                         self.assertTrue(np.array_equal(small, got))
 
+    def test_single_query_tables_match_rule(self):
+        """Batches of 1-3 queries through per-query tables (accept_table1
+        for seeded PQ, forced for 12-bit codebooks too; accept_lut_levels
+        for TurboQuant) decide as the float64 rule and as without them."""
+        X = _clustered()
+        rng = np.random.default_rng(9)
+        Q = np.vstack([_near(X, 0.6, n=2), _unit(rng.standard_normal((150, DIM))), X[:40] * 1.07]).astype(np.float32)
+        for q in (Quantize.SPQ12, Quantize.SPQ16, Quantize.SPQ24, Quantize.SPQ64, Quantize.SPQ20, Quantize.TQ1,
+                  Quantize.TQ2, Quantize.TQ3, Quantize.TQ4):
+            for tau in (0.0, TAU, 0.6):
+                with self.subTest(q=q, tau=tau):
+                    f = CapCoverFilter(DIM, max_caps=30, quantize=q)
+                    f.construct(X)
+                    f._TABLE1_MIN_CAPS = 0
+                    ref = self._reference(f, Q, tau)
+                    for size in (1, 3):
+                        got = np.concatenate([f.query(Q[s:s + size], tau) for s in range(0, len(Q), size)])
+                        self.assertTrue(np.array_equal(got, ref))
+                    f.single_tables = False
+                    plain = np.concatenate([f.query(Q[s:s + 1], tau) for s in range(len(Q))])
+                    self.assertTrue(np.array_equal(plain, ref))
+
     def test_table_scan_matches_float64_rule(self):
         """The codeword-table scan, forced for every seeded-PQ encoding
         (query() takes it only where it pays, see _tables_pay)."""
@@ -338,8 +457,9 @@ class TestCapCoverScan(unittest.TestCase):
                     n = np.linalg.norm(Qw, axis=1)
                     beta, feasible = f._beta(n, tau)
                     Qn = Qw / n[:, None]
-                    got = f._scan_tables(f._quantizers[f._uniform], f.all_caps, Qn, Qn.astype(np.float32), beta,
-                                         feasible, f._slack(), np.zeros(len(Q), dtype=bool))
+                    codes, keys, w, theta = f._level_codes(f._uniform, f.all_caps)
+                    got = f._scan_tables(f._quantizers[f._uniform], codes, keys, w, theta, Qn, Qn.astype(np.float32),
+                                         beta, feasible, f._slack(), np.zeros(len(Q), dtype=bool))
                     self.assertTrue(np.array_equal(got, self._reference(f, Q, tau)))
 
 
