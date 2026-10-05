@@ -20,8 +20,8 @@ from scipy.sparse import csr_matrix
 faiss.omp_set_num_threads(1)  # belt-and-suspenders alongside the env vars above
 
 from logging_config import configure_logging
-from runner import (Runner, BALL_COVER_CONSTRUCT, BALL_COVER_QUANTIZE, CONSTRUCT_METHODS,
-                    QUANTIZATION_SWEEP, QUERY_SOURCES,
+from runner import (Runner, QUANTIZATION_SWEEP, QUERY_SOURCES,
+                    CAP_QUANTIZATION_SWEEP, CAP_CONSTRUCT_METHODS, CAP_COVER_CONSTRUCT,
                     system_tau_ground_truth_worker)
 from plots.plot_quantization import generate_quantization_figures
 from plots.plot_query_performance import generate_query_performance_figures
@@ -34,7 +34,7 @@ from plots.plot_budget import generate_budget_figures
 from plots.plot_construct_methods import generate_construct_methods_figures, load_results as load_construct_methods
 from plots.plot_common import DATASETS, DATASET_LABELS
 from typing import Any, Dict, List, Optional, Tuple
-from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize
+from filters.cap_cover.cap_cover_filter import CapCoverFilter
 from filters.dsh_filter import DSHFilter
 from filters.hnsw_filter import HNSWFilter
 from filters.ivf_filter import IVFFilter
@@ -122,6 +122,12 @@ SYSTEM_TAU_CSV = "results/system_tau.csv"
 # dimensions on memory and quantizer, leaving nowhere to put a dataset.
 QUANTIZATION_DIR = "results/quantization"
 QUANTIZATION_PLOT_DIR = "plots/quantization"
+# generate_cap_quantization's analogue, parallel to generate_quantization
+# rather than replacing it in place -- the two sweep structurally different
+# encodings (see CAP_QUANTIZATION_SWEEP), so keeping both lets either be
+# re-run/compared independently.
+CAP_QUANTIZATION_DIR = "results/cap_quantization"
+CAP_QUANTIZATION_PLOT_DIR = "plots/cap_quantization"
 
 
 def quantization_csv(dataset: str) -> str:
@@ -130,6 +136,14 @@ def quantization_csv(dataset: str) -> str:
 
 def quantization_plot_dir(dataset: str) -> str:
     return os.path.join(QUANTIZATION_PLOT_DIR, dataset)
+
+
+def cap_quantization_csv(dataset: str) -> str:
+    return os.path.join(CAP_QUANTIZATION_DIR, dataset, "cap_quantization.csv")
+
+
+def cap_quantization_plot_dir(dataset: str) -> str:
+    return os.path.join(CAP_QUANTIZATION_PLOT_DIR, dataset)
 
 # generate_scaling runs once per blocklist corpus and keeps each run in its
 # own folder, mirroring quantization_csv/QUANTIZATION_DIR above: throughput
@@ -365,13 +379,6 @@ def generate_equal_memory(runner: Runner) -> None:
     # Fraction of each fold's blocklist query stream spent calibrating each
     # filter's config dial; the rest measures FPR/FNR/latency/throughput.
     calibration_fraction   = 0.2
-    # BallCoverFilter is the one entry with a `quantize` dial worth comparing
-    # multiple settings of (see filters.ball_cover.ball_cover_filter.Quantize)
-    # -- submitted once per variant below, each becoming its own labelled
-    # line ("BallCoverFilter (TQ4)" etc. -- see runner.equal_memory_worker's
-    # Config naming) rather than picking one variant to stand in for it.
-    ball_cover_quantizations = [BALL_COVER_QUANTIZE]
-
     workloads = blocklist_workloads(num_vectors, n_folds=n_folds)
     if not workloads:
         raise RuntimeError(
@@ -429,19 +436,23 @@ def generate_equal_memory(runner: Runner) -> None:
                         actual_calibration=actual_calibration, actual_query=actual_query,
                         dataset=workload.name,
                     )
-                for quantize in ball_cover_quantizations:
-                    runner.submit(
-                        'equal_memory',
-                        output_csv=output_csv,
-                        filter_cls=BallCoverFilter,
-                        dim=dim, distance_threshold=tau,
-                        memory_budget=int(memory_budget),
-                        vectors_construct=vectors_construct, vectors_calibration=vectors_calibration,
-                        vectors_query=vectors_query,
-                        actual_calibration=actual_calibration, actual_query=actual_query,
-                        dataset=workload.name,
-                        extra_kwargs={"quantize": quantize},
-                    )
+                # CapCoverFilter.auto() already chooses its own best encoding
+                # for a budget internally, so (unlike BallCoverFilter's
+                # Quantize) there is no second axis to sweep here -- one
+                # submission per budget, labelled plainly "CapCoverFilter" by
+                # equal_memory_worker's Config naming (no quantize in
+                # extra_kwargs).
+                runner.submit(
+                    'equal_memory',
+                    output_csv=output_csv,
+                    filter_cls=CapCoverFilter,
+                    dim=dim, distance_threshold=tau,
+                    memory_budget=int(memory_budget),
+                    vectors_construct=vectors_construct, vectors_calibration=vectors_calibration,
+                    vectors_query=vectors_query,
+                    actual_calibration=actual_calibration, actual_query=actual_query,
+                    dataset=workload.name,
+                )
 
 
 def save_equal_memory(job_results: List[Tuple[str, Any]]) -> list:
@@ -578,6 +589,117 @@ def save_system_tau(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
 
 def plot_system_tau(df: pd.DataFrame) -> None:
     generate_system_tau_figures(df)
+
+
+# CapCoverFilter's analogue of SYSTEM_TAU_CSV (see generate_cap_cover_system_tau).
+CAP_COVER_SYSTEM_TAU_CSV = "results/cap_cover_system_tau.csv"
+
+
+def generate_cap_cover_system_tau(runner: Runner, num_vectors: int = WORKLOAD_NUM_VECTORS,
+                                  k_folds: int = 5, k_fraction: float = 0.1,
+                                  tau_values: Optional[List[float]] = None) -> None:
+    """CapCoverFilter's end-to-end filtering benefit: the same protocol as
+    generate_system_tau (k_folds non-wrapping 80/20 folds per dataset, one
+    cover per (dataset, fold) queried one at a time at every tau in
+    tau_values without ever rebuilding), but with a CapCoverFilter.auto()
+    cover (runner._cap_cover) in front of the flat index instead of
+    BallCoverFilter. Cap budget k is the same Ball-Cover-TQ4-equal-byte
+    fraction of each fold's construct-set size.
+
+    Ground truth (nearest-construct-set distance per query) is keyed only by
+    (dataset, num_vectors, k_folds, fold), not by which filter queries it, so
+    this reuses generate_system_tau's cache (results/system_tau_ground_truth)
+    rather than recomputing it.
+
+    Only submits 'cap_cover_system_tau' jobs (output_csv=CAP_COVER_SYSTEM_TAU_CSV)
+    -- does not run `runner`. num_vectors/k_folds/k_fraction/tau_values default
+    to generate_system_tau's own, but take explicit arguments (unlike
+    generate_system_tau) so a smaller local validation run doesn't have to
+    monkeypatch module globals -- see CLAUDE.md on sizing local runs."""
+    dim              = 384
+    tau_values       = [float(t) for t in np.logspace(-2, -0.5, num=10)] if tau_values is None else tau_values
+    ground_truth_dir = "results/system_tau_ground_truth"
+
+    datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
+    missing = [d for d in DATASET_KEYS if d not in datasets]
+    if missing:
+        logger.warning(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
+    if set(datasets) != set(DATASET_KEYS):
+        raise RuntimeError(
+            f"generate_cap_cover_system_tau needs all {len(DATASET_KEYS)} datasets "
+            f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
+        )
+
+    logger.info(f"Cap budget fixed as a fraction of the construct set: {k_fraction}")
+    logger.info(f"Fixed tau sweep (shared across datasets): {tau_values}")
+    logger.info(f"K-fold cross-validation: {k_folds} folds, non-wrapping contiguous 80/20 spans")
+
+    query_len = num_vectors // k_folds
+    construct_len = num_vectors - query_len
+
+    splits = []
+    for dataset in datasets:
+        total_rows = len(VectorSource(dataset))
+        fold_starts = advancing_fold_starts(total_rows, k_folds, query_len, num_vectors)
+        for fold, fold_start in enumerate(fold_starts):
+            query_start, query_end = fold_start, fold_start + query_len
+            construct_start, construct_end = query_end, query_end + construct_len
+            construct_source = VectorSource(dataset, construct_start, construct_end)
+            query_source = VectorSource(dataset, query_start, query_end)
+            splits.append((dataset, fold, construct_source, query_source))
+
+    os.makedirs(ground_truth_dir, exist_ok=True)
+    nn_dist_by_split = {}
+    to_compute = []
+    for dataset, fold, construct_source, query_source in splits:
+        cache_path = os.path.join(ground_truth_dir, f"{dataset}_{num_vectors}_{k_folds}fold_{fold}.npy")
+        if os.path.exists(cache_path):
+            nn_dist_by_split[(dataset, fold)] = np.load(cache_path)
+        else:
+            to_compute.append((dataset, fold, cache_path, construct_source, query_source))
+
+    if to_compute:
+        logger.info(f"Computing ground truth for {len(to_compute)} (dataset, fold) pair(s) not yet cached...")
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(system_tau_ground_truth_worker, dim, cs, qs): (dataset, fold, cache_path)
+                for dataset, fold, cache_path, cs, qs in to_compute
+            }
+            for future in as_completed(futures):
+                dataset, fold, cache_path = futures[future]
+                nn_dist = future.result()
+                np.save(cache_path, nn_dist)
+                nn_dist_by_split[(dataset, fold)] = nn_dist
+    else:
+        logger.info("All ground truth already cached on disk; skipping recomputation.")
+
+    for dataset, fold, construct_source, query_source in splits:
+        nn_dist = nn_dist_by_split[(dataset, fold)]
+        actual_results_by_tau = {t: (nn_dist <= t).tolist() for t in tau_values}
+
+        k = min(max(1, round(k_fraction * construct_len)), construct_len - 1)
+
+        runner.submit(
+            'cap_cover_system_tau',
+            output_csv=CAP_COVER_SYSTEM_TAU_CSV,
+            dim=dim, dataset=DATASET_KEYS[dataset],
+            k=k, tau_values=tau_values, seed=fold,
+            vectors_construct=construct_source,
+            vectors_query=query_source,
+            actual_results_by_tau=actual_results_by_tau,
+            )
+
+
+def save_cap_cover_system_tau(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
+    """Extracts this evaluation's rows from a shared Runner's combined
+    run() output (see generate_cap_cover_system_tau()); the Runner itself
+    already wrote CAP_COVER_SYSTEM_TAU_CSV incrementally."""
+    return pd.DataFrame(rows_for_mode(job_results, 'cap_cover_system_tau'))
+
+
+def plot_cap_cover_system_tau(df: pd.DataFrame) -> None:
+    from plots.plot_cap_cover_system_tau import generate_cap_cover_system_tau_figures
+    generate_cap_cover_system_tau_figures(df)
 
 
 # generate_blocklist()'s corpora: deliberately NOT DATASET_KEYS. That list is
@@ -1321,6 +1443,72 @@ def plot_quantization(df: pd.DataFrame) -> None:
         generate_quantization_figures(df[df["dataset"] == dataset], outdir=outdir)
 
 
+def generate_cap_quantization(runner: Runner) -> None:
+    """generate_quantization's cap-cover analogue: CapCoverFilter.auto() per
+    (dataset, k, seed, quantize) over CAP_QUANTIZATION_SWEEP (AUTO_CANDIDATES
+    + DENSE10_LADDER) instead of BallCoverFilter's QUANTIZATION_SWEEP --
+    see runner.cap_quantization_worker's docstring for why this is a
+    parallel sweep rather than an in-place substitution (the two enums have
+    no 1:1 mapping). Otherwise identical in structure: same k ladder, same
+    fixed tau, same blocklist workloads/source-size split.
+
+    Only submits 'cap_quantization' jobs -- does not run `runner`."""
+    num_vectors      = WORKLOAD_NUM_VECTORS
+    dim              = 384
+    n_folds          = BLOCKLIST_FOLDS
+    k_values_nominal = [2 ** i for i in range(11, 17)]
+    tau              = 0.1
+
+    workloads = blocklist_workloads(num_vectors, n_folds=n_folds)
+    if not workloads:
+        raise RuntimeError(
+            "generate_cap_quantization: no usable workload for any corpus (see the errors "
+            "above -- most likely WORKLOAD_NUM_VECTORS is too large for their "
+            "duplicate clusters)")
+
+    for workload in workloads:
+        reference_len = len(workload.selections[0]["reference"])
+        k_values = [k for k in k_values_nominal if k < reference_len]
+        if not k_values:
+            raise RuntimeError(
+                f"No k in {k_values_nominal} is below the reference set of "
+                f"{workload.name} ({reference_len} vectors). Raise "
+                "WORKLOAD_NUM_VECTORS or lower k_values_nominal.")
+
+        logger.info(f"{workload.name}: k_values={k_values} (|B|={reference_len}), tau={tau:.4f}")
+
+        output_csv = cap_quantization_csv(workload.name)
+        os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+        for fold, sel in enumerate(workload.selections):
+            vectors_construct = workload.rows(sel["reference"])
+            vectors_query = workload.query_vectors(sel)
+            actual_results = compute_static_actual_results(
+                vectors_construct, vectors_query, tau)
+            for k in k_values:
+                for quantize in CAP_QUANTIZATION_SWEEP:
+                    runner.submit(
+                        'cap_quantization',
+                        output_csv=output_csv,
+                        dim=dim, dataset=workload.name,
+                        k=k, quantize=quantize, tau=tau, seed=fold,
+                        vectors_construct=vectors_construct, vectors_query=vectors_query,
+                        actual_results=actual_results,
+                        **workload.source_sizes(sel),
+                    )
+
+
+def save_cap_quantization(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
+    return pd.DataFrame(rows_for_mode(job_results, 'cap_quantization'))
+
+
+def plot_cap_quantization(df: pd.DataFrame) -> None:
+    from plots.plot_cap_quantization import generate_quantization_figures as generate_cap_quantization_figures
+    for dataset in sorted(df["dataset"].unique()):
+        outdir = cap_quantization_plot_dir(str(dataset))
+        logger.info(f"Plotting cap_quantization for {dataset} -> {outdir}")
+        generate_cap_quantization_figures(df[df["dataset"] == dataset], outdir=outdir)
+
+
 def generate_query_performance() -> pd.DataFrame:
     """Measures single-query vs. batched-query latency/throughput of a
     BallCoverFilter cover as a function of filter size k, across every
@@ -1400,7 +1588,7 @@ def plot_query_performance(df: pd.DataFrame) -> None:
 
 
 def generate_scaling(runner: Runner) -> None:
-    """Measures three BallCoverFilter throughput surfaces against filter
+    """Measures three CapCoverFilter throughput surfaces against filter
     size k: query (k x batch_size grid), insertion (same grid, timing add()
     instead), and construction (k x n, where indexed-set size itself
     varies).
@@ -1548,17 +1736,20 @@ def plot_scaling(df_query: pd.DataFrame, df_insert: pd.DataFrame, df_constructio
 
 def generate_streaming(runner: Runner) -> None:
     """The paper's "dynamic evaluation" (Section 5.1/5.4, Figure 4): compares
-    BallCoverFilter's insertion strategies via stream_rebuild_worker's
-    policy="streaming" against a static rebuild at every checkpoint
-    (policy="oracle"). Produces the streaming figure's panels: (a) FPR vs.
-    position + the static-rebuild references, (b) threshold-expanded objective
-    inflation vs. position -- at one fixed ball budget k, where only the
-    stream position varies; (c) insertion throughput vs. filter size k.
+    CapCoverFilter's insertion strategies (CAP_INSERT_STRATEGIES -- only
+    cap_merge/nearest, no least_inflation/min_heap/doubling/pooled/
+    exhaustive_merge, which exist only for Ball-Cover) via
+    stream_rebuild_worker's policy="streaming" against a static rebuild at
+    every checkpoint (policy="oracle"). Produces the streaming figure's
+    panels: (a) FPR vs. position + the static-rebuild references, (b)
+    threshold-expanded objective inflation vs. position -- at one fixed cap
+    budget k, where only the stream position varies; (c) insertion
+    throughput vs. filter size k.
 
     Strategies are compared at equal bytes, not equal k: max_memory is the
-    static filter's footprint at k balls, and each strategy keeps as many
-    balls as fit with its own bookkeeping at its peak over the stream (see
-    InsertInterface.max_spheres_for_budget; peak_memory_bytes is recorded).
+    static filter's footprint at k caps, and each strategy keeps as many
+    caps as fit with its own bookkeeping at its peak over the stream (see
+    InsertInterface.max_caps_for_budget; peak_memory_bytes is recorded).
     The position sweep runs once per construct method in construct_methods,
     which builds both the bootstrap and that run's oracle.
 
@@ -1598,14 +1789,14 @@ def generate_streaming(runner: Runner) -> None:
     num_vectors        = WORKLOAD_NUM_VECTORS
     dim                = 384
     n_folds            = BLOCKLIST_FOLDS
-    methods            = ["nearest", "least_inflation", "pooled", "merge", "min_heap", "cap_merge"]
+    methods            = ["nearest", "cap_merge"]
     # The position sweep runs once per constructor: each builds both the
     # streamed filter's bootstrap and its static-rebuild oracle, so every
     # method's gap can be read against either reference. Gonzalez is the
-    # filter's default; runner.BALL_COVER_CONSTRUCT is the paper's
-    # construction. The k sweep uses BALL_COVER_CONSTRUCT only, unquantized
-    # like the position sweep.
-    construct_methods  = ["gonzalez", BALL_COVER_CONSTRUCT]
+    # filter's own built-in fallback; runner.CAP_COVER_CONSTRUCT
+    # (sphere_merge) is CapCoverFilter's actual default. The k sweep uses
+    # CAP_COVER_CONSTRUCT only, unquantized like the position sweep.
+    construct_methods  = ["gonzalez", CAP_COVER_CONSTRUCT]
     # The fixed absolute tau generate_budget/generate_quantization/
     # generate_equal_memory use, so every blocklist-workload evaluation sits
     # at the same operating point.
@@ -1670,7 +1861,7 @@ def generate_streaming(runner: Runner) -> None:
             for method in methods:
                 for k_val in [2 ** p for p in range(4, max_p + 1)]:
                     runner.submit('stream_rebuild', k=k_val, policy="streaming", insertion_level=method,
-                                  sweep="k", construct_method=BALL_COVER_CONSTRUCT, **common)
+                                  sweep="k", construct_method=CAP_COVER_CONSTRUCT, **common)
 
 
 def save_streaming(job_results: List[Tuple[str, Any]], default_k: int = 16) -> Tuple[pd.DataFrame, int]:
@@ -1712,11 +1903,12 @@ def construct_methods_scale_csv(dataset: str, n: int) -> str:
 
 
 def generate_construct_methods(runner: Runner) -> None:
-    """BallCoverFilter's construction methods (runner.CONSTRUCT_METHODS)
-    compared on the blocklist workload: the same construction and query sets
-    as generate_budget/generate_quantization, with ground truth defined as
-    distance to the reference set at tau. Only the construction method
-    varies (see runner.construct_method_worker).
+    """CapCoverFilter's construction methods (runner.CAP_CONSTRUCT_METHODS --
+    only the 3 its package implements: gonzalez/minimax/sphere_merge, no
+    split/merge) compared on the blocklist workload: the same construction
+    and query sets as generate_budget/generate_quantization, with ground
+    truth defined as distance to the reference set at tau. Only the
+    construction method varies (see runner.construct_method_worker).
 
     One job per (corpus, fold, method, k), so rows reach
     construct_methods_csv(corpus) as each cover finishes, and the slow
@@ -1732,7 +1924,7 @@ def generate_construct_methods(runner: Runner) -> None:
     # range is generate_budget's; the bottom extends it into the budgets where
     # every ball is wide, which is where the construction method matters most.
     k_fractions = [0.005, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2]
-    methods     = list(CONSTRUCT_METHODS)
+    methods     = list(CAP_CONSTRUCT_METHODS)
 
     for workload in blocklist_workloads(num_vectors, n_folds=n_folds):
         output_csv = construct_methods_csv(workload.plot_key)
@@ -1767,7 +1959,7 @@ def generate_construct_methods_scale(runner: Runner, dataset: str = "WikiAnswers
     if not os.path.exists(dataset_filenames[dataset]):
         raise FileNotFoundError(f"{dataset}: {dataset_filenames[dataset]} not on disk.")
     output_csv = construct_methods_scale_csv(dataset, n)
-    for method in CONSTRUCT_METHODS:
+    for method in CAP_CONSTRUCT_METHODS:
         for k in k_values:
             runner.submit('construct_method_scale', output_csv=output_csv,
                           dim=384, dataset=dataset, n=n, method=method, k=k)
@@ -1810,7 +2002,10 @@ def generate_and_plot_all() -> None:
     except Exception:
         logger.exception("An error occurred")
     try:
-        generate_quantization(runner)
+        # Replaces generate_quantization (BallCoverFilter) -- same sweep,
+        # CapCoverFilter.auto() per encoding. generate_quantization itself
+        # stays defined but is no longer invoked here.
+        generate_cap_quantization(runner)
     except Exception:
         logger.exception("An error occurred")
     try:
@@ -1827,6 +2022,13 @@ def generate_and_plot_all() -> None:
         logger.exception("An error occurred")
     try:
         generate_equal_memory(runner)
+    except Exception:
+        logger.exception("An error occurred")
+    try:
+        # Replaces generate_system_tau (BallCoverFilter) -- same protocol,
+        # CapCoverFilter cover. generate_system_tau itself stays defined
+        # (git history, not deleted) but is no longer invoked here.
+        generate_cap_cover_system_tau(runner)
     except Exception:
         logger.exception("An error occurred")
     '''
@@ -1860,6 +2062,12 @@ def plot_all() -> None:
         logger.exception("An error occurred")
 
     try:
+        df = pd.read_csv(CAP_COVER_SYSTEM_TAU_CSV)
+        plot_cap_cover_system_tau(df)
+    except Exception:
+        logger.exception("An error occurred")
+
+    try:
         df = pd.read_csv(BLOCKLIST_CSV)
         plot_blocklist(df)
     except Exception:
@@ -1881,13 +2089,13 @@ def plot_all() -> None:
         # would otherwise read back as NaN (see plot_quantization.py::load_data()).
         frames = []
         for name in BLOCKLIST_DATASETS:
-            path = quantization_csv(name)
+            path = cap_quantization_csv(name)
             if os.path.exists(path):
                 # keep_default_na=False: stage/config strings are read verbatim;
                 # pandas would otherwise turn them into NaN.
                 frames.append(pd.read_csv(path, keep_default_na=False))
         if frames:
-            plot_quantization(pd.concat(frames, ignore_index=True))
+            plot_cap_quantization(pd.concat(frames, ignore_index=True))
     except Exception:
         logger.exception("An error occurred")
 

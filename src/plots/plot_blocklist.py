@@ -1,6 +1,6 @@
 """Blocklist-workload figures (see main.generate_blocklist).
 
-Ball budget k is fixed (one representative value, see generate_blocklist's
+Cap budget k is fixed (one representative value, see generate_blocklist's
 docstring) -- varying the budget is generate_budget's job, at its own fixed
 tau. This module's whole figure set is the complementary view: tau swept at
 that one fixed budget.
@@ -68,7 +68,7 @@ BLOCKLIST_MARKERS = {
 }
 
 _REQUIRED_COLUMNS = [
-    "dataset", "seed", "sweep", "k", "k_fraction", "n_reference", "compression", "r_med",
+    "dataset", "seed", "sweep", "k", "k_fraction", "n_reference", "compression", "psi_med",
     "tau", "fpr", "fnr", "fpr_heldout", "fpr_withheld", "fpr_singleton", "neg_share_pct",
     "accesses_saved_pct", "log10_j_tau", "d_withheld_med", "d_heldout_med",
 ]

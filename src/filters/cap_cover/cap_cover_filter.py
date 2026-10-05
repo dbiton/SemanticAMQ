@@ -1,7 +1,7 @@
 import numpy as np
 import faiss
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, Sequence, Tuple, Union
 from filters.filter import Filter, InsufficientMemoryError
@@ -876,7 +876,16 @@ def _ef_encode(keys: np.ndarray, w: int) -> Tuple[int, np.ndarray, np.ndarray]:
 class _Group:
     """One static encoding group in set storage: caps `ids` (sorted by their
     codes' first w bits), those prefixes as an Elias-Fano sequence (l, low,
-    high), the rest of each code (rem) and each cap's angle code."""
+    high), the rest of each code (rem) and each cap's angle code.
+
+    `keys()` and the decoded angle array (`_level_codes`'s theta) used to be
+    recomputed on every query() call -- pure waste for a static filter
+    (set_codes's only user, see _set_storage), whose groups are rebuilt
+    wholesale by _pack() and never mutated in place afterward: caching them
+    here is exactly as safe as not calling _pack() twice. On a cover with a
+    few thousand caps this removed most of a single query's own time, behind
+    only the scan kernel itself (measured: cap_cover_system_tau_worker's
+    single-query throughput, suggestions/cap_cover_query_cache_report.md)."""
     ids: np.ndarray
     w: int
     l: int
@@ -884,13 +893,17 @@ class _Group:
     high: np.ndarray
     rem: np.ndarray
     ang: np.ndarray
+    _keys_cache: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
+    _theta_cache: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
 
     def keys(self) -> np.ndarray:
-        from filters.cap_cover import scan_kernels
-        out = np.empty(len(self.ids), dtype=np.int64)
-        if self.w:
-            scan_kernels.ef_decode(self.low, self.high, len(self.ids), self.l, out)
-        return out
+        if self._keys_cache is None:
+            from filters.cap_cover import scan_kernels
+            out = np.empty(len(self.ids), dtype=np.int64)
+            if self.w:
+                scan_kernels.ef_decode(self.low, self.high, len(self.ids), self.l, out)
+            self._keys_cache = out
+        return self._keys_cache
 
     def codes(self) -> np.ndarray:
         """The full codes, in group order."""
@@ -1620,6 +1633,11 @@ class CapCoverFilter(Filter):
         self._codes = None
 
     _NO_KEYS = np.zeros(1, dtype=np.int64)
+    # _scan's placeholder `ids` when self._packed is not None: _level_codes
+    # ignores it entirely in that case (it reads the group's own g.ids), and
+    # _scan_level's one other use of `ids` (the _tables_pay call) reads
+    # len(codes) instead -- see both below.
+    _NO_IDS = np.zeros(0, dtype=np.int64)
 
     def _level_codes(self, level: int, ids: np.ndarray):
         """(codes, keys, w, theta) the scan reads for caps `ids`, all at
@@ -1628,7 +1646,9 @@ class CapCoverFilter(Filter):
         storage) and the stored angles."""
         if self._packed is not None:
             g = self._packed[int(level)]
-            return g.rem, (g.keys() if g.w else self._NO_KEYS), g.w, self._angle_value(g.ang)
+            if g._theta_cache is None:
+                g._theta_cache = self._angle_value(g.ang)
+            return g.rem, (g.keys() if g.w else self._NO_KEYS), g.w, g._theta_cache
         codes = np.ascontiguousarray(self._codes[ids][:, :self.code_size(level)])
         return codes, self._NO_KEYS, 0, self._angle_value(self._angle_codes[ids])
 
@@ -2441,6 +2461,21 @@ class CapCoverFilter(Filter):
         Qn32 = Qn.astype(np.float32)
         out = np.zeros(len(Qw), dtype=bool)
         slack = self._slack()
+        if self._packed is not None:
+            # A static cover's groups are the whole story: _pack() fixes
+            # which levels exist and which caps each holds, so redoing
+            # self.all_caps/self._cap_level/np.unique bookkeeping here on
+            # every query is pure waste -- _level_codes already reads
+            # straight from the group and ignores `ids` in this case (see
+            # the len(codes) fix in _scan_level's _tables_pay call below).
+            levels_present = sorted(self._packed)
+            if len(levels_present) == 1 and levels_present[0] == self._uniform:
+                return self._scan_level(self._uniform, self._NO_IDS, Qn, Qn32, beta, feasible, slack, out)
+            for level in levels_present:
+                if not (feasible & ~out).any():
+                    break
+                self._scan_level(level, self._NO_IDS, Qn, Qn32, beta, feasible, slack, out)
+            return out
         ids = self.all_caps
         levels = self._cap_level[ids]
         if (levels == self._uniform).all():
@@ -2491,7 +2526,7 @@ class CapCoverFilter(Filter):
             scan_kernels.accept_direct_levels(codes, keys, w, levels, bits, self.dim, theta, np.flatnonzero(live),
                                               beta, np.ascontiguousarray(Qn), slack, out)
             return out
-        if isinstance(sq, _SeededPQ) and self._tables_pay(sq, len(ids)):
+        if isinstance(sq, _SeededPQ) and self._tables_pay(sq, len(codes)):
             return self._scan_tables(sq, codes, keys, w, theta, Qn, Qn32, beta, live, slack, out)
         decode = self._block_decoder(level)
         raw = np.empty((self._SCAN_BLOCK, self.dim), dtype=np.float32)
