@@ -1257,7 +1257,9 @@ def system_tau_worker(
     that single construction, measuring filtered vs. unfiltered
     throughput/index-access/FPR/FNR at each tau. Queries are issued one at a
     time on both arms, reflecting a realistic online setting where the
-    filtered path only falls through to index.search() on a possible match.
+    filtered path only falls through to index.range_search() on a possible
+    match. Both arms ask the flat index for every construct vector within tau
+    (range_search at radius tau**2, squared L2), not just its nearest one.
     redundancy_rate is the measured (not nominal) duplicate fraction.
 
     Also reports log10_vol_low/log10_vol_high: overlap-aware lower/upper
@@ -1289,7 +1291,7 @@ def system_tau_worker(
 
         start = time.perf_counter()
         for i in range(n_q):
-            index.search(query_arr[i:i + 1], 1)
+            index.range_search(query_arr[i:i + 1], t * t)
         time_without = time.perf_counter() - start
 
         predicted = np.empty(n_q, dtype=bool)
@@ -1299,7 +1301,7 @@ def system_tau_worker(
             hit = filt.query(v, distance_threshold=t)[0]
             predicted[i] = hit
             if hit:
-                index.search(v, 1)
+                index.range_search(v, t * t)
         time_with = time.perf_counter() - start
 
         n_index_accesses = int(predicted.sum())
@@ -1367,7 +1369,7 @@ def cap_cover_system_tau_worker(
 
         start = time.perf_counter()
         for i in range(n_q):
-            index.search(query_arr[i:i + 1], 1)
+            index.range_search(query_arr[i:i + 1], t * t)
         time_without = time.perf_counter() - start
 
         predicted = np.empty(n_q, dtype=bool)
@@ -1377,7 +1379,7 @@ def cap_cover_system_tau_worker(
             hit = filt.query(v, distance_threshold=t)[0]
             predicted[i] = hit
             if hit:
-                index.search(v, 1)
+                index.range_search(v, t * t)
         time_with = time.perf_counter() - start
 
         n_index_accesses = int(predicted.sum())
