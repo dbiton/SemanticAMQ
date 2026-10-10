@@ -8,6 +8,7 @@ from filters.filter import Filter, InsufficientMemoryError
 from filters.cap_cover.cap_interfaces import ConstructInterface, Cover, InsertInterface
 from filters.cap_cover.cap_geometry import (angle_between, log_cap_measure, nearest_directions, segments,
                                             segment_max, unit_rows)
+from filters.cap_cover.cap_ivf_index import CapIVFIndex
 
 
 class Quantize(Enum):
@@ -1216,6 +1217,7 @@ class CapCoverFilter(Filter):
         single_tables: bool = True,
         boot_anchors: float = 0.25,
         boot_equal: bool = True,
+        ivf_index: Optional[CapIVFIndex] = CapIVFIndex(),
     ) -> None:
         super().__init__(dim, max_memory=max_memory)
         self.boot_anchors = boot_anchors
@@ -1282,6 +1284,9 @@ class CapCoverFilter(Filter):
         self._cap_level = np.zeros(0, dtype=np.int8)   # each cap's encoding (index into levels)
         self._dirs = None   # decoded unit directions by id: transient, like BallCoverFilter's all_centers
         self.selection_k = None
+        # IVF pruning index: exact, 0-FNR.  Built after construct() completes.
+        # Pass ivf_index=CapIVFIndex() to enable.
+        self._ivf_index: Optional[CapIVFIndex] = ivf_index
         self._set_uniform(0)
 
     def _set_uniform(self, level: int) -> None:
@@ -2402,6 +2407,66 @@ class CapCoverFilter(Filter):
         if self._set_storage():
             self._pack()
 
+        # Build IVF pruning index for static filters.
+        if self._ivf_index is not None and self.insert_method is None:
+            self._build_ivf(tau=self.selection_tau)
+
+    # ------------------------------------------------------------------
+    # IVF pruning index helpers
+    # ------------------------------------------------------------------
+
+    def _build_ivf(self, tau: float = 0.1) -> None:
+        """Build IVF index over the decoded cap directions.
+
+        `tau` is baked into the cell gate bounds; use selection_tau or the
+        largest tau you expect to query.  The per-member test is always exact.
+        """
+        if self._ivf_index is None or self._num_caps == 0:
+            return
+        ids = self.all_caps
+        dirs = self.decode_caps(ids)            # float32[N, d] decoded unit dirs
+        angles = self._angle_value(self._angle_codes[ids])   # float64[N]
+        # beta at tau and norm=1 (worst case for unit queries)
+        norms_one = np.ones(1, dtype=np.float64)
+        beta_arr, _ = self._beta(norms_one, tau)
+        beta_max = float(beta_arr[0])
+        slack = self._slack()
+        K_auto = max(1, min(self._ivf_index.n_cells, int(self._num_caps ** 0.5)))
+        self._ivf_index.n_cells = K_auto
+        self._ivf_index.build(dirs, angles, beta_max=beta_max, slack=slack)
+        # Store raw angles and decoded_norms in the IVF's sorted order
+        # so query_cap can pass them to the C kernel.
+        # _ivf_index._sorted_vecs is the sorted decoded directions.
+        # We need the angles and norms in that same order.
+        # The order is determined by the IVF's own build; recover it:
+        # sorted_vecs[i] = dirs[order[i]], so match by centroid assignment.
+        # Simplest: rebuild from first principles using the ivf's cell_starts.
+        # (The IVF stores sorted_vecs directly; re-derive angles from them.)
+        # Actually, we stored the reaches = theta + beta + slack in sorted order;
+        # strip back to get the raw sorted angles:
+        self._ivf_sorted_angles = (
+            self._ivf_index._sorted_reaches - beta_max - slack
+        ).astype(np.float32)
+        self._ivf_sorted_norms = np.sqrt(
+            np.einsum("ij,ij->i", self._ivf_index._sorted_vecs,
+                      self._ivf_index._sorted_vecs)
+        ).astype(np.float32)
+        self._ivf_beta_baked = beta_max   # remember for re-build check
+
+    def _ivf_query(self, Qn32: np.ndarray, beta: np.ndarray,
+                        feasible: np.ndarray) -> np.ndarray:
+        """Query the IVF index (cap mode). Returns bool[nq]."""
+        if (self._ivf_index is None or not self._ivf_index._built
+                or not hasattr(self, "_ivf_sorted_angles")):
+            return None
+        return self._ivf_index.query(
+            Qn32, beta.astype(np.float32),
+            feasible.astype(np.uint8),
+            theta=self._ivf_sorted_angles,
+            decoded_norms=self._ivf_sorted_norms,
+            slack=self._slack(),
+        )
+
     # ----------------------------------------------------------------- query
     def _beta(self, norms: np.ndarray, tau: float) -> Tuple[np.ndarray, np.ndarray]:
         """(beta, feasible): how far past a cap's edge (in angle) a query of
@@ -2426,6 +2491,31 @@ class CapCoverFilter(Filter):
             raise ValueError("CapCoverFilter has not been constructed.")
         if self._num_caps == 0 or len(vectors) == 0:
             return [False] * len(vectors)
+
+        # IVF pruning path: exact, 0-FNR.  Active for static filters only.
+        # Rebuilds cell bounds when tau exceeds the baked-in beta.
+        if (self._ivf_index is not None
+                and self._ivf_index._built
+                and self.insert_method is None
+                and hasattr(self, "_ivf_sorted_angles")):
+            tau = float(distance_threshold)
+            # Check if current tau fits within baked beta
+            norms_one = np.ones(1, dtype=np.float64)
+            beta_now, _ = self._beta(norms_one, tau)
+            beta_now = float(beta_now[0])
+            if beta_now > self._ivf_beta_baked + 1e-8:
+                self._build_ivf(tau=tau)
+
+            Qw = self.to_working(vectors)
+            nq = np.sqrt(np.einsum("ij,ij->i", Qw, Qw))
+            beta_arr, feasible = self._beta(nq, tau)
+            Qn = Qw / np.maximum(nq, 1e-300)[:, None]
+            Qn32 = Qn.astype(np.float32)
+            beta32 = beta_arr.astype(np.float32)
+            result = self._ivf_query(Qn32, beta32, feasible)
+            if result is not None:
+                return result.tolist()
+
         return self._scan(vectors, float(distance_threshold)).tolist()
 
     def _block_decoder(self, level: Optional[int] = None):

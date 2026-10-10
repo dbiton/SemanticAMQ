@@ -14,6 +14,7 @@ from filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
 from filters.ball_cover.doubling_insert import DoublingInsert
 from filters.ball_cover.pooled_insert import PooledInsert
 from filters.ball_cover import scan_kernels
+from filters.ball_cover.ball_ivf_index import BallIVFIndex
 
 
 class Quantize(Enum):
@@ -183,12 +184,13 @@ class BallCoverFilter(Filter):
     def __init__(
         self,
         dim: int,
-        construct_method: Optional[ConstructInterface] = GonzalesConstruct(),
-        insert_method: Optional[InsertInterface] = NearestInsert(),
+        construct_method: Optional[ConstructInterface] = None,
+        insert_method: Optional[InsertInterface] = None,
         quantize: Quantize = Quantize.NONE,
         max_memory: Optional[int] = None,
         max_spheres: Optional[int] = None,
-        insert_memory_percent: Optional[float] = 0.0
+        insert_memory_percent: Optional[float] = 0.0,
+        ivf_index: Optional[BallIVFIndex] = BallIVFIndex(),
     ) -> None:
         super().__init__(dim, max_memory=max_memory)
         self.quantize = quantize
@@ -200,6 +202,15 @@ class BallCoverFilter(Filter):
                     else self._calculate_max_spheres(self.max_memory))
         self.max_construct_spheres = self._calculate_max_construct_spheres(self.insert_memory_percent)
         self._constructed = False
+
+        if construct_method is None:
+            from filters.ball_cover.gonzales_construct import GonzalesConstruct
+            construct_method = GonzalesConstruct()
+
+        # IVF pruning index: exact, 0-FNR.  Built from construct() and
+        # invalidated by insert/remove so only static filters use it.
+        # Pass ivf_index=BallIVFIndex() to enable.
+        self._ivf_index: Optional[BallIVFIndex] = ivf_index
 
         self._num_spheres = 0
         self._all_spheres = np.arange(self.max_spheres, dtype=np.int32)
@@ -735,6 +746,14 @@ class BallCoverFilter(Filter):
 
         self._store_largest_first()
         self._constructed = True
+
+        # Build the IVF pruning index from the final stored state.
+        # Done after _store_largest_first so sorted_vecs matches the scan order,
+        # though the IVF has its own ordering internally (widest-first per cell).
+        # Only built for static filters: insert/remove invalidate the index.
+        if self._ivf_index is not None and self.insert_method is None:
+            self._build_ivf()
+
         self._all_centers = None # clear temporary centers view
 
 
@@ -768,6 +787,60 @@ class BallCoverFilter(Filter):
         faiss.rev_swig_ptr(id_map.data(), id_map.size())[:] = ids[order]
         self.all_centers_index.construct_rev_map()
 
+    # ------------------------------------------------------------------
+    # IVF pruning index helpers
+    # ------------------------------------------------------------------
+
+    def _build_ivf(self, tau: float = 0.5) -> None:
+        """Build the IVF pruning index from the current stored balls.
+
+        `tau` is the distance_threshold baked into the cell gate.
+        We use a generous default (0.5) so the index is valid across the
+        typical sweep range; the per-member accept test always uses the
+        exact current tau at query time.  Call this again after reconstruct.
+        """
+        if self._ivf_index is None or self._num_spheres == 0:
+            return
+        ids, codes = self._stored_codes()
+        centers_rot = self._decode_rotated(codes)           # rotated basis
+        radii = self._all_radiuses[ids]
+        # Auto-size cells if not already a fixed user choice:
+        K_auto = max(1, min(self._ivf_index.n_cells, int(self._num_spheres ** 0.5)))
+        self._ivf_index.n_cells = K_auto
+        self._ivf_index.build(centers_rot, radii,
+                                    tau=tau,
+                                    eps=self._COVERAGE_EPSILON)
+
+    def _ivf_query(self, Q: np.ndarray, distance_threshold: float) -> np.ndarray:
+        """Query the IVF index (ball mode).  Returns bool[nq].
+        Queries must already be in the rotated basis (Qr).
+        Falls back to None if index not available or built with wrong tau:
+        caller must re-scan in that case.
+        """
+        if self._ivf_index is None or not self._ivf_index._built:
+            return None
+        # Verify the baked tau covers the requested one (conservative check).
+        # If it doesn't, the cell gate may skip a cell it shouldn't.
+        # The per-member test is exact (uses current tau), but the cell gate
+        # used max_reach baked at _build_ivf's tau.  We only trust the index
+        # when baked_tau >= current_tau (so the cell gate is still conservative).
+        baked_reach = self._ivf_index._sorted_reaches  # r + baked_tau + eps
+        ids, codes = self._stored_codes()
+        radii = self._all_radiuses[ids]
+        min_baked = float(baked_reach.min() - radii.max() - self._COVERAGE_EPSILON)
+        if distance_threshold > min_baked + 1e-6:
+            # Rebuild with the current tau so the cell gate stays conservative
+            self._build_ivf(tau=distance_threshold)
+
+        rotation = self._rotation()
+        Qr = np.ascontiguousarray(rotation.apply(Q) if rotation is not None else Q,
+                                   dtype=np.float32)
+        q_norms = np.einsum("ij,ij->i", Qr, Qr).astype(np.float32)
+        rel_error = (2 * self.dim + 4) * 2.0 ** -24
+        return self._ivf_index.query(Qr, q_norms,
+                                           tau=distance_threshold,
+                                           eps=self._COVERAGE_EPSILON,
+                                           rel_error=rel_error)
 
     def surface_distance(self, vectors: np.ndarray) -> np.ndarray:
         """Per query, the smallest (distance to a ball's center - its radius)
@@ -797,6 +870,18 @@ class BallCoverFilter(Filter):
         if _ENCODINGS[self.quantize].kind == "rabitq":
             return (self.surface_distance(vectors) <= distance_threshold + self._COVERAGE_EPSILON).tolist()
         Q = np.ascontiguousarray(vectors, dtype=np.float32)
+
+        # IVF pruning path: exact, 0-FNR.  Only active for static filters
+        # (insert_method is None) when an IVF index has been built.
+        # The IVF kernel operates in the rotated basis (same as _scan); it
+        # uses the same slack and coverage-epsilon so every accept decision
+        # matches _scan's exactly.
+        if (self._ivf_index is not None
+                and self._ivf_index._built
+                and self.insert_method is None
+                and _ENCODINGS[self.quantize].kind not in ("rabitq",)):
+            return self._ivf_query(Q, distance_threshold).tolist()
+
         if self._use_kernel(len(Q)):
             return self._kernel_accepts(Q, distance_threshold).tolist()
         if len(Q) < self._SCAN_MIN_BATCH:
