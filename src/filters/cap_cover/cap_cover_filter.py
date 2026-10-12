@@ -1310,16 +1310,6 @@ class CapCoverFilter(Filter):
         return cls(dim, quantize=candidates, max_memory=max_memory, **kwargs)
 
     # ------------------------------------------------------------ properties
-    # BallCoverFilter's names too, so code written against max_spheres reads
-    # either filter.
-    @property
-    def max_spheres(self) -> int:
-        return self.max_caps
-
-    @property
-    def max_construct_spheres(self) -> int:
-        return self.max_construct_caps
-
     @property
     def all_caps(self) -> np.ndarray:
         return self._all_caps[:self._num_caps]
@@ -1356,9 +1346,6 @@ class CapCoverFilter(Filter):
 
     def bytes_per_cap(self, level: Optional[int] = None) -> int:
         return self.code_size(level) + self.angle_bits // 8
-
-    def bytes_per_ball(self) -> int:
-        return self.bytes_per_cap()
 
     def _quantizer_bytes(self, level: int) -> int:
         sq = self._quantizers[level]
@@ -2666,6 +2653,3 @@ class CapCoverFilter(Filter):
         if self.insert_method:
             total += self.insert_method.get_bytesize(self)
         return total
-
-    def get_construction_bytesize(self) -> int:
-        return self.construct_method.get_bytesize() if self.construct_method else 0

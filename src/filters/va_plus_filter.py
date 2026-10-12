@@ -177,7 +177,6 @@ class VAPlusFilter(Filter):
         max_memory: Optional[int] = None,
         max_bits_per_dim: int = 8,
         seed: int = 42,
-        max_spheres: Optional[int] = None,
     ):
         super().__init__(dim, max_memory=max_memory)
         self.distance_threshold = float(distance_threshold)
@@ -185,7 +184,6 @@ class VAPlusFilter(Filter):
             raise ValueError(f"max_bits_per_dim must be in [1, {_GROUP_BITS}], got {max_bits_per_dim}")
         self.max_bits_per_dim = max_bits_per_dim
         self.seed = seed
-        self._max_spheres = max_spheres  # unused; accepted for _instantiate_filter parity
 
         self._n = 0
         self.bits: Optional[np.ndarray] = None        # (dim,) bits per PCA dim

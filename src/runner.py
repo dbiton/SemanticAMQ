@@ -17,7 +17,6 @@ import faiss
 import numpy as np
 import pandas as pd
 import time
-import inspect
 
 faiss.omp_set_num_threads(1)
 
@@ -161,14 +160,14 @@ class _CapCoverFilterEvalAdapter:
     auto() (not a plain constructor) so a budget gets auto()'s own
     multi-candidate encoding choice, matching how this evaluation uses
     CapCoverFilter everywhere else (_cap_cover). Renames _instantiate_filter's
-    generic max_spheres/insert_mem_percent kwargs onto CapCoverFilter's own
-    max_caps/insert_memory_percent."""
+    generic insert_mem_percent kwarg onto CapCoverFilter's own
+    insert_memory_percent."""
 
     def __init__(self, dim: int, max_memory: int, distance_threshold: float,
-                 max_spheres: Optional[int] = None, insert_mem_percent: Optional[float] = 0.0, **extra_kwargs: Any) -> None:
+                 insert_mem_percent: Optional[float] = 0.0, **extra_kwargs: Any) -> None:
         self.distance_threshold = distance_threshold
         extra_kwargs.setdefault("construct_method", CAP_CONSTRUCT_METHODS[CAP_COVER_CONSTRUCT]())
-        self._filt = CapCoverFilter.auto(dim, max_memory=max_memory, max_caps=max_spheres,
+        self._filt = CapCoverFilter.auto(dim, max_memory=max_memory,
                                          insert_memory_percent=insert_mem_percent, **extra_kwargs)
 
     def construct(self, vectors: np.ndarray) -> None:
@@ -188,7 +187,7 @@ class _CapCoverFilterEvalAdapter:
         return self._filt.all_angles
 
 
-def _instantiate_filter(filter_cls: Any, dim: int, memory_budget: int, distance_threshold: float = None, max_spheres: int = None,
+def _instantiate_filter(filter_cls: Any, dim: int, memory_budget: int, distance_threshold: float = None,
                          insert_mem_percent: Optional[float] = 0.0, extra_kwargs: Optional[Dict[str, Any]] = None) -> Any:
     kwargs = {"dim": dim, "max_memory": memory_budget, **(extra_kwargs or {})}
 
@@ -196,11 +195,8 @@ def _instantiate_filter(filter_cls: Any, dim: int, memory_budget: int, distance_
         kwargs.update(distance_threshold=distance_threshold)
 
         if filter_cls is CapCoverFilter:
-            kwargs.update(max_spheres=max_spheres, insert_mem_percent=insert_mem_percent)
+            kwargs.update(insert_mem_percent=insert_mem_percent)
             return _CapCoverFilterEvalAdapter(**kwargs)
-
-        if "max_spheres" in inspect.signature(filter_cls.__init__).parameters:
-            kwargs.update(max_spheres=max_spheres)
 
         return filter_cls(**kwargs)
     else:

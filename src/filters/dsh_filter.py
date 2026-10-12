@@ -67,7 +67,6 @@ class DSHFilter(Filter):
         calibration_grid: int = 13,
         calibration_min_gap: float = 0.05,
         far_reference_distance: Optional[float] = None,
-        max_spheres: Optional[int] = None,
         seed: int = 42,
         z: Optional[float] = None,
     ):
@@ -75,7 +74,6 @@ class DSHFilter(Filter):
         self.distance_threshold = float(distance_threshold)
         self.num_projections_per_table = num_projections_per_table
         self._error_rate = error_rate
-        self._max_spheres = max_spheres  # unused; accepted for _instantiate_filter parity
         # Real embeddings cluster much more tightly than a uniform-random
         # unit sphere, so a fixed sqrt(2) reference can leave no calibration
         # margin -- scale off tau itself instead.

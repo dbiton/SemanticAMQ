@@ -90,7 +90,6 @@ class IVFFilter(Filter):
         nlist: Optional[int] = None,
         nprobe: int = 8,
         pq_m: Optional[int] = None,
-        max_spheres: Optional[int] = None,
         seed: int = 42,
         accept_radius_scale: float = 1.0,
     ):
@@ -103,7 +102,6 @@ class IVFFilter(Filter):
         self._nlist_override = nlist
         self._nprobe = nprobe
         self._pq_m_override = pq_m
-        self._max_spheres = max_spheres  # unused; accepted for _instantiate_filter parity
         self.seed = seed
 
         self.nlist: Optional[int] = None
