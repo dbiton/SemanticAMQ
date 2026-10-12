@@ -276,7 +276,6 @@ class BallIVFIndex:
 
         if rel_error is None:
             rel_error = (2 * self.d + 4) * 2.0 ** -24
-        slack = rel_error  # per-query slack is O(rel_error); use scalar bound
 
         # Reach at current tau (may differ from baked tau).
         # The cell gate uses the baked max_reach (conservative -- safe).
@@ -312,8 +311,8 @@ class BallIVFIndex:
 
             # Which queries might be accepted by a member of this cell?
             # Gate: d2(q, centroid[c]) <= mr^2
-            live = d2_cen[:, c] <= mr_sq[c]
-            live &= ~out  # already-accepted queries skip further work
+            # Combined masks to avoid intermediate array allocations
+            live = (d2_cen[:, c] <= mr_sq[c]) & ~out
             if not live.any():
                 continue
 
@@ -336,13 +335,21 @@ class BallIVFIndex:
             d2 = qn2[:, None] + cell_vnsq[None, :] - 2.0 * ip
             d2 = np.maximum(d2, 0.0)
 
+            # Scale slack by the norms to match _scan exactness
+            scale = qn2[:, None] + cell_vnsq.max()
+            slack_scaled = rel_error * scale
+
             # Accept: d2 - slack <= reach_sq[m]
             # (slack absorbs fp32 rounding, same as _scan's accept_block)
-            accepts = (d2 - slack) <= cell_rsq[None, :]   # (n_live, m) bool
+            accepts = (d2 - slack_scaled) <= cell_rsq[None, :]   # (n_live, m) bool
 
             # A query is accepted if ANY member in the cell accepts it.
             # np.any over axis=1 is C-speed.
             out[live_idx] |= accepts.any(axis=1)
+
+            # Early stopping: break cell loop if all queries are accepted
+            if out.all():
+                break
 
         return out
 

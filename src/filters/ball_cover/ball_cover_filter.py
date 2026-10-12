@@ -819,16 +819,9 @@ class BallCoverFilter(Filter):
         """
         if self._ivf_index is None or not self._ivf_index._built:
             return None
-        # Verify the baked tau covers the requested one (conservative check).
-        # If it doesn't, the cell gate may skip a cell it shouldn't.
-        # The per-member test is exact (uses current tau), but the cell gate
-        # used max_reach baked at _build_ivf's tau.  We only trust the index
-        # when baked_tau >= current_tau (so the cell gate is still conservative).
-        baked_reach = self._ivf_index._sorted_reaches  # r + baked_tau + eps
-        ids, codes = self._stored_codes()
-        radii = self._all_radiuses[ids]
-        min_baked = float(baked_reach.min() - radii.max() - self._COVERAGE_EPSILON)
-        if distance_threshold > min_baked + 1e-6:
+        
+        # Verify the baked tau covers the requested one.
+        if distance_threshold > self._ivf_index._tau_baked + 1e-6:
             # Rebuild with the current tau so the cell gate stays conservative
             self._build_ivf(tau=distance_threshold)
 
