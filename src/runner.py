@@ -745,7 +745,7 @@ def cap_quantization_worker(
 
     bad = [r for r in rows if r["fnr"] != 0]
     if bad:
-        raise ValueError(
+        raise InvariantViolation(
             f"Zero-false-negative invariant violated (dataset={dataset}, k={k}, quantize={quantize}, seed={seed}): "
             f"{bad[:3]}"
         )
@@ -845,7 +845,7 @@ def construct_method_worker(
         "method_s": timed.seconds, "construct_s": construct_s, "volume_s": volume_s,
     }
     if fn:
-        raise ValueError(f"Zero-false-negative invariant violated -- a bug in construction method "
+        raise InvariantViolation(f"Zero-false-negative invariant violated -- a bug in construction method "
                          f"{method!r}: {row}")
     return row
 
@@ -876,7 +876,7 @@ def construct_method_scale_worker(dim: int, dataset: str, n: int, method: str, k
            "method_s": seconds, "psi_max": float(angles.max()), "psi_mean": float(angles.mean()),
            "worst_uncovered": worst, "covered": worst <= CapCoverFilter._COVERAGE_EPSILON}
     if not row["covered"]:
-        raise ValueError(f"Coverage violation at scale: {row}")
+        raise InvariantViolation(f"Coverage violation at scale: {row}")
     return row
 
 
@@ -1439,7 +1439,7 @@ def stream_rebuild_worker(
         predicted = np.asarray(filt.query(query_arr, distance_threshold=tau), dtype=bool)
         rates = _confusion_rates(predicted, actual)
         if not recalled.all() or rates["fnr"] != 0.0:
-            raise ValueError(
+            raise InvariantViolation(
                 f"Zero-false-negative invariant violated (dataset={dataset}, policy={policy}, "
                 f"insertion_level={insertion_level}, k={k}, seed={seed}, position={pos}): "
                 f"stream fnr={1.0 - recalled.mean()}, query fnr={rates['fnr']}"
@@ -1575,6 +1575,13 @@ def _describe_result(result: Any) -> str:
     return str(result)
 
 
+class InvariantViolation(ValueError):
+    """A job broke the zero-false-negative / coverage invariant. Unlike an
+    ordinary job failure (logged and skipped), Runner.run() re-raises these
+    after all jobs finish. Plain message-only class so it pickles across
+    ProcessPoolExecutor."""
+
+
 class Runner:
     def __init__(self, num_workers: int = 1, truncate: bool = True) -> None:
         """truncate=False preserves an output_csv's existing rows (see
@@ -1584,6 +1591,7 @@ class Runner:
         self._jobs: List[Dict[str, Any]] = []
         self._rows_by_csv: Dict[str, List[Dict[str, Any]]] = {}
         self._initialized_csvs: set = set()
+        self._violations: List[str] = []
 
     def submit(self, mode: str, output_csv: Optional[str] = None, **kwargs: Any) -> None:
         """output_csv, if given, is this job's target CSV: rewritten from
@@ -1621,7 +1629,13 @@ class Runner:
         """Returns (mode, result) pairs, in completion order (parallel) or
         submission order (sequential) -- the mode tag lets a caller that
         shared this Runner across job types split results back apart."""
-        return self._run_sequential() if self.num_workers == 1 else self._run_parallel()
+        self._violations: List[str] = []
+        results = self._run_sequential() if self.num_workers == 1 else self._run_parallel()
+        if self._violations:
+            raise InvariantViolation(
+                f"{len(self._violations)} job(s) violated the zero-FN invariant "
+                "(other jobs' results were recorded):\n" + "\n".join(self._violations))
+        return results
 
     def clear(self) -> None:
         self._jobs.clear()
@@ -1651,7 +1665,9 @@ class Runner:
             kwargs = {k: v for k, v in job.items() if k not in ('mode', 'output_csv')}
             try:
                 result = fn(**kwargs)
-            except Exception:
+            except Exception as e:
+                if isinstance(e, InvariantViolation):
+                    self._violations.append(f"{_describe_job(kwargs)}: {e}")
                 # One job's exception must not lose every other job's
                 # already-completed results.
                 logger.exception(f"Job failed, skipping: {_describe_job(kwargs)}")
@@ -1676,7 +1692,9 @@ class Runner:
                 mode, desc, output_csv = futures[f]
                 try:
                     result = f.result()
-                except Exception:
+                except Exception as e:
+                    if isinstance(e, InvariantViolation):
+                        self._violations.append(f"{desc}: {e}")
                     # See _run_sequential's comment.
                     logger.exception(f"Job failed, skipping: {desc}")
                     continue
