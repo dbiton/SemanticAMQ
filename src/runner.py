@@ -1654,7 +1654,16 @@ class Runner:
         out_dir = os.path.dirname(output_csv)
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
-        pd.DataFrame(rows).to_csv(output_csv, index=False)
+        # Write to a sibling temp file and atomically swap it in, so a crash
+        # mid-write never truncates the rows already on disk.
+        tmp = output_csv + ".tmp"
+        try:
+            pd.DataFrame(rows).to_csv(tmp, index=False)
+            os.replace(tmp, output_csv)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise
 
     def _run_sequential(self) -> List[Tuple[str, Any]]:
         results = []
