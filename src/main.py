@@ -1751,44 +1751,21 @@ def generate_and_plot_all() -> None:
     did complete beforehand is still on disk."""
     runner = Runner(num_workers=MAX_WORKERS)
 
-    try:
-        generate_blocklist(runner)
-    except Exception:
-        logger.exception("An error occurred")
-    try:
-        generate_budget(runner)
-    except Exception:
-        logger.exception("An error occurred")
-    try:
-        generate_cap_quantization(runner)
-    except Exception:
-        logger.exception("An error occurred")
-    try:
-        generate_streaming(runner)
-    except Exception:
-        logger.exception("An error occurred")
-    try:
-        generate_construct_methods(runner)
-    except Exception:
-        logger.exception("An error occurred")
-    try:
-        generate_scaling(runner)
-    except Exception:
-        logger.exception("An error occurred")
-    try:
-        generate_equal_memory(runner)
-    except Exception:
-        logger.exception("An error occurred")
-    try:
-        generate_cap_cover_system_tau(runner)
-    except Exception:
-        logger.exception("An error occurred")
-    '''
-    try:
-        generate_construct_methods_scale(runner)
-    except Exception:
-        logger.exception("An error occurred")
-    '''
+    # generate_construct_methods_scale is disabled.
+    for generate in (
+        generate_blocklist,
+        generate_budget,
+        generate_cap_quantization,
+        generate_streaming,
+        generate_construct_methods,
+        generate_scaling,
+        generate_equal_memory,
+        generate_cap_cover_system_tau,
+    ):
+        try:
+            generate(runner)
+        except Exception:
+            logger.exception(f"{generate.__name__} failed to submit")
     runner.shuffle()
     runner.run()
     logger.info("All submitted jobs completed.")

@@ -41,13 +41,12 @@ def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
 
 
 def _called_generators(tree: ast.Module) -> list:
-    """Names of generate_* functions called anywhere inside generate_and_plot_all."""
+    """Names of generate_* functions referenced (called or looped over) inside generate_and_plot_all."""
     body = _function(tree, "generate_and_plot_all")
     names = []
     for node in ast.walk(body):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id.startswith("generate_")):
-            names.append(node.func.id)
+        if isinstance(node, ast.Name) and node.id.startswith("generate_"):
+            names.append(node.id)
     return names
 
 
