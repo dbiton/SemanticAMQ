@@ -18,38 +18,23 @@ DPI = 300
 EMIT_PDF = False
 DEMO = False
 
-METHODS = ["nearest", "least_inflation", "pooled", "merge", "min_heap", "cap_merge"]
+METHODS = ["nearest", "cap_merge"]
 
 METHOD_LABELS = {
-    "nearest": "Nearest-center absorb",
-    "least_inflation": "Least-inflation absorb",
-    "pooled": "Pooled Gonzales re-cluster",
-    "merge": "Exhaustive cheapest-pair merge",
-    "min_heap": "Heap-based cheapest-pair merge",
-    "cap_merge": "Mass-weighted cap merge",
+    "nearest": "Nearest-cap absorb",
+    "cap_merge": "Cap merge",
 }
 
-# Okabe-Ito for the first five; cap_merge's #882255 (Tol's wine) was checked
-# with the dataviz skill's validate_palette.js (--mode light --pairs all) on
-# all six: it adds no warning of its own. The set's worst all-pairs CVD
-# separation stays #009E73<->#CC79A7 (dE 7.6, the 6-8 band that needs
-# secondary encoding -- the per-method markers), and #E69F00/#CC79A7 sit
-# below 3:1 on white, as before.
+# Okabe-Ito, two of its colorblind-safe entries -- CapCoverFilter's own
+# insert-strategy package only has these two (CAP_INSERT_STRATEGIES; no
+# least_inflation/pooled/merge/min_heap, which exist only for Ball-Cover).
 METHOD_COLORS = {
     "nearest": "#0072B2",
-    "least_inflation": "#E69F00",
-    "pooled": "#CC79A7",
-    "merge": "#009E73",
-    "min_heap": "#D55E00",
     "cap_merge": "#882255",
 }
 
 METHOD_MARKERS = {
     "nearest": "o",         # Circle
-    "least_inflation": "^", # Triangle Up
-    "pooled": "s",          # Square
-    "merge": "D",           # Diamond
-    "min_heap": "v",        # Triangle Down
     "cap_merge": "P",       # Filled plus
 }
 
@@ -63,7 +48,7 @@ REFERENCE_STYLES = {
 
 _REQUIRED_COLUMNS = [
     "dataset", "method", "k", "seed", "fold_offset", "position",
-    "fpr", "log10_j_tau", "n_balls", "memory_bytes", "cumulative_time_s",
+    "fpr", "log10_j_tau", "n_caps", "memory_bytes", "cumulative_time_s",
     "amortized_cost_s", "metric", "sweep",
 ]
 
@@ -98,7 +83,7 @@ def _synthesize_demo_data() -> pd.DataFrame:
                 rows.append({
                     "dataset": "eli5", "method": method, "k": k_fixed, "seed": 0,
                     "fold_offset": fold_offset, "position": int(pos), "fpr": float(fpr),
-                    "log10_j_tau": float(log10_j), "n_balls": k_fixed, "memory_bytes": k_fixed * 1540,
+                    "log10_j_tau": float(log10_j), "n_caps": k_fixed, "memory_bytes": k_fixed * 1540,
                     "cumulative_time_s": cost_scale[method] * pos * 1e-5,
                     "amortized_cost_s": cost_scale[method] * 1e-5,
                     "metric": "checkpoint", "sweep": "position",
@@ -112,7 +97,7 @@ def _synthesize_demo_data() -> pd.DataFrame:
                     "fold_offset": fold_offset, "position": int(pos),
                     "fpr": float(base_fpr["static_rebuild"] * (0.3 + 0.7 * x) * rng.uniform(0.9, 1.1)),
                     "log10_j_tau": float(38.0 + 6.0 * x + rng.normal(0, 0.2)),
-                    "n_balls": k_fixed, "memory_bytes": k_fixed * 1540,
+                    "n_caps": k_fixed, "memory_bytes": k_fixed * 1540,
                     "cumulative_time_s": cost_scale["static_rebuild"] * pos * 1e-5,
                     "amortized_cost_s": cost_scale["static_rebuild"] * 1e-5,
                     "metric": "static_reference", "sweep": "position",
@@ -127,7 +112,7 @@ def _synthesize_demo_data() -> pd.DataFrame:
                 rows.append({
                     "dataset": "eli5", "method": method, "k": k_val, "seed": 0,
                     "fold_offset": fold_offset, "position": 3050, "fpr": 0.02,
-                    "log10_j_tau": 40.0, "n_balls": k_val, "memory_bytes": k_val * 1540,
+                    "log10_j_tau": 40.0, "n_caps": k_val, "memory_bytes": k_val * 1540,
                     "cumulative_time_s": cost * 3000, "amortized_cost_s": cost,
                     "metric": "checkpoint", "sweep": "k",
                 })
@@ -349,12 +334,12 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return agg
 
 
-# Panel (c): number of balls vs. stream position
+# Panel (c): number of caps vs. stream position
 
-def panel_n_balls_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """Ball count over the stream. Expected flat at k_fixed for all methods."""
+def panel_n_caps_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Cap count over the stream. Expected flat at k_fixed for all methods."""
     sel = df[(df["sweep"] == "position") & (df["metric"] == "checkpoint") & (df["k"] == cfg.k_fixed)]
-    agg = mean_std(sel, ["method", "position"], "n_balls")
+    agg = mean_std(sel, ["method", "position"], "n_caps")
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots(figsize=(3.2, 2.4))
@@ -367,15 +352,15 @@ def panel_n_balls_vs_position(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
                 markersize=3.5, linewidth=1.0, zorder=3)
         _std_errorbars(ax, sub["position"], sub, METHOD_COLORS[method])
 
-    ref_positions = _draw_references(ax, df, cfg, "n_balls", band=False)
+    ref_positions = _draw_references(ax, df, cfg, "n_caps", band=False)
 
     _apply_paper_axes_style(ax, log_x=False, log_y=False)
     _set_scaled_linear_x_axis(ax, pd.concat([agg["position"], ref_positions]), "Stream Position")
     _add_k_annotation(ax, cfg.k_fixed, loc="bottom-left")
-    ax.set_ylabel("Number of Balls")
+    ax.set_ylabel("Number of Caps")
     style_axes(ax)
 
-    save_figure(fig, "streaming-n-balls-vs-position.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
+    save_figure(fig, "streaming-n-caps-vs-position.png", cfg.outdir, cfg.dpi, cfg.emit_pdf)
     return agg
 
 
@@ -527,7 +512,7 @@ def generate_streaming_figures(df: Optional[pd.DataFrame] = None, outdir: str = 
 
         panel_fpr_vs_position(sub, cfg)
         panel_geometric_objective(sub, cfg)
-        panel_n_balls_vs_position(sub, cfg)
+        panel_n_caps_vs_position(sub, cfg)
         if ((sub["sweep"] == "k") & (sub["metric"] == "checkpoint")).any():
             panel_insertion_throughput(sub, cfg)
         panel_vectors_vs_balls(sub, cfg)

@@ -1,8 +1,8 @@
 # SemanticAMQ (SAMQ)
 
 An approximate-membership-query (AMQ) filter for semantic near-duplicate
-detection over dense embedding vectors. SAMQ (`BallCoverFilter`,
-[src/filters/ball_cover/](src/filters/ball_cover/)) sits in front of an
+detection over dense embedding vectors. SAMQ (`CapCoverFilter`,
+[src/filters/cap_cover/](src/filters/cap_cover/)) sits in front of an
 exact backend index (e.g. a flat FAISS `IndexFlatL2`) and answers "is
 anything within distance tau of this query?" cheaply, so the expensive
 backend is only hit when the filter can't rule the query out — with a
@@ -10,11 +10,11 @@ guaranteed **no false negatives** invariant, unlike ANN indexes.
 
 ## How it works
 
-SAMQ builds a Gonzalez-style greedy cover of enclosing balls over the
-construct set (radius per ball, quantizable to shrink memory — see
-`Quantize` in [ball_cover_filter.py](src/filters/ball_cover/ball_cover_filter.py)),
-then answers a query by checking whether it falls within any ball's
-radius (expanded by the query threshold tau). It's compared against a set
+SAMQ builds a cover of spherical caps over the construct set (direction
+and angle per cap, quantizable to shrink memory — see `Quantize` in
+[cap_cover_filter.py](src/filters/cap_cover/cap_cover_filter.py)),
+then answers a query by checking whether it falls within any cap's
+angle (expanded by the query threshold tau). It's compared against a set
 of AMQ/ANN baselines implemented in [src/filters/](src/filters/):
 DSH, DSBF, LSBF, a CoveringLSH fallback, and FAISS's HNSW and IVF indexes.
 
@@ -24,7 +24,7 @@ DSH, DSBF, LSBF, a CoveringLSH fallback, and FAISS's HNSW and IVF indexes.
 src/
   main.py            entry point: defines and runs each evaluation
   runner.py           parallel job harness (ProcessPoolExecutor) + per-job workers
-  filters/            SAMQ (ball_cover/) and baseline filter implementations
+  filters/            SAMQ (cap_cover/) and baseline filter implementations
   plots/               one module per evaluation's figure set
   util/                dataset path registry + embedding loaders
   vector_source.py     lazy/array-backed vector handles passed to worker processes

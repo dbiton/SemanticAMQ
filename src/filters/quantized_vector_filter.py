@@ -3,7 +3,7 @@ the vectors" counterpart to BallCoverFilter's "compress the geometry". Keeps
 every construct vector, quantized to whichever scheme on a fixed fidelity
 ladder fits the memory budget, finest first: float16, then the same
 TurboQuant/scalar-quantizer rungs BallCoverFilter's own Quantize ladder sweeps
-(8, 6, 4, 3, 2 bits/dim -- see filters.ball_cover.ball_cover_filter.Quantize
+(8, 6, 4, 3, 2 bits/dim -- see the Quantize
 for the full bits-per-dim table this mirrors), then RaBitQ (~1 bit/dim, no
 codebook) as the coarsest fallback. The finer, evenly-spaced steps (vs. the
 old FP16/8-bit/4-bit/RaBitQ ladder's big jumps) give a smoother

@@ -27,67 +27,80 @@ from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 from logging_config import configure_logging
 from filters.filter import InsufficientMemoryError
 from filters.dsh_filter import DSHFilter
-from filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize
-from filters.quantized_vector_filter import QuantizedVectorFilter
-from filters.ball_cover.nearest_insert import NearestInsert
-from filters.ball_cover.least_inflation_insert import LeastInflationInsert
-from filters.ball_cover.exhaustive_merge_insert import ExhaustiveMergeInsert
-from filters.ball_cover.min_heap_insert import MinHeapInsert
-from filters.ball_cover.doubling_insert import DoublingInsert
-from filters.ball_cover.pooled_insert import PooledInsert
-from filters.ball_cover.cap_merge_insert import CapMergeInsert
-from filters.ball_cover.gonzales_construct import GonzalesConstruct
-from filters.ball_cover.merge_construct import MergeConstruct
-from filters.ball_cover.minimax_construct import MinimaxConstruct
-from filters.ball_cover.split_construct import SplitConstruct
-from filters.ball_cover.sphere_merge_construct import SphereMergeConstruct
-from hyperspheres_volume import estimate_hypersphere_volume
+from filters.cap_cover.cap_cover_filter import (CapCoverFilter, Quantize as CapQuantize,
+                                                AUTO_CANDIDATES as _CAP_AUTO_CANDIDATES,
+                                                DENSE10_LADDER as _CAP_DENSE10_LADDER)
+from filters.cap_cover.cap_geometry import log10_cap_measure, unit_rows
+from filters.cap_cover.nearest_insert import NearestInsert as CapNearestInsert
+from filters.cap_cover.cap_merge_insert import CapMergeInsert as CapCoverMergeInsert
+from filters.cap_cover.gonzales_construct import GonzalesConstruct as CapGonzalesConstruct
+from filters.cap_cover.minimax_construct import MinimaxConstruct as CapMinimaxConstruct
+from filters.cap_cover.sphere_merge_construct import SphereMergeConstruct as CapSphereMergeConstruct
+from filters.cap_cover.cap_interfaces import ConstructInterface as CapConstructInterface
 from vector_source import VectorSource
 
 configure_logging()
 logger = logging.getLogger(__name__)
 
-# Classes, not instances -- each job needs its own fresh strategy object.
-# "doubling" is registered but opt-in only (not in generate_streaming()'s
-# sweep list) since it adds real compute.
-_INSERT_STRATEGIES = {
-    "nearest": NearestInsert,
-    "least_inflation": LeastInflationInsert,
-    "merge": ExhaustiveMergeInsert,
-    "min_heap": MinHeapInsert,
-    "doubling": DoublingInsert,
-    "pooled": PooledInsert,
-    "cap_merge": CapMergeInsert,
+# Byte-budget unit for "k caps": the cost of k (centre code + fp16 radius)
+# records at 4 bits/dim -- the equal-bytes convention every evaluation sizes
+# its CapCoverFilter budget by (k fixes the comparison scale, bytes enforce it).
+_BUDGET_BITS_PER_DIM = 4
+_BUDGET_BYTES_PER_FLOAT16 = 2
+
+
+def _cover_max_memory(dim: int, k: int, bits_per_dim: int = _BUDGET_BITS_PER_DIM) -> int:
+    """max_memory in bytes corresponding to a nominal k covers at bits_per_dim
+    bits per dimension (plus a 2-byte radius each). CapCoverFilter sizes its
+    cap count from a byte budget, not a raw count."""
+    return k * (dim * bits_per_dim // 8 + _BUDGET_BYTES_PER_FLOAT16)
+
+
+
+def _cap_cover(dim: int, k: int) -> CapCoverFilter:
+    """CapCoverFilter.auto() at the nominal k-cover byte budget
+    (_cover_max_memory)."""
+    return CapCoverFilter.auto(dim, max_memory=_cover_max_memory(dim, k))
+
+
+def _cap_cover_insertable(dim: int, k: int) -> CapCoverFilter:
+    """A CapCoverFilter that can insert(), unlike _cap_cover's static
+    auto() (insert_method=None there): single-level TQ4 with CapNearestInsert, at the same equal-bytes budget as
+    _cap_cover. Kept separate from _cap_cover rather than giving it a
+    default insert_method, so cap_cover_system_tau's already-validated
+    static-cover numbers don't shift (an insert strategy's bookkeeping
+    reserves bytes from the cap budget even when insert() is never
+    called -- see InsertInterface.max_caps_for_budget)."""
+    return CapCoverFilter(dim=dim, max_memory=_cover_max_memory(dim, k),
+                          quantize=CapQuantize.TQ4, insert_method=CapNearestInsert())
+
+
+# CapCoverFilter's default construct method (what CapCoverFilter()/
+# _cap_cover() already use when no construct_method is passed) -- a
+# named default for call sites that need one rather than relying on the class's own default.
+CAP_COVER_CONSTRUCT = "sphere_merge"
+
+# CapCoverFilter's own construct-method registry: only the 3 strategies its
+# package implements.
+CAP_CONSTRUCT_METHODS = {
+    "gonzalez": CapGonzalesConstruct,
+    "minimax": CapMinimaxConstruct,
+    "sphere_merge": CapSphereMergeConstruct,
 }
 
-# Construction methods by name, as factories -- shared by
-# construct_method_worker and stream_rebuild_worker's construct_method.
-CONSTRUCT_METHODS = {
-    "gonzalez": GonzalesConstruct,
-    "merge": MergeConstruct,
-    "minimax": MinimaxConstruct,
-    # minimax's own centers, moved onto the data's sphere before the radii are
-    # measured (exact_cover.sphere_centers) -- isolates what the sphere
-    # projection alone is worth, at minimax's cost.
-    "minimax_sphere": lambda: MinimaxConstruct(sphere=True),
-    "split": SplitConstruct,
-    "sphere_merge": SphereMergeConstruct,
+# CapCoverFilter's own insert-strategy registry: only the 2 its package
+# implements.
+CAP_INSERT_STRATEGIES = {
+    "cap_merge": CapCoverMergeInsert,
+    "nearest": CapNearestInsert,
 }
 
-# Ball-Cover as the paper presents it, used by every evaluation that does not
-# sweep one of these itself: minimax with its centers on the sphere
-# (minimax_sphere) is the construction, TQ4 the headline center encoding. The
-# quantization sweep keeps the construction and varies the encoding; the
-# construct_method and streaming sweeps stay unquantized.
-BALL_COVER_CONSTRUCT = "minimax_sphere"
-BALL_COVER_QUANTIZE = Quantize.TQ4
-
-
-def _ball_cover(dim: int, k: int) -> BallCoverFilter:
-    """BallCoverFilter holding exactly k balls, in the paper's configuration."""
-    return BallCoverFilter(dim=dim, max_memory=_ball_cover_max_memory(dim, k, BALL_COVER_QUANTIZE),
-                           quantize=BALL_COVER_QUANTIZE,
-                           construct_method=CONSTRUCT_METHODS[BALL_COVER_CONSTRUCT]())
+# The quantization evaluation's cap-cover sweep: the ~14 encodings
+# CapCoverFilter.auto() actually chooses among (AUTO_CANDIDATES +
+# DENSE10_LADDER), not every Quantize member -- auto()'s own candidate pool,
+# confirmed by its docstring, so the sweep tests what auto() actually picks
+# from rather than exotic opt-in-only rungs (BOOT_CANDIDATES, KSQ_CANDIDATES).
+CAP_QUANTIZATION_SWEEP = tuple(_CAP_AUTO_CANDIDATES) + tuple(_CAP_DENSE10_LADDER)
 
 VectorInput = Union[np.ndarray, VectorSource]
 _QUERY_BATCH = 32
@@ -130,35 +143,33 @@ def _precision_recall_f1(predicted: Any, actual: Any) -> Tuple[float, float, flo
 
 
 _DIRECT_TAU_FILTERS = {
-    "FirstNFilter", "BallCoverFilter", "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter", 
+    "FirstNFilter", "CapCoverFilter", "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter",
     "DSHFilter", "HNSWFilter", "IVFFilter", "QuantizedVectorFilter", "MLPFilter",
     "PacukLSHFilter", "SankowskiWygockiFilter", "VAPlusFilter", "IVFRadiiFilter",
 }
 
 
-def _ball_cover_max_memory(dim: int, k: int, quantize: Quantize = Quantize.FP32) -> int:
-    """BallCoverFilter sizes its ball budget from a byte budget (max_memory),
-    not a raw ball count -- this converts a desired count k into the
-    max_memory that yields exactly k balls for the given quantize type."""
-    bytes_per_ball = BallCoverFilter(dim=dim, max_memory=1, quantize=quantize).bytes_per_ball()
-    return bytes_per_ball * k
 
 
-class _BallCoverFilterEvalAdapter:
-    """BallCoverFilter.query() takes an explicit per-call distance_threshold
+
+
+class _CapCoverFilterEvalAdapter:
+    """CapCoverFilter.query() takes an explicit per-call distance_threshold
     rather than baking one in at construction time like the other
     _DIRECT_TAU_FILTERS -- this captures the threshold once so this module's
-    generic `filter_instance.query(block)` call sites keep working."""
+    generic `filter_instance.query(block)` call sites keep working. Builds via CapCoverFilter.
+    auto() (not a plain constructor) so a budget gets auto()'s own
+    multi-candidate encoding choice, matching how this evaluation uses
+    CapCoverFilter everywhere else (_cap_cover). Renames _instantiate_filter's
+    generic max_spheres/insert_mem_percent kwargs onto CapCoverFilter's own
+    max_caps/insert_memory_percent."""
 
     def __init__(self, dim: int, max_memory: int, distance_threshold: float,
                  max_spheres: Optional[int] = None, insert_mem_percent: Optional[float] = 0.0, **extra_kwargs: Any) -> None:
         self.distance_threshold = distance_threshold
-        quantize = extra_kwargs.get("quantize", Quantize.FP32)
-        extra_kwargs.setdefault("construct_method", CONSTRUCT_METHODS[BALL_COVER_CONSTRUCT]())
-        if max_spheres is not None:
-            max_memory = _ball_cover_max_memory(dim, max_spheres, quantize)
-        self._filt = BallCoverFilter(dim=dim, max_memory=max_memory, max_spheres=max_spheres, 
-                                     insert_memory_percent=insert_mem_percent, **extra_kwargs)
+        extra_kwargs.setdefault("construct_method", CAP_CONSTRUCT_METHODS[CAP_COVER_CONSTRUCT]())
+        self._filt = CapCoverFilter.auto(dim, max_memory=max_memory, max_caps=max_spheres,
+                                         insert_memory_percent=insert_mem_percent, **extra_kwargs)
 
     def construct(self, vectors: np.ndarray) -> None:
         return self._filt.construct(vectors)
@@ -173,8 +184,8 @@ class _BallCoverFilterEvalAdapter:
         return self._filt.get_bytesize()
 
     @property
-    def all_radiuses(self) -> np.ndarray:
-        return self._filt.all_radiuses
+    def all_angles(self) -> np.ndarray:
+        return self._filt.all_angles
 
 
 def _instantiate_filter(filter_cls: Any, dim: int, memory_budget: int, distance_threshold: float = None, max_spheres: int = None,
@@ -183,10 +194,10 @@ def _instantiate_filter(filter_cls: Any, dim: int, memory_budget: int, distance_
 
     if filter_cls.__name__ in _DIRECT_TAU_FILTERS:
         kwargs.update(distance_threshold=distance_threshold)
-    
-        if filter_cls is BallCoverFilter:
+
+        if filter_cls is CapCoverFilter:
             kwargs.update(max_spheres=max_spheres, insert_mem_percent=insert_mem_percent)
-            return _BallCoverFilterEvalAdapter(**kwargs)
+            return _CapCoverFilterEvalAdapter(**kwargs)
 
         if "max_spheres" in inspect.signature(filter_cls.__init__).parameters:
             kwargs.update(max_spheres=max_spheres)
@@ -422,7 +433,7 @@ def _build_calibrated_filter(
     inside .construct() calls, excluding the calibration .query() calls used
     to score candidates, so it reflects reaching a ready-to-query filter.
     extra_kwargs is forwarded to _instantiate_filter for filters outside the
-    config-dial registries (e.g. BallCoverFilter's quantize)."""
+    config-dial registries (e.g. a fixed quantize)."""
     name = filter_cls.__name__
     construction_time = 0.0
 
@@ -494,10 +505,10 @@ def equal_memory_worker(
     dataset: str = "",
     extra_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    # BallCoverFilter can be submitted multiple times at one budget, once per
+    # A filter can be submitted multiple times at one budget, once per
     # quantize variant (see main.generate_equal_memory) -- suffix the variant
     # onto Config so each becomes its own labelled line downstream rather
-    # than being pooled into one "BallCoverFilter" line. The suffix uses
+    # than being pooled into one line. The suffix uses
     # "(...)"  rather than plot_equal_memory.aggregate's " + " delimiter, so
     # its filter-identity split leaves the whole string intact.
     quantize = (extra_kwargs or {}).get("quantize")
@@ -515,8 +526,7 @@ def equal_memory_worker(
         # Expected at small budgets -- recorded as an explicit infeasible
         # row (NaN metrics) rather than dropped or crashing the sweep. Every
         # filter raises the one shared class from filters.filter; this used
-        # to name only QuantizedVectorFilter's copy, so the same condition
-        # from BallCoverFilter took the whole job down instead.
+        # to name only QuantizedVectorFilter's copy.
         logger.warning(f"[Infeasible] {config} at memory_budget={memory_budget}: {e}")
         return {
             'Config': config, 'Dataset': dataset, 'Memory Budget': memory_budget,
@@ -578,84 +588,31 @@ def equal_memory_worker(
 _LN10 = float(np.log(10.0))
 
 
-def _log_effective_radii(radii: np.ndarray, tau: float) -> np.ndarray:
-    """Natural log of each ball's tau-expanded radius, carried in log space --
-    -inf wherever that radius is not positive.
-
-    tau is not guaranteed positive by every caller -- a negative tau is a
-    stricter "inside by a margin" threshold (a query must sit strictly inside
-    a ball's radius, not just within it).
-    A ball whose radius that drives to zero or below covers nothing, and -inf
-    is the log-space statement of exactly that: logsumexp maps it back to a
-    zero contribution, so it drops out of the sum without ever being
-    materialised as a radius.
-
-    Kept in log space rather than clamping the radius to 0, because clamping
-    rewrites the geometry (the sum would be over a cover that does not exist)
-    to work around a representation limit. Taking the log first also avoids
-    both failure modes of the linear form: np.log of a negative radius is NaN
-    ("invalid value encountered in log"), and r**d silently returns a LARGE
-    POSITIVE number when d is even -- which would make a ball that covers
-    nothing the dominant term.
-    """
-    r = np.asarray(radii, dtype=np.float64) + float(tau)
-    logr = np.full(r.shape, -np.inf, dtype=np.float64)
-    # where= leaves the -inf in place for non-positive radii and never
-    # evaluates the log there, so no invalid-value warning is raised.
-    np.log(r, out=logr, where=r > 0.0)
-    return logr
 
 
-def _log10_J(radii: np.ndarray, dim: int, tau: float = 0.0) -> float:
-    """log10 sum_i (r_i + tau)^d, safe for d in the hundreds where r^d over/underflows float64."""
-    logr = _log_effective_radii(radii, tau)
-    if logr.size == 0:
+
+
+
+
+
+
+def _cap_log10_volume(filt: CapCoverFilter, tau: float) -> float:
+    """log10 upper bound on the share of the unit sphere `filt` accepts at
+    `tau`: log10 of the sum over caps of their tau-expanded measure
+    (sigma(psi), psi = min(stored angle + beta, pi)) -- the cap-cover
+    naive sum-of-volumes proxy, ported from
+    compare_cap_cover.py's accept_angles/accept_volume. No overlap-aware
+    union bound exists for caps (nothing in cap_geometry.py does
+    angle-based overlap), so this returns
+    only the upper bound -- callers pair it with NaN where a lower bound
+    column is expected."""
+    angles = filt.all_angles
+    if len(angles) == 0:
         return float('-inf')
-    return float(logsumexp(dim * logr)) / _LN10
-
-
-def _J_tau(radii: np.ndarray, dim: int, tau: float = 0.0) -> float:
-    """Linear J_tau(C) = sum_i (r_i + tau)^d; may overflow to +inf at d~384, r>~1 -- use _log10_J to plot."""
-    if len(radii) == 0:
-        return 0.0
-    # Derived from the log form rather than summed directly, so a ball with a
-    # non-positive tau-expanded radius contributes nothing instead of a large
-    # positive r**d (d is even). Still overflows to +inf at d~384, r>~1 --
-    # that is what _log10_J is for.
-    log10_j = _log10_J(radii, dim, tau)
-    if log10_j == float('-inf'):
-        return 0.0
-    with np.errstate(over='ignore'):
-        return float(10.0 ** log10_j)
-
-
-def _tau_volume_bounds_log10(centers: np.ndarray, radii: np.ndarray, tau: float) -> Tuple[float, float]:
-    """Log10 (lower, upper) bounds on the volume actually covered by the
-    tau-expanded balls (radius + tau), via estimate_hypersphere_volume's
-    overlap-aware union bound -- unlike _log10_J's naive sum-of-volumes proxy,
-    which ignores overlap entirely. High is floored at low the same way
-    _fpvr_bounds floored its log-ratio at 0: floating-point error in the
-    lens/Bonferroni terms can otherwise invert them by a hair.
-
-    This is the only home of that estimate. BallCoverFilter.construct() used
-    to run it eagerly at tau=0 and return the bounds, so every construct() in
-    the suite paid for an O(k^2) union bound that almost no caller read;
-    callers that want it now ask for it here, from all_centers/all_radiuses,
-    at whatever tau they are reporting (pass tau=0.0 for the cover's own
-    volume). Only system_tau_worker does -- see blocklist_tau_worker for a
-    worker that deliberately skips it on cost grounds."""
-    if len(radii) == 0:
-        return float('nan'), float('nan')
-    # This estimator takes radii, not log-radii, so the degenerate case is
-    # expressed as a zero-radius ball -- which is the correct geometry for one
-    # that covers nothing, not a clamp working around a representation limit.
-    eff_radii = np.maximum(np.asarray(radii, dtype=np.float64) + float(tau), 0.0)
-    log_low, log_high = estimate_hypersphere_volume(centers, eff_radii, return_log=True)
-    if np.isnan(log_low) or np.isinf(log_low):
-        return float('nan'), float('nan')
-    log_low /= _LN10
-    log_high = max(log_high / _LN10, log_low)
-    return log_low, log_high
+    beta, _ = filt._beta(np.ones(1), tau)
+    psi = np.minimum(angles + float(beta[0]), np.pi)
+    log10_measure = log10_cap_measure(psi, filt.dim)
+    return float(logsumexp(log10_measure * _LN10)) / _LN10
 
 
 def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, float]:
@@ -699,45 +656,15 @@ def _per_source_rates(predicted: Any, actual: Any, n_heldout: int, n_withheld: i
     return out
 
 
-# NONE is the raw/unquantized baseline point in this sweep (tagged
-# stage="ball"): one "ball" cover to compare every real quantizer against.
-QUANTIZATION_SWEEP = (
-    Quantize.FP32, Quantize.FP16, Quantize.SQ8, Quantize.SQ6, Quantize.SQ4,
-    Quantize.TQ3, Quantize.PQ4_R2, Quantize.PQ8_R2,
-    # Down to 1 b/dim via two subquantizer-width options, the same pairing
-    # the 2 b/dim rung already has (PQ4_R2 vs PQ8_R2): PQ4_R1 packs more,
-    # coarser subquantizers; PQ8_R1 packs fewer, finer ones, at the same
-    # rate and the same 48-byte center cost (see the Quantize docstring's
-    # table). Both are exact ADC, so their zero-false-negative property is a
-    # proof like the rest of the ladder's.
-    #
-    # Quantize.RABITQ is deliberately NOT swept here: unlike every other rung,
-    # its search() is not exact ADC -- it scores through its own estimator,
-    # so its zero-false-negative property rests on a measured one-sided
-    # bound (3.6M (query, center) pairs, always under-estimated) rather than
-    # a proof. Safe in every measurement taken so far, but a materially
-    # weaker guarantee than the other ten rungs; see the CAVEAT on
-    # Quantize.RABITQ. Stays constructible, just not swept by default.
-    Quantize.PQ4_R1, Quantize.PQ8_R1,
-    # The rest of faiss's TurboQuant family alongside TQ3 (TQ1/TQ2/TQ4/TQ8
-    # -- see the Quantize docstring). Evaluation-only: swept here so
-    # results/quantization.csv carries their rows, but deliberately left out
-    # of plot_quantization.QUANTIZE_SWEEP (a separate, hand-kept list, not
-    # imported from here -- see that file's comment) so no figure changes
-    # until they've actually been looked at. All exact ADC like the rest of
-    # the scalar-quantizer rungs. (There is no TQ5: faiss's only 5-bit
-    # TurboQuant, QT_5bit_tq, is not exact ADC and broke the
-    # zero-false-negative invariant this worker asserts -- see the Quantize
-    # docstring.)
-    Quantize.TQ1, Quantize.TQ2, Quantize.TQ4, Quantize.TQ8,
-)
 
 
-def quantization_worker(
+
+
+def cap_quantization_worker(
     dim: int,
     dataset: str,
     k: int,
-    quantize: Quantize,
+    quantize: CapQuantize,
     tau: float,
     seed: int,
     vectors_construct: VectorInput,
@@ -747,33 +674,19 @@ def quantization_worker(
     n_withheld: int,
     n_singleton: int,
 ) -> List[Dict[str, Any]]:
-    """Builds one BallCoverFilter cover per (dataset, k, seed, quantize) and
-    evaluates it at a single tau. Returns one row, tagged
-    stage="ball"/"quantizing".
+    """One CapCoverFilter cover per
+    (dataset, k, seed, quantize) over CAP_QUANTIZATION_SWEEP (AUTO_CANDIDATES
+    + DENSE10_LADDER, the ~14 encodings CapCoverFilter.auto() actually
+    chooses among -- not the full, much larger Quantize enum), evaluated at a single tau. Returns one
+    row, tagged stage="quantizing" always (CAP_QUANTIZATION_SWEEP has no
+    FP32/uncompressed member to single out as a baseline stage).
 
-    Unlike system_tau_worker, this sweep is single-tau by design: it varies
-    the quantizer at a fixed threshold (the paper's Figure 3 fixes tau so 5%
-    of queries are duplicates), so the tau-dependent columns (fpr,
-    log10_J_tau, index_accesses_saved_pct) are unambiguous without the plots
-    having to pick one tau out of several.
+    max_memory is derived from k at 32 bits/dim (_cover_max_memory), held
+    fixed across every quantize candidate, so the sweep varies only the
+    encoding.
 
-    vectors_query is the fold's [held-out, withheld, singleton] query stream
-    (see BlocklistWorkload.query_vectors), sized by n_heldout/n_withheld/
-    n_singleton, and actual_results its distance-at-tau labels. fpr is split
-    by source into fpr_heldout/fpr_withheld/fpr_singleton, the same columns
-    blocklist_tau_worker/budget_worker report (see _per_source_rates).
-
-    max_memory is derived from k using Quantize.FP32's byte-per-ball size and
-    held fixed across every quantize candidate, so a more compact code packs
-    more balls into the same budget -- a quantizer compact enough to
-    saturate at n_construct balls before using the full budget (e.g. PQ)
-    will show flat memory usage across the k sweep, which is real
-    information, not a plotting artifact.
-
-    FNR is asserted (raises on violation), never plotted. If construction
-    itself raises (e.g. InsufficientMemoryError, too tight a budget for PQ's
-    minimum codebook), that candidate is logged and contributes zero rows
-    rather than aborting the whole sweep."""
+    log10_J/log10_J_tau use _cap_log10_volume. FNR is asserted (raises on
+    violation), never plotted."""
     construct_arr = _to_construct_array(vectors_construct)
     query_arr = _to_construct_array(vectors_query)
     n_q = len(query_arr)
@@ -786,29 +699,23 @@ def quantization_worker(
     if n_heldout + n_withheld + n_singleton != n_q:
         raise ValueError(f"Source sizes ({n_heldout}, {n_withheld}, {n_singleton}) do not "
                          f"partition n_queries ({n_q})")
-    stage = "ball" if quantize == Quantize.FP32 else "quantizing"
 
     rows: List[Dict[str, Any]] = []
 
-    max_memory = _ball_cover_max_memory(dim, k, Quantize.FP32)
+    max_memory = _cover_max_memory(dim, k, 32)
     t0 = time.perf_counter()
     try:
-        filt = BallCoverFilter(dim=dim, max_memory=max_memory, quantize=quantize,
-                               construct_method=CONSTRUCT_METHODS[BALL_COVER_CONSTRUCT]())
+        filt = CapCoverFilter(dim=dim, max_memory=max_memory, quantize=quantize,
+                              construct_method=CAP_CONSTRUCT_METHODS[CAP_COVER_CONSTRUCT]())
         filt.construct(construct_arr)
     except Exception as e:
         logger.warning(
-            f"Skipping quantization job (dataset={dataset}, k={k}, quantize={quantize.value}, "
+            f"Skipping cap_quantization job (dataset={dataset}, k={k}, quantize={quantize.value}, "
             f"seed={seed}): construction raised {type(e).__name__}: {e}"
         )
         return []
     stage_time = time.perf_counter() - t0
-    radii = filt.all_radiuses
-    log10_J = _log10_J(radii, dim)
-
-    radius_inflation = filt.all_radius_inflation
-    radius_inflation_mean = float(np.mean(radius_inflation)) if len(radius_inflation) else 0.0
-    radius_inflation_std = float(np.std(radius_inflation)) if len(radius_inflation) else 0.0
+    log10_J = _cap_log10_volume(filt, 0.0)
 
     memory_bytes = filt.get_bytesize()
 
@@ -816,22 +723,14 @@ def quantization_worker(
     predicted = filt.query(query_arr, distance_threshold=tau)
     query_time = time.perf_counter() - q0
 
-    # What the filter buys a downstream system: a query it rejects never
-    # reaches the main index, so accesses == positives and everything else
-    # is saved. Same accounting as system_tau_worker's mean_index_accesses,
-    # counted rather than timed -- no index is built here, since the count
-    # is a property of the filter's decisions, not of what sits behind it.
-    # Given the zero-false-negative guarantee this is determined by fpr and
-    # the duplicate rate, but it is the number a system integrator reads,
-    # and fpr alone doesn't give it without knowing the redundancy rate.
     predicted_arr = np.asarray(predicted, dtype=bool)
     n_index_accesses = int(predicted_arr.sum())
 
     rates = _confusion_rates(predicted, actual)
     rows.append({
-        "dataset": dataset, "k": k, "quantize": quantize.value, "stage": stage, "tau": tau,
+        "dataset": dataset, "k": k, "quantize": quantize.value, "stage": "quantizing", "tau": tau,
         "log10_J": log10_J,
-        "log10_J_tau": _log10_J(radii, dim, tau=tau),
+        "log10_J_tau": _cap_log10_volume(filt, tau),
         "fpr": rates["fpr"], "fnr": rates["fnr"],
         **_per_source_rates(predicted_arr, actual, n_heldout, n_withheld, n_singleton),
         "stage_time_s": stage_time, "cum_time_s": stage_time,
@@ -840,15 +739,7 @@ def quantization_worker(
         "n_index_accesses": n_index_accesses,
         "index_accesses_saved": n_q - n_index_accesses,
         "index_accesses_saved_pct": (1.0 - n_index_accesses / max(n_q, 1)) * 100.0,
-        "n_balls": filt._num_spheres, "memory_bytes": memory_bytes, "seed": seed,
-        "radius_inflation_mean": radius_inflation_mean,
-        "radius_inflation_std": radius_inflation_std,
-        # Size of the set every ball cover in this row is built over -- fixed
-        # per (dataset, seed), not swept, but recorded per row (rather than
-        # left for a caller to look up separately) so plot_quantization can
-        # express memory_bytes as a percentage of storing this set raw
-        # (n_construct * dim float32s) without needing its own copy of the
-        # corpus.
+        "n_caps": filt._num_caps, "memory_bytes": memory_bytes, "seed": seed,
         "n_construct": len(construct_arr),
     })
 
@@ -862,9 +753,16 @@ def quantization_worker(
     return rows
 
 
-class _TimedConstruct:
-    """Times construct_filter alone, apart from the rest of construct()
-    (_tight_radii, index writes), which every construction method shares."""
+
+
+class _TimedCapConstruct(CapConstructInterface):
+    """_TimedConstruct's cap-cover analogue. cap_cover's ConstructInterface
+    adds iter_candidates()/finish() to the ball-cover contract (for choosing
+    among several encodings' cap counts at once), but construct_method_worker
+    only ever asks for one cap count, so the inherited default
+    iter_candidates (which calls construct_filter once) and finish
+    (identity) are exactly what's wanted -- only construct_filter itself
+    needs timing, same as _TimedConstruct."""
 
     def __init__(self, inner: Any) -> None:
         self.inner = inner
@@ -895,18 +793,18 @@ def construct_method_worker(
     n_withheld: int,
     n_singleton: int,
 ) -> Dict[str, Any]:
-    """One BallCoverFilter built by CONSTRUCT_METHODS[method] at k balls,
-    with the filter's default quantization and no insert method, so the
-    construction method is the only thing that varies between rows.
+    """One CapCoverFilter built by CAP_CONSTRUCT_METHODS[method] at k caps,
+    with the filter's default (FP32) quantization and no insert method, so
+    the construction method is the only thing that varies between rows.
 
-    Returns one row: cover volume, radii, FPR/FNR against distance ground
+    Returns one row: cover volume, angles, FPR/FNR against distance ground
     truth at tau, and construction time. vectors_query is the fold's
     [held-out, withheld, singleton] query stream
     (BlocklistWorkload.query_vectors), sized by n_heldout/n_withheld/
     n_singleton, so fpr splits by source as budget_worker's does (see
     _per_source_rates). Covers are unquantized, so a row is not comparable
-    with results/budget.csv's, which is built at BALL_COVER_QUANTIZE. seed is
-    the fold, reported as "fold".
+    with results/cap_quantization.csv's, which is built at a swept encoding.
+    seed is the fold, reported as "fold".
 
     A nonzero FNR is a bug in the construction method, not a data point, so
     it raises (the Runner logs and skips the job) instead of returning."""
@@ -915,16 +813,15 @@ def construct_method_worker(
     actual = np.asarray(actual_results, dtype=bool)
     n = len(construct)
 
-    timed = _TimedConstruct(CONSTRUCT_METHODS[method]())
-    filt = BallCoverFilter(dim, construct_method=timed, max_spheres=k, insert_method=None)
+    timed = _TimedCapConstruct(CAP_CONSTRUCT_METHODS[method]())
+    filt = CapCoverFilter(dim, construct_method=timed, max_caps=k, insert_method=None)
     start = time.perf_counter()
     filt.construct(construct)
     construct_s = time.perf_counter() - start
 
-    centers = np.ascontiguousarray(filt.all_centers, dtype=np.float32)
-    radii = filt.all_radiuses
+    angles = filt.all_angles
     start = time.perf_counter()
-    vol_low, vol_high = _tau_volume_bounds_log10(centers, radii, tau)
+    vol_high = _cap_log10_volume(filt, tau)
     volume_s = time.perf_counter() - start
 
     predicted = np.asarray(filt.query(queries, distance_threshold=tau), dtype=bool)
@@ -935,12 +832,12 @@ def construct_method_worker(
 
     row = {
         "dataset": dataset, "fold": seed, "method": method,
-        "k_fraction": float(k_fraction), "k": k, "n_balls": len(radii), "n_reference": n,
+        "k_fraction": float(k_fraction), "k": k, "n_caps": len(angles), "n_reference": n,
         "tau": tau,
-        "log10_vol_low": vol_low, "log10_vol_high": vol_high,
-        "log10_j_tau": _log10_J(radii, dim, tau=tau),
-        "r_mean": float(radii.mean()), "r_med": float(np.median(radii)),
-        "r_max": float(radii.max()),
+        "log10_vol_low": float('nan'), "log10_vol_high": vol_high,
+        "log10_j_tau": vol_high,
+        "psi_mean": float(angles.mean()), "psi_med": float(np.median(angles)),
+        "psi_max": float(angles.max()),
         "fpr": fp / (fp + tn) if fp + tn else 0.0,
         "fnr": fn / (fn + tp) if fn + tp else 0.0,
         "tp": tp, "fp": fp, "fn": fn, "tn": tn,
@@ -959,21 +856,25 @@ def construct_method_scale_worker(dim: int, dataset: str, n: int, method: str, k
     blocklist workload's size. Raises on a coverage violation, as
     construct_method_worker does on a false negative."""
     X = np.ascontiguousarray(VectorSource(dataset, 0, n).to_array(), dtype=np.float32)
-    filt = BallCoverFilter(dim, max_spheres=k, insert_method=None)
+    filt = CapCoverFilter(dim, max_caps=k, insert_method=None)
     start = time.perf_counter()
-    centers, radii = CONSTRUCT_METHODS[method]().construct_filter(filt, X)
+    directions, angles = CAP_CONSTRUCT_METHODS[method]().construct_filter(filt, X)
     seconds = time.perf_counter() - start
 
-    # Signed distance to the 16 nearest balls, which include the one each
-    # vector was assigned to -- the same test test_ball_cover_construction
-    # applies, at the filter's own coverage epsilon.
-    index = faiss.IndexFlatL2(dim)
-    index.add(np.ascontiguousarray(centers, dtype=np.float32))
-    d2, labels = index.search(X, min(16, len(centers)))
-    worst = float((np.sqrt(np.maximum(d2, 0.0)) - radii[labels]).min(axis=1).max())
-    row = {"dataset": dataset, "n": len(X), "method": method, "k": k, "n_balls": len(radii),
-           "method_s": seconds, "r_max": float(radii.max()), "r_mean": float(radii.mean()),
-           "worst_uncovered": worst, "covered": worst <= BallCoverFilter._COVERAGE_EPSILON}
+    # Angle from each vector to its 16 nearest cap directions (which include
+    # the one it was assigned to), minus that cap's stored angle -- the
+    # angle-cover analogue of construct_method_worker's radius-containment
+    # check, at the filter's own coverage epsilon.
+    directions = unit_rows(np.ascontiguousarray(directions, dtype=np.float64))
+    index = faiss.IndexFlatIP(dim)
+    index.add(directions.astype(np.float32))
+    X_unit = unit_rows(X.astype(np.float64))
+    sims, labels = index.search(X_unit.astype(np.float32), min(16, len(directions)))
+    actual_angle = np.arccos(np.clip(sims, -1.0, 1.0).astype(np.float64))
+    worst = float((actual_angle - angles[labels]).min(axis=1).max())
+    row = {"dataset": dataset, "n": len(X), "method": method, "k": k, "n_caps": len(angles),
+           "method_s": seconds, "psi_max": float(angles.max()), "psi_mean": float(angles.mean()),
+           "worst_uncovered": worst, "covered": worst <= CapCoverFilter._COVERAGE_EPSILON}
     if not row["covered"]:
         raise ValueError(f"Coverage violation at scale: {row}")
     return row
@@ -996,7 +897,9 @@ def system_tau_ground_truth_worker(
     return np.sqrt(np.clip(nn_sq_dist[:, 0], 0, None)).astype(np.float32)
 
 
-def system_tau_worker(
+
+
+def cap_cover_system_tau_worker(
     dim: int,
     dataset: str,
     k: int,
@@ -1006,19 +909,12 @@ def system_tau_worker(
     vectors_query: VectorInput,
     actual_results_by_tau: Dict[float, List[bool]],
 ) -> List[Dict[str, Any]]:
-    """Builds one BallCoverFilter cover (fixed k) plus a flat L2 index over
-    the same construct set, then sweeps the query-time threshold tau over
-    that single construction, measuring filtered vs. unfiltered
-    throughput/index-access/FPR/FNR at each tau. Queries are issued one at a
-    time on both arms, reflecting a realistic online setting where the
-    filtered path only falls through to index.search() on a possible match.
-    redundancy_rate is the measured (not nominal) duplicate fraction.
-
-    Also reports log10_vol_low/log10_vol_high: overlap-aware lower/upper
-    bounds on the volume covered by the tau-expanded cover, from the same
-    estimator BallCoverFilter.construct() uses for its own volume bounds
-    (see _tau_volume_bounds_log10) -- a tighter picture than log10_j_tau's
-    naive sum-of-ball-volumes, which double-counts overlapping regions."""
+    """CapCoverFilter's analogue of system_tau_worker: one CapCoverFilter.auto()
+    cover (_cap_cover's equal-byte budget for k balls) plus a flat L2 index
+    over the same construct set, queried one at a time at every tau in
+    tau_values without ever rebuilding -- the realistic online setting a
+    byte-budgeted membership filter sits in front of a flat index in.
+    Reports n_caps for the cover's size."""
     construct_arr = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
     query_arr = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
     n_q = len(query_arr)
@@ -1031,10 +927,9 @@ def system_tau_worker(
     index = faiss.IndexFlatL2(dim)
     index.add(construct_arr)
 
-    filt = _ball_cover(dim, k)
+    filt = _cap_cover(dim, k)
     filt.construct(construct_arr)
-    radii = filt.all_radiuses
-    centers = filt.all_centers
+    n_caps = len(filt.all_caps)
 
     rows: List[Dict[str, Any]] = []
     for t in tau_values:
@@ -1043,7 +938,7 @@ def system_tau_worker(
 
         start = time.perf_counter()
         for i in range(n_q):
-            index.search(query_arr[i:i + 1], 1)
+            index.range_search(query_arr[i:i + 1], t * t)
         time_without = time.perf_counter() - start
 
         predicted = np.empty(n_q, dtype=bool)
@@ -1053,14 +948,13 @@ def system_tau_worker(
             hit = filt.query(v, distance_threshold=t)[0]
             predicted[i] = hit
             if hit:
-                index.search(v, 1)
+                index.range_search(v, t * t)
         time_with = time.perf_counter() - start
 
         n_index_accesses = int(predicted.sum())
         rates = _confusion_rates(predicted.tolist(), actual)
         throughput_without = n_q / max(time_without, 1e-9)
         throughput_with = n_q / max(time_with, 1e-9)
-        vol_log10_low, vol_log10_high = _tau_volume_bounds_log10(centers, radii, t)
 
         rows.append({
             "dataset": dataset, "k": k, "tau": t, "seed": seed,
@@ -1071,11 +965,7 @@ def system_tau_worker(
             "n_queries": n_q,
             "positive_rate_pct": n_index_accesses / max(n_q, 1) * 100.0,
             "fpr": rates["fpr"], "fnr": rates["fnr"],
-            "j_tau": _J_tau(radii, dim, tau=t),
-            "log10_j_tau": _log10_J(radii, dim, tau=t),
-            "log10_vol_low": vol_log10_low,
-            "log10_vol_high": vol_log10_high,
-            "n_balls": len(radii),
+            "n_caps": n_caps,
         })
     return rows
 
@@ -1096,7 +986,7 @@ def _blocklist_cover_rows(
     volume_bounds: bool,
 ) -> List[Dict[str, Any]]:
     """Shared core of blocklist_tau_worker and budget_worker: build a
-    BallCoverFilter per k in k_fractions and emit one sweep="tau" row per
+    CapCoverFilter per k in k_fractions and emit one sweep="tau" row per
     (k, tau) pair. Both callers read only these rows -- see each one's own
     docstring for which axis it treats as fixed and which it sweeps.
 
@@ -1106,7 +996,8 @@ def _blocklist_cover_rows(
     query is positive iff its exact distance to the reference set is <= tau,
     recomputed per tau, so these rows mean what quantization_worker's and
     equal_memory_worker's do. Predictions use the filter's own acceptance rule
-    (BallCoverFilter.surface_distance), so a row says what query() would.
+    (CapCoverFilter.surface_angle, thresholded at 2*arcsin(tau'/2) -- search
+    once, threshold per tau), so a row says what query() would.
 
     FPR is also split by source (_per_source_rates): withheld-cluster
     negatives test whether the cover localizes to B's clusters rather than to
@@ -1115,13 +1006,12 @@ def _blocklist_cover_rows(
     they sit inside their own cluster's ball. A pooled FPR alone would be
     dominated by whichever source is larger.
 
-    volume_bounds adds the overlap-aware log10_vol_low/log10_vol_high columns
-    (_tau_volume_bounds_log10). Off by default because that bound is ~O(k^2)
-    -- ~160s at k=9665 -- and blocklist_tau_worker sweeps a whole tau grid per
-    k, which multiplies that cost by the length of the grid and dominates the
-    run. budget_worker passes a single tau, so it pays it once per k and turns
-    this on; see the log10_j_tau comment below for the cheap sum-of-volumes
-    proxy that is always reported.
+    volume_bounds adds the log10_vol_high column (_cap_log10_volume). Off by
+    default to match blocklist_tau_worker/budget_worker's existing cost
+    tradeoff (a whole tau grid per k vs. a single tau per k), even though
+    caps have no overlap-aware union bound to make expensive in the first
+    place (see _cap_log10_volume's docstring) -- log10_vol_low stays NaN
+    always, there being no cap counterpart of that lower bound.
     """
     B = np.ascontiguousarray(_to_construct_array(vectors_reference), dtype=np.float32)
     by_source = [np.ascontiguousarray(_to_construct_array(v), dtype=np.float32)
@@ -1150,42 +1040,52 @@ def _blocklist_cover_rows(
 
     for kf in k_fractions:
         k = min(max(1, round(kf * len(B))), len(B))
-        filt = _ball_cover(dim, k)
+        filt = _cap_cover(dim, k)
         filt.construct(B)
-        radii = filt.all_radiuses
-        centers = np.ascontiguousarray(filt.all_centers, dtype=np.float32)
+        angles = filt.all_angles
 
         # Searched once per cover and thresholded per tau; query() applies the
         # same comparison, so these are exactly its predictions. Chunked: the
-        # search scores every ball, and all 20K queries against 16K balls at
+        # search scores every cap, and all 20K queries against 16K caps at
         # once is ~7 GB per job, too much with a full pool of workers.
         surface = np.concatenate(
-            [filt.surface_distance(Q[i:i + _SURFACE_CHUNK]) for i in range(0, n_queries, _SURFACE_CHUNK)]
+            [filt.surface_angle(Q[i:i + _SURFACE_CHUNK]) for i in range(0, n_queries, _SURFACE_CHUNK)]
         ) if n_queries else np.zeros(0)
-        r_med = float(np.median(radii)) if len(radii) else 0.0
+        psi_med = float(np.median(angles)) if len(angles) else 0.0
 
         for tau in tau_values:
             tau = float(tau)
             # Labels are recomputed per tau (the paper's y(q, tau)), and so
-            # are the geometric objective and the volume bounds, since tau
-            # expands every ball (eff. radius r_i + tau).
+            # are the geometric objective and the volume bound, since tau
+            # expands every cap (eff. angle theta_i + beta(tau)).
             actual = nn <= tau
-            predicted = surface <= tau + BallCoverFilter._COVERAGE_EPSILON
+            tau_prime = tau + CapCoverFilter._COVERAGE_EPSILON + CapCoverFilter._NORM_TOLERANCE
+            predicted = surface <= 2.0 * np.arcsin(np.clip(tau_prime / 2.0, 0.0, 1.0))
             fn = int(np.sum(actual & ~predicted))
             if fn:
                 raise ValueError(
                     f"Zero-false-negative invariant violated: {fn} FN "
-                    f"(dataset={dataset}, fold={seed}, k={len(radii)}, tau={tau})")
+                    f"(dataset={dataset}, fold={seed}, k={len(angles)}, tau={tau})")
             rates = _confusion_rates(predicted.tolist(), actual)
             saved = 100.0 * (1.0 - predicted.mean()) if n_queries else 0.0
 
-            vol_low, vol_high = float('nan'), float('nan')
-            if volume_bounds:
-                vol_low, vol_high = _tau_volume_bounds_log10(centers, radii, tau)
+            # log10_vol is a logsumexp over the caps, i.e. O(k) -- the same
+            # cost class as Ball-Cover's "always reported" log10_j_tau, which
+            # it directly replaces; it sums each cap's measure independently
+            # and double-counts overlap, same caveat as log10_j_tau always
+            # had. Unlike Ball-Cover there is no overlap-aware union bound
+            # for caps to opt into (_cap_log10_volume's docstring), so
+            # volume_bounds here only gates whether this same number is also
+            # exposed as log10_vol_high (preserving that column's "opt-in"
+            # meaning for downstream consumers), not any extra computation.
+            log10_vol = _cap_log10_volume(filt, tau)
+            with np.errstate(over='ignore'):
+                j_tau = 0.0 if log10_vol == float('-inf') else float(10.0 ** log10_vol)
+            log10_vol_high = log10_vol if volume_bounds else float('nan')
 
             rows.append({
                 "dataset": dataset, "seed": seed, "sweep": "tau",
-                "k": len(radii), "n_reference": len(B),
+                "k": len(angles), "n_reference": len(B),
                 # k_fraction is the nominal knob and is identical across
                 # datasets and folds; `compression` is what it realised here,
                 # which is not (|B| differs per dataset and per fold, so k =
@@ -1194,8 +1094,8 @@ def _blocklist_cover_rows(
                 # every fold its own singleton group, which silently drops the
                 # error bars and matches only one dataset when filtering.
                 "k_fraction": float(kf),
-                "compression": len(B) / max(len(radii), 1),
-                "r_med": r_med, "r_max": float(radii.max()) if len(radii) else 0.0,
+                "compression": len(B) / max(len(angles), 1),
+                "psi_med": psi_med, "psi_max": float(angles.max()) if len(angles) else 0.0,
                 "tau": tau,
                 "fpr": rates["fpr"], "fnr": rates["fnr"],
                 # fpr_<source>, n_neg_<source>, n_pos, and neg_share_pct --
@@ -1204,16 +1104,11 @@ def _blocklist_cover_rows(
                 **sizes,
                 "n_queries": n_queries,
                 "accesses_saved_pct": saved,
-                # log10_J is a logsumexp over the balls, i.e. O(k), so it is
-                # always reported -- but it sums each ball's volume
-                # independently and double-counts overlap. The overlap-aware
-                # union bound above is the tighter number, and is opt-in
-                # because it is ~O(k^2) (see volume_bounds in the docstring).
-                "j_tau": _J_tau(radii, dim, tau=tau),
-                "log10_j_tau": _log10_J(radii, dim, tau=tau),
-                "log10_vol_low": vol_low,
-                "log10_vol_high": vol_high,
-                "n_balls": len(radii),
+                "j_tau": j_tau,
+                "log10_j_tau": log10_vol,
+                "log10_vol_low": float('nan'),
+                "log10_vol_high": log10_vol_high,
+                "n_caps": len(angles),
                 "d_heldout_med": d_heldout_med, "d_withheld_med": d_withheld_med,
                 "memory_bytes": filt.get_bytesize(),
             })
@@ -1236,7 +1131,7 @@ def blocklist_tau_worker(
     B's own duplicate clusters, withheld clusters and singletons, labeled by
     distance to B at each tau.
 
-    Ball budget k is fixed (a single k_fraction, not a sweep -- varying it is
+    Cap budget k is fixed (a single k_fraction, not a sweep -- varying it is
     budget_worker's job); tau is swept over tau_values so FPR/accesses saved
     are read as one corpus's response curve at that one budget.
     """
@@ -1260,12 +1155,12 @@ def budget_worker(
 ) -> List[Dict[str, Any]]:
     """The same asymmetric blocklist workload as blocklist_tau_worker
     (main.generate_budget), read along the other axis: tau is fixed at a
-    single value and the ball budget k is swept over k_fractions.
+    single value and the cap budget k is swept over k_fractions.
 
-    Always requests the overlap-aware volume bounds: this is the one
-    blocklist-workload sweep that can afford them (~O(k^2) per row, paid once
-    per budget rather than once per (budget, tau) as blocklist_tau_worker's
-    grid would multiply it out to).
+    Requests log10_vol_high (see _blocklist_cover_rows's volume_bounds):
+    exposed here, where it is paid once per budget, rather than in
+    blocklist_tau_worker, which would otherwise multiply the same O(k)
+    computation out over a whole tau grid.
     """
     return _blocklist_cover_rows(
         dim, dataset, seed, k_fractions, [tau],
@@ -1288,7 +1183,7 @@ def query_performance_worker(
     single-query mode is capped at single_query_limit, batched is uncapped."""
     construct_arr = _to_construct_array(vectors_construct)
 
-    filt = _ball_cover(dim, k)
+    filt = _cap_cover(dim, k)
     filt.construct(construct_arr)
 
     rows: List[Dict[str, Any]] = []
@@ -1335,13 +1230,13 @@ def scaling_query_worker(
     vectors_query: VectorInput,
     n_query_vectors: int = 8192,
 ) -> Dict[str, Any]:
-    """Measures batched-query throughput for a BallCoverFilter at filter
+    """Measures batched-query throughput for a CapCoverFilter at filter
     size k, querying in batches of `batch_size`. Every batch_size times the
     same n_query_vectors, so the panel's lines are directly comparable.
 
     tau_mid is part of the measurement: query() abandons a ball once a
     partial distance passes r + tau, and stops a query at the first ball
-    that accepts it (see BallCoverFilter._kernel_accepts and _scan), so a
+    that accepts it (see CapCoverFilter's scan kernels), so a
     larger tau means more work per ball and earlier exits. Throughput is
     therefore reported at this one threshold, not for every tau."""
     construct_arr = _to_construct_array(vectors_construct)
@@ -1353,7 +1248,7 @@ def scaling_query_worker(
             f"max(n_query_vectors, n_insert_vectors)) or lower n_query_vectors."
         )
 
-    filt = _ball_cover(dim, k)
+    filt = _cap_cover(dim, k)
     filt.construct(construct_arr)
 
     stream = query_arr[:n_query_vectors]
@@ -1391,7 +1286,7 @@ def scaling_insert_worker(
             f"max(n_query_vectors, n_insert_vectors)) or lower n_insert_vectors."
         )
 
-    filt = _ball_cover(dim, k)
+    filt = _cap_cover_insertable(dim, k)
     filt.construct(construct_arr)
 
     stream = insert_arr[:n_insert_vectors]
@@ -1416,12 +1311,12 @@ def scaling_construction_worker(
     seed: int,
     vectors_construct: VectorInput,
 ) -> Dict[str, Any]:
-    """Measures construction throughput for a BallCoverFilter at filter size
+    """Measures construction throughput for a CapCoverFilter at filter size
     k built over n indexed vectors -- swept over a (k, n) grid."""
     construct_arr = _to_construct_array(vectors_construct)[:n]
 
     start = time.perf_counter()
-    filt = _ball_cover(dim, k)
+    filt = _cap_cover(dim, k)
     filt.construct(construct_arr)
     elapsed = time.perf_counter() - start
 
@@ -1468,19 +1363,21 @@ def stream_rebuild_worker(
     """Simulates one rebuild policy over vectors_stream (a blocklist fold's
     reference set B, in arrival order -- see main.generate_streaming),
     reporting query FPR and amortized cost per checkpoint.
-      "streaming": BallCoverFilter.insert() per arrival, never rebuilt.
+      "streaming": CapCoverFilter.insert() per arrival, never rebuilt.
       "periodic": like "streaming", rebuilt from scratch every T arrivals.
       "oracle": rebuilt from scratch at every checkpoint.
     sweep/fold_offset/stream_order are pass-through tag columns only.
 
-    construct_method names a CONSTRUCT_METHODS entry (default: the filter's
-    own, GonzalesConstruct) and is used for every construct() the policy
-    makes: the oracle's rebuilds, and the streaming/periodic bootstrap.
+    construct_method names a CAP_CONSTRUCT_METHODS entry (default: the
+    filter's own, SphereMergeConstruct) and is used for every construct()
+    the policy makes: the oracle's rebuilds, and the streaming/periodic
+    bootstrap. insertion_level sweeps CAP_INSERT_STRATEGIES, which only has
+    2 members (cap_merge/nearest).
 
     Memory is held to one budget for every method: max_memory is the static
-    filter's footprint at k balls, and BallCoverFilter sizes each insert
-    strategy's ball count so that its peak get_bytesize() between insert()
-    calls fits it (see InsertInterface.max_spheres_for_budget).
+    filter's footprint at k caps, and CapCoverFilter sizes each insert
+    strategy's cap count so that its peak get_bytesize() between insert()
+    calls fits it (see InsertInterface.max_caps_for_budget).
     peak_memory_bytes is that peak as measured over the stream so far, next
     to budget_bytes. max_insert_s is the slowest single insert() so far, the
     spike a rebuilding strategy trades for its amortized cost, and
@@ -1518,21 +1415,21 @@ def stream_rebuild_worker(
     missing = [c for c in checkpoint_set if c not in actual_at_checkpoint]
     if missing:
         raise ValueError(f"actual_at_checkpoint has no ground truth for checkpoint(s) {missing}")
-    if construct_method is not None and construct_method not in CONSTRUCT_METHODS:
+    if construct_method is not None and construct_method not in CAP_CONSTRUCT_METHODS:
         raise ValueError(f"Unknown construct_method {construct_method!r}; expected one of "
-                         f"{sorted(CONSTRUCT_METHODS)}")
-    budget_bytes = _ball_cover_max_memory(dim, k)
+                         f"{sorted(CAP_CONSTRUCT_METHODS)}")
+    budget_bytes = _cover_max_memory(dim, k)
 
-    def _new_filter(insert_method: Any = None, **kwargs: Any) -> BallCoverFilter:
+    def _new_filter(insert_method: Any = None, **kwargs: Any) -> CapCoverFilter:
         if construct_method is not None:
-            kwargs["construct_method"] = CONSTRUCT_METHODS[construct_method]()
-        return BallCoverFilter(dim=dim, max_memory=budget_bytes, insert_method=insert_method, **kwargs)
+            kwargs["construct_method"] = CAP_CONSTRUCT_METHODS[construct_method]()
+        return CapCoverFilter(dim=dim, max_memory=budget_bytes, insert_method=insert_method, **kwargs)
 
     peak_memory_bytes = 0
     max_insert_s = 0.0
     insert_time_s = 0.0
 
-    def _checkpoint_row(filt: BallCoverFilter, pos: int, cumulative_time_s: float) -> Dict[str, Any]:
+    def _checkpoint_row(filt: CapCoverFilter, pos: int, cumulative_time_s: float) -> Dict[str, Any]:
         """Measures one checkpoint. Raises rather than recording a false
         negative, like every other FNR check here: every stream vector seen
         so far must still be recalled, and so must every query the ground
@@ -1547,7 +1444,6 @@ def stream_rebuild_worker(
                 f"insertion_level={insertion_level}, k={k}, seed={seed}, position={pos}): "
                 f"stream fnr={1.0 - recalled.mean()}, query fnr={rates['fnr']}"
             )
-        radii = filt.all_radiuses
         n_inserted = pos - bootstrap_n
         streamed = policy != "oracle" and n_inserted > 0
         return {
@@ -1558,8 +1454,8 @@ def stream_rebuild_worker(
             # has arrived, which sit inside their cluster's ball.
             **_per_source_rates(predicted, actual, n_heldout, n_withheld, n_singleton),
             "n_queries": n_q, "n_duplicates": int(actual.sum()),
-            "log10_j_tau": _log10_J(radii, dim, tau=tau),
-            "n_balls": len(radii),
+            "log10_j_tau": _cap_log10_volume(filt, tau),
+            "n_caps": filt._num_caps,
             "memory_bytes": filt.get_bytesize(),
             "peak_memory_bytes": max(peak_memory_bytes, filt.get_bytesize()),
             "budget_bytes": budget_bytes,
@@ -1568,7 +1464,7 @@ def stream_rebuild_worker(
             "insert_time_s": insert_time_s if streamed else float("nan"),
             "amortized_insert_s": insert_time_s / n_inserted if streamed else float("nan"),
             "max_insert_s": max_insert_s if streamed else float("nan"),
-            "construct_method": construct_method or "gonzalez",
+            "construct_method": construct_method or CAP_COVER_CONSTRUCT,
             "stream_order": stream_order,
             "insert_memory_percent": insert_memory_percent,
             "metric": metric, "method": method, "sweep": sweep, "fold_offset": fold_offset,
@@ -1589,13 +1485,13 @@ def stream_rebuild_worker(
     if policy not in ("streaming", "periodic"):
         raise ValueError(f"Unknown policy {policy!r}; expected 'streaming', 'periodic', or 'oracle'")
 
-    if insertion_level not in _INSERT_STRATEGIES:
+    if insertion_level not in CAP_INSERT_STRATEGIES:
         raise ValueError(
             f"Unknown insertion_level {insertion_level!r}; expected one of "
-            f"{sorted(_INSERT_STRATEGIES)}"
+            f"{sorted(CAP_INSERT_STRATEGIES)}"
         )
     rebuild_every = T if (policy == "periodic" and T is not None) else None
-    filt = _new_filter(insert_method=_INSERT_STRATEGIES[insertion_level](),
+    filt = _new_filter(insert_method=CAP_INSERT_STRATEGIES[insertion_level](),
                        insert_memory_percent=insert_memory_percent)
     # Bootstrap with construct() on the same vectors and construct_method for
     # every insertion_level, so every checkpoint from bootstrap_n onward
@@ -1628,14 +1524,14 @@ def stream_rebuild_worker(
 
 
 _WORKER_FNS: Dict[str, Any] = {
-    'system_tau': system_tau_worker,
+    'cap_cover_system_tau': cap_cover_system_tau_worker,
     'blocklist': blocklist_tau_worker,
     # Same underlying cover-and-margin core (_blocklist_cover_rows), second
     # worker: generate_budget runs the identical blocklist measurement but
     # sweeps the ball budget at a fixed tau instead of sweeping tau at a fixed
     # budget (see main.generate_budget).
     'budget': budget_worker,
-    'quantization': quantization_worker,
+    'cap_quantization': cap_quantization_worker,
     'query_performance': query_performance_worker,
     'equal_memory': equal_memory_worker,
     'scaling_query': scaling_query_worker,

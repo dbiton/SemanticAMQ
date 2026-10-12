@@ -279,7 +279,7 @@ def print_summary(df: pd.DataFrame, tau: float) -> None:
     sel = df[df["sweep"] == SWEEP_TAU]
     print(f"\n--- Ball-budget sweep (tau fixed at {tau:g}) ---")
     cols = ("fpr", "fpr_heldout", "fpr_withheld", "fpr_singleton", "accesses_saved_pct",
-            "neg_share_pct", "r_med", "log10_j_tau", "log10_vol_low", "log10_vol_high")
+            "neg_share_pct", "psi_med", "log10_j_tau", "log10_vol_low", "log10_vol_high")
     aggs = {c: mean_std(sel, ["dataset", "k_fraction"], c) for c in cols}
     for dataset in BLOCKLIST_DATASETS:
         sub = sel[sel["dataset"] == dataset]
@@ -294,7 +294,7 @@ def print_summary(df: pd.DataFrame, tau: float) -> None:
             def _m(c):
                 row = aggs[c][(aggs[c]["dataset"] == dataset) & (aggs[c]["k_fraction"] == kf)]
                 return float(row["mean"].iloc[0]) if len(row) else float("nan")
-            print(f"  k={100.0*kf:>5.1f}%  r_med={_m('r_med'):.3f} FPR={_m('fpr'):.3f} "
+            print(f"  k={100.0*kf:>5.1f}%  psi_med={_m('psi_med'):.3f} FPR={_m('fpr'):.3f} "
                   f"FPR_heldout={_m('fpr_heldout'):.3f} FPR_withheld={_m('fpr_withheld'):.3f} "
                   f"FPR_singleton={_m('fpr_singleton'):.3f} "
                   f"saved={_m('accesses_saved_pct'):5.1f}% log10_J={_m('log10_j_tau'):.2f} "
