@@ -12,7 +12,6 @@ for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "
 import faiss
 import h5py
 import time
-import inspect
 import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
@@ -20,15 +19,13 @@ from scipy.sparse import csr_matrix
 faiss.omp_set_num_threads(1)  # belt-and-suspenders alongside the env vars above
 
 from logging_config import configure_logging
-from runner import (Runner, QUANTIZATION_SWEEP, QUERY_SOURCES,
+from runner import (Runner, QUERY_SOURCES,
                     CAP_QUANTIZATION_SWEEP, CAP_CONSTRUCT_METHODS, CAP_COVER_CONSTRUCT,
                     system_tau_ground_truth_worker)
-from plots.plot_quantization import generate_quantization_figures
 from plots.plot_query_performance import generate_query_performance_figures
 from plots.plot_equal_memory import generate_equal_memory_figures
 from plots.plot_scaling import generate_scaling_figures
 from plots.plot_streaming import generate_streaming_figures
-from plots.plot_system_tau import generate_system_tau_figures
 from plots.plot_blocklist import generate_blocklist_figures
 from plots.plot_budget import generate_budget_figures
 from plots.plot_construct_methods import generate_construct_methods_figures, load_results as load_construct_methods
@@ -51,11 +48,11 @@ from vector_source import VectorSource
 configure_logging()
 logger = logging.getLogger(__name__)
 
-MAX_WORKERS = 64
+MAX_WORKERS = 16
 DATASET = 'ELI5'
 
 # Vectors/dataset, split 80% construction / 20% queries. One knob for every
-# evaluation: the ground-truth FPR/FNR ones (system_tau, quantization,
+# evaluation: the ground-truth FPR/FNR ones (cap_cover_system_tau, cap_quantization,
 # equal_memory, streaming, blocklist) and the throughput-only sweeps (scaling,
 # query_performance), which used to read a separate STREAM_SIZE.
 #
@@ -63,9 +60,9 @@ DATASET = 'ELI5'
 # reference set must come from duplicate clusters: CC-News holds only 31,696
 # usable vectors in clusters of >=3 at eps=0.4, so anything above ~36,018
 # drops that corpus and silently reduces the comparison to two. 2^15 leaves
-# ~10% headroom there; system_tau's non-wrapping folds need 1.8N = 58,982 rows
+# ~10% headroom there; cap_cover_system_tau's non-wrapping folds need 1.8N = 58,982 rows
 # per dataset, which its shortest (HotpotQA, 97,852) clears comfortably.
-WORKLOAD_NUM_VECTORS = 100_000
+WORKLOAD_NUM_VECTORS = 10_000
 
 # generate_blocklist() knobs. Cluster discovery scans the whole file on disk.
 # Multiplicity is a property of the pool, not of the corpus, so a partial pool
@@ -75,11 +72,11 @@ WORKLOAD_NUM_VECTORS = 100_000
 BLOCKLIST_POOL_SIZE = None  # None = use every row on disk (cluster DISCOVERY only)
 BLOCKLIST_FOLDS = 5
 # The blocklist's query/reference split of WORKLOAD_NUM_VECTORS, mirroring
-# generate_system_tau: one total size, cut into a q query part and a (1-q)
+# generate_cap_cover_system_tau: one total size, cut into a q query part and a (1-q)
 # reference part, with k = k_fraction * |B|. The blocklist deliberately has no
 # size knob of its own -- WORKLOAD_NUM_VECTORS is already the single number
 # that sizes every evaluation, so the two knobs that matter (total size,
-# k_fraction) mean the same thing here as in system_tau:
+# k_fraction) mean the same thing here as in cap_cover_system_tau:
 #
 #     stream (queries) = q * N          |B| (reference) = (1 - q) * N
 #
@@ -107,35 +104,18 @@ BLOCKLIST_MIN_CLUSTER = 3
 
 # Cluster labels are a pure function of (dataset, pool size, eps, and the
 # config), so they are computed once and cached here rather than recomputed
-# every run -- the same pattern generate_system_tau uses for its ground truth.
+# every run -- the same pattern generate_cap_cover_system_tau uses for its ground truth.
 BLOCKLIST_CLUSTER_DIR = "results/blocklist_clusters"
 
 # Registry name -> canonical dataset key, one source of truth via plot_common.
 DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
 
-# Output CSV path per evaluation, shared by each generate_*'s
-# runner.submit(output_csv=...), each save_*'s df, and plot_all()'s reload.
-SYSTEM_TAU_CSV = "results/system_tau.csv"
-# generate_quantization runs once per blocklist corpus and keeps each run in
-# its own folder. Separate rather than one combined file because
-# plot_quantization asserts a single dataset: its panels already spend both
-# dimensions on memory and quantizer, leaving nowhere to put a dataset.
-QUANTIZATION_DIR = "results/quantization"
-QUANTIZATION_PLOT_DIR = "plots/quantization"
 # generate_cap_quantization's analogue, parallel to generate_quantization
 # rather than replacing it in place -- the two sweep structurally different
 # encodings (see CAP_QUANTIZATION_SWEEP), so keeping both lets either be
 # re-run/compared independently.
 CAP_QUANTIZATION_DIR = "results/cap_quantization"
 CAP_QUANTIZATION_PLOT_DIR = "plots/cap_quantization"
-
-
-def quantization_csv(dataset: str) -> str:
-    return os.path.join(QUANTIZATION_DIR, dataset, "quantization.csv")
-
-
-def quantization_plot_dir(dataset: str) -> str:
-    return os.path.join(QUANTIZATION_PLOT_DIR, dataset)
 
 
 def cap_quantization_csv(dataset: str) -> str:
@@ -146,7 +126,7 @@ def cap_quantization_plot_dir(dataset: str) -> str:
     return os.path.join(CAP_QUANTIZATION_PLOT_DIR, dataset)
 
 # generate_scaling runs once per blocklist corpus and keeps each run in its
-# own folder, mirroring quantization_csv/QUANTIZATION_DIR above: throughput
+# own folder, mirroring cap_quantization_csv/CAP_QUANTIZATION_DIR above: throughput
 # is pooled across corpora for plotting, but keeping each corpus's raw rows
 # apart on disk makes a single corpus's run inspectable/rerunnable on its own.
 SCALING_DIR = "results/scaling"
@@ -165,7 +145,7 @@ def scaling_construction_csv(dataset: str) -> str:
 
 
 # generate_equal_memory runs once per blocklist corpus and keeps each run in
-# its own folder, mirroring quantization_csv/QUANTIZATION_DIR above. Plotted
+# its own folder, mirroring cap_quantization_csv/CAP_QUANTIZATION_DIR above. Plotted
 # the same way too (see plot_equal_memory): one figure set per corpus, in its
 # own folder, rather than pooled into a single cross-corpus line per filter.
 EQUAL_MEMORY_DIR = "results/equal_memory"
@@ -181,7 +161,7 @@ def equal_memory_plot_dir(dataset: str) -> str:
 
 
 # generate_streaming runs once per blocklist corpus and keeps each run in its
-# own folder, mirroring quantization_csv/QUANTIZATION_DIR above; plot_streaming
+# own folder, mirroring cap_quantization_csv/CAP_QUANTIZATION_DIR above; plot_streaming
 # pools every dataset's rows the same way plot_scaling does (see its
 # docstring: "this figure is single-dataset" refers to color channel reuse
 # for method, not to a restriction on how many datasets feed it).
@@ -194,10 +174,8 @@ def streaming_csv(dataset: str) -> str:
 # generate_equal_memory()'s own comparison set: excludes DSBFFilter/
 # CoveringLSHFallbackFilter/LSBFFilter, which degenerate to ~100% duplicate
 # predictions at realistic construct-set sizes (still used elsewhere).
-# BallCoverFilter is submitted separately, once per quantize variant (see
-# generate_equal_memory's ball_cover_quantizations), rather than listed here
-# as a single entry -- unlike every other filter here, it has a `quantize`
-# dial worth comparing multiple settings of side by side.
+# CapCoverFilter is submitted separately (see generate_equal_memory), not
+# listed here.
 equal_memory_filters = [
     HNSWFilter, IVFFilter, DSHFilter, QuantizedVectorFilter, MLPFilter,
     PacukLSHFilter, SankowskiWygockiFilter, VAPlusFilter, IVFRadiiFilter,
@@ -359,7 +337,7 @@ def generate_equal_memory(runner: Runner) -> None:
 
     Only submits 'equal_memory' jobs -- does not run `runner`. Each corpus
     writes its own results/equal_memory/<dataset>/equal_memory.csv (see
-    equal_memory_csv()), mirroring quantization_csv/QUANTIZATION_DIR."""
+    equal_memory_csv()), mirroring cap_quantization_csv/CAP_QUANTIZATION_DIR."""
     num_vectors            = WORKLOAD_NUM_VECTORS
     dim                    = 384
     n_folds                = 5
@@ -437,9 +415,8 @@ def generate_equal_memory(runner: Runner) -> None:
                         dataset=workload.name,
                     )
                 # CapCoverFilter.auto() already chooses its own best encoding
-                # for a budget internally, so (unlike BallCoverFilter's
-                # Quantize) there is no second axis to sweep here -- one
-                # submission per budget, labelled plainly "CapCoverFilter" by
+                # for a budget internally, so there is no second axis to
+                # sweep here -- one submission per budget, labelled plainly "CapCoverFilter" by
                 # equal_memory_worker's Config naming (no quantize in
                 # extra_kwargs).
                 runner.submit(
@@ -478,143 +455,27 @@ def plot_equal_memory(results: list) -> None:
         generate_equal_memory_figures(df=df[df["Dataset"] == dataset], outdir=outdir)
 
 
-def generate_system_tau(runner: Runner) -> None:
-    """End-to-end filtering benefit (paper Section 5.2, Figure 2): one
-    BallCoverFilter cover per (dataset, fold), queried at every tau in a
-    fixed sweep without ever rebuilding. Ball budget k is a fixed fraction
-    (k_fraction, 5%) of each fold's construct-set size rather than the
-    paper's fixed k=400.
-
-    Implements the paper's Workloads protocol (Section 5.1): 5 datasets x
-    k_folds=5 non-wrapping folds via advancing_fold_starts (80%
-    construct/20% query per fold); each dataset needs enough vectors on
-    disk for that or it raises. plot_system_tau reports the mean +/- std
-    over the 5 folds, matching the paper's "5 runs" error bars.
-
-    Ground truth (nearest-construct-set distance per query) doesn't depend
-    on k, so it's computed once per (dataset, fold) in parallel and cached
-    to results/system_tau_ground_truth/, not redone per (dataset, fold, k).
-
-    Only submits 'system_tau' jobs (output_csv=SYSTEM_TAU_CSV) -- does not
-    run `runner`. The ground-truth precomputation above still runs eagerly,
-    in its own dedicated ProcessPoolExecutor."""
-    num_vectors      = WORKLOAD_NUM_VECTORS
-    dim              = 384
-    k_folds          = 5
-    k_fraction       = 0.1
-    tau_values       = [float(t) for t in np.logspace(-2, -0.5, num=10)]
-    ground_truth_dir = "results/system_tau_ground_truth"
-
-    datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
-    missing = [d for d in DATASET_KEYS if d not in datasets]
-    if missing:
-        logger.warning(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
-    if set(datasets) != set(DATASET_KEYS):
-        raise RuntimeError(
-            f"generate_system_tau needs all {len(DATASET_KEYS)} datasets "
-            f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
-        )
-
-    logger.info(f"Ball budget fixed as a fraction of the construct set: {k_fraction}")
-    logger.info(f"Fixed tau sweep (shared across datasets): {tau_values}")
-    logger.info(f"K-fold cross-validation: {k_folds} folds, non-wrapping contiguous 80/20 spans")
-
-    query_len = num_vectors // k_folds
-    construct_len = num_vectors - query_len
-
-    # (dataset, fold, construct_source, query_source), reused by both passes
-    # below -- lazy VectorSource pointers, no array materialized here.
-    splits = []
-    for dataset in datasets:
-        total_rows = len(VectorSource(dataset))
-        fold_starts = advancing_fold_starts(total_rows, k_folds, query_len, num_vectors)
-        for fold, fold_start in enumerate(fold_starts):
-            query_start, query_end = fold_start, fold_start + query_len
-            construct_start, construct_end = query_end, query_end + construct_len
-            construct_source = VectorSource(dataset, construct_start, construct_end)
-            query_source = VectorSource(dataset, query_start, query_end)
-            splits.append((dataset, fold, construct_source, query_source))
-
-    # Ground truth (nearest-construct-set distance per query vector): load
-    # whatever's already cached on disk, compute the rest in parallel.
-    os.makedirs(ground_truth_dir, exist_ok=True)
-    nn_dist_by_split = {}
-    to_compute = []
-    for dataset, fold, construct_source, query_source in splits:
-        cache_path = os.path.join(ground_truth_dir, f"{dataset}_{num_vectors}_{k_folds}fold_{fold}.npy")
-        if os.path.exists(cache_path):
-            nn_dist_by_split[(dataset, fold)] = np.load(cache_path)
-        else:
-            to_compute.append((dataset, fold, cache_path, construct_source, query_source))
-
-    if to_compute:
-        logger.info(f"Computing ground truth for {len(to_compute)} (dataset, fold) pair(s) not yet cached...")
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(system_tau_ground_truth_worker, dim, cs, qs): (dataset, fold, cache_path)
-                for dataset, fold, cache_path, cs, qs in to_compute
-            }
-            for future in as_completed(futures):
-                dataset, fold, cache_path = futures[future]
-                nn_dist = future.result()
-                np.save(cache_path, nn_dist)
-                nn_dist_by_split[(dataset, fold)] = nn_dist
-    else:
-        logger.info("All ground truth already cached on disk; skipping recomputation.")
-
-    for dataset, fold, construct_source, query_source in splits:
-        nn_dist = nn_dist_by_split[(dataset, fold)]
-        actual_results_by_tau = {t: (nn_dist <= t).tolist() for t in tau_values}
-
-        k = min(max(1, round(k_fraction * construct_len)), construct_len - 1)
-
-        runner.submit(
-            'system_tau',
-            output_csv=SYSTEM_TAU_CSV,
-            dim=dim, dataset=DATASET_KEYS[dataset],
-            k=k, tau_values=tau_values, seed=fold,
-            vectors_construct=construct_source,
-            vectors_query=query_source,
-            actual_results_by_tau=actual_results_by_tau,
-            )
-
-
-def save_system_tau(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
-    """Extracts this evaluation's rows from a shared Runner's combined
-    run() output (see generate_system_tau()). The Runner itself already
-    wrote results/system_tau.csv incrementally (see generate_system_tau()'s
-    output_csv=), so this only rebuilds the DataFrame for plot_system_tau()."""
-    return pd.DataFrame(rows_for_mode(job_results, 'system_tau'))
-
-
-def plot_system_tau(df: pd.DataFrame) -> None:
-    generate_system_tau_figures(df)
-
-
-# CapCoverFilter's analogue of SYSTEM_TAU_CSV (see generate_cap_cover_system_tau).
+# Output of generate_cap_cover_system_tau.
 CAP_COVER_SYSTEM_TAU_CSV = "results/cap_cover_system_tau.csv"
 
 
 def generate_cap_cover_system_tau(runner: Runner, num_vectors: int = WORKLOAD_NUM_VECTORS,
                                   k_folds: int = 5, k_fraction: float = 0.1,
                                   tau_values: Optional[List[float]] = None) -> None:
-    """CapCoverFilter's end-to-end filtering benefit: the same protocol as
-    generate_system_tau (k_folds non-wrapping 80/20 folds per dataset, one
-    cover per (dataset, fold) queried one at a time at every tau in
-    tau_values without ever rebuilding), but with a CapCoverFilter.auto()
-    cover (runner._cap_cover) in front of the flat index instead of
-    BallCoverFilter. Cap budget k is the same Ball-Cover-TQ4-equal-byte
-    fraction of each fold's construct-set size.
+    """CapCoverFilter's end-to-end filtering benefit: k_folds non-wrapping
+    80/20 folds per dataset, one CapCoverFilter.auto() cover
+    (runner._cap_cover) per (dataset, fold) in front of a flat index,
+    queried one at a time at every tau in tau_values without ever
+    rebuilding. Cap budget k is a fixed fraction of each fold's
+    construct-set size, converted to bytes by runner._cover_max_memory.
 
     Ground truth (nearest-construct-set distance per query) is keyed only by
     (dataset, num_vectors, k_folds, fold), not by which filter queries it, so
-    this reuses generate_system_tau's cache (results/system_tau_ground_truth)
-    rather than recomputing it.
+    it is cached in results/system_tau_ground_truth and reused across runs.
 
     Only submits 'cap_cover_system_tau' jobs (output_csv=CAP_COVER_SYSTEM_TAU_CSV)
-    -- does not run `runner`. num_vectors/k_folds/k_fraction/tau_values default
-    to generate_system_tau's own, but take explicit arguments (unlike
-    generate_system_tau) so a smaller local validation run doesn't have to
+    -- does not run `runner`. num_vectors/k_folds/k_fraction/tau_values take explicit
+    arguments so a smaller local validation run doesn't have to
     monkeypatch module globals -- see CLAUDE.md on sizing local runs."""
     dim              = 384
     tau_values       = [float(t) for t in np.logspace(-2, -0.5, num=10)] if tau_values is None else tau_values
@@ -1219,7 +1080,7 @@ def generate_blocklist(runner: Runner) -> None:
     Those sources decide what is queried, not the answer: every query is
     labeled by its distance to B at each tau (runner._blocklist_cover_rows).
 
-    This is the workload the symmetric sweep (generate_system_tau) cannot
+    This is the workload the symmetric sweep (generate_cap_cover_system_tau) cannot
     measure. There, B is 80% of the same corpus the queries come from, so B is
     as diffuse as the query stream, d(query -> B) is just the ambient distance
     (~1.38 for these unit-normalised 384-d embeddings) and r + tau exceeds it
@@ -1345,111 +1206,10 @@ def plot_budget(df: pd.DataFrame) -> None:
     generate_budget_figures(df)
 
 
-def generate_quantization(runner: Runner) -> None:
-    """Per-quantizer construction data for BallCoverFilter
-    (QUANTIZATION_SWEEP), on the same construction and query sets as
-    generate_blocklist.
-
-    Every candidate shares one memory budget per k (derived from the
-    unquantized cover's byte-per-ball size), so a more compact quantizer packs
-    more balls into the same budget and plot_quantization.py can use recorded
-    memory usage as its x-axis.
-
-    Reuses build_blocklist_workload rather than cutting its own contiguous
-    spans, so the only difference between this sweep and the blocklist one is
-    the variable being swept: the quantizer here, the ball budget there. tau is
-    a single fixed absolute value, the same one generate_budget and
-    generate_equal_memory use, so both evaluations sit at a comparable
-    operating point. Ground truth is distance to the reference set at tau, as
-    everywhere.
-
-    Also passes the source sizes (BlocklistWorkload.source_sizes) so
-    quantization_worker can split fpr by query source the same way
-    blocklist_tau_worker/budget_worker do.
-
-    Runs once per blocklist corpus, each into its own
-    results/quantization/<dataset>/ folder and its own figure folder.
-    Kept apart rather than pooled because plot_quantization asserts a single
-    dataset -- its panels put memory on the x-axis and one line per quantizer,
-    leaving no room for a dataset dimension.
-
-    Only submits 'quantization' jobs -- does not run `runner`."""
-    num_vectors      = WORKLOAD_NUM_VECTORS
-    dim              = 384
-    n_folds          = BLOCKLIST_FOLDS
-    # Absolute filter sizes, same 2^11..2^16 ladder generate_scaling uses --
-    # no cross-corpus pooling constraint forces these to be shared (each
-    # corpus gets its own figure set here), but the same fixed ladder keeps
-    # "k" meaning the same absolute ball count across every evaluation that
-    # reports it.
-    k_values_nominal = [2 ** i for i in range(11, 17)]
-    tau              = 0.1
-
-    workloads = blocklist_workloads(num_vectors, n_folds=n_folds)
-    if not workloads:
-        raise RuntimeError(
-            "generate_quantization: no usable workload for any corpus (see the errors "
-            "above -- most likely WORKLOAD_NUM_VECTORS is too large for their "
-            "duplicate clusters)")
-
-    for workload in workloads:
-        reference_len = len(workload.selections[0]["reference"])
-        k_values = [k for k in k_values_nominal if k < reference_len]
-        if not k_values:
-            raise RuntimeError(
-                f"No k in {k_values_nominal} is below the reference set of "
-                f"{workload.name} ({reference_len} vectors). Raise "
-                "WORKLOAD_NUM_VECTORS or lower k_values_nominal.")
-
-        logger.info(f"{workload.name}: k_values={k_values} (|B|={reference_len}), tau={tau:.4f}")
-
-        output_csv = quantization_csv(workload.name)
-        os.makedirs(os.path.dirname(output_csv), exist_ok=True)
-        for fold, sel in enumerate(workload.selections):
-            vectors_construct = workload.rows(sel["reference"])
-            vectors_query = workload.query_vectors(sel)
-            actual_results = compute_static_actual_results(
-                vectors_construct, vectors_query, tau)
-            for k in k_values:
-                for quantize in QUANTIZATION_SWEEP:
-                    runner.submit(
-                        'quantization',
-                        output_csv=output_csv,
-                        dim=dim, dataset=workload.name,
-                        k=k, quantize=quantize, tau=tau, seed=fold,
-                        vectors_construct=vectors_construct, vectors_query=vectors_query,
-                        actual_results=actual_results,
-                        **workload.source_sizes(sel),
-                    )
-
-
-def save_quantization(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
-    """Extracts this evaluation rows from a shared Runner combined run()
-    output (see generate_quantization()). The Runner already wrote one
-    results/quantization/<dataset>/quantization.csv per corpus, so this only
-    rebuilds the combined DataFrame; plot_quantization splits it again."""
-    return pd.DataFrame(rows_for_mode(job_results, 'quantization'))
-
-
-def plot_quantization(df: pd.DataFrame) -> None:
-    """One figure set per corpus, each in its own folder.
-
-    Split here rather than handed over whole because
-    generate_quantization_figures asserts a single dataset, and its panels
-    leave no room for a dataset dimension (see generate_quantization)."""
-    for dataset in sorted(df["dataset"].unique()):
-        outdir = quantization_plot_dir(str(dataset))
-        logger.info(f"Plotting quantization for {dataset} -> {outdir}")
-        generate_quantization_figures(df[df["dataset"] == dataset], outdir=outdir)
-
-
 def generate_cap_quantization(runner: Runner) -> None:
-    """generate_quantization's cap-cover analogue: CapCoverFilter.auto() per
+    """CapCoverFilter.auto() per
     (dataset, k, seed, quantize) over CAP_QUANTIZATION_SWEEP (AUTO_CANDIDATES
-    + DENSE10_LADDER) instead of BallCoverFilter's QUANTIZATION_SWEEP --
-    see runner.cap_quantization_worker's docstring for why this is a
-    parallel sweep rather than an in-place substitution (the two enums have
-    no 1:1 mapping). Otherwise identical in structure: same k ladder, same
+    + DENSE10_LADDER). Same k ladder, same
     fixed tau, same blocklist workloads/source-size split.
 
     Only submits 'cap_quantization' jobs -- does not run `runner`."""
@@ -1511,7 +1271,7 @@ def plot_cap_quantization(df: pd.DataFrame) -> None:
 
 def generate_query_performance() -> pd.DataFrame:
     """Measures single-query vs. batched-query latency/throughput of a
-    BallCoverFilter cover as a function of filter size k, across every
+    CapCoverFilter cover as a function of filter size k, across every
     dataset in DATASET_KEYS. One job per (dataset, k, seed), written to
     results/query_performance.csv."""
     num_vectors           = WORKLOAD_NUM_VECTORS
@@ -1533,8 +1293,7 @@ def generate_query_performance() -> pd.DataFrame:
             f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
         )
 
-    # k >= a dataset's construct-set size makes BallCoverFilter fall back to
-    # one zero-radius ball per point, so clamp the sweep like generate_quantization() does.
+    # k must stay below a dataset's construct-set size, so clamp the sweep.
     construct_sizes = {d: len(load_embeds(d, num_vectors)[0]) * percentage_construct // 100 for d in datasets}
     min_construct = min(construct_sizes.values())
     usable_k_values = [k for k in k_values if k < min_construct]
@@ -1611,7 +1370,7 @@ def generate_scaling(runner: Runner) -> None:
     Only submits 'scaling_query'/'scaling_insert'/'scaling_construction'
     jobs -- does not run `runner`. Each corpus writes its own
     results/scaling/<dataset>/scaling_{query,insert,construction}.csv (see
-    scaling_query_csv() et al.), mirroring quantization_csv/QUANTIZATION_DIR,
+    scaling_query_csv() et al.), mirroring cap_quantization_csv/CAP_QUANTIZATION_DIR,
     so the Runner writes all of them incrementally."""
     num_vectors      = WORKLOAD_NUM_VECTORS
     dim              = 384
@@ -1736,9 +1495,8 @@ def plot_scaling(df_query: pd.DataFrame, df_insert: pd.DataFrame, df_constructio
 
 def generate_streaming(runner: Runner) -> None:
     """The paper's "dynamic evaluation" (Section 5.1/5.4, Figure 4): compares
-    CapCoverFilter's insertion strategies (CAP_INSERT_STRATEGIES -- only
-    cap_merge/nearest, no least_inflation/min_heap/doubling/pooled/
-    exhaustive_merge, which exist only for Ball-Cover) via
+    CapCoverFilter's insertion strategies (CAP_INSERT_STRATEGIES --
+    cap_merge/nearest) via
     stream_rebuild_worker's policy="streaming" against a static rebuild at
     every checkpoint (policy="oracle"). Produces the streaming figure's
     panels: (a) FPR vs. position + the static-rebuild references, (b)
@@ -1785,7 +1543,7 @@ def generate_streaming(runner: Runner) -> None:
 
     Only submits 'stream_rebuild' jobs -- does not run `runner`. Each corpus
     writes its own results/streaming/<dataset>/streaming.csv (see
-    streaming_csv()), mirroring quantization_csv/QUANTIZATION_DIR."""
+    streaming_csv()), mirroring cap_quantization_csv/CAP_QUANTIZATION_DIR."""
     num_vectors        = WORKLOAD_NUM_VECTORS
     dim                = 384
     n_folds            = BLOCKLIST_FOLDS
@@ -2002,9 +1760,6 @@ def generate_and_plot_all() -> None:
     except Exception:
         logger.exception("An error occurred")
     try:
-        # Replaces generate_quantization (BallCoverFilter) -- same sweep,
-        # CapCoverFilter.auto() per encoding. generate_quantization itself
-        # stays defined but is no longer invoked here.
         generate_cap_quantization(runner)
     except Exception:
         logger.exception("An error occurred")
@@ -2025,17 +1780,10 @@ def generate_and_plot_all() -> None:
     except Exception:
         logger.exception("An error occurred")
     try:
-        # Replaces generate_system_tau (BallCoverFilter) -- same protocol,
-        # CapCoverFilter cover. generate_system_tau itself stays defined
-        # (git history, not deleted) but is no longer invoked here.
         generate_cap_cover_system_tau(runner)
     except Exception:
         logger.exception("An error occurred")
     '''
-    try:
-        generate_system_tau(runner)
-    except Exception:
-        logger.exception("An error occurred")
     try:
         generate_construct_methods_scale(runner)
     except Exception:
@@ -2055,12 +1803,6 @@ def plot_all() -> None:
     plot_ needs from the loaded data. Requires at least one prior
     generate_and_plot_all() (or generate_X + runner.run()) to have produced
     those files."""
-    try:
-        df = pd.read_csv(SYSTEM_TAU_CSV)
-        plot_system_tau(df)
-    except Exception:
-        logger.exception("An error occurred")
-
     try:
         df = pd.read_csv(CAP_COVER_SYSTEM_TAU_CSV)
         plot_cap_cover_system_tau(df)

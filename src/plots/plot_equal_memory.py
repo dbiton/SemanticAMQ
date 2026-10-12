@@ -18,7 +18,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 
-from plots.plot_quantization import apply_style
+from plots.plot_common import apply_style as _apply_style
 from plots.plot_common import collapse_duplicate_x
 
 # CONFIG
@@ -28,6 +28,10 @@ OUTDIR = "plots/equal_memory/"
 DPI = 400
 EMIT_PDF = False
 
+def apply_style() -> None:
+    _apply_style(DPI)
+
+
 # Embedding dimensionality: fixed at 384 across every blocklist-workload
 # evaluation (see main.generate_equal_memory's own dim=384).
 _EMBEDDING_DIM = 384
@@ -35,7 +39,6 @@ _EMBEDDING_DIM = 384
 # Display overrides for recognized filter names; anything else falls back to
 # name[:-len("Filter")] in _label_for.
 _KNOWN_LABELS = {
-    "BallCoverFilter": "BallFilter",
     "HNSWFilter": "HNSW",
     "IVFFilter": "IVF",
     "DSHFilter": "DSH",
@@ -51,13 +54,13 @@ _KNOWN_MARKERS = {
     "HNSWFilter": "P",
     "IVFFilter": "s",
 }
-# Every BallCoverFilter quantize variant (Config strings like
-# "BallCoverFilter (TQ4)" -- see runner.equal_memory_worker) draws from the
-# cold palette; every other method draws from the hot one. Two colorblind-
+# CapCoverFilter (Config strings like "CapCoverFilter" or, if a quantize
+# variant is submitted, "CapCoverFilter (TQ4)" -- see
+# runner.equal_memory_worker) draws from the cold palette; every other method draws from the hot one. Two colorblind-
 # distinguishable-within-family sets, so a method's family reads from color
 # alone and its identity within that family still reads from hue. Each list
-# has more entries than there are current consumers (5 BallCoverFilter
-# variants, 7 other methods) for headroom -- see _derive_style_maps for what
+# has more entries than there are current consumers (1 cover
+# method, 7 other methods) for headroom -- see _derive_style_maps for what
 # happens if a family ever does run out (loops back rather than crashing).
 _COLD_PALETTE_COLORS = ["#023E8A", "#0077B6", "#00B4D8", "#48CAE4", "#3A0CA3", "#7209B7", "#4CC9F0", "#5A189A"]
 _HOT_PALETTE_COLORS = ["#9D0208", "#E85D04", "#FAA307", "#DC2F02", "#6A040F", "#F48C06", "#FFBA08", "#D00000"]
@@ -65,8 +68,8 @@ _PALETTE_MARKERS = ["o", "s", "^", "D", "v", "P", "*", "X", "h", "p", "<", ">", 
 
 
 def _label_for(name: str) -> str:
-    """`name` is a full Config string, e.g. "BallCoverFilter (TQ4)" for one
-    of BallCoverFilter's quantize variants (see runner.equal_memory_worker) --
+    """`name` is a full Config string, e.g. "CapCoverFilter (TQ4)" for one
+    of a filter's quantize variants (see runner.equal_memory_worker) --
     translate the base filter name and reattach the variant suffix verbatim,
     rather than falling through to the raw, un-shortened string."""
     base, sep, suffix = name.partition(" (")
@@ -74,8 +77,8 @@ def _label_for(name: str) -> str:
     return f"{label}{sep}{suffix}" if sep else label
 
 
-def _is_ball_filter(name: str) -> bool:
-    return name.partition(" (")[0] == "BallCoverFilter"
+def _is_cover_filter(name: str) -> bool:
+    return name.partition(" (")[0] == "CapCoverFilter"
 
 
 def _derive_style_maps(configs: list) -> tuple:
@@ -86,7 +89,7 @@ def _derive_style_maps(configs: list) -> tuple:
 
     for name in configs:
         labels[name] = _label_for(name)
-        if _is_ball_filter(name):
+        if _is_cover_filter(name):
             colors[name] = next(cold, _COLD_PALETTE_COLORS[0])
         else:
             colors[name] = next(hot, _HOT_PALETTE_COLORS[0])
