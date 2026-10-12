@@ -1,4 +1,3 @@
-tqdm
 datasets
 sentence_transformers
 faiss-cpu
@@ -7,18 +6,7 @@ numpy
 matplotlib
 scipy
 scikit-learn
-lightgbm
-heapdict
-wordfreq
-xgboost
-pymilvus
-hnswlib
-datasketch[bloom]
-seaborn
-pyfusefilter
-cuckoofilter
 numba
 pybloom_live
 h5py
-pyprobables
 pytest
