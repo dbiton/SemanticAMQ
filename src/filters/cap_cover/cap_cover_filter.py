@@ -2461,7 +2461,7 @@ class CapCoverFilter(Filter):
             return None
         return self._ivf_index.query(
             Qn32, beta.astype(np.float32),
-            feasible.astype(np.uint8),
+            feasible,
             theta=self._ivf_sorted_angles,
             decoded_norms=self._ivf_sorted_norms,
             slack=self._slack(),

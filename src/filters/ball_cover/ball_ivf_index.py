@@ -100,7 +100,7 @@ def _make_csr(cell_ids: np.ndarray, reaches: np.ndarray, K: int,
               unit_vecs: np.ndarray) -> tuple:
     """
     Sort members into cells, widest-first within each cell.
-    Returns (cell_starts, sorted_vecs, sorted_reaches, cell_max_reach, cell_cos_min)
+    Returns (cell_starts, sorted_vecs, sorted_reaches, cell_max_reach)
 
     All arrays are contiguous float32 / int32.  No malloc, no C.
     """
@@ -110,12 +110,6 @@ def _make_csr(cell_ids: np.ndarray, reaches: np.ndarray, K: int,
     cell_max_reach = np.full(K, -np.inf, dtype=np.float64)
     np.maximum.at(cell_max_reach, cell_ids, reaches.astype(np.float64))
     cell_max_reach = cell_max_reach.astype(np.float32)
-
-    # cos(max_reach[c]) for the angle-domain gate
-    r_clipped = np.clip(cell_max_reach, 0.0, np.pi)
-    cell_cos_min = np.cos(r_clipped).astype(np.float32)
-    # Mark empty cells (max_reach == -inf) with cos_min = +2 (unreachable threshold)
-    cell_cos_min[cell_max_reach < -1e30] = 2.0
 
     # Stable sort: primary = cell id, secondary = reach descending (widest first)
     # Use a combined key: sort by (cell_id * big_number - reach)
@@ -132,7 +126,7 @@ def _make_csr(cell_ids: np.ndarray, reaches: np.ndarray, K: int,
     cell_starts = np.zeros(K + 1, dtype=np.int32)
     np.cumsum(counts, out=cell_starts[1:])
 
-    return cell_starts, sorted_vecs, sorted_reaches, cell_max_reach, cell_cos_min
+    return cell_starts, sorted_vecs, sorted_reaches, cell_max_reach
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +198,6 @@ class BallIVFIndex:
             self._centroid_norms = np.empty(0, dtype=np.float32)
             self._cell_starts    = np.array([0], dtype=np.int32)
             self._cell_max_reach = np.empty(0, dtype=np.float32)
-            self._cell_cos_min   = np.empty(0, dtype=np.float32)
             self._sorted_vecs    = np.empty((0, d), dtype=np.float32)
             self._sorted_reaches = np.empty(0, dtype=np.float32)
             self._sorted_reach_sq= np.empty(0, dtype=np.float32)
@@ -224,12 +217,11 @@ class BallIVFIndex:
         self._centroid_norms_sq = (self._centroids * self._centroids).sum(1).astype(np.float32)
 
         # Build CSR layout + sorted arrays
-        cell_starts, sorted_vecs, sorted_reaches, cell_max_reach, cell_cos_min = \
+        cell_starts, sorted_vecs, sorted_reaches, cell_max_reach = \
             _make_csr(labels.astype(np.int32), reaches, K, unit_vecs)
 
         self._cell_starts    = cell_starts
         self._cell_max_reach = cell_max_reach     # float32[K]
-        self._cell_cos_min   = cell_cos_min       # float32[K]  cos(max_reach[c])
         self._sorted_vecs    = sorted_vecs        # float32[N, d]  widest-first within cell
         self._sorted_reaches = sorted_reaches     # float32[N]
 
@@ -321,11 +313,11 @@ class BallIVFIndex:
                 continue
 
             cell_vecs  = self._sorted_vecs[s:e]      # (m, d) contiguous
-            cell_rsq   = self._sorted_reach_sq[s:e]  # (m,)
+            cell_rsq   = reach_sq[s:e]               # (m,) Use updated reach_sq if tau changed
             cell_vnsq  = self._vec_norms_sq[s:e]     # (m,)
 
             live_idx = np.flatnonzero(live)
-            Qs = Qr[live_idx]                         # (n_live, d)
+            Qs = Qr[live_idx]                        # (n_live, d)
             qn2 = q_norms_sq[live_idx]               # (n_live,)
 
             # BLAS GEMM: (n_live, d) @ (d, m) -> (n_live, m)
@@ -389,7 +381,7 @@ class BallIVFIndex:
             return 0
         total = 0
         for arr in (self._centroids, self._centroid_norms_sq,
-                    self._cell_starts, self._cell_max_reach, self._cell_cos_min,
+                    self._cell_starts, self._cell_max_reach,
                     self._sorted_vecs, self._sorted_reaches,
                     self._sorted_reach_sq, self._vec_norms_sq):
             total += arr.nbytes

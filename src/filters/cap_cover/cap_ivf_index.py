@@ -100,7 +100,7 @@ def _make_csr(cell_ids: np.ndarray, reaches: np.ndarray, K: int,
               unit_vecs: np.ndarray) -> tuple:
     """
     Sort members into cells, widest-first within each cell.
-    Returns (cell_starts, sorted_vecs, sorted_reaches, cell_max_reach, cell_cos_min)
+    Returns (cell_starts, sorted_vecs, cell_cos_min)
 
     All arrays are contiguous float32 / int32.  No malloc, no C.
     """
@@ -125,14 +125,13 @@ def _make_csr(cell_ids: np.ndarray, reaches: np.ndarray, K: int,
     order = np.argsort(key, kind="stable")
 
     sorted_vecs    = np.ascontiguousarray(unit_vecs[order],  dtype=np.float32)
-    sorted_reaches = np.ascontiguousarray(reaches[order],    dtype=np.float32)
 
     # CSR starts: cumsum of per-cell counts
     counts = np.bincount(cell_ids, minlength=K).astype(np.int32)
     cell_starts = np.zeros(K + 1, dtype=np.int32)
     np.cumsum(counts, out=cell_starts[1:])
 
-    return cell_starts, sorted_vecs, sorted_reaches, cell_max_reach, cell_cos_min
+    return cell_starts, sorted_vecs, cell_cos_min
 
 
 # ---------------------------------------------------------------------------
@@ -200,14 +199,9 @@ class CapIVFIndex:
             self._built = True
             # Store empty arrays so query methods can still run
             self._centroids      = np.empty((0, d), dtype=np.float32)
-            self._centroid_norms = np.empty(0, dtype=np.float32)
             self._cell_starts    = np.array([0], dtype=np.int32)
-            self._cell_max_reach = np.empty(0, dtype=np.float32)
             self._cell_cos_min   = np.empty(0, dtype=np.float32)
             self._sorted_vecs    = np.empty((0, d), dtype=np.float32)
-            self._sorted_reaches = np.empty(0, dtype=np.float32)
-            self._sorted_reach_sq= np.empty(0, dtype=np.float32)
-            self._vec_norms_sq   = np.empty(0, dtype=np.float32)
             self.K = 0
             return
 
@@ -219,24 +213,13 @@ class CapIVFIndex:
         centroids, labels = _spherical_kmeans(unit_vecs, K, self.n_iter, self.seed)
         self._centroids = np.ascontiguousarray(centroids, dtype=np.float32)
 
-        # Centroid squared norms (should be 1 but compute for numerical safety)
-        self._centroid_norms_sq = (self._centroids * self._centroids).sum(1).astype(np.float32)
-
         # Build CSR layout + sorted arrays
-        cell_starts, sorted_vecs, sorted_reaches, cell_max_reach, cell_cos_min = \
+        cell_starts, sorted_vecs, cell_cos_min = \
             _make_csr(labels.astype(np.int32), reaches, K, unit_vecs)
 
         self._cell_starts    = cell_starts
-        self._cell_max_reach = cell_max_reach     # float32[K]
         self._cell_cos_min   = cell_cos_min       # float32[K]  cos(max_reach[c])
         self._sorted_vecs    = sorted_vecs        # float32[N, d]  widest-first within cell
-        self._sorted_reaches = sorted_reaches     # float32[N]
-
-        # Pre-square for ball mode L2 gate
-        self._sorted_reach_sq = (sorted_reaches.astype(np.float64) ** 2).astype(np.float32)
-
-        # Per-member ||v||^2 for L2 computation: ||q-v||^2 = ||q||^2 + ||v||^2 - 2<q,v>
-        self._vec_norms_sq = (sorted_vecs * sorted_vecs).sum(1).astype(np.float32)
 
         self._built = True
 
@@ -256,7 +239,7 @@ class CapIVFIndex:
             Unit queries in the working basis.
         beta : float32[nq]
             Per-query acceptance margin (from CapCoverFilter._beta).
-        feasible : uint8 or bool [nq]
+        feasible : bool[nq]
             Mask; infeasible queries are always rejected.
         theta : float32[N]
             Raw cap angles in the IVF's sorted member order.
@@ -280,6 +263,9 @@ class CapIVFIndex:
         nq           = len(Qn32)
         out          = np.zeros(nq, dtype=bool)
 
+        if not feasible.any():
+            return out
+
         # --- Gate: one BLAS GEMM against K centroids ---
         ip_cen = Qn32 @ self._centroids.T   # (nq, K)
 
@@ -288,11 +274,8 @@ class CapIVFIndex:
             if cos_min > 1.0:
                 continue  # empty cell
 
-            # Gate: ip(q, centroid[c]) < cos(max_reach[c]) => skip
-            # (angle(q, centroid) > max_reach[c] => no member can accept q)
-            live = ip_cen[:, c] >= cos_min
-            live &= feasible
-            live &= ~out
+            # Combined boolean masks to avoid intermediate array allocations
+            live = (ip_cen[:, c] >= cos_min) & feasible & ~out
             if not live.any():
                 continue
 
@@ -300,12 +283,12 @@ class CapIVFIndex:
             if s == e:
                 continue
 
-            cell_dirs  = self._sorted_vecs[s:e]     # (m, d)
+            cell_dirs  = self._sorted_vecs[s:e]      # (m, d)
             cell_theta = theta[s:e]                  # (m,)  raw angles
             cell_norms = decoded_norms[s:e]          # (m,)
 
             live_idx = np.flatnonzero(live)
-            Qs   = Qn32[live_idx]                   # (n_live, d)
+            Qs   = Qn32[live_idx]                    # (n_live, d)
             beta_live = beta[live_idx]               # (n_live,)
 
             # BLAS GEMM: (n_live, m) inner products
@@ -320,6 +303,10 @@ class CapIVFIndex:
             accepts = ip + slack >= thr                      # (n_live, m) bool
             out[live_idx] |= accepts.any(axis=1)
 
+            # Early stopping: break cell loop if all queries are accepted
+            if out.all():
+                break
+
         return out
 
     # ------------------------------------------------------------------
@@ -327,25 +314,24 @@ class CapIVFIndex:
     # ------------------------------------------------------------------
 
     def pruning_fraction(self, Qr: np.ndarray,
-                         q_norms_sq: np.ndarray = None) -> np.ndarray:
+                         q_norms_sq: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Fraction of members (by count) visited per query.
+        1.0 = no pruning.
         """
         if not self._built or self.N == 0:
             return np.ones(len(Qr))
         Qr = np.ascontiguousarray(Qr, dtype=np.float32)
-        if q_norms_sq is None:
-            q_norms_sq = (Qr * Qr).sum(1).astype(np.float32)
+        
+        # Queries are expected to be unit vectors (Qn32).
+        # Normalise them if not already to ensure accurate cosine pruning metric.
+        norms = np.sqrt((Qr * Qr).sum(axis=1, keepdims=True))
+        Qn32 = np.divide(Qr, np.maximum(norms, 1e-30)).astype(np.float32)
 
-        ip_cen = Qr @ self._centroids.T  # (nq, K)
-        d2_cen = (q_norms_sq[:, None]
-                  + self._centroid_norms_sq[None, :]
-                  - 2.0 * ip_cen)
-        d2_cen = np.maximum(d2_cen, 0.0)
-        mr_sq  = (self._cell_max_reach.astype(np.float64) ** 2).astype(np.float32)
-
-        # Cells that survive the gate per query
-        gate_pass = d2_cen <= mr_sq[None, :]  # (nq, K) bool
+        ip_cen = Qn32 @ self._centroids.T  # (nq, K)
+        
+        # Cells that survive the gate per query (angular cosine gate)
+        gate_pass = ip_cen >= self._cell_cos_min[None, :]  # (nq, K) bool
 
         cell_sizes = np.diff(self._cell_starts).astype(np.float32)  # (K,)
         members_visited = gate_pass @ cell_sizes  # (nq,)
@@ -356,10 +342,9 @@ class CapIVFIndex:
         if not self._built:
             return 0
         total = 0
-        for arr in (self._centroids, self._centroid_norms_sq,
-                    self._cell_starts, self._cell_max_reach, self._cell_cos_min,
-                    self._sorted_vecs, self._sorted_reaches,
-                    self._sorted_reach_sq, self._vec_norms_sq):
+        for arr in (self._centroids,
+                    self._cell_starts, self._cell_cos_min,
+                    self._sorted_vecs):
             total += arr.nbytes
         return total
 
