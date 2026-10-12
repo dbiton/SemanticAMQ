@@ -121,36 +121,16 @@ def _fits(dim: int, q: Quantize) -> bool:
 
 # Candidate encodings CapCoverFilter.auto() chooses among: the seeded-PQ rungs
 # below 1 bit/dim plus TurboQuant above it, so small budgets can buy many
-# coarse caps and large ones fewer, finer caps. Coarser rungs (6 and 9 B,
-# ~1.2 and 1.12 rad) measured worse: the reach proxy over-rates them once
-# the encoding error rivals the caps' own angles (+0.16 FPR at k = 0.5%).
-# Encodings with a trained basis (PSPQ*, DPQ*, KSQ*) are left out: at
-# |B| = 8000 their basis takes most of a small budget and mixing never
-# picked them at k <= 1% (v2_*.csv), and at 80K they double construction
-# time; KSQ_CANDIDATES adds the VA+-style KLT codes for budgets that hold
-# a basis (see CapCoverFilter's Encodings trained on B).
+# coarse caps and large ones fewer, finer caps. Encodings with a trained
+# basis (PSPQ*, DPQ*, KSQ*) are left out: at |B| = 8000 their basis takes
+# most of a small budget and mixing never picked them at k <= 1%, and at 80K
+# they double construction time (see CapCoverFilter's Encodings trained on B).
 AUTO_CANDIDATES = (Quantize.SPQ12, Quantize.SPQ16, Quantize.SPQ24, Quantize.SPQ36, Quantize.SPQ48,
                    Quantize.SPQ64, Quantize.TQ2, Quantize.TQ3, Quantize.TQ4)
-KSQ_CANDIDATES = AUTO_CANDIDATES + (Quantize.KSQ6, Quantize.KSQ12, Quantize.KSQ24, Quantize.KSQ48)
-# 10- and 12-bit seeded-PQ rungs between AUTO_CANDIDATES' (2026-10-04): with
-# them a cap can coarsen, or the top band refine (mix_finer), by a smaller
-# step. Every new rung is used. |B| = 8000, 175 cells, fold-paired against
-# AUTO_CANDIDATES (no set storage; lad_*.csv): FPR -0.014 / -0.006 / -0.006
-# at k = 0.5/1/2% of |B| (+-0.002 above), log10 volume -0.3 / -0.6 / -1.2
-# (+0.9 at 20%), for 1.5-2x the construction time (encoding 10/12-bit
-# codes). With mix_finer=1 and set storage see CapCoverFilter's Choosing the
-# encoding. 8-bit rungs at the same byte sizes (SPQ24B8, SPQ32B8, SPQ48B8;
-# 0.03 rad more blur than 12-bit at equal bytes, but scored by table)
-# measured volume- and FPR-neutral in the mix (+-0.003 FPR, +-0.6 orders).
-DENSE_LADDER = (Quantize.SPQ18, Quantize.SPQ20, Quantize.SPQ30, Quantize.SPQ40, Quantize.SPQ60, Quantize.SPQ72,
-                Quantize.SPQ96)
-# The dense rungs at 10 bits only (auto()'s default since 2026-10-04, with
-# mix_finer=1): a 2^bits codebook costs dim * 2^bits multiply-adds per
-# encoded cap, so these five cost about one 12-bit rung's. Against
-# DENSE_LADDER (both with mix_finer=1 and set storage, d10f1_*, cdf1_*.csv):
-# within +-0.002 FPR and +-0.4 orders at k >= 2% of |B| = 8000, +0.005 /
-# +0.002 FPR at k = 0.5 / 1%; at |B| = 80K every job fits the benchmark's
-# 5-minute limit (DENSE_LADDER: 9 of 35 do not).
+# Seeded-PQ rungs between AUTO_CANDIDATES' at 10 bits (auto()'s default, with
+# mix_finer=1): a cap can coarsen, or the top band refine, by a smaller step,
+# and a 2^bits codebook costs dim * 2^bits multiply-adds per encoded cap, so
+# 10-bit rungs keep construction inside the benchmark's 5-minute limit at 80K.
 DENSE10_LADDER = (Quantize.SPQ20, Quantize.SPQ30, Quantize.SPQ40, Quantize.SPQ60, Quantize.SPQ80)
 
 class CapCoverFilter(_CapScanMixin, Filter):
@@ -190,31 +170,21 @@ class CapCoverFilter(_CapScanMixin, Filter):
     member, so `quantize` may be a sequence of candidates (auto() uses
     AUTO_CANDIDATES + DENSE10_LADDER), and construct() builds covers at the candidates' cap
     counts from one merge (ConstructInterface.iter_candidates) and keeps
-    the best by `selection`:
-
-    - "volume" (default): the least accept region on the sphere, ln of the
-      sum over caps of sigma(theta' + beta) at selection_tau (theta' the
-      members' widest angle around the decoded direction) -- from B and
-      the stored caps only, so it holds whatever the queries (_volume). At
-      d = 384 the widest caps dominate the sum. With `mixed` (static
-      filters) each cap takes its own encoding (_choose_mixed): "coarsen"
-      (default) lets caps narrower than the widest take coarser codes than
-      the least-volume single encoding where that keeps them within the
-      widest angle, buying more caps with the bytes freed; "free" also
-      lets the widest caps take finer codes, which shrinks the region most
-      but spends bytes on few caps; False keeps one encoding (_choose).
-    - "proxy": sum over caps of phi^p, the in-data reach (p =
-      selection_exponent): assumes queries lie near the data.
-    - "holdout": the proxy with a veto by held-out members used as pseudo-
-      queries (_choose_holdout); fits the choice to query-like data, so it
-      is kept only to reproduce earlier rows.
+    the one with the least accept region on the sphere (_volume): ln of the
+    sum over caps of sigma(theta' + beta) at selection_tau (theta' the
+    members' widest angle around the decoded direction) -- from B and
+    the stored caps only, so it holds whatever the queries. At
+    d = 384 the widest caps dominate the sum. With `mixed` (static
+    filters) each cap takes its own encoding (_choose_mixed): "coarsen"
+    (default) lets caps narrower than the widest take coarser codes than
+    the least-volume single encoding where that keeps them within the
+    widest angle, buying more caps with the bytes freed; "free" also
+    lets the widest caps take finer codes, which shrinks the region most
+    but spends bytes on few caps; False keeps one encoding (_choose).
 
     Measured (src/compare_cap_cover.py, |B| = 8000, 5 corpora x 5 folds,
-    fold-paired; results/cap_cover/v1_*.csv, v5_*.csv): against the reach
-    proxy, the least-volume single encoding (mixed=False) costs +0.064 /
-    +0.068 / +0.024 / +0.034 FPR at k = 0.5/1/2/5% of |B| (within +0.003
-    at 10-20%) for 3.6 / 6.6 / 6.5 / 6.3 orders less log10 volume (4.6-5.2
-    at 10-20%). Against that single encoding, mixed="coarsen" moves FPR by
+    fold-paired; results/cap_cover/v1_*.csv, v5_*.csv): against the
+    least-volume single encoding (mixed=False), mixed="coarsen" moves FPR by
     -0.058 / -0.056 / -0.035 / -0.026 / -0.002 / +0.001 / -0.001 at
     k = 0.5/1/2/5/10/15/20% at about its volume (+0.8 / +0.5 / -0.5 / -0.6
     / +0.4 / +1.0 / -1.2 orders), for 1.6-2.7x its construction time;
@@ -229,7 +199,7 @@ class CapCoverFilter(_CapScanMixin, Filter):
     rad of the widest (often 10-300 of them), so `mix_finer` raises
     coarsen's ceiling by that many rungs: a plan then gives a finer code
     only to a cap that would otherwise exceed the widest angle it keeps.
-    With DENSE_LADDER's smaller steps and set storage (cdf1_*.csv, 175
+    With DENSE10_LADDER's smaller steps and set storage (cdf1_*.csv, 175
     cells, fold-paired against the v5 default): FPR -0.020 / -0.013 /
     -0.004 / -0.002 / -0.002 / -0.005 / -0.002 and log10 volume -0.8 /
     -1.4 / -3.0 / -4.7 / -11.5 / -9.6 / -10.2 at k = 0.5/1/2/5/10/15/20%
@@ -243,14 +213,6 @@ class CapCoverFilter(_CapScanMixin, Filter):
     caps paid for by merging narrow ones (the cheapest merges of non-band
     caps land above the band floor in 62-100% of cases at k <= 2%; the k
     grid already undoes the last, widest merges).
-
-    The reach proxy errs coarse at small budgets: against the best fixed
-    encoding per cell (|B| = 8000, folds 0-2) it is +0.015 / +0.014 /
-    +0.008 FPR at k = 1/2/5% of |B|, within +-0.003 elsewhere; the
-    held-out veto recovered -0.003 / -0.008 / -0.015 / -0.006 at
-    k = 0.5/1/2/5% for ~1.7x the construction time (veto2_*.csv). A proxy
-    over member angles did 5x worse than the reach proxy; sub-12-byte rungs
-    (SPQ6, SPQ9) win only 3 of 30 cells at k <= 1% even in hindsight.
 
     Angles are stored in 8 bits over the filter's own [min, max] when no
     insert strategy can grow one past max (else 16 bits over [0, pi]).
@@ -299,11 +261,7 @@ class CapCoverFilter(_CapScanMixin, Filter):
     v5_*.csv, m80*_*.csv) had FPR .619/.414/.292/.180/.122/.102/.087 at
     log10 volume -6.0/-12.0/-22.0/-45.5/-78.6/-107.9/-126.9 (|B| = 8000)
     and .736/.578/.415/.252/.169/.136/.117 at -10.3/-17.4/-27.3/-49.6/
-    -83.9/-110.8/-126.3 (80K); the reach proxy, then its held-out veto,
-    before that: .612/.402/.303/.172/.121/.098/.087 and .609/.394/.289/
-    .166/.121/.098/.087 at 3-7 orders more volume. With the KLT codes as
-    candidates (KSQ_CANDIDATES) FPR was .657 at 80K, k = 1% (worse: the
-    basis takes budget).
+    -83.9/-110.8/-126.3 (80K).
 
     Working basis. Rotating encodings quantize in a seeded orthonormal
     basis; members and queries are rotated in float64 and every cap angle is
@@ -402,11 +360,6 @@ class CapCoverFilter(_CapScanMixin, Filter):
         fit_passes: int = 2,
         fit_rounds: int = 1,
         selection_tau: float = 0.1,
-        selection_exponent: float = 8.0,
-        selection: str = "volume",
-        holdout_fraction: float = 0.25,
-        holdout_queries: int = 2000,
-        holdout_z: float = 3.0,
         basis_fit: str = "caps",
         mixed: Union[bool, str] = "coarsen",
         mix_finer: int = 0,
@@ -455,16 +408,7 @@ class CapCoverFilter(_CapScanMixin, Filter):
         # filter narrows it to its own angles at construct() (see there).
         self._angle_lo, self._angle_hi = 0.0, float(np.pi)
         self.selection_tau = selection_tau
-        self.selection_exponent = selection_exponent
-        if selection not in ("volume", "proxy", "holdout"):
-            raise ValueError(f"selection must be 'volume', 'proxy' or 'holdout', got {selection!r}")
-        self.selection = selection
-        self.holdout_fraction = holdout_fraction
-        self.holdout_queries = holdout_queries
-        self.holdout_z = holdout_z
         self.selection_scores = None    # encoding -> score, set by construct() when choosing
-        self.holdout_scores = None      # encoding -> held-out acceptance (selection="holdout")
-        self.selection_override = None  # (proxy's pick, override, b, c) when the held-out test overrode
         # Choosing compares encodings in one working basis, so every
         # candidate gets the rotation then (harmless where not needed).
         rotate = any(_ENCODINGS[q].rotate for q in self.levels) or len(self.levels) > 1
@@ -498,7 +442,7 @@ class CapCoverFilter(_CapScanMixin, Filter):
     @classmethod
     def auto(cls, dim: int, max_memory: int, **kwargs) -> "CapCoverFilter":
         """A filter that picks its encodings for the budget at construct()
-        (by `selection`, see _choose_mixed) among AUTO_CANDIDATES plus
+        (by accept-region volume, see _choose_mixed) among AUTO_CANDIDATES plus
         DENSE10_LADDER, with the top band one rung finer (mix_finer=1): the
         defaults since 2026-10-04 (see Choosing the encoding and The top
         band). candidates=AUTO_CANDIDATES, mix_finer=0 gives the earlier
@@ -1045,23 +989,6 @@ class CapCoverFilter(_CapScanMixin, Filter):
                 owner[i] = home[i]
         return angles, owner
 
-    def _reach(self, X: np.ndarray, U: np.ndarray, labels: np.ndarray) -> np.ndarray:
-        """Per cap, phi: how far along the data the cap on direction U[j]
-        holding members X[labels == j] reaches once encoded. phi =
-        sqrt((theta' + alpha)^2 - delta^2), theta' the members' widest angle
-        around the decoded direction, delta the direction's encoding error
-        -- the in-data reach when the error is orthogonal to the data (see
-        the class docstring). Trains the quantizer on U."""
-        self._train_quantizers(U, X)
-        order, starts, counts = segments(labels, len(U))
-        alpha = 2.0 * np.arcsin(min(1.0, 0.5 * self.selection_tau))
-        # Scored on nearest-codeword encodings: scoring on fitted codes
-        # (what construct() stores) measured to pick the same encoding.
-        decoded = self.decode_directions(U)
-        delta = angle_between(U, decoded)
-        theta = segment_max(angle_between(X, decoded[labels])[order], starts, counts)
-        return np.sqrt(np.maximum((theta + alpha) ** 2 - delta ** 2, 1e-300))[counts > 0]
-
     def _volume(self, X: np.ndarray, U: np.ndarray, labels: np.ndarray) -> float:
         """ln of sum over caps of sigma(theta' + beta): the share of the unit
         sphere the cover on directions U, members X[labels == j], would
@@ -1077,26 +1004,17 @@ class CapCoverFilter(_CapScanMixin, Filter):
         psi = np.minimum(theta[counts > 0] + beta[0], np.pi)
         return float(np.logaddexp.reduce(log_cap_measure(psi, self.dim))) if len(psi) else -np.inf
 
-    def _score(self, X: np.ndarray, U: np.ndarray, labels: np.ndarray) -> float:
-        """What _choose minimizes for the encoding in use (see there)."""
-        if self.selection == "volume":
-            return self._volume(X, U, labels)
-        phi = self._reach(X, U, labels)
-        return float(np.logaddexp.reduce(self.selection_exponent * np.log(phi))) if len(phi) else -np.inf
-
     def _choose(self, X: np.ndarray, weights: np.ndarray) -> Cover:
         """Scores a cover per candidate encoding at that encoding's cap count
-        (one merge, see ConstructInterface.iter_candidates) by how far its
-        caps reach along the data -- sum over caps of phi^p -- keeps the
-        best, fixes the filter's encoding to it, and returns its finished
+        (one merge, see ConstructInterface.iter_candidates) by its accept
+        region's volume (_volume) and keeps the best, fixes the filter's encoding to it, and returns its finished
         cover. Candidates come largest cap count first, and the scan stops
         once the score has risen twice in a row: it is unimodal along the
         ladder (more, coarser caps against fewer, finer ones).
 
         Levels whose budget buys a cap per distinct member or more all get
-        that same cover, on which a finer code always reaches less (phi
-        grows with delta at fixed theta): only the finest of them is
-        scored."""
+        that same cover, on which a finer code always accepts less: only
+        the finest of them is scored."""
         ks = []
         for level in range(len(self.levels)):
             self._set_uniform(level)
@@ -1112,7 +1030,7 @@ class CapCoverFilter(_CapScanMixin, Filter):
             improved = False
             for level in levels_at[k]:
                 self._set_uniform(level)
-                score = self._score(X, cover.directions, cover.labels)
+                score = self._volume(X, cover.directions, cover.labels)
                 scores[self.levels[level].value] = score
                 if best is None or score < best[0]:
                     best, improved = (score, level, cover), True
@@ -1133,7 +1051,7 @@ class CapCoverFilter(_CapScanMixin, Filter):
     _CHEAP_CODEBOOK = 1024
 
     def _mixing(self) -> bool:
-        return (bool(self.mixed) and self.selection == "volume" and self.insert_method is None
+        return (bool(self.mixed) and self.insert_method is None
                 and len(self.levels) > 1 and self.max_memory is not None)
 
     def _construct_budget(self) -> int:
@@ -1403,89 +1321,6 @@ class CapCoverFilter(_CapScanMixin, Filter):
             self._quantizers[l] = self._make_quantizer(self.levels[l])
             self._quantizers[l].train(anchors)
 
-    def _choose_holdout(self, X: np.ndarray, weights: np.ndarray) -> Cover:
-        """_choose with a held-out veto. The reach proxy's cover is built
-        as _choose builds it; then candidate covers are built per encoding
-        on all but `holdout_fraction` of the distinct members, at that share
-        of each encoding's cap count, with codes fitted as construct() fits
-        them and angles from the training members, and each encoding gets
-        the set of held-out members farther than selection_tau from every
-        training member that its caps would accept at selection_tau. The
-        finer encoding accepting the fewest replaces the proxy's only if it
-        beats it in a paired test on those members (b - c >= holdout_z sqrt(b + c),
-        b and c the members only one of the two accepts) -- held-out members
-        are cluster-mates, often all accepted at small k, where differences
-        are noise -- and its cover is then built on all members. Without
-        an override the result is exactly _choose's."""
-        cover = self._choose(X, weights)
-        chosen = self._uniform
-        rng = np.random.default_rng(0x5EED)
-        hold = rng.random(len(X)) < self.holdout_fraction
-        if hold.sum() < 50 or (~hold).sum() < 50:
-            return cover
-        Xt, wt, V = X[~hold], weights[~hold], X[hold]
-        alpha = 2.0 * np.arcsin(min(1.0, 0.5 * self.selection_tau))
-        ip, _ = nearest_directions(V, Xt)
-        far = V[np.flatnonzero(2.0 - 2.0 * ip.astype(np.float64) > self.selection_tau ** 2)]
-        if len(far) > self.holdout_queries:
-            far = far[rng.choice(len(far), self.holdout_queries, replace=False)]
-        if len(far) < 50:
-            self._set_uniform(chosen)
-            return cover
-        far32 = np.ascontiguousarray(far, dtype=np.float32)
-        ks_full, ks = [], []
-        for level in range(len(self.levels)):
-            self._set_uniform(level)
-            ks_full.append(min(self.max_construct_caps, len(X)))
-            ks.append(max(1, min(round(self.max_construct_caps * len(Xt) / len(X)), len(Xt))))
-        levels_at = {}
-        for level, k in enumerate(ks):
-            levels_at.setdefault(k, []).append(level)
-        if len(Xt) in levels_at:
-            levels_at[len(Xt)] = [max(levels_at[len(Xt)], key=lambda lv: self._code_sizes[lv])]
-        hits = {}
-        for k, cand in self.construct_method.iter_candidates(self, Xt, ks, wt):
-            U, labels = unit_rows(cand.directions), cand.labels
-            for level in levels_at[k]:
-                self._set_uniform(level)
-                self._train_quantizers(U, Xt)
-                sq = self._quantizers[level]
-                if hasattr(sq, "fit_codes"):
-                    codes = sq.fit_codes(U, Xt, labels, self.fit_candidates, self.fit_passes)
-                elif self._is_turboquant():
-                    codes = _fit_scalar_codes(sq, U, Xt, labels, self.fit_passes)
-                else:
-                    codes = self.encode(U)
-                D = self.decode(codes)
-                order, starts, counts = segments(labels, len(U))
-                theta = segment_max(angle_between(Xt, D[labels])[order], starts, counts)
-                thr = np.cos(np.minimum(theta + alpha, np.pi)).astype(np.float32)
-                D32 = D.astype(np.float32)
-                hit = np.zeros(len(far32), dtype=bool)
-                for s in range(0, len(D32), 4096):
-                    hit |= (far32 @ D32[s:s + 4096].T >= thr[None, s:s + 4096]).any(axis=1)
-                hits[level] = hit
-        self.holdout_scores = {self.levels[lv].value: float(h.mean()) for lv, h in hits.items()}
-        # The proxy's pick may have no held-out row (its count rounded onto
-        # a coarser level's): then the comparison is to the nearest scored.
-        base = chosen if chosen in hits else min(hits, key=lambda lv: abs(self._code_sizes[lv]
-                                                                       - self._code_sizes[chosen]))
-        # Only finer encodings may override: the proxy's known bias is toward
-        # coarse codes, and held-out cluster-mates favour more caps than the
-        # query mix does (coarser overrides measured +0.003..+0.011 at
-        # kf = 10-15% on ChatGPT-paraphrases).
-        finer = [lv for lv in hits if self._code_sizes[lv] >= self._code_sizes[base]]
-        rival = min(finer, key=lambda lv: (hits[lv].sum(), abs(lv - base)))
-        b = int((hits[base] & ~hits[rival]).sum())
-        c = int((hits[rival] & ~hits[base]).sum())
-        if rival == base or b - c < self.holdout_z * np.sqrt(max(b + c, 1)):
-            self._set_uniform(chosen)
-            return cover
-        self._set_uniform(rival)
-        self.selection_override = (self.levels[chosen].value, self.levels[rival].value, b, c)
-        for _, cand in self.construct_method.iter_candidates(self, X, [ks_full[rival]], weights):
-            return self.construct_method.finish(self, X, cand)
-
     @staticmethod
     def _distinct_rows(vectors: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """(rows, inverse, counts): the distinct rows of `vectors` in order of
@@ -1539,9 +1374,7 @@ class CapCoverFilter(_CapScanMixin, Filter):
         X = self._prepare_members(distinct)
         levels = None
         if len(self.levels) > 1:
-            if self.selection == "holdout":
-                cover = self._choose_holdout(X, copies)
-            elif self._mixing():
+            if self._mixing():
                 cover, levels = self._choose_mixed(X, copies)
             else:
                 cover = self._choose(X, copies)

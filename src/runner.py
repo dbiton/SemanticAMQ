@@ -98,7 +98,7 @@ CAP_INSERT_STRATEGIES = {
 # CapCoverFilter.auto() actually chooses among (AUTO_CANDIDATES +
 # DENSE10_LADDER), not every Quantize member -- auto()'s own candidate pool,
 # confirmed by its docstring, so the sweep tests what auto() actually picks
-# from rather than exotic opt-in-only rungs (BOOT_CANDIDATES, KSQ_CANDIDATES).
+# from rather than exotic opt-in-only rungs (BOOT_CANDIDATES).
 CAP_QUANTIZATION_SWEEP = tuple(_CAP_AUTO_CANDIDATES) + tuple(_CAP_DENSE10_LADDER)
 
 VectorInput = Union[np.ndarray, VectorSource]
