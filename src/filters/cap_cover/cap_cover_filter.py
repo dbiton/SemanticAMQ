@@ -2409,62 +2409,34 @@ class CapCoverFilter(Filter):
 
         # Build IVF pruning index for static filters.
         if self._ivf_index is not None and self.insert_method is None:
-            self._build_ivf(tau=self.selection_tau)
+            self._build_ivf()
 
     # ------------------------------------------------------------------
     # IVF pruning index helpers
     # ------------------------------------------------------------------
 
-    def _build_ivf(self, tau: float = 0.1) -> None:
+    def _build_ivf(self) -> None:
         """Build IVF index over the decoded cap directions.
-
-        `tau` is baked into the cell gate bounds; use selection_tau or the
-        largest tau you expect to query.  The per-member test is always exact.
+        The per-member test is exact and dynamically accounts for tau at query time.
         """
         if self._ivf_index is None or self._num_caps == 0:
             return
         ids = self.all_caps
-        dirs = self.decode_caps(ids)            # float32[N, d] decoded unit dirs
-        angles = self._angle_value(self._angle_codes[ids])   # float64[N]
-        # beta at tau and norm=1 (worst case for unit queries)
-        norms_one = np.ones(1, dtype=np.float64)
-        beta_arr, _ = self._beta(norms_one, tau)
-        beta_max = float(beta_arr[0])
-        slack = self._slack()
+        dirs = self.decode_caps(ids)
+        angles = self._angle_value(self._angle_codes[ids])
+        # Auto-size cells if not already a fixed user choice:
         K_auto = max(1, min(self._ivf_index.n_cells, int(self._num_caps ** 0.5)))
         self._ivf_index.n_cells = K_auto
-        self._ivf_index.build(dirs, angles, beta_max=beta_max, slack=slack)
-        # Store raw angles and decoded_norms in the IVF's sorted order
-        # so query_cap can pass them to the C kernel.
-        # _ivf_index._sorted_vecs is the sorted decoded directions.
-        # We need the angles and norms in that same order.
-        # The order is determined by the IVF's own build; recover it:
-        # sorted_vecs[i] = dirs[order[i]], so match by centroid assignment.
-        # Simplest: rebuild from first principles using the ivf's cell_starts.
-        # (The IVF stores sorted_vecs directly; re-derive angles from them.)
-        # Actually, we stored the reaches = theta + beta + slack in sorted order;
-        # strip back to get the raw sorted angles:
-        self._ivf_sorted_angles = (
-            self._ivf_index._sorted_reaches - beta_max - slack
-        ).astype(np.float32)
-        self._ivf_sorted_norms = np.sqrt(
-            np.einsum("ij,ij->i", self._ivf_index._sorted_vecs,
-                      self._ivf_index._sorted_vecs)
-        ).astype(np.float32)
-        self._ivf_beta_baked = beta_max   # remember for re-build check
+        self._ivf_index.build(dirs, angles)
 
     def _ivf_query(self, Qn32: np.ndarray, beta: np.ndarray,
-                        feasible: np.ndarray) -> np.ndarray:
-        """Query the IVF index (cap mode). Returns bool[nq]."""
-        if (self._ivf_index is None or not self._ivf_index._built
-                or not hasattr(self, "_ivf_sorted_angles")):
+                   feasible: np.ndarray) -> Optional[np.ndarray]:
+        """Query the IVF index (cap mode). Returns bool[nq] or None if not built."""
+        if self._ivf_index is None or not self._ivf_index._built:
             return None
         return self._ivf_index.query(
-            Qn32, beta.astype(np.float32),
-            feasible,
-            theta=self._ivf_sorted_angles,
-            decoded_norms=self._ivf_sorted_norms,
-            slack=self._slack(),
+            Qn32, beta=beta.astype(np.float32),
+            feasible=feasible, slack=self._slack()
         )
 
     # ----------------------------------------------------------------- query
@@ -2492,20 +2464,12 @@ class CapCoverFilter(Filter):
         if self._num_caps == 0 or len(vectors) == 0:
             return [False] * len(vectors)
 
-        # IVF pruning path: exact, 0-FNR.  Active for static filters only.
-        # Rebuilds cell bounds when tau exceeds the baked-in beta.
+        # IVF pruning path: exact, 0-FNR. Active for static filters only.
+        # (insert_method is None) when an IVF index has been built.
         if (self._ivf_index is not None
                 and self._ivf_index._built
-                and self.insert_method is None
-                and hasattr(self, "_ivf_sorted_angles")):
+                and self.insert_method is None):
             tau = float(distance_threshold)
-            # Check if current tau fits within baked beta
-            norms_one = np.ones(1, dtype=np.float64)
-            beta_now, _ = self._beta(norms_one, tau)
-            beta_now = float(beta_now[0])
-            if beta_now > self._ivf_beta_baked + 1e-8:
-                self._build_ivf(tau=tau)
-
             Qw = self.to_working(vectors)
             nq = np.sqrt(np.einsum("ij,ij->i", Qw, Qw))
             beta_arr, feasible = self._beta(nq, tau)

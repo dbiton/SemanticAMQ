@@ -4,7 +4,7 @@ sys.path.append(os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file
 import unittest
 import numpy as np
 import time
-from src.filters.ball_cover.ball_ivf_index import BallIVFIndex, _spherical_kmeans as _ball_kmeans, _make_csr as _ball_csr
+from src.filters.ball_cover.ball_ivf_index import BallIVFIndex, _euclidean_kmeans as _ball_kmeans, _make_csr as _ball_csr
 from src.filters.cap_cover.cap_ivf_index  import CapIVFIndex,  _spherical_kmeans as _cap_kmeans,  _make_csr as _cap_csr
 
 
@@ -78,74 +78,78 @@ def _cap_slack(d: int) -> float:
 # ===========================================================================
 
 class TestCSR(unittest.TestCase):
-    """Tests run against both ball and cap copies of _make_csr (they are
-    identical code, but each file is self-contained)."""
+    
+    def test_ball_csr_cell_starts_sum_to_N(self):
+        N, K = 100, 8
+        r = rng(0)
+        ids     = r.integers(0, K, N).astype(np.int32)
+        reaches = r.uniform(0.1, 1.0, N).astype(np.float32)
+        vecs    = unit(r.standard_normal((N, 16)).astype(np.float32))
+        starts, _, _, _ = _ball_csr(ids, K, vecs, reaches)
+        self.assertEqual(starts[-1], N, "CSR total must equal N")
+        self.assertTrue((np.diff(starts) >= 0).all())
 
-    def _run_both(self, fn):
-        fn(_ball_csr)
-        fn(_cap_csr)
+    def test_cap_csr_cell_starts_sum_to_N(self):
+        N, K = 100, 8
+        r = rng(0)
+        ids     = r.integers(0, K, N).astype(np.int32)
+        angles  = r.uniform(0.1, 1.0, N).astype(np.float32)
+        vecs    = unit(r.standard_normal((N, 16)).astype(np.float32))
+        starts, _, _, _, _ = _cap_csr(ids, K, angles, vecs)
+        self.assertEqual(starts[-1], N, "CSR total must equal N")
+        self.assertTrue((np.diff(starts) >= 0).all())
 
-    def test_cell_starts_sum_to_N(self):
-        def check(make_csr):
-            N, K = 100, 8
-            r = rng(0)
-            ids     = r.integers(0, K, N).astype(np.int32)
-            reaches = r.uniform(0.1, 1.0, N).astype(np.float32)
-            vecs    = unit(r.standard_normal((N, 16)).astype(np.float32))
-            starts, _, _, _, _ = make_csr(ids, reaches, K, vecs)
-            self.assertEqual(starts[-1], N, "CSR total must equal N")
-            self.assertTrue((np.diff(starts) >= 0).all())
-        self._run_both(check)
+    def test_ball_max_reach_per_cell(self):
+        N, K = 50, 4
+        r = rng(1)
+        ids     = (np.arange(N) % K).astype(np.int32)
+        reaches = r.uniform(0.0, 2.0, N).astype(np.float32)
+        vecs    = unit(r.standard_normal((N, 8)).astype(np.float32))
+        _, _, _, cell_max = _ball_csr(ids, K, vecs, reaches)
+        for c in range(K):
+            expected = float(reaches[ids == c].max())
+            self.assertTrue(abs(float(cell_max[c]) - expected) < 1e-5,
+                            f"cell {c}: {cell_max[c]:.4f} != {expected:.4f}")
 
-    def test_max_reach_per_cell(self):
-        def check(make_csr):
-            N, K = 50, 4
-            r = rng(1)
-            ids     = (np.arange(N) % K).astype(np.int32)
-            reaches = r.uniform(0.0, 2.0, N).astype(np.float32)
-            vecs    = unit(r.standard_normal((N, 8)).astype(np.float32))
-            _, _, _, cell_max, _ = make_csr(ids, reaches, K, vecs)
-            for c in range(K):
-                expected = float(reaches[ids == c].max())
-                self.assertTrue(abs(float(cell_max[c]) - expected) < 1e-5,
-                                f"cell {c}: {cell_max[c]:.4f} != {expected:.4f}")
-        self._run_both(check)
+    def test_cap_max_reach_per_cell(self):
+        N, K = 50, 4
+        r = rng(1)
+        ids     = (np.arange(N) % K).astype(np.int32)
+        angles  = r.uniform(0.0, 2.0, N).astype(np.float32)
+        vecs    = unit(r.standard_normal((N, 8)).astype(np.float32))
+        _, _, _, _, cell_max = _cap_csr(ids, K, angles, vecs)
+        for c in range(K):
+            expected = float(angles[ids == c].max())
+            self.assertTrue(abs(float(cell_max[c]) - expected) < 1e-5,
+                            f"cell {c}: {cell_max[c]:.4f} != {expected:.4f}")
 
-    def test_widest_first_within_cell(self):
-        def check(make_csr):
-            N, K = 80, 5
-            r = rng(2)
-            ids     = r.integers(0, K, N).astype(np.int32)
-            reaches = r.uniform(0.0, 1.0, N).astype(np.float32)
-            vecs    = unit(r.standard_normal((N, 8)).astype(np.float32))
-            starts, _, sorted_r, _, _ = make_csr(ids, reaches, K, vecs)
-            for c in range(K):
-                s, e = int(starts[c]), int(starts[c + 1])
-                self.assertTrue((np.diff(sorted_r[s:e]) <= 1e-6).all(),
-                                f"cell {c}: not widest-first")
-        self._run_both(check)
+    def test_ball_widest_first_within_cell(self):
+        N, K = 80, 5
+        r = rng(2)
+        ids     = r.integers(0, K, N).astype(np.int32)
+        reaches = r.uniform(0.0, 1.0, N).astype(np.float32)
+        vecs    = unit(r.standard_normal((N, 8)).astype(np.float32))
+        starts, _, sorted_r, _ = _ball_csr(ids, K, vecs, reaches)
+        for c in range(K):
+            s, e = int(starts[c]), int(starts[c + 1])
+            self.assertTrue((np.diff(sorted_r[s:e]) <= 1e-6).all(),
+                            f"cell {c}: not widest-first")
 
-    def test_cos_min_matches_max_reach(self):
-        """cell_cos_min[c] must equal cos(cell_max_reach[c])."""
-        def check(make_csr):
-            N, K = 60, 6
-            r = rng(3)
-            ids     = r.integers(0, K, N).astype(np.int32)
-            reaches = r.uniform(0.0, np.pi * 0.9, N).astype(np.float32)
-            vecs    = unit(r.standard_normal((N, 8)).astype(np.float32))
-            _, _, _, cell_max, cell_cos = make_csr(ids, reaches, K, vecs)
-            for c in range(K):
-                if cell_max[c] < -1e30:
-                    self.assertTrue(cell_cos[c] > 1.0, "empty cell sentinel")
-                else:
-                    expected = float(np.cos(np.clip(cell_max[c], 0, np.pi)))
-                    self.assertTrue(abs(float(cell_cos[c]) - expected) < 1e-5,
-                                    f"cell {c}: cos_min {cell_cos[c]:.4f} != {expected:.4f}")
-        self._run_both(check)
+    def test_cap_widest_first_within_cell(self):
+        N, K = 80, 5
+        r = rng(2)
+        ids     = r.integers(0, K, N).astype(np.int32)
+        angles  = r.uniform(0.0, 1.0, N).astype(np.float32)
+        vecs    = unit(r.standard_normal((N, 8)).astype(np.float32))
+        starts, _, sorted_a, _, _ = _cap_csr(ids, K, angles, vecs)
+        for c in range(K):
+            s, e = int(starts[c]), int(starts[c + 1])
+            self.assertTrue((np.diff(sorted_a[s:e]) <= 1e-6).all(),
+                            f"cell {c}: not widest-first")
 
 
 # ===========================================================================
-# TestKmeans  --  shared _spherical_kmeans
+# TestKmeans
 # ===========================================================================
 
 class TestKmeans(unittest.TestCase):
@@ -188,7 +192,7 @@ class TestBallIVFIndex(unittest.TestCase):
                 centers, radii, queries = make_ball_data(N, d)
                 eps = 1e-3
                 idx = BallIVFIndex(n_cells=max(4, N // 10))
-                idx.build(centers, radii, tau=tau, eps=eps)
+                idx.build(centers, radii)
                 qn  = (queries * queries).sum(1).astype(np.float32)
                 ref = ref_ball(centers, radii, tau, eps, queries)
                 ivf = idx.query(queries, qn, tau=tau, eps=eps)
@@ -204,7 +208,7 @@ class TestBallIVFIndex(unittest.TestCase):
             centers, radii, queries = make_ball_data(300, 64)
             eps = 1e-3
             idx = BallIVFIndex(n_cells=32)
-            idx.build(centers, radii, tau=tau, eps=eps)
+            idx.build(centers, radii)
             qn  = (queries * queries).sum(1).astype(np.float32)
             ref = ref_ball(centers, radii, tau, eps, queries)
             ivf = idx.query(queries, qn, tau=tau, eps=eps)
@@ -218,7 +222,7 @@ class TestBallIVFIndex(unittest.TestCase):
         c   = unit(np.ones((1, d), dtype=np.float32))
         r   = np.array([0.2], dtype=np.float32)
         idx = BallIVFIndex(n_cells=1)
-        idx.build(c, r, tau=0.1, eps=1e-3)
+        idx.build(c, r)
         q   = np.vstack([c, -c])
         qn  = (q * q).sum(1).astype(np.float32)
         out = idx.query(q, qn, tau=0.1, eps=1e-3)
@@ -229,7 +233,7 @@ class TestBallIVFIndex(unittest.TestCase):
         d   = 64
         idx = BallIVFIndex(n_cells=16)
         idx.build(np.empty((0, d), dtype=np.float32),
-                  np.empty(0, dtype=np.float32), tau=0.1, eps=1e-3)
+                  np.empty(0, dtype=np.float32))
         q   = unit(np.ones((5, d), dtype=np.float32))
         qn  = (q * q).sum(1).astype(np.float32)
         self.assertFalse(idx.query(q, qn, tau=0.1, eps=1e-3).any())
@@ -239,37 +243,11 @@ class TestBallIVFIndex(unittest.TestCase):
         centers, radii, queries = make_ball_data(100, 32)
         tau = 3.0; eps = 1e-3
         idx = BallIVFIndex(n_cells=16)
-        idx.build(centers, radii, tau=tau, eps=eps)
+        idx.build(centers, radii)
         qn  = (queries * queries).sum(1).astype(np.float32)
         ref = ref_ball(centers, radii, tau, eps, queries)
         ivf = idx.query(queries, qn, tau=tau, eps=eps)
         self.assertEqual((ref & ~ivf).sum(), 0)
-
-    # ---- Tau rebuild ----
-
-    def test_query_at_smaller_tau_than_baked(self):
-        """Querying at tau < tau_baked: cell gate is conservative, still 0-FNR."""
-        centers, radii, queries = make_ball_data(200, 32)
-        eps = 1e-3
-        idx = BallIVFIndex(n_cells=16)
-        idx.build(centers, radii, tau=0.30, eps=eps)   # bake large tau
-        tau_q = 0.05
-        qn  = (queries * queries).sum(1).astype(np.float32)
-        ref = ref_ball(centers, radii, tau_q, eps, queries)
-        ivf = idx.query(queries, qn, tau=tau_q, eps=eps)
-        self.assertEqual((ref & ~ivf).sum(), 0, "FN when tau_query < tau_baked")
-
-    def test_query_at_larger_tau_triggers_rebuild(self):
-        """Querying at tau > tau_baked triggers an internal rebuild, still 0-FNR."""
-        centers, radii, queries = make_ball_data(200, 32)
-        eps = 1e-3
-        idx = BallIVFIndex(n_cells=16)
-        idx.build(centers, radii, tau=0.05, eps=eps)   # bake small tau
-        tau_q = 0.30
-        qn  = (queries * queries).sum(1).astype(np.float32)
-        ref = ref_ball(centers, radii, tau_q, eps, queries)
-        ivf = idx.query(queries, qn, tau=tau_q, eps=eps)
-        self.assertEqual((ref & ~ivf).sum(), 0, "FN when tau_query > tau_baked")
 
 
 # ===========================================================================
@@ -283,7 +261,7 @@ class TestCapIVFIndex(unittest.TestCase):
         beta_max = _cap_beta(tau, eps)
         slack    = _cap_slack(d)
         idx = CapIVFIndex(n_cells=32)
-        idx.build(dirs, angles, beta_max=beta_max, slack=slack)
+        idx.build(dirs, angles)
         return idx, beta_max, slack
 
     def _beta_arr(self, n: int, beta_max: float):
@@ -298,12 +276,11 @@ class TestCapIVFIndex(unittest.TestCase):
             idx, beta_max, slack = self._build(dirs, angles, tau, d)
             feasible = np.ones(len(queries), dtype=bool)
             beta_arr = self._beta_arr(len(queries), beta_max)
-            decoded_norms = np.linalg.norm(dirs, axis=1).astype(np.float32)
 
             Qn32 = queries.astype(np.float32)
             ref  = ref_cap(dirs, angles,
                            beta_arr.astype(np.float64), feasible, slack, Qn32)
-            ivf  = idx.query(Qn32, beta_arr, feasible, angles.astype(np.float32), decoded_norms, slack=slack)
+            ivf  = idx.query(Qn32, beta_arr, feasible, slack)
             fn   = ref & ~ivf
             self.assertEqual(fn.sum(), 0,
                              f"CapIVFIndex: {fn.sum()} FN at tau={tau}")
@@ -317,12 +294,11 @@ class TestCapIVFIndex(unittest.TestCase):
         idx, beta_max, slack = self._build(dirs, angles, tau, d)
         feasible = np.ones(len(queries), dtype=bool)
         beta_arr = self._beta_arr(len(queries), beta_max)
-        decoded_norms = np.linalg.norm(dirs, axis=1).astype(np.float32)
 
         Qn32 = queries.astype(np.float32)
         ref  = ref_cap(dirs, angles,
                        beta_arr.astype(np.float64), feasible, slack, Qn32)
-        ivf  = idx.query(Qn32, beta_arr, feasible, angles.astype(np.float32), decoded_norms, slack=slack)
+        ivf  = idx.query(Qn32, beta_arr, feasible, slack)
         self.assertEqual((ivf & ~ref).sum(), 0, "CapIVFIndex: extra FP")
 
     # ---- Infeasible queries ----
@@ -336,9 +312,8 @@ class TestCapIVFIndex(unittest.TestCase):
         Qn32     = unit(rng(5).standard_normal((nq, d)).astype(np.float32))
         feasible = np.zeros(nq, dtype=bool)           # all infeasible
         beta_arr = self._beta_arr(nq, beta_max)
-        decoded_norms = np.linalg.norm(dirs, axis=1).astype(np.float32)
         
-        out      = idx.query(Qn32, beta_arr, feasible, angles.astype(np.float32), decoded_norms, slack=slack)
+        out      = idx.query(Qn32, beta_arr, feasible, slack)
         self.assertFalse(out.any(), "infeasible queries must always be rejected")
 
     # ---- Edge cases ----
@@ -347,15 +322,12 @@ class TestCapIVFIndex(unittest.TestCase):
         d   = 32
         idx = CapIVFIndex(n_cells=8)
         idx.build(np.empty((0, d), dtype=np.float32),
-                  np.empty(0, dtype=np.float64),
-                  beta_max=0.3, slack=_cap_slack(d))
+                  np.empty(0, dtype=np.float64))
         q        = unit(rng(0).standard_normal((5, d)).astype(np.float32))
         feasible = np.ones(5, dtype=bool)
         beta_arr = np.full(5, 0.3, dtype=np.float32)
-        angles   = np.empty(0, dtype=np.float32)
-        decoded_norms = np.empty(0, dtype=np.float32)
         
-        out      = idx.query(q, beta_arr, feasible, angles, decoded_norms, slack=_cap_slack(d))
+        out      = idx.query(q, beta_arr, feasible, slack=_cap_slack(d))
         self.assertFalse(out.any())
 
     def test_single_cap(self):
@@ -365,7 +337,7 @@ class TestCapIVFIndex(unittest.TestCase):
         idx = CapIVFIndex(n_cells=1)
         beta_max = _cap_beta(0.1)
         slack    = _cap_slack(d)
-        idx.build(u, th, beta_max=beta_max, slack=slack)
+        idx.build(u, th)
 
         # Query aligned with direction: must accept
         q_in  = u.copy()
@@ -374,9 +346,8 @@ class TestCapIVFIndex(unittest.TestCase):
         Qn32  = np.vstack([q_in, q_out]).astype(np.float32)
         feas  = np.ones(2, dtype=bool)
         beta  = np.full(2, beta_max, dtype=np.float32)
-        decoded_norms = np.linalg.norm(u, axis=1).astype(np.float32)
         
-        out   = idx.query(Qn32, beta, feas, th.astype(np.float32), decoded_norms, slack=slack)
+        out   = idx.query(Qn32, beta, feas, slack)
         self.assertTrue(out[0], "direction query should be accepted")
         self.assertFalse(out[1], "antipodal query should be rejected")
 
@@ -385,7 +356,8 @@ class TestCapIVFIndex(unittest.TestCase):
     def test_pruning_fraction_in_range(self):
         dirs, angles, queries = make_cap_data(200, 64)
         idx, beta_max, slack = self._build(dirs, angles, 0.1, 64)
-        fracs = idx.pruning_fraction(queries.astype(np.float32))
+        beta_arr = self._beta_arr(len(queries), beta_max)
+        fracs = idx.pruning_fraction(queries.astype(np.float32), beta=beta_arr, slack=slack)
         self.assertTrue((fracs >= 0.0).all() and (fracs <= 1.0 + 1e-6).all())
 
 
@@ -397,9 +369,9 @@ class TestPruning(unittest.TestCase):
     def test_fraction_in_range(self):
         centers, radii, queries = make_ball_data(200, 64)
         idx = BallIVFIndex(n_cells=32)
-        idx.build(centers, radii, tau=0.1, eps=1e-3)
+        idx.build(centers, radii)
         qn    = (queries * queries).sum(1).astype(np.float32)
-        fracs = idx.pruning_fraction(queries, qn)
+        fracs = idx.pruning_fraction(queries, qn, tau=0.1, eps=1e-3)
         self.assertTrue((fracs >= 0.0).all() and (fracs <= 1.0 + 1e-6).all())
 
     def test_negatives_prune_more_than_positives(self):
@@ -410,15 +382,15 @@ class TestPruning(unittest.TestCase):
         centers = unit(r.standard_normal((N, d)).astype(np.float32))
         radii   = np.full(N, 0.05, dtype=np.float32)
         idx = BallIVFIndex(n_cells=64)
-        idx.build(centers, radii, tau=0.05, eps=1e-3)
+        idx.build(centers, radii)
 
         pos     = centers[:20]
         far_neg = unit(-centers[:20] + r.standard_normal((20, d)).astype(np.float32) * 0.01)
         qn_p    = (pos     * pos    ).sum(1).astype(np.float32)
         qn_n    = (far_neg * far_neg).sum(1).astype(np.float32)
 
-        frac_p = idx.pruning_fraction(pos,     qn_p)
-        frac_n = idx.pruning_fraction(far_neg, qn_n)
+        frac_p = idx.pruning_fraction(pos,     qn_p, tau=0.05, eps=1e-3)
+        frac_n = idx.pruning_fraction(far_neg, qn_n, tau=0.05, eps=1e-3)
         self.assertTrue(frac_n.mean() < frac_p.mean() + 0.5,
                         (f"negatives fraction {frac_n.mean():.2f} should not exceed "
                          f"positives {frac_p.mean():.2f} by 0.5"))
@@ -432,7 +404,7 @@ class TestThroughput(unittest.TestCase):
     """Correctness + informational throughput numbers."""
 
     @staticmethod
-    def _blas_brute(centers, radii, tau, eps, Qr):
+    def _blas_brute_ball(centers, radii, tau, eps, Qr):
         """Vectorised brute-force via a single BLAS GEMM."""
         qn  = (Qr * Qr).sum(1).astype(np.float32)
         vn  = (centers * centers).sum(1).astype(np.float32)
@@ -441,15 +413,28 @@ class TestThroughput(unittest.TestCase):
         rch = ((radii + tau + eps) ** 2).astype(np.float32)
         return (d2 <= rch[None, :]).any(1)
 
+    @staticmethod
+    def _blas_brute_cap(dirs, angles, beta, feasible, slack, Qn32):
+        """Vectorised brute-force via a single BLAS GEMM for cap cover."""
+        D64   = dirs.astype(np.float64)
+        norms = np.linalg.norm(D64, axis=1)
+        ip    = Qn32.astype(np.float64) @ D64.T
+        thr   = norms[None, :] * np.cos(angles[None, :] + beta.astype(np.float64)[:, None])
+        
+        accepts = ip + slack >= thr
+        out = np.zeros(len(Qn32), dtype=bool)
+        out[feasible] = accepts[feasible].any(axis=1)
+        return out
+
     def test_ball_ivf_correctness_and_speed(self):
-        N, d = 600, 128
+        N, d = 500, 128
         r    = rng(30)
         centers = unit(r.standard_normal((N, d)).astype(np.float32))
         radii   = np.full(N, 0.04, dtype=np.float32)
         tau = 0.04; eps = 1e-3
 
         idx = BallIVFIndex(n_cells=64)
-        idx.build(centers, radii, tau=tau, eps=eps)
+        idx.build(centers, radii)
 
         neg = unit(r.standard_normal((500, d)).astype(np.float32))
         qn  = (neg * neg).sum(1).astype(np.float32)
@@ -463,7 +448,7 @@ class TestThroughput(unittest.TestCase):
         t_ivf   = time.perf_counter() - t0
 
         t0  = time.perf_counter()
-        ref_out = self._blas_brute(centers, radii, tau, eps, neg)
+        ref_out = self._blas_brute_ball(centers, radii, tau, eps, neg)
         t_ref   = time.perf_counter() - t0
 
         self.assertTrue((ivf_out == ref_out).all(), "BallIVFIndex result disagrees with brute-force")
@@ -474,7 +459,7 @@ class TestThroughput(unittest.TestCase):
         self.assertTrue(t_ivf <= 10 * t_ref + 1.0)
 
     def test_cap_ivf_correctness_and_speed(self):
-        N, d = 400, 128
+        N, d = 500, 128
         r    = rng(31)
         dirs   = unit(r.standard_normal((N, d)).astype(np.float32))
         angles = np.full(N, 0.08)
@@ -484,25 +469,31 @@ class TestThroughput(unittest.TestCase):
         slack    = _cap_slack(d)
 
         idx = CapIVFIndex(n_cells=32)
-        idx.build(dirs, angles, beta_max=beta_max, slack=slack)
+        idx.build(dirs, angles)
 
         Qn32     = queries.astype(np.float32)
         feasible = np.ones(len(queries), dtype=bool)
         beta_arr = np.full(len(queries), beta_max, dtype=np.float32)
-        decoded_norms = np.linalg.norm(dirs, axis=1).astype(np.float32)
 
         for _ in range(3):
-            idx.query(Qn32, beta_arr, feasible, angles.astype(np.float32), decoded_norms, slack=slack)
+            idx.query(Qn32, beta_arr, feasible, slack)
 
         t0      = time.perf_counter()
-        ivf_out = idx.query(Qn32, beta_arr, feasible, angles.astype(np.float32), decoded_norms, slack=slack)
+        ivf_out = idx.query(Qn32, beta_arr, feasible, slack)
         t_ivf   = time.perf_counter() - t0
 
-        ref_out = ref_cap(dirs, angles,
-                          beta_arr.astype(np.float64), feasible, slack, Qn32)
+        t0      = time.perf_counter()
+        ref_out = self._blas_brute_cap(dirs, angles, beta_arr, feasible, slack, Qn32)
+        t_ref   = time.perf_counter() - t0
+
         fn = ref_out & ~ivf_out
         self.assertEqual(fn.sum(), 0, f"CapIVFIndex: {fn.sum()} FN in throughput test")
-        print(f"\n  CapIVFIndex: {len(queries)/t_ivf:.0f} q/s  (N={N}, d={d})")
+        
+        print(f"\n  CapIVFIndex: {len(queries)/t_ivf:.0f} q/s  |  "
+              f"BLAS brute-force: {len(queries)/t_ref:.0f} q/s  |  "
+              f"speedup: {t_ref/t_ivf:.1f}x  (N={N}, d={d})")
+        # Soft sanity: not more than 10x slower than brute force
+        self.assertTrue(t_ivf <= 10 * t_ref + 1.0)
 
 
 # ===========================================================================
@@ -513,13 +504,13 @@ class TestBookkeeping(unittest.TestCase):
     def test_ball_bytesize_positive(self):
         centers, radii, _ = make_ball_data(100, 32)
         idx = BallIVFIndex(n_cells=16)
-        idx.build(centers, radii, tau=0.1, eps=1e-3)
+        idx.build(centers, radii)
         self.assertTrue(idx.get_bytesize() > 0)
 
     def test_ball_repr_built(self):
         centers, radii, _ = make_ball_data(50, 16)
         idx = BallIVFIndex(n_cells=8)
-        idx.build(centers, radii, tau=0.1, eps=1e-3)
+        idx.build(centers, radii)
         s = repr(idx)
         self.assertTrue("BallIVFIndex" in s and "K=" in s and "not built" not in s)
 
@@ -529,13 +520,13 @@ class TestBookkeeping(unittest.TestCase):
     def test_cap_bytesize_positive(self):
         dirs, angles, _ = make_cap_data(100, 32)
         idx = CapIVFIndex(n_cells=16)
-        idx.build(dirs, angles, beta_max=0.3, slack=_cap_slack(32))
+        idx.build(dirs, angles)
         self.assertTrue(idx.get_bytesize() > 0)
 
     def test_cap_repr_built(self):
         dirs, angles, _ = make_cap_data(50, 16)
         idx = CapIVFIndex(n_cells=8)
-        idx.build(dirs, angles, beta_max=0.3, slack=_cap_slack(16))
+        idx.build(dirs, angles)
         s = repr(idx)
         self.assertTrue("CapIVFIndex" in s and "K=" in s and "not built" not in s)
 
