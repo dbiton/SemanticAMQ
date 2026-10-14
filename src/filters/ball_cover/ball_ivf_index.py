@@ -1,344 +1,240 @@
 """
-BallIVFIndex -- exact IVF pruning index for BallCoverFilter.
+BallIVFIndex -- exact IVF index for BallCoverFilter (zero false negatives).
 
-Every hot loop is a NumPy vectorised op backed by BLAS (OpenBLAS / MKL),
-so the arithmetic is C-speed with no Python interpreter overhead in the
-inner loop.
+Accept test
+-----------
+    accept(q)  <=>  exists ball j :  ||q - c_j||  <=  r_j + tau + eps
 
-Design
-------
-Sphere centers are clustered into K cells by euclidean k-means.
-Each cell stores the max possible intrinsic reach of any of its members,
-incorporating the intra-cell distance to the centroid to guarantee 0-FNR.
+c_j is ball j's decoded center, r_j its radius, tau the distance threshold and
+eps BallCoverFilter's coverage margin.  A negative reach admits nothing.
 
-A cell is skipped when ||q - centroid[c]||^2  >  (max_reach[c] + tau + eps)^2
-where max_reach[c] = max_j(r_j + dist(centroid[c], center_j)) over the cell.
-
-For surviving cells the query is scored with one BLAS GEMM:
-  ip = Q @ sorted_centers[cell_start:cell_end].T
-followed by a NumPy vectorised accept test (one Python line, fully C-speed).
-
-Zero-FNR guarantee
-------------------
-max_reach[c] >= reach of every member in cell c by construction.
-For ball cover: dist(q, centroid[c]) <= dist(q, center_j) + dist(centroid[c], center_j)
-  <= reach_j + centroid_radius <= max_reach[c], so any accepting sphere's cell passes.
-Therefore: if an accepting member exists, its cell passes the gate -- nothing is skipped.
-
-Usage
+Index
 -----
-  # Ball filter (static only -- insert_method=None):
-  idx = BallIVFIndex(n_cells=128)
-  idx.build(centers, radii)
-  out = idx.query(Qr, q_norms, tau, eps)
+1. IVF cells: K = sqrt(N) k-means cells, visited nearest-first.
+   Cell c is skipped only if ||q - mu_c|| > U_c + tau + eps, where
+   U_c = max_j (r_j + ||c_j - mu_c||) over its balls.
+2. Early abandoning: centers are stored in a centred-PCA basis; a ball is
+   dropped once a lower bound on ||q - c_j||^2 (partial sum over the leading
+   coordinates + reverse triangle inequality on the rest) exceeds its reach.
+   ~98% of balls are dropped within the first 64 of 384 coordinates.
+3. Exact decision: survivors are tested in full; pairs within float32 rounding
+   of the boundary are re-measured in float64 by BallCoverFilter's own rule.
+Large batches compute step 2's first bound for all pairs as one BLAS GEMM.
+Compiled kernels: ball_ivf_kernels.py.
 
+Correctness
+-----------
+Steps 1-2 discard a ball only via a valid lower bound (triangle inequality),
+widened by its float rounding error, so no ball that accepts q is discarded.
+Step 3 leans towards accept by _TINY, so it never rejects a pair the scan
+accepts.
+
+Threshold
+---------
+Dynamic: tau is passed at query time; each new tau recomputes the per-ball
+reach (r_j + tau + eps)^2 in O(N), nothing else depends on it.
+
+Cost
+----
+Build: k-means + PCA, O(N d (K + d)).  Memory: a float32 copy of the centers
+plus their 64-coordinate PCA head, outside the filter's budget (get_bytesize()).
 """
 
 import numpy as np
-from typing import Optional
+from filters.ball_cover import ball_ivf_kernels as IVF_K
 
 
 # ---------------------------------------------------------------------------
-# Euclidean k-means -- pure numpy, run once at build time
+# Euclidean k-means (build time only)
 # ---------------------------------------------------------------------------
 
-def _euclidean_kmeans(X: np.ndarray, K: int, n_iter: int = 20, seed: int = 0) -> tuple:
-    """
-    (centroids, labels): float32 centroids [K, d] and int32 labels [N].
-    Clustering is strictly L2 (Euclidean).
-    """
+def _euclidean_kmeans(X: np.ndarray, K: int, n_iter: int = 20, seed: int = 0):
+    """(centroids float32 [K,d], labels int32 [N]); strictly L2."""
     rng = np.random.default_rng(seed)
     N, d = X.shape
     K = min(K, N)
     if K == 0:
-        return np.empty((0, d), dtype=np.float32), np.empty(0, dtype=np.int32)
+        return np.empty((0, d), np.float32), np.empty(0, np.int32)
 
-    # Init: K random rows
-    idx = rng.choice(N, K, replace=False)
-    centroids = X[idx].copy()
+    # k-means++ seeding keeps cells balanced
+    centroids = np.empty((K, d), np.float32)
+    first = int(rng.integers(N))
+    centroids[0] = X[first]
+    xn = np.einsum("ij,ij->i", X, X)
+    best = np.maximum(xn + xn[first] - 2.0 * (X @ X[first]), 0.0)
+    for k in range(1, K):
+        p = best / best.sum() if best.sum() > 0 else None
+        nxt = int(rng.choice(N, p=p)) if p is not None else int(rng.integers(N))
+        centroids[k] = X[nxt]
+        best = np.minimum(best, np.maximum(xn + xn[nxt] - 2.0 * (X @ X[nxt]), 0.0))
 
-    labels = np.zeros(N, dtype=np.int32)
+    labels = np.full(N, -1, np.int32)
     for it in range(n_iter):
-        # Assign: nearest centroid by L2 distance
-        # d^2(x, c) = ||x||^2 + ||c||^2 - 2<x, c>
-        # To minimize d^2 across c, we maximize 2<x, c> - ||c||^2
-        c_norms_sq = (centroids * centroids).sum(axis=1).astype(np.float32)
-        ip = X @ centroids.T
-        scores = 2.0 * ip - c_norms_sq[None, :]
-        new_labels = scores.argmax(axis=1).astype(np.int32)
+        cn = np.einsum("ij,ij->i", centroids, centroids)
+        new_labels = (2.0 * (X @ centroids.T) - cn[None, :]).argmax(axis=1).astype(np.int32)
 
-        # Re-seat empty cells to random data points
+        # re-seat empty cells to random data points
         counts = np.bincount(new_labels, minlength=K)
         empty = np.flatnonzero(counts == 0)
         if len(empty):
-            spare = rng.choice(N, len(empty), replace=False)
-            new_labels[spare] = empty
+            # re-seat on the points farthest from their centroid
+            dist = xn - 2.0 * np.einsum("ij,ij->i", X, centroids[new_labels]) + cn[new_labels]
+            far = np.argsort(-dist)[:len(empty)]
+            new_labels[far] = empty
+            counts = np.bincount(new_labels, minlength=K)
 
-        # Update centroids as mean of members
-        new_centroids = np.zeros_like(centroids)
-        np.add.at(new_centroids, new_labels, X)
-        counts2 = np.bincount(new_labels, minlength=K).astype(np.float32)
-        new_centroids /= np.maximum(counts2[:, None], 1.0)
+        order = np.argsort(new_labels, kind="stable")
+        starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
+        sums = np.add.reduceat(X[order].astype(np.float64), starts, axis=0)
+        centroids = (sums / counts[:, None]).astype(np.float32)
 
-        if it > 0 and (new_labels == labels).all():
+        if (new_labels == labels).all():
             break
         labels = new_labels
-        centroids = new_centroids
-
     return centroids, labels
 
 
 # ---------------------------------------------------------------------------
-# CSR layout helper
-# ---------------------------------------------------------------------------
-
-def _make_csr(cell_ids: np.ndarray, K: int,
-              centers: np.ndarray, radii: np.ndarray) -> tuple:
-    """
-    Sort members into cells, widest-first within each cell.
-    Returns (cell_starts, sorted_vecs, sorted_reaches, cell_max_reach)
-    """
-    N = len(cell_ids)
-
-    # Per-cell max reach
-    cell_max_reach = np.full(K, -1e30, dtype=np.float64)
-    np.maximum.at(cell_max_reach, cell_ids, radii.astype(np.float64))
-    cell_max_reach = cell_max_reach.astype(np.float32)
-
-    # Stable sort: primary = cell id, secondary = radii descending (widest first)
-    BIG = float(radii.max() + 1.0) if N > 0 else 1.0
-    key = cell_ids.astype(np.float64) * BIG - radii.astype(np.float64)
-    order = np.argsort(key, kind="stable")
-
-    sorted_centers = np.ascontiguousarray(centers[order], dtype=np.float32)
-    sorted_radii   = np.ascontiguousarray(radii[order], dtype=np.float32)
-
-    # CSR starts: cumsum of per-cell counts
-    counts = np.bincount(cell_ids, minlength=K).astype(np.int32)
-    cell_starts = np.zeros(K + 1, dtype=np.int32)
-    np.cumsum(counts, out=cell_starts[1:])
-
-    return cell_starts, sorted_centers, sorted_radii, cell_max_reach
-
-
-# ---------------------------------------------------------------------------
-# Main class
+# Index
 # ---------------------------------------------------------------------------
 
 class BallIVFIndex:
     """
-    Exact IVF pruning index for BallCoverFilter.  
-    Zero false negatives by construction.
-
-    All arithmetic is NumPy vectorised (BLAS GEMMs, no Python inner loops).
+    Exact IVF index for BallCoverFilter.  Zero false negatives.
 
     Parameters
     ----------
     n_cells : int
-        Number of k-means cells.  Auto-sized to min(n_cells, sqrt(N)) at
-        build time so small covers aren't over-partitioned.
-    n_iter : int
-        k-means iterations.
-    seed : int
-        k-means RNG seed.
+        Upper bound on the number of cells; K = min(n_cells, sqrt(N)).
+    n_iter, seed : k-means iterations / RNG seed.
+    gemm_min_batch : int
+        Batches with at least this many queries take the large-batch path:
+        the first abandon test for every (query, member) pair as one BLAS GEMM
+        over the leading PCA coordinates (see ivf_kernels.KernelData.run_gemm).
+    parallel_min_batch : int
+        Batches with at least this many queries run multi-threaded.
     """
 
-    def __init__(self, n_cells: int = 128, n_iter: int = 20, seed: int = 0):
+    # The exact test accepts d^2 <= reach^2 + _TINY (|q|^2 + |c|^2): float64
+    # rounding plus the ~1e-6 by which BallCoverFilter._scan's rotated float32
+    # distances may differ from the input-basis ones here -- towards accept, so
+    # the index never rejects a query the scan accepts; it can only accept a pair
+    # within ~1e-5 of the boundary, far inside the filter's 1e-3 coverage margin.
+    _TINY = 2e-6
+
+    def __init__(self, n_cells: int = 4096, n_iter: int = 12, seed: int = 0,
+                 parallel_min_batch: int = 8, gemm_min_batch: int = 16):
         self.n_cells = n_cells
-        self.n_iter  = n_iter
-        self.seed    = seed
-        self._built  = False
+        self.n_iter = n_iter
+        self.seed = seed
+        self.parallel_min_batch = int(parallel_min_batch)
+        self.gemm_min_batch = int(gemm_min_batch)
+        self._built = False
+        self._tau_key = None
 
     # ------------------------------------------------------------------
     # Build
     # ------------------------------------------------------------------
 
     def build(self, centers: np.ndarray, radii: np.ndarray) -> None:
-        """
-        Build the ball-filter IVF index.
-
-        Parameters
-        ----------
-        centers : float32[N, d]
-            Decoded sphere centers in the rotated working basis.
-        radii : float32[N]
-            Stored sphere radii.
-        """
+        """centers: [N,d] decoded centers (in the basis queries will be passed
+        in); radii: [N]."""
         centers = np.ascontiguousarray(centers, dtype=np.float32)
-        radii   = np.asarray(radii, dtype=np.float32).ravel()
-        self._build_common(centers, radii)
-
-    def _build_common(self, centers: np.ndarray, radii: np.ndarray) -> None:
+        radii = np.asarray(radii, dtype=np.float32).ravel()
         N, d = centers.shape
-        self.d = d
-        self.N = N
-
+        self.N, self.d = N, d
+        self._tau_key = None
+        self.K = 0
         if N == 0:
             self._built = True
-            self._centroids      = np.empty((0, d), dtype=np.float32)
-            self._centroid_norms = np.empty(0, dtype=np.float32)
-            self._cell_starts    = np.array([0], dtype=np.int32)
-            self._cell_max_reach = np.empty(0, dtype=np.float32)
-            self._sorted_centers = np.empty((0, d), dtype=np.float32)
-            self._sorted_radii   = np.empty(0, dtype=np.float32)
-            self._vec_norms_sq   = np.empty(0, dtype=np.float32)
-            self.K = 0
             return
 
-        K = min(self.n_cells, max(1, int(N ** 0.5)))
-        K = min(K, N)
+        # --- cells: K = sqrt(N) k-means ---
+        K = max(1, min(int(self.n_cells), int(np.sqrt(N))))
+        mu, labels = _euclidean_kmeans(centers, K, self.n_iter, self.seed)
+        used = np.unique(labels)
+        remap = np.full(len(mu), -1, np.int64)
+        remap[used] = np.arange(len(used))
+        labels = remap[labels]
+        mu64 = mu[used].astype(np.float64)
+        K = len(mu64)
+
+        # per-ball distance to its own centroid (float64, rounded up); cell reach U_c
+        c64 = centers.astype(np.float64)
+        delta = np.linalg.norm(c64 - mu64[labels], axis=1)
+        delta = delta * (1.0 + 1e-9) + 1e-9
+        r64 = radii.astype(np.float64)
+        cell_U = np.full(K, -np.inf)
+        np.maximum.at(cell_U, labels, r64 + delta)
+
+        # storage: by cell, widest ball first within a cell
+        order = np.lexsort((-radii, labels))
+        self._order = order.astype(np.int64)
+        counts = np.bincount(labels, minlength=K)
+        self._cell_starts = np.concatenate(([0], np.cumsum(counts))).astype(np.int64)
+        self._cell_sizes = counts.astype(np.float64)
+        self._cell_U = cell_U
+        self._r64 = r64[order]
         self.K = K
 
-        # Euclidean k-means on the vectors
-        centroids, labels = _euclidean_kmeans(centers, K, self.n_iter, self.seed)
-        self._centroids = np.ascontiguousarray(centroids, dtype=np.float32)
-        self._centroid_norms_sq = (self._centroids * self._centroids).sum(1).astype(np.float32)
-
-        # Build CSR layout and sorted arrays
-        cell_starts, sorted_centers, sorted_radii, cell_max_reach = \
-            _make_csr(labels.astype(np.int32), K, centers, radii)
-
-        self._cell_starts    = cell_starts
-        self._cell_max_reach = cell_max_reach     
-        self._sorted_centers = sorted_centers     
-        self._sorted_radii   = sorted_radii       
-        self._vec_norms_sq   = (sorted_centers * sorted_centers).sum(1).astype(np.float32)
+        n = self.N
+        self._kd = IVF_K.KernelData(c64[order], centers[order], np.full(n, -1.0), np.zeros(n), np.ones(n),
+                                 mu64, cell_U, self._cell_starts, dense=3, gemm_ck=3)
         self._built = True
 
     # ------------------------------------------------------------------
     # Query
     # ------------------------------------------------------------------
 
-    def query(self, Qr: np.ndarray, q_norms_sq: np.ndarray,
-              tau: float, eps: float, rel_error: Optional[float] = None) -> np.ndarray:
-        """
-        Exact ball-filter IVF query.  0-FNR guaranteed.
+    def _prepare(self, tau_eps: float) -> None:
+        """Per-tau reach^2 of every ball (-1 for a negative reach: admits nothing)."""
+        if self._tau_key == tau_eps:
+            return
+        reach = self._r64 + tau_eps
+        with np.errstate(over="ignore", invalid="ignore"):
+            rsq = np.where(reach >= 0.0, reach * reach, -1.0)
+        self._kd.set_reach(rsq)
+        self._tau_key = tau_eps
 
-        Parameters
-        ----------
-        Qr : float32[nq, d]
-            Queries in the rotated working basis.
-        q_norms_sq : float32[nq]
-            Per-query ||q||^2.
-        tau, eps : float
-            Distance threshold and coverage epsilon.
-        rel_error : float, optional
-            Float32 slack: (2*d + 4) * 2^{-24}.  Computed from d if None.
-
-        Returns
-        -------
-        out : bool[nq]
-        """
-        if not self._built or self.N == 0:
-            return np.zeros(len(Qr), dtype=bool)
-
-        Qr          = np.ascontiguousarray(Qr, dtype=np.float32)
-        q_norms_sq  = np.ascontiguousarray(q_norms_sq, dtype=np.float32)
-        nq          = len(Qr)
-        out         = np.zeros(nq, dtype=bool)
-
-        if rel_error is None:
-            rel_error = (2 * self.d + 4) * 2.0 ** -24
-
+    def query(self, Q: np.ndarray, tau: float, eps: float) -> np.ndarray:
+        """bool[nq]: does some ball accept the query?  Exact, 0-FNR.
+        Q: queries [nq,d] in the centers' basis (float64; float32 is widened)."""
+        nq = len(Q)
+        if not self._built or self.N == 0 or nq == 0:
+            return np.zeros(nq, dtype=bool)
         tau_eps = float(tau) + float(eps)
-
-        # --- Gate: one BLAS GEMM against K centroids ---
-        ip_cen = Qr @ self._centroids.T
-        d2_cen = (q_norms_sq[:, None] + self._centroid_norms_sq[None, :] - 2.0 * ip_cen)
-        d2_cen = np.maximum(d2_cen, 0.0)
-
-        # Fully vectorized, precomputed threshold bounds for all queries against all cells
-        max_reach_sq = np.where(self._cell_max_reach > -1e30, 
-                                (self._cell_max_reach + tau_eps)**2, -1.0).astype(np.float32)
-
-        # --- Per-cell scan over surviving (query, cell) pairs ---
-        # Outer loop is over K cells (scalar Python, O(K) iterations).
-        # Inner ops are BLAS + NumPy vectorised over all live queries at once.
-        for c in range(self.K):
-            if max_reach_sq[c] < 0.0:
-                continue  # empty cell
-
-            live = (d2_cen[:, c] <= max_reach_sq[c]) & ~out
-            if not live.any():
-                continue
-
-            s, e = int(self._cell_starts[c]), int(self._cell_starts[c + 1])
-            if s == e:
-                continue
-
-            cell_vecs  = self._sorted_centers[s:e]
-            cell_radii = self._sorted_radii[s:e]
-            cell_vnsq  = self._vec_norms_sq[s:e]
-
-            # Dynamic member reach boundary
-            cell_rsq   = (cell_radii + tau_eps)**2
-
-            live_idx = np.flatnonzero(live)
-            Qs = Qr[live_idx]
-            qn2 = q_norms_sq[live_idx]
-
-            # L2^2(q, v) = ||q||^2 + ||v||^2 - 2*ip
-            ip = Qs @ cell_vecs.T
-            d2 = qn2[:, None] + cell_vnsq[None, :] - 2.0 * ip
-            d2 = np.maximum(d2, 0.0)
-
-            # Scale slack by the norms to match _scan exactness
-            scale = qn2[:, None] + cell_vnsq.max()
-            slack_scaled = rel_error * scale
-
-            # A query is accepted if ANY member in the cell accepts it
-            accepts = (d2 - slack_scaled) <= cell_rsq[None, :]
-            out[live_idx] |= accepts.any(axis=1)
-
-            # Early stopping: break cell loop if all queries are accepted
-            if out.all():
-                break
-
-        return out
+        self._prepare(tau_eps)
+        Q64 = np.ascontiguousarray(Q, dtype=np.float64)
+        live = np.ones(nq, dtype=np.bool_)
+        parallel = nq >= self.parallel_min_batch and IVF_K.get_num_threads() > 1
+        if nq >= self.gemm_min_batch:
+            return self._kd.run_gemm(live, Q64, np.zeros(nq), self._TINY, 0.0, parallel)
+        return self._kd.run(live, Q64, np.zeros(nq), tau_eps, self._TINY, 0.0, parallel)
 
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
 
-    def pruning_fraction(self, Qr: np.ndarray, q_norms_sq: np.ndarray = None, 
-                         tau: float = 0.5, eps: float = 1e-3) -> np.ndarray:
-        """
-        Fraction of members (by count) visited per query.
-        1.0 = no pruning.
-        """
+    def pruning_fraction(self, Q: np.ndarray, tau: float = 0.5, eps: float = 1e-3,
+                         stage: str = "full") -> np.ndarray:
+        """Per query, the fraction of balls still alive after the IVF cell gate
+        (stage="gate") or after the gate and every early-abandon checkpoint,
+        i.e. measured in full (stage="full", the default).  0.0 = everything
+        pruned, 1.0 = nothing."""
         if not self._built or self.N == 0:
-            return np.ones(len(Qr))
-        Qr = np.ascontiguousarray(Qr, dtype=np.float32)
-        if q_norms_sq is None:
-            q_norms_sq = (Qr * Qr).sum(1).astype(np.float32)
-
-        ip_cen = Qr @ self._centroids.T
-        d2_cen = np.maximum(q_norms_sq[:, None] + self._centroid_norms_sq[None, :] - 2.0 * ip_cen, 0.0)
-        
-        tau_eps = float(tau) + float(eps)
-        max_reach_sq = np.where(self._cell_max_reach > -1e30, 
-                         (self._cell_max_reach + tau_eps)**2, -1.0).astype(np.float32)
-
-        # Cells that survive the gate per query
-        gate_pass = d2_cen <= max_reach_sq[None, :]
-        cell_sizes = np.diff(self._cell_starts).astype(np.float32)
-        members_visited = gate_pass @ cell_sizes
-        return members_visited / max(1, self.N)
+            return np.ones(len(Q))
+        self._prepare(float(tau) + float(eps))
+        Q64 = np.asarray(Q, dtype=np.float64)
+        return self._kd.survivor_fraction(Q64, np.zeros(len(Q64)), float(tau) + float(eps), stage)
 
     def get_bytesize(self) -> int:
-        """Approximate RAM used by the index arrays."""
-        if not self._built:
+        if not self._built or self.N == 0:
             return 0
-        total = 0
-        for arr in (self._centroids, self._centroid_norms_sq,
-                    self._cell_starts, self._cell_max_reach,
-                    self._sorted_centers, self._sorted_radii,
-                    self._vec_norms_sq):
-            total += arr.nbytes
-        return total
+        return self._kd.nbytes() + int(sum(a.nbytes for a in (
+            self._cell_U, self._cell_starts, self._cell_sizes, self._r64, self._order)))
 
     def __repr__(self):
         if not self._built:
-            return (f"BallIVFIndex(n_cells={self.n_cells}, not built)")
-        return (f"BallIVFIndex(K={self.K}, N={self.N}, "
-                f"d={self.d}, ~{self.get_bytesize() // 1024} KB)")
+            return f"BallIVFIndex(n_cells={self.n_cells}, not built)"
+        return (f"BallIVFIndex(K={self.K}, N={self.N}, d={self.d}, "
+                f"~{self.get_bytesize() // 1024} KB)")

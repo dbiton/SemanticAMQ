@@ -1217,7 +1217,7 @@ class CapCoverFilter(Filter):
         single_tables: bool = True,
         boot_anchors: float = 0.25,
         boot_equal: bool = True,
-        ivf_index: Optional[CapIVFIndex] = CapIVFIndex(),
+        ivf_index: Union[CapIVFIndex, None, str] = "auto",
     ) -> None:
         super().__init__(dim, max_memory=max_memory)
         self.boot_anchors = boot_anchors
@@ -1284,9 +1284,9 @@ class CapCoverFilter(Filter):
         self._cap_level = np.zeros(0, dtype=np.int8)   # each cap's encoding (index into levels)
         self._dirs = None   # decoded unit directions by id: transient, like BallCoverFilter's all_centers
         self.selection_k = None
-        # IVF pruning index: exact, 0-FNR.  Built after construct() completes.
-        # Pass ivf_index=CapIVFIndex() to enable.
-        self._ivf_index: Optional[CapIVFIndex] = ivf_index
+        # IVF pruning index: exact, 0-FNR. Built after construct() completes (static covers only).
+        # "auto" = a fresh CapIVFIndex() per filter, None disables it.
+        self._ivf_index: Optional[CapIVFIndex] = CapIVFIndex() if ivf_index == "auto" else ivf_index
         self._set_uniform(0)
 
     def _set_uniform(self, level: int) -> None:
@@ -2424,20 +2424,18 @@ class CapCoverFilter(Filter):
         ids = self.all_caps
         dirs = self.decode_caps(ids)
         angles = self._angle_value(self._angle_codes[ids])
-        # Auto-size cells if not already a fixed user choice:
-        K_auto = max(1, min(self._ivf_index.n_cells, int(self._num_caps ** 0.5)))
-        self._ivf_index.n_cells = K_auto
+        if self._rotation is not None:
+            dirs = np.asarray(dirs, dtype=np.float64) @ self._rotation.T
         self._ivf_index.build(dirs, angles)
 
-    def _ivf_query(self, Qn32: np.ndarray, beta: np.ndarray,
+    def _ivf_query(self, Qn: np.ndarray, beta: np.ndarray,
                    feasible: np.ndarray) -> Optional[np.ndarray]:
-        """Query the IVF index (cap mode). Returns bool[nq] or None if not built."""
+        """Query the IVF index (cap mode). Returns bool[nq] or None if not built.
+        Qn, beta in float64, as _scan uses them (a float32 beta could round
+        a boundary query to a reject)."""
         if self._ivf_index is None or not self._ivf_index._built:
             return None
-        return self._ivf_index.query(
-            Qn32, beta=beta.astype(np.float32),
-            feasible=feasible, slack=self._slack()
-        )
+        return self._ivf_index.query(Qn, beta=beta, feasible=feasible)
 
     # ----------------------------------------------------------------- query
     def _beta(self, norms: np.ndarray, tau: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -2470,13 +2468,11 @@ class CapCoverFilter(Filter):
                 and self._ivf_index._built
                 and self.insert_method is None):
             tau = float(distance_threshold)
-            Qw = self.to_working(vectors)
+            Qw = np.asarray(vectors, dtype=np.float64)
             nq = np.sqrt(np.einsum("ij,ij->i", Qw, Qw))
             beta_arr, feasible = self._beta(nq, tau)
             Qn = Qw / np.maximum(nq, 1e-300)[:, None]
-            Qn32 = Qn.astype(np.float32)
-            beta32 = beta_arr.astype(np.float32)
-            result = self._ivf_query(Qn32, beta32, feasible)
+            result = self._ivf_query(Qn, beta_arr, feasible)
             if result is not None:
                 return result.tolist()
 

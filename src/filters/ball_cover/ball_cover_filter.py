@@ -3,7 +3,7 @@ import faiss
 import sys
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Union
 from filters.filter import Filter, InsufficientMemoryError
 from filters.ball_cover.ball_interfaces import ConstructInterface, InsertInterface
 from filters.ball_cover.gonzales_construct import GonzalesConstruct
@@ -190,7 +190,7 @@ class BallCoverFilter(Filter):
         max_memory: Optional[int] = None,
         max_spheres: Optional[int] = None,
         insert_memory_percent: Optional[float] = 0.0,
-        ivf_index: Optional[BallIVFIndex] = BallIVFIndex(),
+        ivf_index: Union[BallIVFIndex, None, str] = "auto",
     ) -> None:
         super().__init__(dim, max_memory=max_memory)
         self.quantize = quantize
@@ -207,10 +207,9 @@ class BallCoverFilter(Filter):
             from filters.ball_cover.gonzales_construct import GonzalesConstruct
             construct_method = GonzalesConstruct()
 
-        # IVF pruning index: exact, 0-FNR.  Built from construct() and
-        # invalidated by insert/remove so only static filters use it.
-        # Pass ivf_index=BallIVFIndex() to enable.
-        self._ivf_index: Optional[BallIVFIndex] = ivf_index
+        # IVF pruning index: exact, 0-FNR. Built after construct() completes (static covers only).
+        # "auto" = a fresh CapIVFIndex() per filter, None disables it.
+        self._ivf_index: Optional[BallIVFIndex] = BallIVFIndex() if ivf_index == "auto" else ivf_index
 
         self._num_spheres = 0
         self._all_spheres = np.arange(self.max_spheres, dtype=np.int32)
@@ -792,34 +791,32 @@ class BallCoverFilter(Filter):
     # ------------------------------------------------------------------
 
     def _build_ivf(self) -> None:
-        """Build the IVF pruning index from the current stored balls."""
+        """Build the IVF pruning index from the current stored balls, in the
+        INPUT basis: the quantizer's rotation (x_rot = A x + b) is undone once
+        here, in float64, so the indexed query path rotates nothing -- that
+        rotation (one d x d GEMM per batch) otherwise costs about as much as
+        the index itself.  A is orthonormal to ~5e-7, so distances agree with
+        _scan's rotated-basis ones to ~5e-6 in d^2, inside the index's
+        accept-side tolerance: no query the scan accepts is rejected."""
         if self._ivf_index is None or self._num_spheres == 0:
             return
         ids, codes = self._stored_codes()
-        centers_rot = self._decode_rotated(codes)
+        centers = self._decode_rotated(codes).astype(np.float64)
         radii = self._all_radiuses[ids]
-        # Auto-size cells if not already a fixed user choice:
-        K_auto = max(1, min(self._ivf_index.n_cells, int(self._num_spheres ** 0.5)))
-        self._ivf_index.n_cells = K_auto
-        self._ivf_index.build(centers_rot, radii)
+        rotation = self._rotation()
+        if rotation is not None:
+            lt = faiss.downcast_VectorTransform(rotation)
+            A = faiss.vector_to_array(lt.A).reshape(lt.d_out, lt.d_in).astype(np.float64)
+            if lt.have_bias:
+                centers -= faiss.vector_to_array(lt.b).astype(np.float64)
+            centers = centers @ A
+        self._ivf_index.build(centers, radii)
 
     def _ivf_query(self, Q: np.ndarray, distance_threshold: float) -> np.ndarray:
-        """Query the IVF index (ball mode).  Returns bool[nq].
-        Queries must already be in the rotated basis (Qr).
-        """
+        """Query the IVF index (ball mode), raw queries.  Returns bool[nq]."""
         if self._ivf_index is None or not self._ivf_index._built:
             return None
-
-        rotation = self._rotation()
-        Qr = np.ascontiguousarray(rotation.apply(Q) if rotation is not None else Q,
-                                   dtype=np.float32)
-        q_norms = np.einsum("ij,ij->i", Qr, Qr).astype(np.float32)
-        rel_error = (2 * self.dim + 4) * 2.0 ** -24
-
-        return self._ivf_index.query(
-            Qr, q_norms, tau=distance_threshold,
-            eps=self._COVERAGE_EPSILON, rel_error=rel_error
-        )
+        return self._ivf_index.query(Q, tau=distance_threshold, eps=self._COVERAGE_EPSILON)
 
     def surface_distance(self, vectors: np.ndarray) -> np.ndarray:
         """Per query, the smallest (distance to a ball's center - its radius)

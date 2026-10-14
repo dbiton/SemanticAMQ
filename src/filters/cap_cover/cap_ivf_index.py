@@ -1,335 +1,260 @@
 """
-CapIVFIndex -- exact IVF pruning index for CapCoverFilter.
+CapIVFIndex -- exact IVF index for CapCoverFilter (zero false negatives).
 
-Every hot loop is a NumPy vectorised op backed by BLAS (OpenBLAS / MKL),
-so the arithmetic is C-speed with no Python interpreter overhead in the
-inner loop.
+Accept test
+-----------
+    accept(q)  <=>  feasible(q)  and  exists cap j :  angle(q, u_j) <= theta_j + beta
 
-Design
-------
-Cap centers are clustered into K cells by spherical k-means.
-Each cell stores the max intrinsic angle (theta) of any of its members.
+u_j = v_j / |v_j| is cap j's decoded direction, theta_j its angle, beta the
+per-query margin CapCoverFilter derives from tau and |q|.  Equivalently
+||q - u_j||^2 <= |q|^2 + 1 - 2 cos(theta_j + beta): a ball test on the sphere.
 
-A cell is skipped when <q, centroid[c]>  <  cos(max_theta[c] + beta_q + slack)
-
-For surviving cells the query is scored with one BLAS GEMM:
-  ip = Q @ sorted_vecs[cell_start:cell_end].T
-followed by a NumPy vectorised accept test (one Python line, fully C-speed).
-
-Zero-FNR guarantee
-------------------
-max_theta[c] >= theta of every member in cell c by construction.
-For cap mode: angle(q, centroid[c]) <= angle(q, dir_j) + angle(centroid[c], dir_j)
-  and the analogous bound holds in angle space.
-Therefore: if an accepting member exists, its cell passes the gate -- nothing is skipped.
-
-Usage
+Index
 -----
-  # Cap filter (static only -- insert_method=None):
-  idx = CapIVFIndex(n_cells=128)
-  idx.build(decoded_dirs, angles)
-  out = idx.query(Qn32, beta_f32, feasible, slack)
+1. IVF cells: K = sqrt(N) spherical k-means cells, visited nearest-first.
+   Cell c is skipped only if angle(q, mu_c) > U_c + beta, where
+   U_c = max_j (theta_j + angle(u_j, mu_c)) over its caps.
+2. Early abandoning: caps are stored in a centred-PCA basis; a cap is dropped
+   once a lower bound on ||q - u_j||^2 (partial sum over the leading
+   coordinates + reverse triangle inequality on the rest) exceeds its reach.
+   ~99.8% of caps are dropped within the first 64 of 384 coordinates.
+3. Exact decision: survivors are tested in full; pairs within float32 rounding
+   of the boundary are re-measured in float64 by CapCoverFilter's own rule.
+Large batches compute step 2's first bound for all pairs as one BLAS GEMM.
+Compiled kernels: cap_ivf_kernels.py.
+
+Correctness
+-----------
+Steps 1-2 discard a cap only via a valid lower bound (triangle inequality),
+widened by its float rounding error, so no cap that accepts q is discarded.
+Step 3 leans towards accept by _TINY, so it never rejects a pair the scan
+accepts.  Queries with theta_max + beta >= pi are accepted outright (the
+widest cap covers the sphere); infeasible queries are rejected.
+
+Threshold
+---------
+Dynamic: beta is passed per query at query time; nothing depends on it at
+build time.
+
+Cost
+----
+Build: k-means + PCA, O(N d (K + d)).  Memory: a float32 copy of the caps plus
+their 64-coordinate PCA head, outside the filter's budget (get_bytesize()).
 """
 
 import numpy as np
-from typing import Optional
+from filters.cap_cover import cap_ivf_kernels as IVF_K
 
 
 # ---------------------------------------------------------------------------
-# Spherical k-means -- pure numpy, run once at build time
+# Spherical k-means (build time only)
 # ---------------------------------------------------------------------------
 
-def _spherical_kmeans(X: np.ndarray, K: int, n_iter: int = 20, seed: int = 0) -> tuple:
-    """
-    (centroids, labels): unit float32 centroids [K, d] and int32 labels [N].
-    X must have unit rows (float32).
-    """
+def _spherical_kmeans(X: np.ndarray, K: int, n_iter: int = 12, seed: int = 0):
+    """(unit float32 centroids [K,d], int32 labels [N]).  X: unit float32 rows."""
     rng = np.random.default_rng(seed)
     N, d = X.shape
     K = min(K, N)
     if K == 0:
-        return np.empty((0, d), dtype=np.float32), np.empty(0, dtype=np.int32)
+        return np.empty((0, d), np.float32), np.empty(0, np.int32)
 
-    # Init: K random rows
-    idx = rng.choice(N, K, replace=False)
-    centroids = X[idx].copy()
-    _renorm(centroids)
+    # k-means++ seeding (chord distance^2 = 2 - 2<x,c>) keeps cells balanced
+    centroids = np.empty((K, d), np.float32)
+    first = int(rng.integers(N))
+    centroids[0] = X[first]
+    best = np.maximum(2.0 - 2.0 * (X @ X[first]), 0.0).astype(np.float64)
+    for k in range(1, K):
+        tot = best.sum()
+        nxt = int(rng.choice(N, p=best / tot)) if tot > 0 else int(rng.integers(N))
+        centroids[k] = X[nxt]
+        best = np.minimum(best, np.maximum(2.0 - 2.0 * (X @ X[nxt]), 0.0))
 
-    labels = np.zeros(N, dtype=np.int32)
-    for it in range(n_iter):
-        # Assign: nearest centroid by inner product (= smallest angle)
+    labels = np.full(N, -1, np.int32)
+    for _ in range(n_iter):
         ip = X @ centroids.T
-        new_labels = ip.argmax(1).astype(np.int32)
+        new_labels = ip.argmax(axis=1).astype(np.int32)
 
-        # Re-seat empty cells to random data points
+        # re-seat empty cells to random data points
         counts = np.bincount(new_labels, minlength=K)
         empty = np.flatnonzero(counts == 0)
         if len(empty):
-            spare = rng.choice(N, len(empty), replace=False)
-            new_labels[spare] = empty
+            # re-seat on the points least well served by their centroid
+            fit = ip[np.arange(N), new_labels]
+            for c, p in zip(empty, np.argsort(fit)[:len(empty)]):
+                new_labels[p] = c
+            counts = np.bincount(new_labels, minlength=K)
 
-        # Update centroids as mean of members, renormalised
-        new_centroids = np.zeros_like(centroids)
-        np.add.at(new_centroids, new_labels, X)
-        counts2 = np.bincount(new_labels, minlength=K).astype(np.float32)
-        new_centroids /= np.maximum(counts2[:, None], 1.0)
-        _renorm(new_centroids)
+        order = np.argsort(new_labels, kind="stable")
+        starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
+        sums = np.add.reduceat(X[order].astype(np.float64), starts, axis=0)
+        nrm = np.linalg.norm(sums, axis=1, keepdims=True)
+        centroids = (sums / np.maximum(nrm, 1e-300)).astype(np.float32)
 
-        if it > 0 and (new_labels == labels).all():
+        if (new_labels == labels).all():
             break
         labels = new_labels
-        centroids = new_centroids
-
     return centroids, labels
 
 
-def _renorm(X: np.ndarray) -> None:
-    """Normalise rows of X to unit length in-place (float32)."""
-    n = np.sqrt((X * X).sum(axis=1, keepdims=True))
-    np.divide(X, np.maximum(n, 1e-30), out=X)
-
-
 # ---------------------------------------------------------------------------
-# CSR layout helper
-# ---------------------------------------------------------------------------
-
-def _make_csr(cell_ids: np.ndarray, K: int, angles: np.ndarray,
-              directions: np.ndarray) -> tuple:
-    """
-    Sort members into cells, widest-first within each cell.
-    Returns (cell_starts, sorted_vecs, sorted_angles, sorted_norms, cell_max_theta)
-    """
-    N = len(cell_ids)
-
-    # Per-cell max intrinsic angle (theta)
-    cell_max_theta = np.full(K, -1e30, dtype=np.float64)
-    np.maximum.at(cell_max_theta, cell_ids, angles.astype(np.float64))
-    cell_max_theta = cell_max_theta.astype(np.float32)
-
-    # Stable sort: primary = cell id, secondary = angle descending (widest first)
-    BIG = float(angles.max() + 1.0) if N > 0 else 1.0
-    key = cell_ids.astype(np.float64) * BIG - angles.astype(np.float64)
-    order = np.argsort(key, kind="stable")
-
-    sorted_vecs   = np.ascontiguousarray(directions[order], dtype=np.float32)
-    sorted_angles = np.ascontiguousarray(angles[order],    dtype=np.float32)
-    sorted_norms  = np.sqrt((sorted_vecs * sorted_vecs).sum(axis=1)).astype(np.float32)
-
-    # CSR starts: cumsum of per-cell counts
-    counts = np.bincount(cell_ids, minlength=K).astype(np.int32)
-    cell_starts = np.zeros(K + 1, dtype=np.int32)
-    np.cumsum(counts, out=cell_starts[1:])
-
-    return cell_starts, sorted_vecs, sorted_angles, sorted_norms, cell_max_theta
-
-
-# ---------------------------------------------------------------------------
-# Main class
+# Index
 # ---------------------------------------------------------------------------
 
 class CapIVFIndex:
     """
-    Exact IVF pruning index for CapCoverFilter.  
-    Zero false negatives by construction.
-
-    All arithmetic is NumPy vectorised (BLAS GEMMs, no Python inner loops).
+    Exact IVF index for CapCoverFilter.  Zero false negatives.
 
     Parameters
     ----------
     n_cells : int
-        Number of k-means cells.  Auto-sized to min(n_cells, sqrt(N)) at
-        build time so small covers aren't over-partitioned.
-    n_iter : int
-        k-means iterations.
-    seed : int
-        k-means RNG seed.
+        Upper bound on the number of cells; K = min(n_cells, sqrt(N)).
+    n_iter, seed : k-means iterations / RNG seed.
+    gemm_min_batch : int
+        Batches with at least this many queries take the large-batch path:
+        the first abandon test for every (query, member) pair as one BLAS GEMM
+        over the leading PCA coordinates (see ivf_kernels.KernelData.run_gemm).
+    parallel_min_batch : int
+        Batches with at least this many live queries run multi-threaded.
     """
 
-    def __init__(self, n_cells: int = 128, n_iter: int = 20, seed: int = 0):
+    _TINY = 4e-7 # accept-side slack of the exact rule, per unit norm
+
+    def __init__(self, n_cells: int = 4096, n_iter: int = 12, seed: int = 0,
+                 parallel_min_batch: int = 8, gemm_min_batch: int = 16):
         self.n_cells = n_cells
-        self.n_iter  = n_iter
-        self.seed    = seed
-        self._built  = False
+        self.n_iter = n_iter
+        self.seed = seed
+        self.parallel_min_batch = int(parallel_min_batch)
+        self.gemm_min_batch = int(gemm_min_batch)
+        self._built = False
 
     # ------------------------------------------------------------------
     # Build
     # ------------------------------------------------------------------
 
     def build(self, directions: np.ndarray, angles: np.ndarray) -> None:
-        """
-        Build the cap-filter IVF index.
-
-        Parameters
-        ----------
-        directions : float32[N, d]
-            Decoded unit cap directions (working basis).
-        angles : array[N]
-            Stored cap angles theta_j in radians.
-        """
-        directions = np.ascontiguousarray(directions, dtype=np.float32)
-        angles     = np.asarray(angles, dtype=np.float64).ravel()
-        self._build_common(directions, angles)
-
-    def _build_common(self, directions: np.ndarray, angles: np.ndarray) -> None:
-        N, d = directions.shape
-        self.d = d
-        self.N = N
+        """directions: [N,d] decoded cap vectors (norm ~1), in the basis queries
+        will be passed in (CapCoverFilter passes the input basis); angles: [N]
+        cap angles in radians (kept in float64)."""
+        V = np.ascontiguousarray(directions, dtype=np.float32)
+        theta = np.clip(np.asarray(angles, dtype=np.float64).ravel(), 0.0, np.pi)
+        N, d = V.shape
+        self.N, self.d = N, d
+        self._degenerate = False
+        self.K = 0
 
         if N == 0:
             self._built = True
-            self._centroids      = np.empty((0, d), dtype=np.float32)
-            self._centroid_norms_sq = np.empty(0, dtype=np.float32)
-            self._cell_starts    = np.array([0], dtype=np.int32)
-            self._cell_max_theta = np.empty(0, dtype=np.float32)
-            self._sorted_vecs    = np.empty((0, d), dtype=np.float32)
-            self._sorted_angles  = np.empty(0, dtype=np.float32)
-            self._sorted_norms   = np.empty(0, dtype=np.float32)
-            self.K = 0
             return
 
-        K = min(self.n_cells, max(1, int(N ** 0.5)))
-        K = min(K, N)
+        V64 = V.astype(np.float64)
+        n = np.linalg.norm(V64, axis=1)
+        if (n < 1e-12).any():
+            # A zero decoded vector satisfies <q,v> >= |v| cos(.) for every q:
+            # it accepts every feasible query.  Keep that behaviour, trivially.
+            self._degenerate = True
+            self._built = True
+            return
+        U64 = V64 / n[:, None]
+
+        # --- cells: K = sqrt(N) spherical k-means on the unit directions ---
+        K = max(1, min(int(self.n_cells), int(np.sqrt(N))))
+        mu, labels = _spherical_kmeans(U64.astype(np.float32), K, self.n_iter, self.seed)
+        used = np.unique(labels)
+        remap = np.full(len(mu), -1, np.int64)
+        remap[used] = np.arange(len(used))
+        labels = remap[labels]
+        mu64 = mu[used].astype(np.float64)
+        mu64 /= np.linalg.norm(mu64, axis=1, keepdims=True)
+        K = len(mu64)
+
+        # per-cap angle to its own centroid, rounded up; cell reach U_c
+        chord = np.linalg.norm(U64 - mu64[labels], axis=1)
+        delta = 2.0 * np.arcsin(np.minimum(chord * 0.5, 1.0))
+        delta = delta * (1.0 + 1e-9) + 1e-9
+        cell_U = np.full(K, -np.inf)
+        np.maximum.at(cell_U, labels, theta + delta)
+
+        # storage: by cell, widest cap first within a cell
+        order = np.lexsort((-theta, labels))
+        self._order = order.astype(np.int64) # storage row -> input row
+        counts = np.bincount(labels, minlength=K)
+        self._cell_starts = np.concatenate(([0], np.cumsum(counts))).astype(np.int64)
+        self._cell_sizes = counts.astype(np.float64)
+        self._cell_U = cell_U
         self.K = K
 
-        # Spherical k-means on the unit vectors
-        centroids, labels = _spherical_kmeans(directions, K, self.n_iter, self.seed)
-        self._centroids = np.ascontiguousarray(centroids, dtype=np.float32)
-        self._centroid_norms_sq = (self._centroids * self._centroids).sum(1).astype(np.float32)
-
-        # Build CSR layout and sorted arrays
-        cell_starts, sorted_vecs, sorted_angles, sorted_norms, cell_max_theta = \
-            _make_csr(labels.astype(np.int32), K, angles, directions)
-
-        self._cell_starts    = cell_starts
-        self._cell_max_theta = cell_max_theta
-        self._sorted_vecs    = sorted_vecs
-        self._sorted_angles  = sorted_angles
-        self._sorted_norms   = sorted_norms
+        th_s = theta[order]
+        self._theta_max = float(theta.max())
+        # kernel data: unit directions in storage order; reach of cap j at margin beta
+        #   ||q - u_j||^2 <= |q|^2 + 1 + RB_j cos(beta) + RC_j sin(beta)
+        self._eip = 2.0 * (d + 6) * 2.0 ** -24 + 1e-6 # float32 error of the full <q,v> test, per |v|
+        self._kd = IVF_K.KernelData(U64[order], V[order], -2.0 * np.cos(th_s), 2.0 * np.sin(th_s),
+                                 n[order], mu64, cell_U, self._cell_starts, gemm_ck=2)
+        # cos-domain slack of the exact rule -> angle slack for the gate
+        # (arccos is 1/2-Holder with constant pi/sqrt2): cells are never cut by it
+        t = (self._TINY + 2.0 * self._eip) / float(n.min())
+        self._eta = 2.3 * float(np.sqrt(t)) + 1e-9
         self._built = True
 
     # ------------------------------------------------------------------
     # Query
     # ------------------------------------------------------------------
 
-    def query(self, Qn32: np.ndarray, beta: np.ndarray,
-              feasible: np.ndarray, slack: float) -> np.ndarray:
-        """
-        Exact cap-filter IVF query.  0-FNR guaranteed.
+    def query(self, Qn: np.ndarray, beta: np.ndarray, feasible: np.ndarray) -> np.ndarray:
+        """bool[nq]: does some cap accept the query?  Exact, 0-FNR.
 
-        Parameters
-        ----------
-        Qn32 : float32[nq, d]
-            Unit queries in the working basis.
-        beta : float32[nq]
-            Per-query acceptance margin (from CapCoverFilter._beta).
-        feasible : uint8 or bool [nq]
-            Mask; infeasible queries are always rejected.
-        slack : float
-            CapCoverFilter._slack().
-
-        Returns
-        -------
-        out : bool[nq]
-        """
-        if not self._built or self.N == 0:
-            return np.zeros(len(Qn32), dtype=bool)
-
-        Qn32     = np.ascontiguousarray(Qn32, dtype=np.float32)
-        beta     = np.ascontiguousarray(beta, dtype=np.float32)
+        Qn: unit queries [nq,d] (float64 -- the exact boundary rule is
+        evaluated on them; float32 input is widened); beta: per-query margin
+        (radians); feasible: bool mask (infeasible queries are rejected)."""
+        nq = len(Qn)
+        if not self._built or self.N == 0 or nq == 0:
+            return np.zeros(nq, dtype=bool)
         feasible = np.asarray(feasible, dtype=bool)
-        nq       = len(Qn32)
-        out      = np.zeros(nq, dtype=bool)
+        if self._degenerate:
+            return feasible.copy()
+        beta = np.ascontiguousarray(beta, dtype=np.float64).reshape(-1)
 
-        # --- Gate: one BLAS GEMM against K centroids ---
-        ip_cen = Qn32 @ self._centroids.T
-
-        # Fully vectorized, precomputed threshold bounds for all queries against all cells
-        gate_angles = self._cell_max_theta[None, :] + beta[:, None] + slack
-        np.clip(gate_angles, 0.0, np.pi, out=gate_angles)
-        cos_min_all = np.cos(gate_angles)
-
-        # --- Per-cell scan over surviving (query, cell) pairs ---
-        # Outer loop is over K cells (scalar Python, O(K) iterations).
-        # Inner ops are BLAS + NumPy vectorised over all live queries at once.
-        for c in range(self.K):
-            s, e = int(self._cell_starts[c]), int(self._cell_starts[c + 1])
-            if s == e:
-                continue  # empty cell
-
-            # Gate: ip(q, centroid[c]) < cos(max_theta[c] + beta_q + slack) => skip
-            live = ip_cen[:, c] >= cos_min_all[:, c]
-            live &= feasible
-            live &= ~out
-            if not live.any():
-                continue
-
-            cell_dirs  = self._sorted_vecs[s:e]
-            cell_theta = self._sorted_angles[s:e]
-            cell_norms = self._sorted_norms[s:e]
-
-            live_idx = np.flatnonzero(live)
-            Qs   = Qn32[live_idx]
-            beta_live = beta[live_idx]
-
-            # BLAS GEMM: (n_live, m) inner products
-            ip = Qs @ cell_dirs.T
-
-            # Accept rule: ip(q, decoded_j) + slack >= |decoded_j| * cos(theta_j + beta_i)
-            thr = cell_norms[None, :] * np.cos(
-                cell_theta[None, :] + beta_live[:, None])
-
-            accepts = ip + slack >= thr
-            out[live_idx] |= accepts.any(axis=1)
-
+        # the widest cap already covers the sphere -> accept; no scan needed
+        full = beta >= np.pi - self._theta_max
+        live = feasible & ~full
+        Q64 = np.ascontiguousarray(Qn, dtype=np.float64)
+        n_live = int(live.sum())
+        parallel = n_live >= self.parallel_min_batch and IVF_K.get_num_threads() > 1
+        if n_live >= self.gemm_min_batch:
+            out = self._kd.run_gemm(live, Q64, beta, self._TINY, self._eip, parallel)
+        else:
+            out = self._kd.run(live, Q64, beta, self._eta, self._TINY, self._eip, parallel)
+        out |= feasible & full
         return out
 
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
 
-    def pruning_fraction(self, Qr: np.ndarray, beta: np.ndarray = None, 
-                         slack: float = 0.0) -> np.ndarray:
-        """
-        Fraction of members (by count) visited per query.
-        """
-        if not self._built or self.N == 0:
-            return np.ones(len(Qr))
-        
-        Qr = np.ascontiguousarray(Qr, dtype=np.float32)
-        nq = len(Qr)
-        q_norms = np.sqrt((Qr * Qr).sum(axis=1)).astype(np.float32)
-        Qn32 = Qr / np.maximum(q_norms, 1e-30)[:, None]
-        
-        ip_cen = Qn32 @ self._centroids.T
-        if beta is None:
-            beta = np.zeros(nq, dtype=np.float32)
-        else:
-            beta = np.ascontiguousarray(beta, dtype=np.float32)
-            
-        gate_angles = self._cell_max_theta[None, :] + beta[:, None] + slack
-        np.clip(gate_angles, 0.0, np.pi, out=gate_angles)
-        cos_min_all = np.cos(gate_angles)
-
-        # Cells that survive the gate per query
-        gate_pass = ip_cen >= cos_min_all
-        cell_sizes = np.diff(self._cell_starts).astype(np.float32)
-        members_visited = gate_pass @ cell_sizes
-        return members_visited / max(1, self.N)
+    def pruning_fraction(self, Q: np.ndarray, beta: np.ndarray = None, stage: str = "full") -> np.ndarray:
+        """Per query, the fraction of caps still alive after the IVF cell gate
+        (stage="gate") or after the gate and every early-abandon checkpoint,
+        i.e. measured in full (stage="full", the default).  0.0 = everything
+        pruned, 1.0 = nothing; queries with theta_max + beta >= pi count as 1.0
+        (accepted outright, no pruning needed).  Q is normalised here."""
+        if not self._built or self.N == 0 or self._degenerate:
+            return np.ones(len(Q))
+        Q64 = np.asarray(Q, dtype=np.float64)
+        Q64 = Q64 / np.maximum(np.linalg.norm(Q64, axis=1, keepdims=True), 1e-300)
+        b = np.zeros(len(Q64)) if beta is None else np.asarray(beta, dtype=np.float64).ravel()
+        out = self._kd.survivor_fraction(Q64, b, self._eta, stage)
+        out[b >= np.pi - self._theta_max] = 1.0
+        return out
 
     def get_bytesize(self) -> int:
-        """Approximate RAM used by the index arrays."""
-        if not self._built:
+        if not self._built or self.N == 0 or self._degenerate:
             return 0
-        total = 0
-        for arr in (self._centroids, self._centroid_norms_sq,
-                    self._cell_starts, self._cell_max_theta,
-                    self._sorted_vecs, self._sorted_angles,
-                    self._sorted_norms):
-            total += arr.nbytes
-        return total
+        return self._kd.nbytes() + int(sum(a.nbytes for a in (
+            self._cell_U, self._cell_starts, self._cell_sizes, self._order)))
 
     def __repr__(self):
         if not self._built:
-            return (f"CapIVFIndex(n_cells={self.n_cells}, not built)")
-        return (f"CapIVFIndex(K={self.K}, N={self.N}, "
-                f"d={self.d}, ~{self.get_bytesize() // 1024} KB)")
+            return f"CapIVFIndex(n_cells={self.n_cells}, not built)"
+        return (f"CapIVFIndex(K={self.K}, N={self.N}, d={self.d}, "
+                f"~{self.get_bytesize() // 1024} KB)")
