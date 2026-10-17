@@ -791,32 +791,33 @@ class BallCoverFilter(Filter):
     # ------------------------------------------------------------------
 
     def _build_ivf(self) -> None:
-        """Build the IVF pruning index from the current stored balls, in the
-        INPUT basis: the quantizer's rotation (x_rot = A x + b) is undone once
-        here, in float64, so the indexed query path rotates nothing -- that
-        rotation (one d x d GEMM per batch) otherwise costs about as much as
-        the index itself.  A is orthonormal to ~5e-7, so distances agree with
-        _scan's rotated-basis ones to ~5e-6 in d^2, inside the index's
-        accept-side tolerance: no query the scan accepts is rejected."""
-        if self._ivf_index is None or self._num_spheres == 0:
+        """Build the IVF index over the stored balls, in the quantizer's basis
+        (past its rotation, where _scan works too), within the filter's own
+        size: its exact test reads the filter's own codes, radii and id map
+        in place (zero-copy views), so it holds no copy of them.  No index for
+        encodings other than float32 or 4-bit nibbles: query() scans."""
+        kind = self._kernel_kind()
+        if self._ivf_index is None or self._num_spheres == 0 or kind is None:
             return
-        ids, codes = self._stored_codes()
-        centers = self._decode_rotated(codes).astype(np.float64)
-        radii = self._all_radiuses[ids]
+        _, codes = self._stored_codes()
+        id_map = self.all_centers_index.id_map
         rotation = self._rotation()
         if rotation is not None:
             lt = faiss.downcast_VectorTransform(rotation)
-            A = faiss.vector_to_array(lt.A).reshape(lt.d_out, lt.d_in).astype(np.float64)
-            if lt.have_bias:
-                centers -= faiss.vector_to_array(lt.b).astype(np.float64)
-            centers = centers @ A
-        self._ivf_index.build(centers, radii)
+            rotation = (faiss.rev_swig_ptr(lt.A.data(), lt.A.size()).reshape(lt.d_out, lt.d_in),
+                        faiss.rev_swig_ptr(lt.b.data(), lt.b.size()) if lt.have_bias else None)
+        table = self._nibble_table(2 * codes.shape[1])[:self.dim] if kind == "nibble" else None
+        self._ivf_index.build(self._decode_rotated(codes), self._all_radiuses, rotation=rotation, codes=codes, table=table,
+                            ids=faiss.rev_swig_ptr(id_map.data(), id_map.size()), max_memory=self.get_bytesize())
 
-    def _ivf_query(self, Q: np.ndarray, distance_threshold: float) -> np.ndarray:
-        """Query the IVF index (ball mode), raw queries.  Returns bool[nq]."""
-        if self._ivf_index is None or not self._ivf_index._built:
-            return None
-        return self._ivf_index.query(Q, tau=distance_threshold, eps=self._COVERAGE_EPSILON)
+
+    def _query_ivf(self, Q: np.ndarray, distance_threshold: float) -> np.ndarray:
+        """query() through the IVF index (static filters, see _build_ivf):
+        exact, 0-FNR; the rare query it leaves undecided is decided by the
+        index-free path."""
+        return self._ivf_index.query(Q, distance_threshold, self._COVERAGE_EPSILON,
+                                     exact=lambda rows: self._scan_accepts(Q[rows], distance_threshold))
+
 
     def surface_distance(self, vectors: np.ndarray) -> np.ndarray:
         """Per query, the smallest (distance to a ball's center - its radius)
@@ -847,24 +848,20 @@ class BallCoverFilter(Filter):
             return (self.surface_distance(vectors) <= distance_threshold + self._COVERAGE_EPSILON).tolist()
         Q = np.ascontiguousarray(vectors, dtype=np.float32)
 
-        # IVF pruning path: exact, 0-FNR.  Only active for static filters
-        # (insert_method is None) when an IVF index has been built.
-        # The IVF kernel operates in the rotated basis (same as _scan); it
-        # uses the same slack and coverage-epsilon so every accept decision
-        # matches _scan's exactly.
-        if (self._ivf_index is not None
-                and self._ivf_index._built
-                and self.insert_method is None
-                and _ENCODINGS[self.quantize].kind not in ("rabitq",)):
-            result = self._ivf_query(Q, distance_threshold)
-            if result is not None:
-                return result.tolist()
+        if self._ivf_index is not None and self._ivf_index._built and self.insert_method is None:
+            return self._query_ivf(Q, distance_threshold).tolist()
+        return self._scan_accepts(Q, distance_threshold).tolist()
 
+
+    def _scan_accepts(self, Q: np.ndarray, distance_threshold: float) -> np.ndarray:
+        """Accept mask for Q by the fastest exact path for its size: the
+        compiled scan kernel where it wins, a faiss range search for a
+        handful of queries, else the blocked _scan."""
         if self._use_kernel(len(Q)):
-            return self._kernel_accepts(Q, distance_threshold).tolist()
+            return self._kernel_accepts(Q, distance_threshold)
         if len(Q) < self._SCAN_MIN_BATCH:
-            return self._range_accepts(Q, distance_threshold).tolist()
-        return self._scan(Q, distance_threshold=distance_threshold).tolist()
+            return self._range_accepts(Q, distance_threshold)
+        return self._scan(Q, distance_threshold=distance_threshold)
 
 
     # 4-bit scalar quantizers whose decode is a per-dimension table lookup on

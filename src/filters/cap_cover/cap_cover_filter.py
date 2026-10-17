@@ -2416,26 +2416,40 @@ class CapCoverFilter(Filter):
     # ------------------------------------------------------------------
 
     def _build_ivf(self) -> None:
-        """Build IVF index over the decoded cap directions.
-        The per-member test is exact and dynamically accounts for tau at query time.
-        """
-        if self._ivf_index is None or self._num_caps == 0:
+        """Build the IVF index over the decoded caps (working basis), within the
+        filter's own size: its exact test reads the set storage's codes in
+        place, so it holds no copy of them.  No index without set storage or
+        for levels coded other than seeded PQ / TurboQuant: query() scans."""
+        if self._ivf_index is None or self._num_caps == 0 or self._packed is None:
             return
-        ids = self.all_caps
+        codes = [] # per level: (group, codewords, bits, slices)
+        for level in sorted(self._packed):
+            sq = self._quantizers[level]
+            if type(sq) is _SeededPQ:
+                codes.append((self._packed[level], sq.codebook, sq.bits, sq.m))
+            elif self._is_turboquant(level):
+                bits = int(round(_ENCODINGS[self.levels[level]].rate))
+                book = faiss.vector_to_array(sq.trained)[:1 << bits].astype(np.float32).reshape(-1, 1)
+                codes.append((self._packed[level], book, bits, self.dim))
+            else:
+                return
+        ids = np.concatenate([g.ids for g, _, _, _ in codes])
         dirs = self.decode_caps(ids)
-        angles = self._angle_value(self._angle_codes[ids])
-        if self._rotation is not None:
-            dirs = np.asarray(dirs, dtype=np.float64) @ self._rotation.T
-        self._ivf_index.build(dirs, angles)
+        step = max(self._angle_hi - self._angle_lo, 0.0) / self._angle_levels
+        self._ivf_index.build(dirs, self._angle_value(self._angle_codes[ids]), rotation=self._rotation, codes=codes,
+                              angle_grid=(self._angle_lo, step), max_memory=self.get_bytesize())
 
-    def _ivf_query(self, Qn: np.ndarray, beta: np.ndarray,
-                   feasible: np.ndarray) -> Optional[np.ndarray]:
-        """Query the IVF index (cap mode). Returns bool[nq] or None if not built.
-        Qn, beta in float64, as _scan uses them (a float32 beta could round
-        a boundary query to a reject)."""
-        if self._ivf_index is None or not self._ivf_index._built:
-            return None
-        return self._ivf_index.query(Qn, beta=beta, feasible=feasible)
+        self._scan(dirs[:1] @ self._rotation.T if self._rotation is not None else dirs[:1], 0.0)
+
+    def _query_ivf(self, vectors: np.ndarray, tau: float) -> np.ndarray:
+        """query() through the IVF index (static filters with set storage, see
+        _build_ivf): exact, 0-FNR.  Qn and beta in float64, as _scan uses them;
+        the rare query the index leaves undecided is decided by _scan."""
+        Qn = np.array(vectors, dtype=np.float64)
+        nq = np.sqrt(np.einsum("ij,ij->i", Qn, Qn))
+        beta, feasible = self._beta(nq, tau)
+        Qn /= np.maximum(nq, 1e-300)[:, None]
+        return self._ivf_index.query(Qn, beta, feasible, exact=lambda rows: self._scan(vectors[rows], tau))
 
     # ----------------------------------------------------------------- query
     def _beta(self, norms: np.ndarray, tau: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -2444,11 +2458,12 @@ class CapCoverFilter(Filter):
         cap, and whether any unit vector is within tau' of it at all."""
         tp = float(tau) + self._COVERAGE_EPSILON + self._NORM_TOLERANCE
         n = np.asarray(norms, dtype=np.float64)
-        feasible = (np.abs(n - 1.0) <= tp) & (n > 0.0)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            cos_b = (n * n + 1.0 - tp * tp) / (2.0 * n)
-        beta = np.arccos(np.clip(np.where(feasible, cos_b, 1.0), -1.0, 1.0))
-        return beta, feasible
+        feasible = np.abs(n - 1.0) <= tp
+        feasible &= n > 0.0
+        m = np.where(feasible, n, 1.0)
+        cos_b = (m * m + 1.0 - tp * tp) / (2.0 * m)
+        cos_b[~feasible] = 1.0
+        return np.arccos(np.minimum(np.maximum(cos_b, -1.0), 1.0)), feasible
 
     def _slack(self) -> float:
         """Bound on a float32 inner product's error for unit vectors,
@@ -2462,21 +2477,10 @@ class CapCoverFilter(Filter):
         if self._num_caps == 0 or len(vectors) == 0:
             return [False] * len(vectors)
 
-        # IVF pruning path: exact, 0-FNR. Active for static filters only.
-        # (insert_method is None) when an IVF index has been built.
-        if (self._ivf_index is not None
-                and self._ivf_index._built
-                and self.insert_method is None):
-            tau = float(distance_threshold)
-            Qw = np.asarray(vectors, dtype=np.float64)
-            nq = np.sqrt(np.einsum("ij,ij->i", Qw, Qw))
-            beta_arr, feasible = self._beta(nq, tau)
-            Qn = Qw / np.maximum(nq, 1e-300)[:, None]
-            result = self._ivf_query(Qn, beta_arr, feasible)
-            if result is not None:
-                return result.tolist()
-
-        return self._scan(vectors, float(distance_threshold)).tolist()
+        tau = float(distance_threshold)
+        if self._ivf_index is not None and self._ivf_index._built and self.insert_method is None:
+            return self._query_ivf(vectors, tau).tolist()
+        return self._scan(vectors, tau).tolist()
 
     def _block_decoder(self, level: Optional[int] = None):
         """decode(codes, keys, w, out, norms): the float32 vectors `codes`

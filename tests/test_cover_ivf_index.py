@@ -41,8 +41,9 @@ def make_cap_data(N: int = 300, d: int = 64, seed: int = 1):
 # ---------------------------------------------------------------------------
 
 def ref_ball(centers, radii, tau, eps, Qr):
-    """True if any sphere accepts the query (exact, float64)."""
-    reach = (radii + tau + eps).astype(np.float64)
+    """True if any sphere accepts the query (exact, float64; the reach in
+    float64 too, as BallCoverFilter computes it)."""
+    reach = radii.astype(np.float64) + tau + eps
     out   = np.zeros(len(Qr), dtype=bool)
     C64   = centers.astype(np.float64)
     for i, q in enumerate(Qr.astype(np.float64)):
@@ -87,36 +88,37 @@ class TestLayout(unittest.TestCase):
         centers, radii, _ = make_ball_data(300, 32)
         idx = BallIVFIndex()
         idx.build(centers, radii)
-        cs = idx._cell_starts
+        order, cs, cell_U = idx.layout()
         self.assertEqual(cs[-1], 300)
         self.assertTrue((np.diff(cs) >= 0).all())
-        self.assertTrue((np.sort(idx._order) == np.arange(300)).all())
-        C = centers[idx._order].astype(np.float64)
+        self.assertTrue((np.sort(order) == np.arange(300)).all())
+        C = centers[order].astype(np.float64)
+        r = radii[order].astype(np.float64)
         for c in range(idx.K):
             s_, e_ = int(cs[c]), int(cs[c + 1])
-            mu = C[s_:e_].mean(axis=0)               # k-means leaves each centroid at its members' mean
-            reach = idx._r64[s_:e_] + np.linalg.norm(C[s_:e_] - mu, axis=1)
-            self.assertTrue((reach <= idx._cell_U[c] + 1e-6).all(), f"cell {c}: U_c below a member's reach")
-            self.assertTrue((np.diff(idx._r64[s_:e_]) <= 0).all(), f"cell {c}: not widest-first")
+            mu = C[s_:e_].mean(axis=0) # each centroid is its members' mean
+            reach = r[s_:e_] + np.linalg.norm(C[s_:e_] - mu, axis=1)
+            self.assertTrue((reach <= cell_U[c] + 1e-6).all(), f"cell {c}: U_c below a member's reach")
+            self.assertTrue((np.diff(r[s_:e_]) <= 0).all(), f"cell {c}: not widest-first")
 
     def test_cap_cells_partition_and_bound_members(self):
         dirs, angles, _ = make_cap_data(300, 32)
         idx = CapIVFIndex()
         idx.build(dirs, angles)
         self.assertEqual(idx.K, int(np.sqrt(300)), "K must be sqrt(N)")
-        cs = idx._cell_starts
+        order, cs, cell_U = idx.layout()
         self.assertEqual(cs[-1], 300)
         self.assertTrue((np.diff(cs) >= 0).all())
-        self.assertTrue((np.sort(idx._order) == np.arange(300)).all())
-        U = dirs[idx._order].astype(np.float64)
+        self.assertTrue((np.sort(order) == np.arange(300)).all())
+        U = dirs[order].astype(np.float64)
         U /= np.linalg.norm(U, axis=1, keepdims=True)
-        theta = angles[idx._order]
+        theta = angles[order]
         for c in range(idx.K):
             s_, e_ = int(cs[c]), int(cs[c + 1])
-            mu = U[s_:e_].sum(axis=0)                # spherical k-means: normalised member mean
+            mu = U[s_:e_].sum(axis=0) # spherical k-means: normalised member mean
             mu /= np.linalg.norm(mu)
             delta = np.arccos(np.clip(U[s_:e_] @ mu, -1.0, 1.0))
-            self.assertTrue((theta[s_:e_] + delta <= idx._cell_U[c] + 1e-6).all(),
+            self.assertTrue((theta[s_:e_] + delta <= cell_U[c] + 1e-6).all(),
                             f"cell {c}: U_c below a member's theta + delta")
             self.assertTrue((np.diff(theta[s_:e_]) <= 0).all(), f"cell {c}: not widest-first")
 
@@ -229,6 +231,66 @@ class TestBallIVFIndex(unittest.TestCase):
                 self.assertEqual((ref & ~ivf).sum(), 0, f"FN tau={tau} parallel_min_batch={pmb}")
                 self.assertEqual((ivf & ~ref).sum(), 0, f"extra FP tau={tau} parallel_min_batch={pmb}")
 
+    def test_exact_callback_decides_undecided_queries(self):
+        """Queries placed exactly on a ball's boundary may fall inside the exact
+        test's float margin: the index must hand them (and only queries it
+        cannot decide) to `exact`, and use its answer -- one query at a time
+        (survivors tested per query) and as one batch (tested grouped by ball)."""
+        r = rng(24)
+        centers, radii, _ = make_ball_data(300, 48)
+        tau, eps = 0.1, 1e-3
+        j = r.integers(300, size=40)
+        dirs = unit(r.standard_normal((40, 48)).astype(np.float32)).astype(np.float64)
+        reach = radii[j].astype(np.float64) + tau + eps
+        Q = (centers[j].astype(np.float64) + dirs * reach[:, None]).astype(np.float32)
+        Q = np.vstack([Q, unit(r.standard_normal((40, 48)).astype(np.float32))])
+        ref = ref_ball(centers, radii, tau, eps, Q)
+        idx = BallIVFIndex()
+        idx.build(centers, radii)
+        for bs in (1, len(Q)):
+            asked = []
+            out = []
+            for s0 in range(0, len(Q), bs):
+                rows0 = np.arange(s0, min(s0 + bs, len(Q)))
+                def exact(rows, rows0=rows0):
+                    asked.extend(rows0[rows].tolist())
+                    return ref[rows0[rows]]
+                out.append(idx.query(Q[rows0], tau=tau, eps=eps, exact=exact))
+            self.assertTrue((np.concatenate(out) == ref).all(), f"batch size {bs}")
+            self.assertLessEqual(len(asked), 40, "only boundary queries may need the exact test")
+
+    def test_sketch_fits_its_budget(self):
+        """The sketch (int8 PCA head, uint8 tail, locator, cells) fits the
+        byte budget it is given -- the head narrows to fit -- and the index
+        stays exact at every width."""
+        for cls, (X, w, Q), per_member in ((BallIVFIndex, make_ball_data(2000, 384), 194),
+                                           (CapIVFIndex, make_cap_data(2000, 384), 75),
+                                           (CapIVFIndex, make_cap_data(2000, 384), 40)):
+            idx = cls()
+            copy = 2000 * 384 * 4 + 2000 * 8 # the standalone float32 copy (+ angles / radii, ids)
+            budget = copy + per_member * 2000
+            idx.build(X, w, max_memory=budget)
+            self.assertEqual(idx._kd.XC.dtype, np.int8)
+            self.assertLessEqual(idx.get_bytesize() - idx._kd.owned, per_member * 2000,
+                                 f"{cls.__name__} h={idx.h}")
+            if cls is BallIVFIndex:
+                self.assertTrue((idx.query(Q, 0.1, 1e-3) == ref_ball(X, w, 0.1, 1e-3, Q)).all())
+            else:
+                b = np.full(len(Q), 0.1)
+                f = np.ones(len(Q), bool)
+                self.assertTrue((idx.query(Q, b, f) == ref_cap(X, w, b, f, Q)).all(), f"h={idx.h}")
+
+    def test_no_index_when_nothing_fits(self):
+        """A budget too small for any sketch builds no index, and an unbuilt
+        index refuses to answer rather than answer wrongly."""
+        X, w, Q = make_ball_data(500, 64)
+        idx = BallIVFIndex()
+        idx.build(X, w, max_memory=1000)
+        self.assertFalse(idx._built)
+        self.assertEqual(idx.get_bytesize(), 0)
+        with self.assertRaises(RuntimeError):
+            idx.query(Q, 0.1, 1e-3)
+
     def test_mixed_batch_sizes(self):
         centers, radii, queries = make_ball_data(500, 96)
         ref = ref_ball(centers, radii, 0.15, 1e-3, queries)
@@ -321,7 +383,7 @@ class TestCapIVFIndex(unittest.TestCase):
             beta = np.full(len(Q), 0.15)
             feas = np.ones(len(Q), dtype=bool)
             ref  = ref_cap(dirs, angles, beta, feas, Q)
-            for pmb in (1, 10 ** 9):                  # parallel tiles / serial
+            for pmb in (1, 10 ** 9):
                 idx = CapIVFIndex(parallel_min_batch=pmb)
                 idx.build(dirs, angles)
                 ivf = idx.query(Q, beta, feas)
@@ -334,7 +396,7 @@ class TestCapIVFIndex(unittest.TestCase):
         test in the original basis, at mixed batch sizes and per-query beta."""
         r    = rng(21)
         d    = 384
-        spec = np.exp(-np.arange(d) / 40.0)                       # decaying spectrum
+        spec = np.exp(-np.arange(d) / 40.0)
         base = r.standard_normal((12, d)) * spec
         dirs = unit(base[r.integers(12, size=1500)] + 0.35 * r.standard_normal((1500, d)) * spec)
         Q    = unit(base[r.integers(12, size=600)] + 0.35 * r.standard_normal((600, d)) * spec)
@@ -350,24 +412,26 @@ class TestCapIVFIndex(unittest.TestCase):
         self.assertTrue((out == ref).all(), f"FN={(ref & ~out).sum()} FP={(out & ~ref).sum()}")
 
     def test_abandon_bound_is_a_lower_bound(self):
-        """(*) of ivf_kernels: partial sum over the first p PCA coordinates plus
-        (|q_{>=p}| - |x_{>=p}|)^2 never exceeds ||q - x||^2, at every checkpoint."""
+        """(*) of cap_ivf_kernels on the stored sketch: (||q_h - x^_h|| - dl)_+^2
+        (x^ the int8 head) plus the distance from |q past the head| to the
+        cap's uint8 tail interval never exceeds ||q - x||^2."""
         dirs, angles, Q = make_clustered_caps(N=300, d=96, n_q=200, seed=3)
         idx = CapIVFIndex()
         idx.build(dirs, angles)
         kd  = idx._kd
-        X   = dirs[idx._order].astype(np.float64)
+        pos, _, g = kd.layout()
+        X   = dirs[g].astype(np.float64)
         X  /= np.linalg.norm(X, axis=1, keepdims=True)
         Q64 = Q.astype(np.float64)
-        Yq  = Q64 @ kd.Eh
-        Yx  = X @ kd.Eh
+        Yq  = Q64 @ kd.Eh.astype(np.float64)
+        Xh  = kd.head(pos) * kd.su
         d2  = ((Q64[:, None, :] - X[None, :, :]) ** 2).sum(-1)
-        for p in kd.ck:
-            part = ((Yq[:, None, :p] - Yx[None, :, :p]) ** 2).sum(-1)
-            qt = np.sqrt(np.maximum((Q64 * Q64).sum(1) - (Yq[:, :p] ** 2).sum(1), 0.0))
-            xt = kd.XtT[list(kd.ck).index(p), kd.pos].astype(np.float64)
-            lb = part + (qt[:, None] - xt[None, :]) ** 2
-            self.assertTrue((lb <= d2 + 1e-6).all(), f"bound exceeds the distance at p={p}")
+        part = ((Yq[:, None, :] - Xh[None, :, :]) ** 2).sum(-1)
+        hs = np.maximum(np.sqrt(part) - kd.dl * kd.su, 0.0)
+        qt = np.sqrt(np.maximum((Q64 * Q64).sum(1) - (Yq ** 2).sum(1), 0.0))[:, None]
+        lo = kd.TQ[pos].astype(np.float64)[None, :] * kd.st
+        td = np.maximum(np.maximum(lo - qt, qt - lo - kd.st), 0.0)
+        self.assertTrue((hs ** 2 + td ** 2 <= d2 + 1e-9).all(), "bound exceeds the distance")
 
     def test_boundary_queries_accepted(self):
         """Queries placed at exactly theta + beta from a cap (float64) are accepted."""
@@ -407,7 +471,7 @@ class TestCapIVFIndex(unittest.TestCase):
         idx, beta_max = self._build(dirs, angles, tau, d)
         nq       = 30
         Qn32     = unit(rng(5).standard_normal((nq, d)).astype(np.float32))
-        feasible = np.zeros(nq, dtype=bool)           # all infeasible
+        feasible = np.zeros(nq, dtype=bool) # all infeasible
         beta_arr = self._beta_arr(nq, beta_max)
         
         out      = idx.query(Qn32, beta_arr, feasible)
@@ -430,7 +494,7 @@ class TestCapIVFIndex(unittest.TestCase):
     def test_single_cap(self):
         d   = 16
         u   = unit(np.ones((1, d), dtype=np.float32))
-        th  = np.array([0.3], dtype=np.float64)                        # 0.3 rad cap
+        th  = np.array([0.3], dtype=np.float64)
         idx = CapIVFIndex(n_cells=1)
         beta_max = _cap_beta(0.1)
         idx.build(u, th)
@@ -613,6 +677,55 @@ class TestThroughput(unittest.TestCase):
               f"speedup: {t_ref/t_ivf:.1f}x  (N={N}, d={d})")
         # Soft sanity: not more than 10x slower than brute force
         self.assertTrue(t_ivf <= 10 * t_ref + 1.0)
+
+
+# ===========================================================================
+# TestFilterMemory  --  the index next to the real filters
+# ===========================================================================
+
+class TestFilterMemory(unittest.TestCase):
+    """Each filter gives its index its own size as the budget: with the index
+    the filter takes at most twice its memory (the index about as much as
+    the filter, never more), and answers exactly as without it."""
+
+    @staticmethod
+    def _data(n=3000, d=96, seed=40):
+        r = rng(seed)
+        base = r.standard_normal((30, d))
+        X = unit(base[r.integers(30, size=n)] + 0.6 * r.standard_normal((n, d)))
+        Q = unit(base[r.integers(30, size=400)] + 0.6 * r.standard_normal((400, d)))
+        return X, Q
+
+    def _check(self, filt, X, Q, tau):
+        filt.construct(X)
+        idx = filt._ivf_index
+        self.assertTrue(idx._built, "the index should fit the filter's own size")
+        fb, ib = filt.get_bytesize(), idx.get_bytesize()
+        self.assertGreater(ib, 0)
+        self.assertLessEqual(ib, fb, f"index {ib} B > filter {fb} B")
+        self.assertLessEqual((fb + ib) / fb, 2.0)
+        with_index = np.asarray(filt.query(Q, tau))
+        filt._ivf_index = None
+        without = np.asarray(filt.query(Q, tau))
+        filt._ivf_index = idx
+        self.assertTrue((with_index == without).all(),
+                        f"FN={(without & ~with_index).sum()} FP={(with_index & ~without).sum()}")
+        return ib / fb
+
+    def test_cap_cover_filter(self):
+        from src.filters.cap_cover.cap_cover_filter import CapCoverFilter
+        X, Q = self._data()
+        ratio = self._check(CapCoverFilter.auto(96, 40_000, ivf_index="auto"), X, Q, 0.3)
+        self.assertGreater(ratio, 0.5, "the index should use most of its budget for its head")
+
+    def test_ball_cover_filter(self):
+        from src.filters.ball_cover.ball_cover_filter import BallCoverFilter, Quantize
+        from src.filters.ball_cover.gonzales_construct import GonzalesConstruct
+        X, Q = self._data()
+        filt = BallCoverFilter(96, construct_method=GonzalesConstruct(), quantize=Quantize.TQ4,
+                               max_spheres=1000, ivf_index="auto")
+        ratio = self._check(filt, X, Q, 0.3)
+        self.assertGreater(ratio, 0.5, "the index should use most of its budget for its head")
 
 
 # ===========================================================================
