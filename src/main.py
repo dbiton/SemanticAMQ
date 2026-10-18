@@ -11,10 +11,8 @@ for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "
 
 import faiss
 import h5py
-import time
 import numpy as np
 import pandas as pd
-from scipy.sparse import csr_matrix
 
 faiss.omp_set_num_threads(1)  # belt-and-suspenders alongside the env vars above
 
@@ -42,7 +40,7 @@ from filters.pacuk_lsh_filter import PacukLSHFilter
 from filters.sankowski_wygocki_filter import SankowskiWygockiFilter
 from filters.va_plus_filter import VAPlusFilter
 from util.dataset_paths import dataset_filenames, HDF5_DATASET_KEY
-from util.fetch_datasets import load_embeds, load_meta
+from util.fetch_datasets import load_embeds
 from vector_source import VectorSource
 
 configure_logging()
@@ -64,48 +62,14 @@ DATASET = 'ELI5'
 # per dataset, which its shortest (HotpotQA, 97,852) clears comfortably.
 WORKLOAD_NUM_VECTORS = 10_000
 
-# generate_blocklist() knobs. Cluster discovery scans the whole file on disk.
-# Multiplicity is a property of the pool, not of the corpus, so a partial pool
-# undercounts it: a cluster of true size m yields only ~m * pool/corpus
-# members, which is why a 50k pool over 250k CC-News rows reported a median
-# cluster of 3 for a corpus whose syndication clusters are much larger.
-BLOCKLIST_POOL_SIZE = None  # None = use every row on disk (cluster DISCOVERY only)
 BLOCKLIST_FOLDS = 5
-# The blocklist's query/reference split of WORKLOAD_NUM_VECTORS, mirroring
-# generate_cap_cover_system_tau: one total size, cut into a q query part and a (1-q)
-# reference part, with k = k_fraction * |B|. The blocklist deliberately has no
-# size knob of its own -- WORKLOAD_NUM_VECTORS is already the single number
-# that sizes every evaluation, so the two knobs that matter (total size,
-# k_fraction) mean the same thing here as in cap_cover_system_tau:
+# The blocklist's query/construct split of WORKLOAD_NUM_VECTORS: one total
+# size, cut into a q query part and a (1-q) construct part, with
+# k = k_fraction * |B|. Position-based (build_blocklist_workload): construct
+# rows come from the start of the file, queries from its end.
 #
 #     stream (queries) = q * N          |B| (reference) = (1 - q) * N
-#
-# This is deliberately NOT the pool size. The pool is every row on disk because
-# cluster multiplicity is a property of the corpus and a partial pool
-# undercounts it; |B| is a property of the WORKLOAD and has to be chosen. Left
-# coupled, a whole-file pool gave WildChat |B|=131,776 -- 13% of its corpus,
-# which is the symmetric regime this workload exists to avoid (measured: FPR
-# 0.016 at |B|=500, 0.051 at 2,000, 0.326 at 10,000) -- and made |B| differ 8x
-# between corpora purely because one file is bigger.
 BLOCKLIST_QUERY_FRACTION = 0.2
-
-# 0.4 L2 on unit-normalised vectors = cosine 0.92, the conventional
-# paraphrase threshold. Inspected rather than assumed: same-cluster
-# WikiAnswers pairs at d~0.4 are true rewordings ("How many calories on 10
-# strawberries?" / "How many calories in some strawberries?"), while pairs
-# at d~0.75 are merely on-topic ("Why was the schlefan plan important to
-# britain?" / "Why was the battle of britain important?"). Agreement with
-# WikiAnswers' editor labels actually peaks near 0.75, but those labels are
-# loose -- they group topically related questions -- so fitting them would
-# pull eps into the non-paraphrase range.
-BLOCKLIST_EPS = 0.4
-BLOCKLIST_MIN_CLUSTER = 3
-
-
-# Cluster labels are a pure function of (dataset, pool size, eps, and the
-# config), so they are computed once and cached here rather than recomputed
-# every run -- the same pattern generate_cap_cover_system_tau uses for its ground truth.
-BLOCKLIST_CLUSTER_DIR = "results/blocklist_clusters"
 
 # Registry name -> canonical dataset key, one source of truth via plot_common.
 DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
@@ -317,7 +281,7 @@ def generate_equal_memory(runner: Runner) -> None:
     runner.py::_build_calibrated_filter), then FPR/FNR/latency/throughput are
     measured on a separate held-out query set.
 
-    Reuses blocklist_workloads() -- the same corpora, cluster-based fold
+    Reuses blocklist_workloads() -- the same corpora, position-based fold
     splits and reference set B as generate_blocklist/generate_quantization/
     generate_scaling -- rather than its own single-dataset (MMLU) split, so
     the SOTA baselines are compared on the same data the rest of the suite
@@ -576,177 +540,19 @@ BLOCKLIST_CSV = "results/blocklist.csv"
 # column on top of `sweep`.
 BUDGET_CSV = "results/budget.csv"
 BLOCKLIST_DATASETS = {
-    # registry name -> (plot key, label column in the HDF5 meta group or None)
-    # WildChat: clusters of repeated prompts, multiplicity up to 500+, but
-    # duplicates are mostly exact reposts. No labels -- clusters are discovered
-    # geometrically.
-    "WildChat": ("wildchat", None),
-    # CC-News: cross-outlet wire syndication. Same-domain repeats are templated
-    # boilerplate, not syndication, so they are dropped during discovery.
-    "CCNews": ("ccnews", None),
-    # WikiAnswers: paraphrase questions. Clustered geometrically like the other
-    # two rather than by its set_id column, so all three corpora share one
-    # cluster definition and a difference between them is a difference in
-    # geometry, not in how their clusters were defined.
-    #
-    # The labels are still the better ground truth in one respect -- they do
-    # not come from the same metric the filter thresholds -- but they are loose
-    # enough that using them would not buy that: editors group "Why was the
-    # schlefan plan important to britain?" with "Why was the battle of britain
-    # important?", pairs at d~0.75 that are on-topic rather than duplicates.
-    # set_id stays in the metadata and is what eps=0.4 was calibrated against.
-    "WikiAnswers": ("wikianswers", None),
-    # Quora: is_duplicate question pairs. Its set_id column exists (see
-    # build_quora) but the on-disk file predates _write_meta, so load_meta
-    # returns {} for it -- geometric discovery is the only option available
-    # without a full re-embed, and it doesn't need the label anyway: eps=0.4
-    # alone found 48,111 clusters>=3 here (median 4, ~259k usable vectors),
-    # the same shared cluster definition every other entry here uses.
-    "Quora": ("quora", None),
-    # ChatGPT-paraphrases: a source text plus 5 LLM-generated paraphrases,
-    # one cluster of 6 by construction (see build_chatgpt_paraphrases).
-    # Considered and rejected first: TaPaCo and StackExchange's official
-    # duplicate-question pairs, both community "same topic" labels that
-    # turned out geometrically sparse once actually clustered (~10-26k
-    # usable vectors from a comparable sample) -- "duplicate" there does not
-    # imply nearby embeddings the way a paraphrase does. eps=0.4 on this
-    # corpus instead recovered a median cluster size of 5 out of the native
-    # 6, ~166k usable vectors from a 360k-row sample alone.
-    "ChatGPTParaphrases": ("chatgpt_paraphrases", None),
+    # registry name -> plot key
+    "WildChat": "wildchat",
+    "CCNews": "ccnews",
+    "WikiAnswers": "wikianswers",
+    "Quora": "quora",
+    "ChatGPTParaphrases": "chatgpt_paraphrases",
 }
 
 
-def _group_by_label(labels: np.ndarray, wanted: np.ndarray) -> Dict[int, np.ndarray]:
-    """{label: row indices} for the wanted labels, in one O(n log n) pass."""
-    order = np.argsort(labels, kind="stable")
-    sorted_labels = labels[order]
-    starts = np.searchsorted(sorted_labels, wanted, side="left")
-    stops = np.searchsorted(sorted_labels, wanted, side="right")
-    return {int(c): order[a:b] for c, a, b in zip(wanted, starts, stops)}
-
-
 def _selection_is_usable(selections: List[Dict[str, np.ndarray]]) -> bool:
-    """Every fold needs a reference set, held-out cluster members, and
-    withheld-cluster members. Singletons may legitimately be absent (a corpus
-    can have no singletons), so they are not required."""
+    """Every fold needs a reference set and a query stream."""
     return bool(selections) and all(
-        len(sel["reference"]) and len(sel["heldout"]) and len(sel["withheld"])
-        for sel in selections
-    )
-
-
-# Query sources were once named for the labels they used to imply
-# (positive/hard/easy). Selections cached under those keys are read through
-# this map, so existing folds -- and results computed on them -- stay
-# comparable with new ones.
-_LEGACY_SELECTION_KEYS = {"heldout": "positive", "withheld": "hard", "singleton": "easy"}
-_SELECTION_KEYS = ("reference", "heldout", "withheld", "singleton")
-
-
-def _load_selection_key(z: Any, fold: int, key: str) -> np.ndarray:
-    name = f"{fold}_{key}"
-    if name not in z.files and key in _LEGACY_SELECTION_KEYS:
-        name = f"{fold}_{_LEGACY_SELECTION_KEYS[key]}"
-    return z[name]
-
-
-def _fold_selections(dataset: str, labels: np.ndarray, dup_clusters: np.ndarray,
-                     singletons: np.ndarray, members_by_cluster: Dict[int, np.ndarray],
-                     n_folds: int, reference_target: int, n_heldout: int, n_withheld: int,
-                     n_singleton: int, pool_n: int, eps: float, stream_size: int,
-                     query_fraction: float, xgroup: bool,
-                     cache_dir: str = BLOCKLIST_CLUSTER_DIR) -> List[Dict[str, np.ndarray]]:
-    """Per-fold reference/heldout/withheld/singleton ROW INDICES, cached to disk.
-
-    Indices rather than vectors: they are the reproducible part, they are three
-    orders of magnitude smaller than the embeddings they select, and they let a
-    fold read only its own rows (see _read_rows) instead of holding the pool in
-    memory. Stored per (dataset, pool size, eps, stream size, query fraction,
-    folds), all of which are in the filename, so changing a knob misses the
-    cache rather than reusing a stale split.
-
-    Clusters are taken whole until the reference set reaches its target, so the
-    multiplicity that bounds compression survives the sizing; the clusters not
-    taken are withheld and supply the withheld-cluster queries.
-    """
-    os.makedirs(cache_dir, exist_ok=True)
-    tag = "_xgroup" if xgroup else ""
-    path = os.path.join(
-        cache_dir,
-        f"{dataset}_{pool_n}_eps{eps:g}_stream{stream_size}_q{query_fraction:g}"
-        f"_folds{n_folds}{tag}_selection.npz")
-    if os.path.exists(path):
-        with np.load(path) as z:
-            cached = [{key: _load_selection_key(z, f, key) for key in _SELECTION_KEYS}
-                      for f in range(n_folds)]
-        if _selection_is_usable(cached):
-            logger.info(f"{dataset}: loaded cached fold selection from {path}")
-            return cached
-        # A run whose sizing was infeasible used to write its empty splits here
-        # and every later run replayed them, skipping every fold while
-        # reporting nothing worse than "loaded cached fold selection". Drop it
-        # and rebuild rather than trusting the file's existence.
-        logger.warning(f"{dataset}: cached fold selection at {path} has empty splits; recomputing")
-        os.remove(path)
-
-    def take(rng, pool_idx, n):
-        pool_idx = np.asarray(pool_idx, dtype=np.int64)
-        if len(pool_idx) == 0 or n <= 0:
-            return pool_idx[:0]
-        return rng.choice(pool_idx, size=min(n, len(pool_idx)), replace=False)
-
-    selections = []
-    for fold in range(n_folds):
-        rng = np.random.default_rng(fold)
-        shuffled = rng.permutation(dup_clusters)
-
-        reference, heldout, n_taken = [], [], 0
-        for c in shuffled:
-            if len(reference) >= reference_target:
-                break
-            members = members_by_cluster[int(c)].copy()
-            rng.shuffle(members)
-            cut = max(1, int(0.8 * len(members)))
-            reference.extend(members[:cut].tolist())
-            heldout.extend(members[cut:].tolist())
-            n_taken += 1
-        # Trimmed to exactly the target so |B| matches across corpora and the
-        # three stay comparable at a given k_fraction.
-        reference = np.asarray(reference[:reference_target], dtype=np.int64)
-        withheld_pool = np.concatenate(
-            [members_by_cluster[int(c)] for c in shuffled[n_taken:]]
-        ) if n_taken < len(shuffled) else np.empty(0, dtype=np.int64)
-
-        selections.append({
-            "reference": reference,
-            "heldout": take(rng, heldout, n_heldout),
-            "withheld": take(rng, withheld_pool, n_withheld),
-            "singleton": take(rng, singletons, n_singleton),
-        })
-
-    if not _selection_is_usable(selections):
-        # Not cached on purpose: an unusable split is a sizing failure, and
-        # persisting it would make the failure sticky across runs.
-        logger.error(
-            f"{dataset}: fold selection is empty (reference/heldout/withheld); not caching. "
-            f"Reduce WORKLOAD_NUM_VECTORS or loosen eps/min_cluster."
-        )
-        return selections
-
-    np.savez_compressed(path, **{f"{f}_{k}": v for f, sel in enumerate(selections)
-                                 for k, v in sel.items()})
-    logger.info(f"{dataset}: wrote fold selection to {path}")
-    return selections
-
-
-def _cluster_cache_path(dataset: str, n: int, eps: float, xgroup: bool,
-                        cache_dir: str = BLOCKLIST_CLUSTER_DIR) -> str:
-    tag = "_xgroup" if xgroup else ""
-    return os.path.join(cache_dir, f"{dataset}_{n}_eps{eps:g}_seedball{tag}.npy")
-
-
-def _cluster_cache_exists(dataset: str, n: int, eps: float, xgroup: bool) -> bool:
-    return os.path.exists(_cluster_cache_path(dataset, n, eps, xgroup))
+        len(sel["reference"]) and len(sel["singleton"]) for sel in selections)
 
 
 _READ_WINDOW = 65_536  # rows per contiguous HDF5 read in _read_rows (~100 MB at d=384)
@@ -776,161 +582,6 @@ def _read_rows(dataset: str, idx: np.ndarray) -> np.ndarray:
     out = np.empty((len(idx), block.shape[1]), dtype=np.float32)
     out[order] = block[inverse]
     return np.ascontiguousarray(out)
-
-
-def _ivf_params(n: int) -> Tuple[int, int]:
-    """(nlist, nprobe) for a pool of n vectors.
-
-    nlist = 4*sqrt(n) is the usual faiss starting point, clamped so each cell
-    still holds enough points to train on. nprobe=8 was chosen by measurement:
-    on a 250k WildChat pool, edge recall at eps=0.25 was 0.9906 at nprobe 8, 16
-    and 32 alike, so probing harder buys nothing -- near duplicates are nearly
-    identical vectors and land in the same Voronoi cell. HNSW was measured too
-    and lost on both axes (0.865 recall at efSearch=64, 0.888 at 128, no
-    faster). The approximation is free in practice: on a 60k pool the resulting
-    partition was *identical* to one built from exact search (adjusted Rand
-    index 1.000000).
-    """
-    nlist = int(4 * np.sqrt(max(n, 1)))
-    nlist = max(1, min(nlist, max(1, n // 39), 65_536))
-    return nlist, min(8, nlist)
-
-
-def _eps_neighbors(vectors: np.ndarray, eps: float,
-                   exclude_same: Optional[np.ndarray] = None,
-                   chunk: int = 50_000) -> csr_matrix:
-    """Adjacency of every pair within eps, as a CSR matrix.
-
-    Uses range_search, not a top-k search: a fixed k silently caps how large a
-    cluster can be, which is not a tunable but a measurement error. At knn=64
-    every WildChat cluster came back as exactly 65 members, and at knn=256 as
-    exactly 257, at every eps -- the retrieval cap, not the corpus. WildChat's
-    99th-percentile neighbourhood at eps=0.4 is 405 and its largest is over
-    1400, so no fixed k is safe.
-
-    Chunked over queries because range_search output is unbounded; only the
-    surviving pairs are retained.
-
-    exclude_same: optional per-vector group key (CC-News' publisher domain).
-    Edges inside a group are dropped, so a site reposting its own boilerplate
-    does not form a cluster no filter should get credit for finding.
-    """
-    n = len(vectors)
-    nlist, nprobe = _ivf_params(n)
-    quantizer = faiss.IndexFlatL2(vectors.shape[1])
-    index = faiss.IndexIVFFlat(quantizer, vectors.shape[1], nlist, faiss.METRIC_L2)
-    rng = np.random.default_rng(0)
-    train_n = min(n, 200_000)
-    index.train(np.ascontiguousarray(vectors if train_n == n else vectors[rng.choice(n, train_n, replace=False)]))
-    index.add(vectors)
-    index.nprobe = nprobe
-    logger.info(f"  IVF nlist={nlist} nprobe={nprobe}, range search at eps={eps} over {n} vectors...")
-
-    rows_out, cols_out = [], []
-    for start in range(0, n, chunk):
-        stop = min(start + chunk, n)
-        # faiss METRIC_L2 works in squared distance.
-        lims, _, nbr = index.range_search(vectors[start:stop], float(eps) ** 2)
-        # faiss returns lims as uint64; np.repeat refuses unsigned counts.
-        counts = np.diff(lims).astype(np.int64)
-        rows = np.repeat(np.arange(start, stop, dtype=np.int64), counts)
-        cols = nbr.astype(np.int64)
-        keep = cols != rows
-        if exclude_same is not None:
-            keep &= exclude_same[rows] != exclude_same[cols]
-        rows_out.append(rows[keep])
-        cols_out.append(cols[keep])
-
-    rows = np.concatenate(rows_out) if rows_out else np.empty(0, dtype=np.int64)
-    cols = np.concatenate(cols_out) if cols_out else np.empty(0, dtype=np.int64)
-    logger.info(f"  {len(rows)} edges within eps={eps}")
-    return csr_matrix((np.ones(len(rows), dtype=np.int8), (rows, cols)), shape=(n, n))
-
-
-def _discover_clusters(vectors: np.ndarray, eps: float,
-                       exclude_same: Optional[np.ndarray] = None) -> np.ndarray:
-    """Cluster id per vector, by greedy seed-ball covering: the highest-degree
-    unassigned point becomes a seed and claims every unassigned point within
-    eps of it.
-
-    Every cluster is therefore contained in one ball of radius eps -- which is
-    both what bounds it and what makes it the right unit here, since the filter
-    stores exactly one ball per cluster. Connected components was tried first
-    and is the wrong rule: it has no diameter bound, so chains of near
-    duplicates fuse unrelated content. On WildChat at 1M it produced a single
-    "cluster" of 57,749 vectors (5.8% of the corpus), and on WikiAnswers its
-    agreement with editor labels collapsed from 0.75 to 0.004 adjusted Rand
-    index over two steps of eps while its largest cluster went 185 -> 24,457.
-    Seed-ball degrades gracefully across the same range.
-
-    The seed relation is what carries the semantics: every member is within eps
-    of the seed, and the seed is what enters the blocklist, so a held-out
-    member is a genuine near-duplicate of a blocklisted item. Two members can
-    be up to 2*eps apart, but that pair is never the relation under test.
-    """
-    n = len(vectors)
-    adj = _eps_neighbors(vectors, eps, exclude_same=exclude_same)
-    indptr, indices = adj.indptr, adj.indices
-    degree = np.diff(indptr)
-
-    labels = np.full(n, -1, dtype=np.int64)
-    # Isolated points are their own cluster; assigning them in bulk keeps the
-    # Python loop below to the minority of points that actually have a
-    # neighbour (over half of WildChat has none at eps=0.4).
-    isolated = np.flatnonzero(degree == 0)
-    labels[isolated] = np.arange(len(isolated), dtype=np.int64)
-    next_label = len(isolated)
-
-    for seed in np.argsort(-degree, kind="stable"):
-        if degree[seed] == 0:
-            break  # sorted descending: everything from here on is isolated
-        if labels[seed] != -1:
-            continue
-        labels[seed] = next_label
-        nbrs = indices[indptr[seed]:indptr[seed + 1]]
-        labels[nbrs[labels[nbrs] == -1]] = next_label
-        next_label += 1
-    return labels
-
-
-def _cluster_labels(dataset: str, vectors: Optional[np.ndarray], eps: float,
-                    exclude_same: Optional[np.ndarray] = None,
-                    cache_dir: str = BLOCKLIST_CLUSTER_DIR,
-                    pool_n: Optional[int] = None) -> np.ndarray:
-    """Cluster labels for a pool, cached to disk by ordering index.
-
-    The saved array holds one label per row of the pool in dataset order, so
-    entry i names the cluster of the i-th vector on disk and any caller reading
-    the same prefix of the same file can reuse it. Labels depend only on
-    (dataset, pool size, eps, whether same-group edges were dropped), all of
-    which are in the filename, so changing a knob misses the cache rather than
-    silently reusing stale labels.
-    """
-    os.makedirs(cache_dir, exist_ok=True)
-    n = pool_n if vectors is None else len(vectors)
-    path = _cluster_cache_path(dataset, n, eps, exclude_same is not None, cache_dir)
-    if os.path.exists(path):
-        logger.info(f"{dataset}: loaded cached cluster labels from {path}")
-        return np.load(path)
-
-    # Discovery runs in the main process, before any worker starts, so it can
-    # use every core. The module-level pinning to one thread exists to stop
-    # MAX_WORKERS processes each grabbing all cores; it does not apply here,
-    # and leaving it would cost roughly an order of magnitude.
-    prev_threads = faiss.omp_get_max_threads()
-    faiss.omp_set_num_threads(os.cpu_count() or prev_threads)
-    try:
-        if vectors is None:
-            raise ValueError(f"{dataset}: no cached labels and no vectors supplied to compute them")
-        t0 = time.perf_counter()
-        labels = _discover_clusters(vectors, eps, exclude_same=exclude_same)
-        logger.info(f"{dataset}: clustered {len(vectors)} vectors in {time.perf_counter() - t0:.1f}s")
-    finally:
-        faiss.omp_set_num_threads(prev_threads)
-
-    np.save(path, labels)
-    logger.info(f"{dataset}: wrote cluster labels to {path}")
-    return labels
 
 
 class BlocklistWorkload:
@@ -976,122 +627,63 @@ class BlocklistWorkload:
         return {f"n_{key}": len(sel[key]) for key in QUERY_SOURCES}
 
 
-def build_blocklist_workload(name: str, plot_key: str, label_col: Optional[str],
+def build_blocklist_workload(name: str, plot_key: str,
                              num_vectors: int, n_folds: int) -> Optional[BlocklistWorkload]:
-    """Cluster a corpus and cut it into per-fold blocklist splits, or return
-    None (logging why) if it cannot supply the requested sizes."""
-    eps, min_cluster = BLOCKLIST_EPS, BLOCKLIST_MIN_CLUSTER
-    query_fraction, frac_heldout, frac_withheld = BLOCKLIST_QUERY_FRACTION, 0.2, 0.4
+    """Cut a corpus into per-fold construct/query splits by file position, or
+    return None (logging why) if the file is too short.
 
+    No clustering and no sampling: fold f constructs from the f-th window of
+    the first rows of the file and queries from the f-th window of its last
+    rows, so the two regions never overlap and folds are disjoint. All
+    queries are carried as one stream (the "singleton" slot); strata are not
+    defined by file position, and ground truth is distance at tau regardless."""
     if not os.path.exists(dataset_filenames[name]):
         logger.warning(f"Skipping {name}: not found on disk")
         return None
 
     total = len(VectorSource(name))
-    pool_n = total if BLOCKLIST_POOL_SIZE is None else min(BLOCKLIST_POOL_SIZE, total)
-
-    # The pool is materialised only to DISCOVER clusters: not needed when a
-    # corpus carries its own labels, nor once discovery has cached them.
-    needs_pool = label_col is None and not _cluster_cache_exists(
-        name, pool_n, eps, name == "CCNews")
-    pool = None
-    if needs_pool:
-        pool = np.ascontiguousarray(VectorSource(name, 0, pool_n).to_array(), dtype=np.float32)
-
-    if label_col is not None:
-        meta = load_meta(name, pool_n)
-        if label_col not in meta:
-            logger.warning(f"{name}: meta column {label_col!r} missing; using geometric discovery")
-            labels = _cluster_labels(name, pool, eps, pool_n=pool_n)
-        else:
-            labels = np.asarray(meta[label_col], dtype=np.int64)
-    else:
-        exclude = None
-        if name == "CCNews":
-            dom = load_meta(name, pool_n).get("domain")
-            exclude = np.asarray(dom) if dom is not None else None
-        labels = _cluster_labels(name, pool, eps, exclude_same=exclude, pool_n=pool_n)
-
-    sizes = np.bincount(labels)
-    dup_clusters = np.where(sizes >= min_cluster)[0]
-    singletons = np.where(np.isin(labels, np.where(sizes == 1)[0]))[0]
-    logger.info(
-        f"{name}: pool={pool_n} clusters>={min_cluster}: {len(dup_clusters)} "
-        f"(largest={sizes.max()}, median={np.median(sizes[dup_clusters]) if len(dup_clusters) else 0:.0f}), "
-        f"singletons={len(singletons)}")
-    if len(dup_clusters) < 2:
-        logger.warning(f"Skipping {name}: too few duplicate clusters at eps={eps}")
-        return None
-
-    stream_size = int(round(query_fraction * num_vectors))
+    stream_size = int(round(BLOCKLIST_QUERY_FRACTION * num_vectors))
     reference_target = num_vectors - stream_size
-    n_heldout = int(frac_heldout * stream_size)
-    n_withheld = int(frac_withheld * stream_size)
-    n_singleton = stream_size - n_heldout - n_withheld
-
-    # Feasibility up front, not fold by fold: a corpus that cannot fill |B|
-    # consumes every cluster trying, leaves none withheld, loses its
-    # withheld-cluster queries, and disappears from the results with only a per-fold warning.
-    usable = int(0.8 * sizes[dup_clusters].sum())
-    if usable < reference_target + n_withheld:
-        max_n = int(usable / ((1.0 - query_fraction) + frac_withheld * query_fraction))
+    if n_folds * (reference_target + stream_size) > total:
         logger.error(
-            f"Skipping {name}: needs {reference_target} reference + {n_withheld} withheld-cluster "
-            f"vectors but only {usable} are available in clusters of >={min_cluster} at "
-            f"eps={eps}. Lower WORKLOAD_NUM_VECTORS to <= {max_n} for this corpus, or "
-            f"loosen eps/min_cluster.")
+            f"Skipping {name}: {n_folds} folds of {reference_target} construct + {stream_size} "
+            f"query rows need {n_folds * num_vectors} rows but the file has {total}.")
         return None
 
-    members_by_cluster = _group_by_label(labels, dup_clusters)
-    selections = _fold_selections(
-        name, labels, dup_clusters, singletons, members_by_cluster,
-        n_folds=n_folds, reference_target=reference_target,
-        n_heldout=n_heldout, n_withheld=n_withheld, n_singleton=n_singleton,
-        pool_n=pool_n, eps=eps, stream_size=stream_size,
-        query_fraction=query_fraction, xgroup=(name == "CCNews"))
-    if not _selection_is_usable(selections):
-        logger.error(f"Skipping {name}: fold selection is empty")
-        return None
+    empty = np.empty(0, dtype=np.int64)
+    selections = [{
+        "reference": np.arange(f * reference_target, (f + 1) * reference_target, dtype=np.int64),
+        "heldout": empty, "withheld": empty,
+        "singleton": np.arange(total - (f + 1) * stream_size, total - f * stream_size, dtype=np.int64),
+    } for f in range(n_folds)]
 
-    logger.info(
-        f"{name}: |B|={len(selections[0]['reference'])} (target {reference_target}), "
-        f"stream={stream_size} ({n_heldout} heldout / {n_withheld} withheld / "
-        f"{n_singleton} singleton)")
-    return BlocklistWorkload(name, plot_key, selections, pool, stream_size, reference_target)
+    logger.info(f"{name}: |B|={reference_target} from the start of the file, "
+                f"stream={stream_size} from the end ({total} rows)")
+    return BlocklistWorkload(name, plot_key, selections, None, stream_size, reference_target)
 
 
 def blocklist_workloads(num_vectors: int, n_folds: int = BLOCKLIST_FOLDS,
                         only: Optional[str] = None) -> List[BlocklistWorkload]:
     """Every corpus's workload, or just the one `only` names."""
     out = []
-    for name, (plot_key, label_col) in BLOCKLIST_DATASETS.items():
+    for name, plot_key in BLOCKLIST_DATASETS.items():
         if only is not None and name != only:
             continue
-        w = build_blocklist_workload(name, plot_key, label_col, num_vectors, n_folds)
+        w = build_blocklist_workload(name, plot_key, num_vectors, n_folds)
         if w is not None:
             out.append(w)
     return out
 
 
 def generate_blocklist(runner: Runner) -> None:
-    """Asymmetric blocklist workload: a tight reference set B built from
-    duplicate clusters, queried by a stream drawn from held-out cluster
-    members, members of non-blocklisted (withheld) clusters, and singletons.
-    Those sources decide what is queried, not the answer: every query is
-    labeled by its distance to B at each tau (runner._blocklist_cover_rows).
-
-    This is the workload the symmetric sweep (generate_cap_cover_system_tau) cannot
-    measure. There, B is 80% of the same corpus the queries come from, so B is
-    as diffuse as the query stream, d(query -> B) is just the ambient distance
-    (~1.38 for these unit-normalised 384-d embeddings) and r + tau exceeds it
-    for any ball holding more than one point -- FPR pins at 1 regardless of
-    memory. Shrinking B to a set of tight clusters is what opens the budget.
-
-    Clusters are partitioned by cluster, not by vector: some are blocklisted
-    (80% of each into B, 20% held out as queries) and the rest are withheld
-    entirely. Splitting by vector instead would scatter every cluster across
-    both roles and leave no withheld clusters -- the queries that test whether
-    the cover localizes to B's clusters rather than to dense regions.
+    """Fixed-budget tau sweep. The reference set B is the first rows of each
+    corpus's file and the query stream is the last rows of it
+    (build_blocklist_workload): no clustering, no stratified sampling. Every
+    query is labeled by its distance to B at each tau
+    (runner._blocklist_cover_rows), so the positive share is whatever the
+    file order yields and bounds the accesses saved. File order can carry
+    structure (e.g. paraphrase groups stored together), which this split
+    does not correct.
 
     A single fixed ball budget (k_fraction, not a sweep) -- varying the
     budget is generate_budget's job now, at its own fixed tau.
@@ -1105,7 +697,6 @@ def generate_blocklist(runner: Runner) -> None:
     pool in memory.
     """
     dim              = 384
-    pool_size        = BLOCKLIST_POOL_SIZE
     num_vectors      = WORKLOAD_NUM_VECTORS
     k_fraction       = 0.1  # fixed ball budget; see docstring
     # Shared absolute grid for the tau-swept panels. Stops at 0.4: measured on
@@ -1352,7 +943,7 @@ def generate_scaling(runner: Runner) -> None:
     instead), and construction (k x n, where indexed-set size itself
     varies).
 
-    Reuses blocklist_workloads() -- the same corpora, cluster-based fold
+    Reuses blocklist_workloads() -- the same corpora, position-based fold
     splits, reference set B and query stream as generate_blocklist and
     generate_quantization -- rather than cutting its own contiguous window
     over a separate dataset, so throughput is measured on the same data the
@@ -1511,7 +1102,7 @@ def generate_streaming(runner: Runner) -> None:
     The position sweep runs once per construct method in construct_methods,
     which builds both the bootstrap and that run's oracle.
 
-    Reuses blocklist_workloads() -- the same corpora, cluster-based fold
+    Reuses blocklist_workloads() -- the same corpora, position-based fold
     splits, reference set B, query stream and fixed tau as generate_blocklist/
     generate_budget/generate_quantization/generate_equal_memory -- so the
     dynamic results are read on exactly the data the static ones are. Each
@@ -1751,44 +1342,21 @@ def generate_and_plot_all() -> None:
     did complete beforehand is still on disk."""
     runner = Runner(num_workers=MAX_WORKERS)
 
-    try:
-        generate_blocklist(runner)
-    except Exception:
-        logger.exception("An error occurred")
-    try:
-        generate_budget(runner)
-    except Exception:
-        logger.exception("An error occurred")
-    try:
-        generate_cap_quantization(runner)
-    except Exception:
-        logger.exception("An error occurred")
-    try:
-        generate_streaming(runner)
-    except Exception:
-        logger.exception("An error occurred")
-    try:
-        generate_construct_methods(runner)
-    except Exception:
-        logger.exception("An error occurred")
-    try:
-        generate_scaling(runner)
-    except Exception:
-        logger.exception("An error occurred")
-    try:
-        generate_equal_memory(runner)
-    except Exception:
-        logger.exception("An error occurred")
-    try:
-        generate_cap_cover_system_tau(runner)
-    except Exception:
-        logger.exception("An error occurred")
-    '''
-    try:
-        generate_construct_methods_scale(runner)
-    except Exception:
-        logger.exception("An error occurred")
-    '''
+    # generate_construct_methods_scale is disabled.
+    for generate in (
+        generate_blocklist,
+        generate_budget,
+        generate_cap_quantization,
+        generate_streaming,
+        generate_construct_methods,
+        generate_scaling,
+        generate_equal_memory,
+        generate_cap_cover_system_tau,
+    ):
+        try:
+            generate(runner)
+        except Exception:
+            logger.exception(f"{generate.__name__} failed to submit")
     runner.shuffle()
     runner.run()
     logger.info("All submitted jobs completed.")

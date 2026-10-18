@@ -82,7 +82,6 @@ class HNSWFilter(Filter):
         M: int = 32,
         ef_construction: int = 200,
         ef_search: int = 64,
-        max_spheres: Optional[int] = None,
         quantize: Optional[str] = "auto",
         accept_radius_scale: float = 1.0,
     ):
@@ -98,7 +97,6 @@ class HNSWFilter(Filter):
         self.M = M
         self.ef_construction = ef_construction
         self._ef_search = ef_search
-        self._max_spheres = max_spheres  # unused; accepted for _instantiate_filter parity
         if quantize != "auto" and quantize not in self._quantize_ladder():
             raise ValueError(
                 f"quantize={quantize!r} not recognized; expected 'auto' or one of "

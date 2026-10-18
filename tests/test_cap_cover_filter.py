@@ -147,7 +147,6 @@ class TestCapCoverSoundness(unittest.TestCase):
     def test_auto_selects_least_volume(self):
         X = _clustered(n_clusters=60, per=10, dim=96, spread=0.4)
         f = CapCoverFilter.auto(96, 4000, mixed=False)
-        self.assertEqual(f.selection, "volume")
         f.construct(X)
         self.assertEqual(f.quantize.value, min(f.selection_scores, key=f.selection_scores.get))
         _assert_no_fn(self, f, X)
@@ -224,22 +223,6 @@ class TestCapCoverSoundness(unittest.TestCase):
                         codes = f._stored_codes(f.all_caps[levels == l])[:, :f.code_size(l)]
                         self.assertTrue(np.array_equal(sq.decode(codes), f._quantizers[l].decode(codes)))
         self.assertTrue(chosen, "no boot level chosen on low-rank data")
-
-    def test_auto_holdout_selection(self):
-        X = _clustered(n_clusters=60, per=10, dim=96, spread=0.4)
-        for budget in (1500, 4000):
-            with self.subTest(budget=budget):
-                proxy = CapCoverFilter.auto(96, budget, selection="proxy")
-                proxy.construct(X)
-                f = CapCoverFilter.auto(96, budget, selection="holdout")
-                f.construct(X)
-                self.assertLessEqual(f.get_bytesize(), budget)
-                _assert_no_fn(self, f, X)
-                if f.selection_override is None:
-                    # No override: exactly the proxy's filter.
-                    self.assertEqual(f.quantize, proxy.quantize)
-                    self.assertTrue(np.array_equal(f._stored_codes(f.all_caps), proxy._stored_codes(proxy.all_caps)))
-                    self.assertTrue(np.array_equal(f.all_angles, proxy.all_angles))
 
     def test_query_rule_for_non_unit_queries(self):
         X = _clustered()

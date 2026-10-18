@@ -210,7 +210,6 @@ class QuantizedVectorFilter(Filter):
         max_memory: Optional[int] = None,
         error_budget_mode: ErrorBudgetMode = ErrorBudgetMode.PER_CLUSTER,
         per_vector_eps_bits: int = 8,
-        max_spheres: Optional[int] = None,
         seed: int = 42,
     ):
         super().__init__(dim, max_memory=max_memory)
@@ -219,7 +218,6 @@ class QuantizedVectorFilter(Filter):
         if per_vector_eps_bits not in (1, 2, 4, 8):
             raise ValueError(f"per_vector_eps_bits must be one of (1, 2, 4, 8), got {per_vector_eps_bits}")
         self.per_vector_eps_bits = per_vector_eps_bits
-        self._max_spheres = max_spheres  # unused; accepted for _instantiate_filter parity
         self.seed = seed
 
         self.level: Optional[QuantizationLevel] = None

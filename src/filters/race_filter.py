@@ -47,7 +47,6 @@ class RaceFilter(Filter):
         far_reference_distance: Optional[float] = None,
         calibration_min_snr: float = 3.0,
         calibration_probes: int = 200,
-        max_spheres: Optional[int] = None,
         seed: int = 42,
     ):
         super().__init__(dim, max_memory=max_memory)
@@ -59,7 +58,6 @@ class RaceFilter(Filter):
         self.distance_threshold = float(distance_threshold)
         self.hashes_per_table = hashes_per_table
         self.table_range = 1 << hashes_per_table
-        self._max_spheres = max_spheres  # unused; accepted for _instantiate_filter parity
         # Same reasoning as DSHFilter's far_reference_distance: scale off tau, not a fixed sqrt(2).
         self.far_reference_distance = (
             far_reference_distance if far_reference_distance is not None

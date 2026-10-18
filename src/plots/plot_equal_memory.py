@@ -7,6 +7,7 @@ Edit the CONFIG block below to change parameters -- no CLI flags."""
 from __future__ import annotations
 
 import dataclasses
+import logging
 import os
 from typing import Optional
 
@@ -151,6 +152,21 @@ def check_budget_compliance(df: pd.DataFrame) -> None:
             f"(worst {worst:.2f}x); these are plotted at a budget they did not respect. "
             f"Affected filters: {sorted(over['Config'].unique())}"
         )
+
+
+def drop_over_budget(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop rows the runner flagged 'Over Budget' (index exceeded its byte
+    budget, so the row is unsound). Tolerates a missing column (old CSVs) and
+    'True'/'False' strings from CSV."""
+    if "Over Budget" not in df.columns:
+        return df
+    col = df["Over Budget"]
+    over = col.map(lambda v: str(v).strip().lower() in ("true", "1", "1.0"))
+    if over.any():
+        logging.getLogger(__name__).warning(
+            "Dropping %d over-budget row(s) from the equal-memory plots.", int(over.sum())
+        )
+    return df[~over].copy()
 
 
 def drop_infeasible(df: pd.DataFrame) -> pd.DataFrame:
@@ -447,6 +463,7 @@ def generate_equal_memory_figures(
         _validate_schema(df)
 
     check_budget_compliance(df)
+    df = drop_over_budget(df)
     df = drop_infeasible(df)
     if df.empty:
         raise ValueError("No feasible rows to plot: every result row is marked infeasible.")

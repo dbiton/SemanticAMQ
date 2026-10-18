@@ -17,7 +17,6 @@ import faiss
 import numpy as np
 import pandas as pd
 import time
-import inspect
 
 faiss.omp_set_num_threads(1)
 
@@ -99,7 +98,7 @@ CAP_INSERT_STRATEGIES = {
 # CapCoverFilter.auto() actually chooses among (AUTO_CANDIDATES +
 # DENSE10_LADDER), not every Quantize member -- auto()'s own candidate pool,
 # confirmed by its docstring, so the sweep tests what auto() actually picks
-# from rather than exotic opt-in-only rungs (BOOT_CANDIDATES, KSQ_CANDIDATES).
+# from rather than exotic opt-in-only rungs (BOOT_CANDIDATES).
 CAP_QUANTIZATION_SWEEP = tuple(_CAP_AUTO_CANDIDATES) + tuple(_CAP_DENSE10_LADDER)
 
 VectorInput = Union[np.ndarray, VectorSource]
@@ -161,14 +160,14 @@ class _CapCoverFilterEvalAdapter:
     auto() (not a plain constructor) so a budget gets auto()'s own
     multi-candidate encoding choice, matching how this evaluation uses
     CapCoverFilter everywhere else (_cap_cover). Renames _instantiate_filter's
-    generic max_spheres/insert_mem_percent kwargs onto CapCoverFilter's own
-    max_caps/insert_memory_percent."""
+    generic insert_mem_percent kwarg onto CapCoverFilter's own
+    insert_memory_percent."""
 
     def __init__(self, dim: int, max_memory: int, distance_threshold: float,
-                 max_spheres: Optional[int] = None, insert_mem_percent: Optional[float] = 0.0, **extra_kwargs: Any) -> None:
+                 insert_mem_percent: Optional[float] = 0.0, **extra_kwargs: Any) -> None:
         self.distance_threshold = distance_threshold
         extra_kwargs.setdefault("construct_method", CAP_CONSTRUCT_METHODS[CAP_COVER_CONSTRUCT]())
-        self._filt = CapCoverFilter.auto(dim, max_memory=max_memory, max_caps=max_spheres,
+        self._filt = CapCoverFilter.auto(dim, max_memory=max_memory,
                                          insert_memory_percent=insert_mem_percent, **extra_kwargs)
 
     def construct(self, vectors: np.ndarray) -> None:
@@ -188,7 +187,7 @@ class _CapCoverFilterEvalAdapter:
         return self._filt.all_angles
 
 
-def _instantiate_filter(filter_cls: Any, dim: int, memory_budget: int, distance_threshold: float = None, max_spheres: int = None,
+def _instantiate_filter(filter_cls: Any, dim: int, memory_budget: int, distance_threshold: float = None,
                          insert_mem_percent: Optional[float] = 0.0, extra_kwargs: Optional[Dict[str, Any]] = None) -> Any:
     kwargs = {"dim": dim, "max_memory": memory_budget, **(extra_kwargs or {})}
 
@@ -196,11 +195,8 @@ def _instantiate_filter(filter_cls: Any, dim: int, memory_budget: int, distance_
         kwargs.update(distance_threshold=distance_threshold)
 
         if filter_cls is CapCoverFilter:
-            kwargs.update(max_spheres=max_spheres, insert_mem_percent=insert_mem_percent)
+            kwargs.update(insert_mem_percent=insert_mem_percent)
             return _CapCoverFilterEvalAdapter(**kwargs)
-
-        if "max_spheres" in inspect.signature(filter_cls.__init__).parameters:
-            kwargs.update(max_spheres=max_spheres)
 
         return filter_cls(**kwargs)
     else:
@@ -745,7 +741,7 @@ def cap_quantization_worker(
 
     bad = [r for r in rows if r["fnr"] != 0]
     if bad:
-        raise ValueError(
+        raise InvariantViolation(
             f"Zero-false-negative invariant violated (dataset={dataset}, k={k}, quantize={quantize}, seed={seed}): "
             f"{bad[:3]}"
         )
@@ -845,7 +841,7 @@ def construct_method_worker(
         "method_s": timed.seconds, "construct_s": construct_s, "volume_s": volume_s,
     }
     if fn:
-        raise ValueError(f"Zero-false-negative invariant violated -- a bug in construction method "
+        raise InvariantViolation(f"Zero-false-negative invariant violated -- a bug in construction method "
                          f"{method!r}: {row}")
     return row
 
@@ -876,7 +872,7 @@ def construct_method_scale_worker(dim: int, dataset: str, n: int, method: str, k
            "method_s": seconds, "psi_max": float(angles.max()), "psi_mean": float(angles.mean()),
            "worst_uncovered": worst, "covered": worst <= CapCoverFilter._COVERAGE_EPSILON}
     if not row["covered"]:
-        raise ValueError(f"Coverage violation at scale: {row}")
+        raise InvariantViolation(f"Coverage violation at scale: {row}")
     return row
 
 
@@ -1439,7 +1435,7 @@ def stream_rebuild_worker(
         predicted = np.asarray(filt.query(query_arr, distance_threshold=tau), dtype=bool)
         rates = _confusion_rates(predicted, actual)
         if not recalled.all() or rates["fnr"] != 0.0:
-            raise ValueError(
+            raise InvariantViolation(
                 f"Zero-false-negative invariant violated (dataset={dataset}, policy={policy}, "
                 f"insertion_level={insertion_level}, k={k}, seed={seed}, position={pos}): "
                 f"stream fnr={1.0 - recalled.mean()}, query fnr={rates['fnr']}"
@@ -1575,6 +1571,13 @@ def _describe_result(result: Any) -> str:
     return str(result)
 
 
+class InvariantViolation(ValueError):
+    """A job broke the zero-false-negative / coverage invariant. Unlike an
+    ordinary job failure (logged and skipped), Runner.run() re-raises these
+    after all jobs finish. Plain message-only class so it pickles across
+    ProcessPoolExecutor."""
+
+
 class Runner:
     def __init__(self, num_workers: int = 1, truncate: bool = True) -> None:
         """truncate=False preserves an output_csv's existing rows (see
@@ -1584,6 +1587,7 @@ class Runner:
         self._jobs: List[Dict[str, Any]] = []
         self._rows_by_csv: Dict[str, List[Dict[str, Any]]] = {}
         self._initialized_csvs: set = set()
+        self._violations: List[str] = []
 
     def submit(self, mode: str, output_csv: Optional[str] = None, **kwargs: Any) -> None:
         """output_csv, if given, is this job's target CSV: rewritten from
@@ -1621,7 +1625,13 @@ class Runner:
         """Returns (mode, result) pairs, in completion order (parallel) or
         submission order (sequential) -- the mode tag lets a caller that
         shared this Runner across job types split results back apart."""
-        return self._run_sequential() if self.num_workers == 1 else self._run_parallel()
+        self._violations: List[str] = []
+        results = self._run_sequential() if self.num_workers == 1 else self._run_parallel()
+        if self._violations:
+            raise InvariantViolation(
+                f"{len(self._violations)} job(s) violated the zero-FN invariant "
+                "(other jobs' results were recorded):\n" + "\n".join(self._violations))
+        return results
 
     def clear(self) -> None:
         self._jobs.clear()
@@ -1640,7 +1650,16 @@ class Runner:
         out_dir = os.path.dirname(output_csv)
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
-        pd.DataFrame(rows).to_csv(output_csv, index=False)
+        # Write to a sibling temp file and atomically swap it in, so a crash
+        # mid-write never truncates the rows already on disk.
+        tmp = output_csv + ".tmp"
+        try:
+            pd.DataFrame(rows).to_csv(tmp, index=False)
+            os.replace(tmp, output_csv)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise
 
     def _run_sequential(self) -> List[Tuple[str, Any]]:
         results = []
@@ -1651,7 +1670,9 @@ class Runner:
             kwargs = {k: v for k, v in job.items() if k not in ('mode', 'output_csv')}
             try:
                 result = fn(**kwargs)
-            except Exception:
+            except Exception as e:
+                if isinstance(e, InvariantViolation):
+                    self._violations.append(f"{_describe_job(kwargs)}: {e}")
                 # One job's exception must not lose every other job's
                 # already-completed results.
                 logger.exception(f"Job failed, skipping: {_describe_job(kwargs)}")
@@ -1676,7 +1697,9 @@ class Runner:
                 mode, desc, output_csv = futures[f]
                 try:
                     result = f.result()
-                except Exception:
+                except Exception as e:
+                    if isinstance(e, InvariantViolation):
+                        self._violations.append(f"{desc}: {e}")
                     # See _run_sequential's comment.
                     logger.exception(f"Job failed, skipping: {desc}")
                     continue
