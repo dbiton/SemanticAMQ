@@ -16,6 +16,7 @@ main.py run write the same files -- and truncate them, see CLAUDE.md):
                                                            sphere_merge bootstrap only)
     equal-memory  equal_memory/<corpus>/equal_memory.csv   generate_equal_memory (the baselines
                                                            the figure shows only)
+    throughput    end_to_end.csv                           generate_end_to_end (defined here)
 
 Not generated: scaling, cap_cover_system_tau, query_performance and the
 construct-method scale run, which no paper figure reads.
@@ -30,10 +31,12 @@ for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "
 from functools import partial
 
 import main
-from main import (Runner, MAX_WORKERS, CAP_COVER_CONSTRUCT, equal_memory_filters, logger,
+from main import (Runner, MAX_WORKERS, CAP_COVER_CONSTRUCT, WORKLOAD_NUM_VECTORS, BLOCKLIST_FOLDS,
+                  blocklist_workloads, equal_memory_filters, logger,
                   generate_blocklist, generate_budget, generate_cap_quantization,
                   generate_construct_methods, generate_streaming, generate_equal_memory)
-from plots.plot_paper import plot_figures, CONFIG_TO_METHOD, EQUAL_MEMORY_HIDDEN, STREAM_BOOTSTRAP
+from plots.plot_paper import (plot_figures, CONFIG_TO_METHOD, EQUAL_MEMORY_HIDDEN, STREAM_BOOTSTRAP,
+                              E2E_TAU, E2E_K_FRACTION, E2E_TAUS, E2E_K_FRACTIONS)
 
 assert STREAM_BOOTSTRAP == CAP_COVER_CONSTRUCT, "the streaming figure bootstraps with the paper's construct method"
 
@@ -42,6 +45,28 @@ assert STREAM_BOOTSTRAP == CAP_COVER_CONSTRUCT, "the streaming figure bootstraps
 PAPER_EQUAL_MEMORY_FILTERS = [cls for cls in equal_memory_filters
                               if CONFIG_TO_METHOD.get(cls.__name__) not in EQUAL_MEMORY_HIDDEN]
 
+END_TO_END_CSV = "results/end_to_end.csv"
+
+
+def generate_end_to_end(runner: Runner) -> None:
+    """The throughput figure's data: per corpus and fold, a CapCoverFilter in
+    front of a flat index against the index alone (runner.end_to_end_worker),
+    on the blocklist workload. Only the cells the three panels read: tau swept
+    at the fixed budget E2E_K_FRACTION, and the budget swept at E2E_TAU.
+
+    Only submits 'end_to_end' jobs -- does not run `runner`."""
+    dim = 384
+    cells = sorted({(E2E_K_FRACTION, t) for t in E2E_TAUS} | {(kf, E2E_TAU) for kf in E2E_K_FRACTIONS})
+    for workload in blocklist_workloads(WORKLOAD_NUM_VECTORS, n_folds=BLOCKLIST_FOLDS):
+        for fold, sel in enumerate(workload.selections):
+            runner.submit(
+                'end_to_end', output_csv=END_TO_END_CSV,
+                dim=dim, dataset=workload.plot_key, seed=fold, cells=cells,
+                vectors_reference=workload.rows(sel["reference"]),
+                vectors_query=workload.query_vectors(sel),
+            )
+
+
 PAPER_GENERATORS = (
     generate_blocklist,
     generate_budget,
@@ -49,6 +74,7 @@ PAPER_GENERATORS = (
     generate_construct_methods,
     partial(generate_streaming, construct_methods=[STREAM_BOOTSTRAP], k_sweep=False),
     partial(generate_equal_memory, filters=PAPER_EQUAL_MEMORY_FILTERS),
+    generate_end_to_end,
 )
 
 

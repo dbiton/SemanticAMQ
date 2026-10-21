@@ -9,13 +9,14 @@ go to suggestions/figures/ under the names paper.tex includes:
     construction-fpr-vs-k.*            fig:construction construct_methods/<corpus>.csv
     streaming-fpr-vs-position.*        fig:streaming    streaming/<corpus>/streaming.csv
     equal-memory-fpr-fnr-vs-budget.*   fig:equal-memory equal_memory/<corpus>/equal_memory.csv
+    throughput-improvement.*           fig:throughput   end_to_end.csv
 
 (figures/scheme.pdf is a hand-drawn diagram and is not produced here.)
 
 Run from the repo root with the global Python 3.12:
     PYTHONPATH=src python src/plots/plot_paper.py [results-folder] [figure ...]
 results-folder defaults to results/. Figure names are the keys of FIGURES
-(sweeps, quantization, construction, streaming, equal-memory); default is all.
+(sweeps, quantization, construction, streaming, equal-memory, throughput); default is all.
 
 The sweeps figure's FPR panels group the negatives by how related a query is
 to the indexed set -- the cosine similarity to its nearest construct vector:
@@ -93,6 +94,14 @@ CONFIG_TO_METHOD = {
 EQUAL_MEMORY_HIDDEN = {"QuantizedVector", "MLP", "HNSW", "Zero-FN LSH"}
 
 QUANT_TOP_N = 5
+
+# End-to-end throughput (src/paper.py generates exactly these cells): the filter
+# in front of a flat index vs the index alone. The tau panel fixes the budget,
+# the memory and K panels fix tau; the budget sweep is shared by those two.
+E2E_TAU = 0.1
+E2E_K_FRACTION = 0.1
+E2E_TAUS = (0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4)
+E2E_K_FRACTIONS = (0.005, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2)
 
 # Construction methods shown (CSV key -> label, color, marker, linestyle).
 CONSTRUCT_SHOWN = {
@@ -435,12 +444,68 @@ def equal_memory():
     save(fig, "equal-memory-fpr-fnr-vs-budget")
 
 
+# ---------------------------------------------------------------------------
+# fig:throughput  throughput-improvement
+# ---------------------------------------------------------------------------
+
+def throughput():
+    """End-to-end throughput improvement (%) of the filter in front of a flat
+    index over the index alone, one line per corpus, against tau (budget
+    fixed), against the memory the filter actually uses, and against its
+    number of caps K (tau fixed). Memory and K both come from the budget
+    sweep, but differ: a compact encoding packs more caps into the same
+    bytes. Error bars: +-1 std over folds."""
+    d = pd.read_csv(RESULTS / "end_to_end.csv")
+    d["corpus"] = to_corpus(d.dataset)
+    at_k = d[np.isclose(d.k_fraction, E2E_K_FRACTION)]
+    at_tau = d[np.isclose(d.tau, E2E_TAU)]
+    panels = [
+        (at_k, "tau", "$\\tau$", f"fixed $k={100 * E2E_K_FRACTION:g}\\%$ of $|X|$", False),
+        (at_tau, "memory_pct_raw", "memory (% of raw fp32 index, log)", f"fixed $\\tau={E2E_TAU:g}$", True),
+        (at_tau, "n_caps", "caps $K$ (log)", f"fixed $\\tau={E2E_TAU:g}$", True),
+    ]
+    width = len(panels) * PANEL + (len(panels) - 1) * GAP_LABELLED
+    height = PANEL + MARGIN_TOP
+    fig, axes = plt.subplots(1, len(panels), figsize=(width, height), squeeze=False,
+                             gridspec_kw=dict(left=0, right=1, bottom=0, top=1 - MARGIN_TOP / height,
+                                              wspace=GAP_LABELLED / PANEL))
+    for ax, (df, x, xlabel, title, logx) in zip(axes[0], panels):
+        ax.set_box_aspect(1)
+        agg = (df.groupby(["corpus", "k_fraction", "tau"])
+               .agg(x=(x, "mean"), y=("throughput_improvement_pct", "mean"),
+                    sd=("throughput_improvement_pct", "std"))
+               .reset_index())
+        if agg.empty:
+            mark_empty(ax)
+        for corpus in CORPORA:
+            g = agg[agg.corpus == corpus].sort_values("x")
+            if g.empty:
+                continue
+            color, marker = CORPUS_STYLE[corpus]
+            ax.errorbar(g.x, g.y, yerr=g.sd.fillna(0), color=color, marker=marker, ms=3,
+                        capsize=1.5, elinewidth=0.8)
+        ax.axhline(0, color=INK_MUTED, lw=0.8)
+        if logx:
+            ax.set_xscale("log")
+            ax.xaxis.set_major_formatter(PCT_FMT)
+        if x == "tau":
+            ax.set_xticks([0.05, 0.1, 0.2, 0.3, 0.4])
+        ax.set_xlabel(xlabel)
+        ax.set_title(title, color=INK)
+    axes[0, 0].set_ylabel("throughput improvement (%)")
+    present = [c for c in CORPORA if c in set(to_corpus(d.dataset))]
+    handles = [plt.Line2D([], [], color=CORPUS_STYLE[c][0], marker=CORPUS_STYLE[c][1]) for c in present]
+    fig_legend(fig, handles, [CORPUS_LABEL[c] for c in present], ncol=len(present))
+    save(fig, "throughput-improvement")
+
+
 FIGURES = {
     "sweeps": sweeps_grid,
     "quantization": quantization,
     "construction": construction,
     "streaming": streaming,
     "equal-memory": equal_memory,
+    "throughput": throughput,
 }
 
 

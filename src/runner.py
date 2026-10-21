@@ -964,6 +964,91 @@ def cap_cover_system_tau_worker(
     return rows
 
 
+def end_to_end_worker(
+    dim: int,
+    dataset: str,
+    seed: int,
+    cells: List[Tuple[float, float]],
+    vectors_reference: VectorInput,
+    vectors_query: VectorInput,
+    repeats: int = 3,
+) -> List[Dict[str, Any]]:
+    """End-to-end throughput of a CapCoverFilter in front of a flat L2 index
+    over the same reference set, against the index alone: queries one at a
+    time (the online setting), the index searched for every query without the
+    filter and only for the accepted ones with it. One row per (k_fraction,
+    tau) in `cells`; one cover per k_fraction (_cap_cover), built once.
+
+    throughput_improvement_pct = (with - without) / without. Both timings come
+    from this one process back to back, each the best of `repeats` runs, so
+    the ratio is far steadier than either absolute qps when many workers share
+    the machine (absolute timings still want a pinned run, see CLAUDE.md).
+    The filter is warmed up before timing (the first query() hands the caps
+    to Rust). Raises on a false negative, as every worker does."""
+    B = np.ascontiguousarray(_to_construct_array(vectors_reference), dtype=np.float32)
+    Q = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
+    n_q = len(Q)
+    index = faiss.IndexFlatL2(dim)
+    index.add(B)
+    d2, _ = index.search(Q, 1)
+    nn = np.sqrt(np.clip(d2[:, 0], 0, None))
+
+    def best_time(fn) -> float:
+        best = float("inf")
+        for _ in range(repeats):
+            start = time.perf_counter()
+            fn()
+            best = min(best, time.perf_counter() - start)
+        return best
+
+    without: Dict[float, float] = {}
+    for tau in sorted({float(t) for _, t in cells}):
+        def search_all(tau=tau) -> None:
+            for i in range(n_q):
+                index.range_search(Q[i:i + 1], tau * tau)
+        without[tau] = best_time(search_all)
+
+    rows: List[Dict[str, Any]] = []
+    for kf in sorted({float(f) for f, _ in cells}):
+        k = min(max(1, round(kf * len(B))), len(B))
+        filt = _cap_cover(dim, k)
+        filt.construct(B)
+        memory_bytes = filt.get_bytesize()
+        for tau in sorted(float(t) for f, t in cells if float(f) == kf):
+            predicted = np.zeros(n_q, dtype=bool)
+            filt.query(Q[:1], distance_threshold=tau)
+
+            def filtered_search() -> None:
+                for i in range(n_q):
+                    v = Q[i:i + 1]
+                    hit = filt.query(v, distance_threshold=tau)[0]
+                    predicted[i] = hit
+                    if hit:
+                        index.range_search(v, tau * tau)
+            with_s = best_time(filtered_search)
+
+            actual = nn <= tau
+            fn = int(np.sum(actual & ~predicted))
+            if fn:
+                raise InvariantViolation(
+                    f"Zero-false-negative invariant violated: {fn} FN "
+                    f"(dataset={dataset}, fold={seed}, k={k}, tau={tau})")
+            qps_without = n_q / max(without[tau], 1e-9)
+            qps_with = n_q / max(with_s, 1e-9)
+            rows.append({
+                "dataset": dataset, "seed": seed, "k_fraction": kf, "k": k,
+                "n_caps": filt._num_caps, "n_reference": len(B), "memory_bytes": memory_bytes,
+                "memory_pct_raw": 100.0 * memory_bytes / (len(B) * dim * 4),
+                "tau": tau, "n_queries": n_q,
+                "positive_rate_pct": 100.0 * float(predicted.mean()),
+                "true_positive_rate_pct": 100.0 * float(actual.mean()),
+                "fpr": _confusion_rates(predicted.tolist(), actual)["fpr"],
+                "throughput_without_qps": qps_without, "throughput_with_qps": qps_with,
+                "throughput_improvement_pct": 100.0 * (qps_with - qps_without) / qps_without,
+            })
+    return rows
+
+
 _SURFACE_CHUNK = 2048  # queries per all-balls search in _blocklist_cover_rows
 
 
@@ -1491,6 +1576,7 @@ def stream_rebuild_worker(
 
 _WORKER_FNS: Dict[str, Any] = {
     'cap_cover_system_tau': cap_cover_system_tau_worker,
+    'end_to_end': end_to_end_worker,
     'blocklist': blocklist_tau_worker,
     # Same underlying cover-and-margin core (_blocklist_cover_rows), second
     # worker: generate_budget runs the identical blocklist measurement but
