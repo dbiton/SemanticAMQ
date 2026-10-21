@@ -64,8 +64,13 @@ src/filters/cap_cover/
   *_construct.py       construction strategies (gonzalez [file: gonzales_construct.py],
                        minimax, sphere_merge)
   *_insert.py          dynamic-insertion strategies (nearest, cap_merge)
-  scan_kernels.py      numba early-abandon accept kernels behind query()
-                       (compiled at import)
+  (CAP_COVER_EXPERIMENTS.md at the repo root: what was tried on CapCoverFilter and why variants were removed)
+  cap_scan.py          query() path: accept-rule constants (_beta) and the bridge to the
+                       Rust scan (freeze/thaw of the codes); float64 fallback for FP32/FP16/SQ*
+  scan_kernels.py      numba helper for construction planning (nearest_codeword)
+CapCoverRustFilter/    Rust crate capcover_rs (PyO3/maturin) behind CapCoverFilter.query();
+                       rust-improve.md = design/benchmark report. Build into the Python in use:
+                       `pip install maturin && cd CapCoverRustFilter && maturin develop --release`
 src/filters/           baselines: dsh, hnsw, ivf, quantized_vector, va_plus, race, mlp,
                        pacuk_lsh / sankowski_wygocki (zero-FN LSH, on _floor_lsh.FloorLSHFilter)
 src/plots/             one module per evaluation's figures; plot_common.py = shared style/datasets

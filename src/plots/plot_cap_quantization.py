@@ -1,7 +1,7 @@
 """CapCoverFilter's analogue of plot_quantization.py (see
 main.py::generate_cap_quantization): same long-format-CSV-to-panels shape
 (x-axis = memory usage, one line per quantize method, single dataset), swept
-over CAP_QUANTIZATION_SWEEP (AUTO_CANDIDATES + DENSE10_LADDER) instead of
+over CAP_QUANTIZATION_SWEEP (AUTO_CANDIDATES) instead of
 BallCoverFilter's QUANTIZATION_SWEEP.
 
 Two structural differences from plot_quantization.py, both because the cap
@@ -27,7 +27,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 
-from filters.cap_cover.cap_cover_filter import AUTO_CANDIDATES, DENSE10_LADDER
+from filters.cap_cover.cap_cover_filter import AUTO_CANDIDATES
 from plots.plot_common import apply_style as _apply_style, collapse_duplicate_x, save_figure
 
 # CONFIG
@@ -41,7 +41,7 @@ EMIT_PDF = False
 # Mirrors runner.CAP_QUANTIZATION_SWEEP (not imported, to avoid a dependency
 # on runner.py's multiprocessing machinery, same reason plot_quantization.py
 # hand-keeps its own QUANTIZE_SWEEP instead of importing runner's).
-STAGES = [q.value for q in (tuple(AUTO_CANDIDATES) + tuple(DENSE10_LADDER))]
+STAGES = [q.value for q in AUTO_CANDIDATES]
 # Labelled by name only (unlike Ball-Cover's rate-annotated labels): the cap
 # sweep mixes seeded-PQ families at several bit widths with no single
 # "bits/dim" reading as clean as Ball-Cover's ladder -- see Quantize's own

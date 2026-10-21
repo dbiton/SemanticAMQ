@@ -799,8 +799,7 @@ def plot_budget(df: pd.DataFrame) -> None:
 
 def generate_cap_quantization(runner: Runner) -> None:
     """CapCoverFilter.auto() per
-    (dataset, k, seed, quantize) over CAP_QUANTIZATION_SWEEP (AUTO_CANDIDATES
-    + DENSE10_LADDER). Same k ladder, same
+    (dataset, k, seed, quantize) over CAP_QUANTIZATION_SWEEP (AUTO_CANDIDATES). Same k ladder, same
     fixed tau, same blocklist workloads/source-size split.
 
     Only submits 'cap_quantization' jobs -- does not run `runner`."""

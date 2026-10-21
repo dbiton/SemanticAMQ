@@ -114,13 +114,18 @@ class TestBlocklistGroundTruth(unittest.TestCase):
         Q = np.concatenate([self.heldout, self.withheld, self.singleton])
         nn = _nn(self.B, Q)
         n_q = len(Q)
+        # The runner's rows apply the angle rule alone (surface_angle ignores
+        # a query's norm), while query() also rejects a query whose norm is
+        # more than tau' from 1. The planted queries are off the sphere, so
+        # compare on their directions.
+        Qdir = _unit(Q)
         sizes = (len(self.heldout), len(self.withheld), len(self.singleton))
         for kf in K_FRACTIONS:
             k = min(max(1, round(kf * len(self.B))), len(self.B))
             filt = runner._cap_cover(DIM, k)
             filt.construct(self.B)
             for row in (r for r in self.rows if r["k_fraction"] == kf):
-                predicted = np.asarray(filt.query(Q, distance_threshold=row["tau"]), dtype=bool)
+                predicted = np.asarray(filt.query(Qdir, distance_threshold=row["tau"]), dtype=bool)
                 self.assertAlmostEqual(row["accesses_saved_pct"], 100.0 * (1.0 - predicted.mean()),
                                        delta=100.0 / n_q + 1e-9)
                 expected = runner._per_source_rates(predicted, nn <= row["tau"], *sizes)

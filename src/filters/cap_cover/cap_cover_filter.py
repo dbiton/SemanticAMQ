@@ -1,18 +1,14 @@
 import numpy as np
 import faiss
+import os
 import sys
-from dataclasses import dataclass, field
-from enum import Enum
 from typing import List, Optional, Sequence, Tuple, Union
 from filters.filter import Filter, InsufficientMemoryError
-from filters.cap_cover.cap_quantizers import (Quantize, _Encoding, _ENCODINGS, BOOT_CANDIDATES, _SeededPQ, _BasisPQ, _BootPQ, _DualPQ, _KLTSQ,  # noqa: F401
-                                                _gaussian_lloyd_max, _LLOYD_MAX, _fit_scalar_codes, _PROBE_RNG)
+from filters.cap_cover.cap_quantizers import Quantize, _ENCODINGS, _SeededPQ, _fit_scalar_codes, _PROBE_RNG  # noqa: F401
 from filters.cap_cover.cap_scan import _CapScanMixin
 from filters.cap_cover.cap_interfaces import ConstructInterface, Cover, InsertInterface
 from filters.cap_cover.cap_geometry import (angle_between, log_cap_measure, nearest_directions, segments,
                                             segment_max, unit_rows)
-
-
 
 
 _ROTATION_SEED = 0x5EED
@@ -20,118 +16,17 @@ _ROTATION_SEED_BYTES = 4
 _ANGLE_GRID_BYTES = 8      # a static 8-bit filter's angle grid: two float32
 
 
-# Set storage (CapCoverFilter's set_codes). A static cover is a set of caps,
-# so storing a group of n caps in a fixed order spends log2(n!) bits on the
-# order alone. Each group is instead sorted by the first w bits of its codes
-# (w = 8, 16 or 24, whichever saves most), and those prefixes are stored as
-# an Elias-Fano sequence: n (l + 1) + (2^w >> l) + 1 bits, l = floor(log2(2^w
-# / n)), about log2(e 2^w / n) + 0.6 per cap instead of w -- log2 n - 2 bits
-# saved per cap. The rest of each code is stored as it was, byte-aligned.
-
-def _ef_layout(n: int, w: int) -> Tuple[int, int, int]:
-    """(l, low bytes, high bytes) of an Elias-Fano sequence of n values
-    below 2^w (scan_kernels.ef_decode's layout)."""
-    universe = 1 << w
-    l = 0
-    while n << (l + 1) <= universe:
-        l += 1
-    return l, (n * l + 7) // 8, (n + ((universe - 1) >> l) + 1 + 7) // 8
-
-
-def _key_width(n: int, code_size: int) -> int:
-    """Bits of each code (0, 8, 16 or 24) a group of n codes of code_size
-    bytes keeps as an Elias-Fano set: the width that saves most bytes, 0 if
-    none saves any."""
-    best, best_w = 0, 0
-    for w in (8, 16, 24):
-        if w > 8 * code_size:
-            break
-        _, low, high = _ef_layout(n, w)
-        save = n * (w // 8) - low - high
-        if save > best:
-            best, best_w = save, w
-    return best_w
-
-
-def _ef_encode(keys: np.ndarray, w: int) -> Tuple[int, np.ndarray, np.ndarray]:
-    """(l, low, high) for non-decreasing keys below 2^w: little-endian bit
-    streams, low = each key's low l bits, high = a set bit at
-    (key >> l) + i for the i-th key."""
-    keys = np.asarray(keys, dtype=np.int64)
-    n = len(keys)
-    l, low_bytes, high_bytes = _ef_layout(n, w)
-    low = np.zeros(low_bytes, dtype=np.uint8)
-    if l:
-        bits = ((keys[:, None] >> np.arange(l)[None, :]) & 1).astype(np.uint8).ravel()
-        low[:] = np.packbits(np.concatenate([bits, np.zeros(8 * low_bytes - len(bits), np.uint8)]),
-                             bitorder="little")
-    high_bits = np.zeros(8 * high_bytes, dtype=np.uint8)
-    high_bits[(keys >> l) + np.arange(n)] = 1
-    return l, low, np.packbits(high_bits, bitorder="little")
-
-
-@dataclass
-class _Group:
-    """One static encoding group in set storage: caps `ids` (sorted by their
-    codes' first w bits), those prefixes as an Elias-Fano sequence (l, low,
-    high), the rest of each code (rem) and each cap's angle code.
-
-    `keys()` and the decoded angle array (`_level_codes`'s theta) used to be
-    recomputed on every query() call -- pure waste for a static filter
-    (set_codes's only user, see _set_storage), whose groups are rebuilt
-    wholesale by _pack() and never mutated in place afterward: caching them
-    here is exactly as safe as not calling _pack() twice. On a cover with a
-    few thousand caps this removed most of a single query's own time, behind
-    only the scan kernel itself (measured: cap_cover_system_tau_worker's
-    single-query throughput, suggestions/cap_cover_query_cache_report.md)."""
-    ids: np.ndarray
-    w: int
-    l: int
-    low: np.ndarray
-    high: np.ndarray
-    rem: np.ndarray
-    ang: np.ndarray
-    _keys_cache: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
-    _theta_cache: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
-
-    def keys(self) -> np.ndarray:
-        if self._keys_cache is None:
-            from filters.cap_cover import scan_kernels
-            out = np.empty(len(self.ids), dtype=np.int64)
-            if self.w:
-                scan_kernels.ef_decode(self.low, self.high, len(self.ids), self.l, out)
-            self._keys_cache = out
-        return self._keys_cache
-
-    def codes(self) -> np.ndarray:
-        """The full codes, in group order."""
-        k = self.keys()
-        prefix = ((k[:, None] >> (8 * np.arange(self.w // 8))[None, :]) & 0xFF).astype(np.uint8)
-        return np.ascontiguousarray(np.concatenate([prefix, self.rem], axis=1))
-
 def _fits(dim: int, q: Quantize) -> bool:
     """Whether encoding q can code directions of `dim` dimensions."""
-    spec = _ENCODINGS[q]
-    if spec.klt_bits:
-        return spec.rank <= dim
-    if spec.rank:
-        return spec.rank <= dim and spec.rank % spec.sub == 0 and not (spec.dual and dim % (spec.rank // spec.sub))
-    return dim % max(spec.sub, 1) == 0
+    return dim % max(_ENCODINGS[q].sub, 1) == 0
 
 
 # Candidate encodings CapCoverFilter.auto() chooses among: the seeded-PQ rungs
 # below 1 bit/dim plus TurboQuant above it, so small budgets can buy many
-# coarse caps and large ones fewer, finer caps. Encodings with a trained
-# basis (PSPQ*, DPQ*, KSQ*) are left out: at |B| = 8000 their basis takes
-# most of a small budget and mixing never picked them at k <= 1%, and at 80K
-# they double construction time (see CapCoverFilter's Encodings trained on B).
+# coarse caps and large ones fewer, finer caps.
 AUTO_CANDIDATES = (Quantize.SPQ12, Quantize.SPQ16, Quantize.SPQ24, Quantize.SPQ36, Quantize.SPQ48,
                    Quantize.SPQ64, Quantize.TQ2, Quantize.TQ3, Quantize.TQ4)
-# Seeded-PQ rungs between AUTO_CANDIDATES' at 10 bits (auto()'s default, with
-# mix_finer=1): a cap can coarsen, or the top band refine, by a smaller step,
-# and a 2^bits codebook costs dim * 2^bits multiply-adds per encoded cap, so
-# 10-bit rungs keep construction inside the benchmark's 5-minute limit at 80K.
-DENSE10_LADDER = (Quantize.SPQ20, Quantize.SPQ30, Quantize.SPQ40, Quantize.SPQ60, Quantize.SPQ80)
+
 
 class CapCoverFilter(_CapScanMixin, Filter):
     """Ball-Cover for unit-norm vectors, with spherical caps in place of
@@ -142,11 +37,8 @@ class CapCoverFilter(_CapScanMixin, Filter):
 
     Accept rule. For a unit query, angle(q, u) <= theta + alpha with
     alpha = 2 arcsin(tau / 2): the exact tau-neighbourhood of the cap on the
-    sphere, so no rule that knows only the cap can be tighter. (A ball's
-    |q - c| <= r + tau holds the same cap but over-expands it unless its
-    center sits at norm 1 / cos(theta); BallCoverFilter's common norm costs
-    it a little -- 0.1-0.5% FPR on the same cover.) For a query of norm n
-    the rule generalizes exactly: angle(q, u) - theta <= beta(n),
+    sphere, so no rule that knows only the cap can be tighter. For a query
+    of norm n the rule generalizes exactly: angle(q, u) - theta <= beta(n),
     cos beta = (n^2 + 1 - tau^2) / (2n), and nothing is accepted when
     |n - 1| > tau. Members must be unit vectors (within _NORM_TOLERANCE,
     which the rule adds to tau).
@@ -164,104 +56,23 @@ class CapCoverFilter(_CapScanMixin, Filter):
     Fitted codes. A cap's code need not be the one nearest its center, only
     one whose decoded direction holds its members tightly: construct()
     searches codes for the least members' angle (_SeededPQ.fit_codes,
-    _fit_scalar_codes) -- -0.02..-0.08 FPR at k <= 5% of |B|, free in bytes.
+    _fit_scalar_codes), free in bytes.
 
     Choosing the encoding. How coarse is best depends on the budget per
     member, so `quantize` may be a sequence of candidates (auto() uses
-    AUTO_CANDIDATES + DENSE10_LADDER), and construct() builds covers at the candidates' cap
-    counts from one merge (ConstructInterface.iter_candidates) and keeps
-    the one with the least accept region on the sphere (_volume): ln of the
-    sum over caps of sigma(theta' + beta) at selection_tau (theta' the
-    members' widest angle around the decoded direction) -- from B and
-    the stored caps only, so it holds whatever the queries. At
-    d = 384 the widest caps dominate the sum. With `mixed` (static
-    filters) each cap takes its own encoding (_choose_mixed): "coarsen"
-    (default) lets caps narrower than the widest take coarser codes than
-    the least-volume single encoding where that keeps them within the
-    widest angle, buying more caps with the bytes freed; "free" also
-    lets the widest caps take finer codes, which shrinks the region most
-    but spends bytes on few caps; False keeps one encoding (_choose).
-
-    Measured (src/compare_cap_cover.py, |B| = 8000, 5 corpora x 5 folds,
-    fold-paired; results/cap_cover/v1_*.csv, v5_*.csv): against the
-    least-volume single encoding (mixed=False), mixed="coarsen" moves FPR by
-    -0.058 / -0.056 / -0.035 / -0.026 / -0.002 / +0.001 / -0.001 at
-    k = 0.5/1/2/5/10/15/20% at about its volume (+0.8 / +0.5 / -0.5 / -0.6
-    / +0.4 / +1.0 / -1.2 orders), for 1.6-2.7x its construction time;
-    mixed="free" by -0.017 / -0.007 / -0.002 / +0.004 / +0.020 / +0.001 /
-    +0.001 for 1.5 / 2.6 / 4.3 / 9.0 / 12.0 / 10.0 / 10.7 orders less
-    volume (CC-News at 10%: +0.10, its widest caps take TQ4/TQ3 codes and
-    the cover keeps 2.3K caps instead of 4.2K). Mixing must plan the
-    finished cover again: carrying the plan over finish(), which moves
-    members between caps, left the coarsened covers 0.4-1.2 orders wider.
-
-    The top band. At d = 384 the region is set by the caps within ~0.02
-    rad of the widest (often 10-300 of them), so `mix_finer` raises
-    coarsen's ceiling by that many rungs: a plan then gives a finer code
-    only to a cap that would otherwise exceed the widest angle it keeps.
-    With DENSE10_LADDER's smaller steps and set storage (cdf1_*.csv, 175
-    cells, fold-paired against the v5 default): FPR -0.020 / -0.013 /
-    -0.004 / -0.002 / -0.002 / -0.005 / -0.002 and log10 volume -0.8 /
-    -1.4 / -3.0 / -4.7 / -11.5 / -9.6 / -10.2 at k = 0.5/1/2/5/10/15/20%
-    of |B| (smaller in 18-25 of 25 cells per k) -- at 10-20% the volume of
-    mixed="free" (-0.8 .. +0.7 orders from it) at better FPR than coarsen.
-    On the default ladder (band_*.csv, no set storage) mix_finer=1 trades:
-    -1.1 .. -9.9 orders for +0.006 .. +0.017 FPR at k <= 5%. Two other
-    top-band moves measured no room (suggestions/cap_cover_volume_report.md):
-    planning on fitted codes and tight angles (the plan's widest angle is
-    within 0.001-0.012 rad of the stored one), and bisecting the widest
-    caps paid for by merging narrow ones (the cheapest merges of non-band
-    caps land above the band floor in 62-100% of cases at k <= 2%; the k
-    grid already undoes the last, widest merges).
+    AUTO_CANDIDATES), and construct() builds covers at the candidates' cap
+    counts from one merge (ConstructInterface.iter_candidates) and keeps the
+    one with the least accept region on the sphere (_volume): ln of the sum
+    over caps of sigma(theta' + beta) at selection_tau (theta' the members'
+    widest angle around the decoded direction) -- from B and the stored caps
+    only, so it holds whatever the queries. With `mixed` (static filters)
+    each cap takes its own encoding (_choose_mixed): caps narrower than the
+    widest take coarser codes than the least-volume single encoding where
+    that keeps them within the widest angle, buying more caps with the bytes
+    freed. mixed=False keeps one encoding (_choose).
 
     Angles are stored in 8 bits over the filter's own [min, max] when no
     insert strategy can grow one past max (else 16 bits over [0, pi]).
-
-    Set storage (set_codes, static filters; see _ef_layout and _pack). A
-    static cover is a set, so each encoding group is stored sorted by its
-    codes' first 8-24 bits, those as an Elias-Fano sequence: log2(n) - 2
-    bits saved per cap of a group of n, 1.7-4.6% of the budget at k <= 5%
-    of |B| = 8000 (0.7-3.5% above; fold 0's v5 covers). The scan decodes
-    the sequence once per call and the kernels take each code's first bits
-    from it, so what is charged is what is read. Every byte-level step
-    (plan, cap counts, get_bytesize) charges the exact Elias-Fano size.
-    |B| = 8000, 175 cells, fold-paired against fixed-order groups (v5_*,
-    set_*.csv): FPR -0.016 / -0.011 / -0.004 / -0.004 / -0.001 / 0.000 /
-    0.000 at k = 0.5/1/2/5/10/15/20% (the bytes buy caps), log10 volume
-    +0.2 .. -1.0; set_codes=False reproduces the earlier rows exactly.
-
-    Measured (src/compare_cap_cover.py, blocklist workload, 5 corpora x 5
-    folds, tau = 0.1, equal bytes = Ball-Cover TQ4 at k = k_fraction * |B|
-    balls; suggestions/cap_cover_volume_report.md). auto()'s defaults since
-    2026-10-04 (DENSE10_LADDER, mix_finer=1, set storage; d10f1_*.csv),
-    |B| = 8000: mean FPR .603/.404/.289/.178/.121/.097/.085 at k = 0.5/1/2/
-    5/10/15/20%, log10 volume -6.8/-13.4/-25.1/-50.2/-89.7/-117.4/-137.1;
-    fold-paired against the previous defaults (v5_*.csv) FPR -0.016 /
-    -0.011 / -0.003 / -0.002 / -0.001 / -0.005 / -0.002 and volume -0.8 /
-    -1.3 / -3.0 / -4.7 / -11.2 / -9.6 / -10.2 orders. Against the best of
-    five Ball-Cover configurations *per cell* (sphere_merge at TQ1-TQ4,
-    which weights its merges by member counts, and the paper's
-    minimax_sphere at TQ4; ballvol_*.csv) .927/.705/.445/.272/.147/.111/.097
-    it wins 25/25/25/25/21/21/20 of 25 cells (losses <= 0.030), against the
-    paper's configuration (.970/.893/.740/.469/.312/.237/.188) all 175, and
-    its volume is below every Ball configuration's (best: -2.4/-5.6/-11.5/
-    -27.1/-50.3/-82.9/-94.0) in all 175. |B| = 80K (fold 0, d1080_*.csv):
-    FPR .725/.561/.419/.243/.166/.142/.114, volume -12.1/-18.7/-32.0/-55.8/
-    -95.1/-121.0/-136.5; against the previous defaults (m80_*, m80c_*.csv)
-    FPR -0.011/-0.018/+0.004/-0.009/-0.003/+0.006/-0.003 and volume -1.7 /
-    -1.3 / -4.7 / -6.2 / -11.2 / -10.3 / -10.3 (smaller in 33 of 35);
-    Ball-Cover's paper configuration .963/.896/.782 at -5.2/-8.8/-13.5 for
-    k <= 2% (ball80vol_*.csv; its larger k and every sphere_merge
-    configuration exceed the 5-minute job limit on this machine).
-    Construction: 3.9-24.7 s at |B| = 8000 (median 10.7; the cells of
-    timing_v5_10k.csv, one P-core, timing_s4_10k.csv), 75-103 s at 80K
-    alone, up to ~290 s with five 80K jobs at once.
-
-    The previous defaults (AUTO_CANDIDATES, mix_finer=0, fixed-order groups;
-    v5_*.csv, m80*_*.csv) had FPR .619/.414/.292/.180/.122/.102/.087 at
-    log10 volume -6.0/-12.0/-22.0/-45.5/-78.6/-107.9/-126.9 (|B| = 8000)
-    and .736/.578/.415/.252/.169/.136/.117 at -10.3/-17.4/-27.3/-49.6/
-    -83.9/-110.8/-126.3 (80K).
 
     Working basis. Rotating encodings quantize in a seeded orthonormal
     basis; members and queries are rotated in float64 and every cap angle is
@@ -269,64 +80,16 @@ class CapCoverFilter(_CapScanMixin, Filter):
     scores against. Strategies only ever see working-basis unit vectors;
     angles are rotation-invariant, so none of them needs to know.
 
-    query() scans the caps in blocks: decode a block (compiled for seeded-PQ
-    and TurboQuant codes, see scan_kernels), one float32 GEMM of the unit
-    queries against the decoded vectors, compared in one compiled pass with
+    query() runs in Rust (capcover_rs, see cap_scan.py): per cap, the unit
+    query's float32 score against the decoded direction (table lookups on the
+    stored codes, nothing decoded persists between calls) is compared with
     |raw| cos(theta + beta); pairs within float32's error bound of that
     boundary are re-decided exactly in float64, so decisions match a
-    float64 evaluation of the rule. Nothing decoded persists between calls.
-    One P-core, batches of 32: 2.5x the throughput of the numpy scan at
-    |B| = 80K (701 -> 1720 q/s on 21K SPQ36 caps), 1.9x at 8K (3.1K caps).
-    Seeded-PQ codes with small codebooks skip decoding: per chunk of
-    queries, a table of each slice against each codeword, summed per cap
-    (_scan_tables, where _tables_pay; 3.2x on SPQ16). Batches of 1-3
-    queries on 12-bit seeded PQ skip both: each cap's slices are scored
-    straight from the codebook and a cap is given up once the rest of the
-    code cannot reach its threshold (scan_kernels.accept_direct; single
-    queries 2.5-3.5x: 2.0K -> 7.1K q/s on 635 SPQ48 caps, 0.3K -> 0.9K on
-    7.9K SPQ36, |B| = 8000, one P-core); TurboQuant codes likewise sum
-    q . raw and |raw|^2 in one pass over the codes (accept_direct_levels;
-    single queries 1.7-2.4x on 1.6K-3.2K TQ2/TQ3 caps, with other jobs
-    running). Since 2026-10-04 batches of 1-3 queries go through per-query
-    tables instead (single_tables): seeded PQ through a table of each slice
-    against each codeword, m reads per cap with an exact early abandon on
-    the remaining slices' best entries (scan_kernels.accept_table1; always
-    for 8-bit codebooks, for 10/12-bit ones from _TABLE1_MIN_CAPS caps --
-    below that the table's 2^bits * dim costs more than it saves, 3.7x
-    slower on 1K 12-bit caps), TurboQuant through tables of 2-8 dimensions
-    per entry (scan_kernels.accept_lut_levels). One P-core, the same filter
-    (kernel_timing.py): single queries 1.6x on 7.9K SPQ36 caps (1.0K ->
-    1.6K q/s), 1.75x on 1.7K TQ2+SPQ64 caps (1.5K -> 2.6K), unchanged on
-    covers below the 12-bit threshold. Against the previous defaults' rows
-    (timing_v5_*.csv vs timing_s4_*.csv, the same cells and core), auto()
-    now answers batches of 32 at 1.15x (0.76-1.36x; slower where it holds
-    more caps) and single queries at 1.28x (0.86-3.5x), median.
-    Exact pruning (cell bounds,
-    partial dot products) cannot help much here: a coarse cap's decoded
-    direction sits up to ~1 rad off its members, so caps that neighbour in
-    the data do not neighbour in decoded space; storing caps widest first
-    (BallCoverFilter's 1.16-1.48x) measured flat, as the scan decides a
-    block of 1024 caps per GEMM.
+    float64 evaluation of the rule. Encodings Rust has no kernel for (FP32,
+    FP16, SQ*) are answered by that float64 rule directly.
 
-    Encodings trained on B (not in AUTO_CANDIDATES; pass `candidates` to
-    auto()). Embedding directions are far from isotropic, so a basis
-    fitted to the caps codes most of them more finely at equal bytes:
-    seeded PQ in a rank-r principal basis (PSPQ*, _BasisPQ), the better of
-    that and whole-space seeded PQ per cap (DPQ*, _DualPQ), or VA+'s KLT
-    code -- bits by reverse water-filling over the KLT coordinates, scalar
-    Lloyd-Max levels on each (KSQ*, _KLTSQ). Each charges its basis (r TQ4
-    rows, 9-44 KB at d = 384). Median accept angles drop 0.1-0.3 rad, but
-    (a) at |B| = 8000 the basis takes most of a budget at k <= 2% of |B|,
-    (b) a few directions with energy outside the basis code worse, so the
-    widest caps -- which set the accept volume at d = 384 -- often widen,
-    and (c) the coding error now lies inside the data's subspace, where
-    queries are, so a cap reaches further along the data than its angle
-    suggests. Fold 0, Quora, |B| = 80K, against whole-space seeded PQ at
-    the same code bytes: k = 5%, KSQ48 FPR .084 vs .096 (log10 volume -43
-    vs -55), DPQ48 .098 (-59), KSQ24 .143 vs .167 (-20 vs -28), DPQ24 .152
-    (-30); k = 1%, KSQ24 .417 vs .378, DPQ12 .514 vs .414 (-9.7 vs -8.0).
-    Per-cap mixing (see Choosing the encoding) can take a KLT code for
-    the caps it suits and seeded PQ for the rest."""
+    Measurements behind each of these, and the variants that were tried and
+    removed, are in CAP_COVER_EXPERIMENTS.md."""
 
     # Added to tau, as BallCoverFilter's own _COVERAGE_EPSILON: ground truth
     # is computed by faiss in float32 (|q - x|^2 <= tau^2), whose cancellation
@@ -339,11 +102,6 @@ class CapCoverFilter(_CapScanMixin, Filter):
     # How many of a member's nearest caps _tight_angles tests when looking for
     # one that already covers it (BallCoverFilter._COVERAGE_NEIGHBORS).
     _COVERAGE_NEIGHBORS = 16
-
-    # Caps decoded per block of the scan (1.5 MB of float32 at d = 384, so
-    # the GEMM reads them from L2), and queries per GEMM.
-    _SCAN_BLOCK = 1024
-    _SCAN_QUERY_CHUNK = 1024
 
     def __init__(
         self,
@@ -358,27 +116,19 @@ class CapCoverFilter(_CapScanMixin, Filter):
         fit_codes: bool = True,
         fit_candidates: int = 8,
         fit_passes: int = 2,
-        fit_rounds: int = 1,
         selection_tau: float = 0.1,
-        basis_fit: str = "caps",
-        mixed: Union[bool, str] = "coarsen",
-        mix_finer: int = 0,
-        set_codes: bool = True,
-        single_tables: bool = True,
-        boot_anchors: float = 0.25,
-        boot_equal: bool = True,
+        mixed: bool = True,
+        rust_threads: Optional[int] = None,
     ) -> None:
         super().__init__(dim, max_memory=max_memory)
-        self.boot_anchors = boot_anchors
-        self.boot_equal = boot_equal
-        self.basis_fit = basis_fit
-        self.mix_finer = mix_finer
-        self.set_codes = set_codes
-        self.single_tables = single_tables
-        self._packed = None    # level -> _Group, a static filter's set storage (see _pack)
-        if mixed not in (False, True, "coarsen", "free"):
-            raise ValueError(f"mixed must be False, 'coarsen' or 'free', got {mixed!r}")
-        self.mixed = "coarsen" if mixed is True else mixed
+        # Threads of query()'s Rust scan: the evaluation runs one process per
+        # core, so 1 (or env CAPCOVER_RUST_THREADS) is the default.
+        self.rust_threads = int(os.environ.get("CAPCOVER_RUST_THREADS", 1)) if rust_threads is None else rust_threads
+        self._rust = None            # capcover_rs.CapIndex while frozen (cap_scan.py)
+        self._groups = []            # encodings in Rust's group order
+        if mixed not in (False, True):
+            raise ValueError(f"mixed must be True or False, got {mixed!r}")
+        self.mixed = mixed
         if construct_method is None:
             from filters.cap_cover.sphere_merge_construct import SphereMergeConstruct
             construct_method = SphereMergeConstruct()
@@ -402,7 +152,6 @@ class CapCoverFilter(_CapScanMixin, Filter):
         self.fit_codes = fit_codes
         self.fit_candidates = fit_candidates
         self.fit_passes = fit_passes
-        self.fit_rounds = fit_rounds
         self._angle_levels = (1 << angle_bits) - 1
         # Angle grid [lo, hi]: all of [0, pi] by default; a static 8-bit
         # filter narrows it to its own angles at construct() (see there).
@@ -442,13 +191,8 @@ class CapCoverFilter(_CapScanMixin, Filter):
     @classmethod
     def auto(cls, dim: int, max_memory: int, **kwargs) -> "CapCoverFilter":
         """A filter that picks its encodings for the budget at construct()
-        (by accept-region volume, see _choose_mixed) among AUTO_CANDIDATES plus
-        DENSE10_LADDER, with the top band one rung finer (mix_finer=1): the
-        defaults since 2026-10-04 (see Choosing the encoding and The top
-        band). candidates=AUTO_CANDIDATES, mix_finer=0 gives the earlier
-        ones."""
-        candidates = [q for q in kwargs.pop("candidates", AUTO_CANDIDATES + DENSE10_LADDER) if _fits(dim, q)]
-        kwargs.setdefault("mix_finer", 1)
+        (by accept-region volume, see _choose_mixed) among AUTO_CANDIDATES."""
+        candidates = [q for q in kwargs.pop("candidates", AUTO_CANDIDATES) if _fits(dim, q)]
         return cls(dim, quantize=candidates, max_memory=max_memory, **kwargs)
 
     # ------------------------------------------------------------ properties
@@ -475,10 +219,8 @@ class CapCoverFilter(_CapScanMixin, Filter):
     @staticmethod
     def _code_size_of(dim: int, q: Quantize) -> int:
         spec = _ENCODINGS[q]
-        if spec.klt_bits:
-            return spec.klt_bits // 8
         if spec.sub:
-            return ((spec.rank or dim) // spec.sub * spec.bits + 7) // 8
+            return (dim // spec.sub * spec.bits + 7) // 8
         if spec.qtype is None:
             return dim * 4
         return int(faiss.ScalarQuantizer(dim, spec.qtype).code_size)
@@ -493,7 +235,7 @@ class CapCoverFilter(_CapScanMixin, Filter):
         sq = self._quantizers[level]
         if sq is None:
             return 0
-        if isinstance(sq, (_SeededPQ, _BasisPQ, _DualPQ, _KLTSQ)):
+        if isinstance(sq, _SeededPQ):
             return sq.codebook_bytes()
         trained = faiss.vector_to_array(sq.trained)
         if len(trained) == 0:
@@ -511,39 +253,12 @@ class CapCoverFilter(_CapScanMixin, Filter):
             total += _ANGLE_GRID_BYTES
         return total + self._quantizer_bytes(level)
 
-    def _set_storage(self) -> bool:
-        """Whether groups are stored as sets (static filters; see _ef_layout)."""
-        return self.set_codes and self.insert_method is None
-
-    def _group_bytes(self, level: int, n: int) -> int:
-        """Bytes of n caps stored at `level`: codes and angles, in set
-        storage with each code's first w bits as an Elias-Fano sequence."""
-        per = self.bytes_per_cap(level)
-        if n <= 0:
-            return 0
-        w = _key_width(n, self.code_size(level)) if self._set_storage() else 0
-        if w == 0:
-            return n * per
-        _, low, high = _ef_layout(n, w)
-        return low + high + n * (per - w // 8)
-
     def _calculate_max_caps(self, max_memory: Optional[int]) -> int:
         if max_memory is None:
             return sys.maxsize
         usable = max(0, max_memory - self._codebook_bytes())
         if self.insert_method is None:
-            n = max(1, usable // self.bytes_per_cap())
-            if self._set_storage():
-                # Most caps whose set-stored group fits (bytes grow with n).
-                lo, hi = n, 2 * n + 16
-                while lo < hi:
-                    mid = (lo + hi + 1) // 2
-                    if self._group_bytes(self._uniform, mid) <= usable:
-                        lo = mid
-                    else:
-                        hi = mid - 1
-                n = max(1, lo)
-            return n
+            return max(1, usable // self.bytes_per_cap())
         return max(1, self.insert_method.max_caps_for_budget(usable, self.bytes_per_cap()))
 
     def _calculate_max_construct_caps(self, insertion_memory_percent: float) -> int:
@@ -565,32 +280,20 @@ class CapCoverFilter(_CapScanMixin, Filter):
 
     def _make_quantizer(self, q: Quantize):
         spec = _ENCODINGS[q]
-        if spec.klt_bits:
-            return _KLTSQ(self.dim, spec.klt_bits, spec.rank, fit_on=self.basis_fit)
-        if spec.dual:
-            return _DualPQ(self.dim, spec.rank, spec.sub, spec.bits, fit_on=self.basis_fit)
-        if spec.boot:
-            return _BootPQ(self.dim, spec.rank, spec.sub, spec.bits)
-        if spec.rank:
-            return _BasisPQ(self.dim, spec.rank, spec.sub, spec.bits, fit_on=self.basis_fit)
         if spec.sub:
             return _SeededPQ(self.dim, spec.sub, spec.bits)
         if spec.qtype is None:
             return None
         return faiss.ScalarQuantizer(self.dim, spec.qtype)
 
-    def _train_quantizers(self, directions: np.ndarray, members: Optional[np.ndarray] = None,
-                          level: Optional[int] = None) -> None:
+    def _train_quantizers(self, directions: np.ndarray, level: Optional[int] = None) -> None:
         """A fresh quantizer for the encoding in use (or `level`), trained on
-        the cap directions (and, for a basis fitted on them, the members)."""
+        the cap directions."""
         level = self._uniform if level is None else level
         sq = self._quantizers[level] = self._make_quantizer(self.levels[level])
         if sq is None or len(directions) == 0:
             return
-        if isinstance(sq, (_BasisPQ, _DualPQ, _KLTSQ)):
-            sq.train(directions, members)
-        else:
-            sq.train(np.ascontiguousarray(directions, dtype=np.float32))
+        sq.train(np.ascontiguousarray(directions, dtype=np.float32))
 
     def to_working(self, vectors: np.ndarray) -> np.ndarray:
         """Rows in the working basis, float64 (norms preserved)."""
@@ -621,7 +324,7 @@ class CapCoverFilter(_CapScanMixin, Filter):
             return D.view(np.uint8).reshape(len(D), -1).copy()
         if len(D) == 0:
             return np.empty((0, self.code_size(level)), dtype=np.uint8)
-        if fast and isinstance(sq, (_SeededPQ, _BasisPQ)) and not isinstance(sq, _DualPQ):
+        if fast and isinstance(sq, _SeededPQ):
             return np.ascontiguousarray(sq.compute_codes(D, fast=True), dtype=np.uint8)
         return np.ascontiguousarray(sq.compute_codes(D), dtype=np.uint8)
 
@@ -715,71 +418,9 @@ class CapCoverFilter(_CapScanMixin, Filter):
         return self._decode_levels(self._stored_codes(ids), self._cap_level[ids])
 
     def _stored_codes(self, ids: np.ndarray) -> np.ndarray:
-        """Codes of caps `ids` (rows of the widest code size), from the
-        per-id array or, in set storage, rebuilt from the groups."""
-        ids = np.asarray(ids, dtype=np.int64)
-        if self._packed is None:
-            return self._codes[ids]
-        out = np.zeros((len(ids), int(self._code_sizes.max())), dtype=np.uint8)
-        levels = self._cap_level[ids]
-        for level in np.unique(levels):
-            g = self._packed[int(level)]
-            slot = np.full(int(g.ids.max()) + 1, -1, dtype=np.int64)
-            slot[g.ids] = np.arange(len(g.ids))
-            rows = np.flatnonzero(levels == level)
-            codes = g.codes()
-            out[rows, :codes.shape[1]] = codes[slot[ids[rows]]]
-        return out
-
-    def _pack(self) -> None:
-        """Moves a static filter's codes into set storage: per encoding
-        group, the caps sorted by their codes' first w bits (_key_width),
-        those prefixes Elias-Fano coded and the rest of each code kept as it
-        was. The scan reads the groups (_level_codes); ids are reordered so
-        each group's caps come in its stored order."""
-        ids = self.all_caps
-        levels = self._cap_level[ids]
-        packed, order = {}, []
-        for level in np.unique(levels):
-            level = int(level)
-            lid = ids[levels == level]
-            cs = self.code_size(level)
-            codes = self._codes[lid][:, :cs]
-            w = _key_width(len(lid), cs)
-            if w:
-                keys = (codes[:, :w // 8].astype(np.int64) << (8 * np.arange(w // 8))[None, :]).sum(axis=1)
-                srt = np.argsort(keys, kind="stable")
-                lid, codes = lid[srt], codes[srt]
-                l, low, high = _ef_encode(keys[srt], w)
-            else:
-                l, low, high = 0, np.zeros(0, dtype=np.uint8), np.zeros(0, dtype=np.uint8)
-            packed[level] = _Group(ids=lid, w=w, l=l, low=low, high=high,
-                                   rem=np.ascontiguousarray(codes[:, w // 8:]), ang=self._angle_codes[lid].copy())
-            order.append(lid)
-        if order:
-            self._all_caps[:len(ids)] = np.concatenate(order)
-        self._packed = packed
-        self._codes = None
-
-    _NO_KEYS = np.zeros(1, dtype=np.int64)
-    # _scan's placeholder `ids` when self._packed is not None: _level_codes
-    # ignores it entirely in that case (it reads the group's own g.ids), and
-    # _scan_level's one other use of `ids` (the _tables_pay call) reads
-    # len(codes) instead -- see both below.
-    _NO_IDS = np.zeros(0, dtype=np.int64)
-
-    def _level_codes(self, level: int, ids: np.ndarray):
-        """(codes, keys, w, theta) the scan reads for caps `ids`, all at
-        `level`: the codes without their first w bits, those bits per cap
-        (decoded from the group's Elias-Fano sequence; w = 0 outside set
-        storage) and the stored angles."""
-        if self._packed is not None:
-            g = self._packed[int(level)]
-            if g._theta_cache is None:
-                g._theta_cache = self._angle_value(g.ang)
-            return g.rem, (g.keys() if g.w else self._NO_KEYS), g.w, g._theta_cache
-        codes = np.ascontiguousarray(self._codes[ids][:, :self.code_size(level)])
-        return codes, self._NO_KEYS, 0, self._angle_value(self._angle_codes[ids])
+        """Codes of caps `ids` (rows of the widest code size)."""
+        self._thaw()
+        return self._codes[np.asarray(ids, dtype=np.int64)]
 
     def decode_directions(self, directions: np.ndarray, level: Optional[int] = None) -> np.ndarray:
         """Where each unit direction would point once stored at `level`."""
@@ -844,8 +485,7 @@ class CapCoverFilter(_CapScanMixin, Filter):
         ids[current:] = np.arange(current, new_cap, dtype=np.int32)
         self._all_caps = ids
         codes = np.zeros((new_cap, int(self._code_sizes.max())), dtype=np.uint8)
-        if self._codes is not None:
-            codes[:current] = self._codes
+        codes[:current] = self._codes
         self._codes = codes
         angles = np.zeros(new_cap, dtype=np.uint16)
         angles[:current] = self._angle_codes
@@ -861,10 +501,6 @@ class CapCoverFilter(_CapScanMixin, Filter):
             self.insert_method.ensure_capacity(new_cap)
 
     def _reset_buffers(self, capacity: int) -> None:
-        if self._codes is None:
-            # Set storage held the codes (see _pack): back to one row per id.
-            self._codes = np.zeros((len(self._angle_codes), int(self._code_sizes.max())), dtype=np.uint8)
-        self._packed = None
         self._ensure_capacity(capacity)
         self._num_caps = 0
         self._all_caps[:] = np.arange(len(self._all_caps), dtype=np.int32)
@@ -996,7 +632,7 @@ class CapCoverFilter(_CapScanMixin, Filter):
         measure), theta' the members' widest angle around the decoded
         direction and beta the accept rule's own expansion at |q| = 1.
         Trains the quantizer on U."""
-        self._train_quantizers(U, X)
+        self._train_quantizers(U)
         order, starts, counts = segments(labels, len(U))
         decoded = self.decode_directions(U)
         theta = segment_max(angle_between(X, decoded[labels])[order], starts, counts)
@@ -1043,12 +679,9 @@ class CapCoverFilter(_CapScanMixin, Filter):
         return self.construct_method.finish(self, X, cover)
 
     # Mixed encodings (_choose_mixed): cap counts tried step down by this
-    # factor; the scan stops after this many counts without a better cover;
-    # encodings whose codebook costs more than this many bytes join the
-    # mix one at a time (their codebook paid only where used).
+    # factor; the scan stops after this many counts without a better cover.
     _MIX_STEP = 1.1
     _MIX_PATIENCE = 4
-    _CHEAP_CODEBOOK = 1024
 
     def _mixing(self) -> bool:
         return (bool(self.mixed) and self.insert_method is None
@@ -1059,24 +692,17 @@ class CapCoverFilter(_CapScanMixin, Filter):
             return int(self.max_memory * (1.0 - self.insert_memory_percent / 100.0))
         return int(self.max_memory)
 
-    def _is_boot(self, level: int) -> bool:
-        """Whether `level`'s basis is rebuilt from the cover's own caps (_BootPQ)."""
-        return _ENCODINGS[self.levels[level]].boot
-
     def _quick_level(self, level: int) -> bool:
         """Whether `level` encodes fast: TurboQuant / scalar / raw floats,
         or seeded PQ with 8-bit codebooks."""
         spec = _ENCODINGS[self.levels[level]]
-        if spec.rank or spec.klt_bits:
-            return False
         return spec.qtype is not None or not spec.sub or spec.bits <= 8
 
     def _data_free(self, level: int) -> bool:
         """Whether `level`'s quantizer is the same whatever it is trained on
         (seeded PQ, TurboQuant, raw floats)."""
-        q = self.levels[level]
-        spec = _ENCODINGS[q]
-        return not (spec.rank or spec.klt_bits) and (spec.qtype is None or spec.rotate)
+        spec = _ENCODINGS[self.levels[level]]
+        return spec.qtype is None or spec.rotate
 
     def _level_psi(self, X: np.ndarray, U: np.ndarray, labels: np.ndarray,
                    cache: Optional[dict] = None, levels: Optional[List[int]] = None,
@@ -1084,8 +710,7 @@ class CapCoverFilter(_CapScanMixin, Filter):
         """(caps x levels): each cap's accept angle at selection_tau were its
         direction stored at each candidate encoding -- the members' widest
         angle around the nearest-codeword decoded direction (its own encoding
-        error for a cap with no member), plus beta. Trains the data-dependent
-        levels' quantizers on U. `cache` (level -> {direction bytes: decoded
+        error for a cap with no member), plus beta. `cache` (level -> {direction bytes: decoded
         direction}) carries data-free levels' decodings across the covers of
         one merge, where most caps are unchanged from one cover to the next:
         a merge only moves the caps it merges, so a cap whose direction is
@@ -1099,8 +724,7 @@ class CapCoverFilter(_CapScanMixin, Filter):
         keys = [u.tobytes() for u in U] if cache is not None else None
         for level in (range(len(self.levels)) if levels is None else levels):
             if cache is None or not self._data_free(level):
-                if not self._is_boot(level):
-                    self._train_quantizers(U, X, level=level)
+                self._train_quantizers(U, level=level)
                 D = self.decode(self.encode(U, level, fast=True), level)
                 theta = segment_max(angle_between(X, D[labels])[order], starts, counts)
                 theta = np.where(counts > 0, theta, angle_between(U, D))
@@ -1108,7 +732,7 @@ class CapCoverFilter(_CapScanMixin, Filter):
                 continue
             known = cache.setdefault(level, {})
             if not known:
-                self._train_quantizers(U, X, level=level)
+                self._train_quantizers(U, level=level)
             new = np.array([i for i, key in enumerate(keys) if key not in known], dtype=np.int64)
             if len(new):
                 D = self.decode(self.encode(U[new], level, fast=True), level)
@@ -1146,7 +770,7 @@ class CapCoverFilter(_CapScanMixin, Filter):
             choice = np.argmin(np.where(ok, cost[None, :] + 1e-3 * P, np.inf), axis=1)
             counts = np.bincount(choice, minlength=len(allowed))
             used = np.flatnonzero(counts)
-            total = (base + sum(self._group_bytes(int(allowed[i]), int(counts[i])) for i in used)
+            total = (base + sum(int(counts[i]) * int(cost[i]) for i in used)
                      + fixed[used].sum() + self._GROUP_BYTES * (len(used) - 1))
             return total, choice
 
@@ -1176,43 +800,34 @@ class CapCoverFilter(_CapScanMixin, Filter):
         _MIX_STEP from the coarsest encoding's (one merge) are each planned
         by _plan -- the cheap encodings together, plus at most one with a
         costly codebook (a trained basis) -- and the least summed measure
-        wins, and the finished cover is planned again. With mixed="coarsen", no cap
-        takes a code finer than the least-volume single encoding's, so caps
-        only coarsen and the cover keeps at least that encoding's cap
-        count. Returns (cover, each cap's level); the filter's own encoding
-        (whose codebook _codebook_bytes charges) becomes the finest one in
-        use.
-
-        Measured: see the class docstring (Choosing the encoding)."""
-        L = len(self.levels)
-        # Boot levels (_BootPQ) need anchors, which only a finished cover
-        # has: they join at its final plan (_plan_boot), not the grid.
-        grid_levels = [l for l in range(L) if not self._is_boot(l)]
+        wins, and the finished cover is planned again. No cap takes a code
+        finer than the least-volume single encoding's, so caps only coarsen
+        and the cover keeps at least that encoding's cap count. Returns
+        (cover, each cap's level); the filter's own encoding (whose codebook
+        _codebook_bytes charges) becomes the finest one in use."""
+        grid_levels = list(range(len(self.levels)))
         ks = []
         for level in grid_levels:
             self._set_uniform(level)
             ks.append(max(1, min(self.max_construct_caps, len(X))))
         budget = self._construct_budget()
-        cheap = [l for l in grid_levels if self._quantizer_bytes(l) <= self._CHEAP_CODEBOOK]
-        costly = [l for l in grid_levels if l not in cheap]
-        mixes = ([cheap] if cheap else []) + [cheap + [l] for l in costly]
         grid, k = set(ks), max(ks)
         while k > min(ks):
             grid.add(k)
             k = int(k / self._MIX_STEP)
         # Scoring a level costs an encoding of every new cap: cheap for
-        # TurboQuant and 8-bit seeded PQ, not for 12-bit codebooks or a
-        # trained basis. Those are scored only when their encoding error on
-        # a sample of the members (its 1st percentile, plus beta) is under
-        # the widest angle the cheap levels already reach: a cap at such a
-        # level could not narrow the cover's widest cap.
+        # TurboQuant and 8-bit seeded PQ, not for 12-bit codebooks. Those
+        # are scored only when their encoding error on a sample of the
+        # members (its 1st percentile, plus beta) is under the widest angle
+        # the cheap levels already reach: a cap at such a level could not
+        # narrow the cover's widest cap.
         beta = float(self._beta(np.ones(1), self.selection_tau)[0][0])
         quick = [l for l in grid_levels if self._quick_level(l)]
         slow = [l for l in grid_levels if l not in quick]
         sample = X[np.random.default_rng(0x5EED).choice(len(X), min(len(X), 512), replace=False)]
         floor = {}
         for l in slow:
-            self._train_quantizers(sample, sample, level=l)
+            self._train_quantizers(sample, level=l)
             D = self.decode(self.encode(sample, l, fast=True), l)
             floor[l] = float(np.quantile(angle_between(sample, D), 0.01)) + beta
         # The best plan under each ceiling on code size (None: no ceiling),
@@ -1222,22 +837,21 @@ class CapCoverFilter(_CapScanMixin, Filter):
         for k, cover in self.construct_method.iter_candidates(self, X, sorted(grid, reverse=True), weights):
             U = unit_rows(cover.directions)
             psi = self._level_psi(X, U, cover.labels, cache, levels=quick)
-            here = [self._plan(psi, [l for l in m if l in quick], budget) for m in mixes]
-            reach = max([r[3] for r in here if r is not None] + [b[4] for b in best.values()] + [-np.inf])
+            here = self._plan(psi, quick, budget)
+            reach = max(([here[3]] if here is not None else []) + [b[4] for b in best.values()] + [-np.inf])
             reach = np.inf if reach == -np.inf else reach
             psi = self._level_psi(X, U, cover.labels, cache, levels=[l for l in slow if floor[l] < reach], psi=psi)
             improved = False
-            for allowed in mixes:
-                for c in ceilings:
-                    capped = [l for l in allowed if c is None or self._code_sizes[l] <= c]
-                    plan = self._plan(psi, capped, budget) if capped else None
-                    if plan is None:
-                        continue
-                    if c is None:
-                        scores[k] = min(scores.get(k, np.inf), plan[0])
-                    if c not in best or plan[0] < best[c][0]:
-                        best[c] = (plan[0], cover._replace(directions=U), capped, plan[1], plan[3])
-                        improved = True
+            for c in ceilings:
+                capped = [l for l in grid_levels if c is None or self._code_sizes[l] <= c]
+                plan = self._plan(psi, capped, budget) if capped else None
+                if plan is None:
+                    continue
+                if c is None:
+                    scores[k] = min(scores.get(k, np.inf), plan[0])
+                if c not in best or plan[0] < best[c][0]:
+                    best[c] = (plan[0], cover._replace(directions=U), capped, plan[1], plan[3])
+                    improved = True
             for l in grid_levels:
                 plan = self._plan(psi, [l], budget) if np.isfinite(psi[:, l]).all() else None
                 if plan is not None and plan[0] < uniform.get(l, np.inf):
@@ -1247,15 +861,11 @@ class CapCoverFilter(_CapScanMixin, Filter):
                 break
         self.selection_scores = scores
         key = None
-        if self.mixed == "coarsen" and uniform:
+        if uniform:
             # No code finer than the best single encoding's: caps only
             # coarsen where that keeps them within the widest angle, and the
-            # bytes freed buy more caps. mix_finer > 0 raises that ceiling
-            # by as many rungs (a plan takes a finer code only for a cap
-            # that would otherwise exceed its widest angle: the top band).
+            # bytes freed buy more caps.
             key = int(self._code_sizes[min(uniform, key=uniform.get)])
-            sizes = ceilings[1:]
-            key = sizes[min(sizes.index(key) + self.mix_finer, len(sizes) - 1)]
             key = key if key in best else None
         _, cover, allowed, levels, reach = best[key]
         cover = self.construct_method.finish(self, X, cover)
@@ -1267,59 +877,14 @@ class CapCoverFilter(_CapScanMixin, Filter):
         use = [l for l in allowed if l in quick or floor[l] < reach + 0.05]
         psi = self._level_psi(X, U, cover.labels, levels=use)
         plan = self._plan(psi, use, budget)
-        boot = [l for l in range(L) if self._is_boot(l) and (key is None or self._code_sizes[l] <= key)]
         if plan is not None:
             levels = plan[1]
-            if boot:
-                levels = self._plan_boot(X, U, cover.labels, psi, use, boot, plan, budget)
         elif cover.kept is not None:
             levels = levels[cover.kept]
         used = np.unique(levels)
         self._set_uniform(int(used[np.argmax(self._code_sizes[used])]))
         self.selection_k = len(U)
         return cover, levels
-
-    def _plan_boot(self, X: np.ndarray, U: np.ndarray, labels: np.ndarray, psi: np.ndarray, use: List[int],
-                   boot: List[int], plan, budget: int) -> np.ndarray:
-        """The finished cover's plan with boot levels (_BootPQ) allowed: the
-        boot_anchors share of caps with most room under the plan's widest
-        angle T stay at their planned whole-space codes as anchors, the
-        basis is rebuilt from their codes as construct() fits them, and the
-        other caps are planned again over `use` plus `boot`. Returns each
-        cap's level, the whole-space plan's if the boot plan is no smaller.
-        construct() rebuilds the basis from all whole-space caps it stores,
-        so stored angles may differ a little from these planned ones."""
-        levels, T = plan[1], plan[3]
-        rows = np.arange(len(U))
-        A = np.argsort(-(T - psi[rows, levels]), kind="stable")[:int(np.ceil(self.boot_anchors * len(U)))]
-        local = np.full(len(U), -1, dtype=np.int64)
-        local[A] = np.arange(len(A))
-        held = np.flatnonzero(local[labels] >= 0)
-        codes = self._fit_codes_by_level(U[A], X[held], local[labels[held]], levels[A])
-        self._train_boot(self._decode_levels(codes, levels[A]), boot)
-        P = np.full((len(U), len(self.levels)), np.inf)
-        P[:, use] = psi[:, use]
-        P = self._level_psi(X, U, labels, levels=boot, psi=P)
-        if self.boot_equal:
-            # A cap may take a boot code only of its planned code's size:
-            # at the finished cover's cap count, bytes a cheaper code frees
-            # buy nothing, and the cap would only widen toward T.
-            for l in boot:
-                P[self._code_sizes[levels] != self._code_sizes[l], l] = np.inf
-        keep = P[A, levels[A]].copy()
-        P[A, :] = np.inf
-        P[A, levels[A]] = keep
-        new = self._plan(P, list(use) + list(boot), budget)
-        self.boot_plan = (len(A), None if new is None else float(new[0]), float(plan[0]))
-        if new is None or new[0] >= plan[0]:
-            return levels
-        return new[1]
-
-    def _train_boot(self, anchors: np.ndarray, boot: List[int]) -> None:
-        """Rebuilds boot levels' bases from decoded anchor directions."""
-        for l in boot:
-            self._quantizers[l] = self._make_quantizer(self.levels[l])
-            self._quantizers[l].train(anchors)
 
     @staticmethod
     def _distinct_rows(vectors: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1343,14 +908,8 @@ class CapCoverFilter(_CapScanMixin, Filter):
         members `owner` puts in it where the encoding can be (fit_codes),
         else nearest U's direction."""
         codes = np.zeros((len(U), int(self._code_sizes.max())), dtype=np.uint8)
-        boot = [int(l) for l in np.unique(levels) if self._is_boot(int(l))]
-        for level in sorted(np.unique(levels), key=lambda l: self._is_boot(int(l))):
+        for level in np.unique(levels):
             level = int(level)
-            if level == (boot[0] if boot else None):
-                # The anchors -- every cap at a whole-space level, fitted
-                # above -- decoded as a decoder would, rebuild the basis.
-                anchors = np.flatnonzero(~np.isin(levels, boot))
-                self._train_boot(self._decode_levels(codes[anchors], levels[anchors]), boot)
             caps = np.flatnonzero(levels == level)
             local = np.full(len(U), -1, dtype=np.int64)
             local[caps] = np.arange(len(caps))
@@ -1366,6 +925,7 @@ class CapCoverFilter(_CapScanMixin, Filter):
         return codes
 
     def construct(self, vectors: np.ndarray) -> None:
+        self._invalidate()
         if len(vectors) == 0:
             self._reset_buffers(0)
             self._constructed = True
@@ -1389,21 +949,16 @@ class CapCoverFilter(_CapScanMixin, Filter):
             levels = np.full(len(U), self._uniform, dtype=np.int64)
         self._reset_buffers(len(U))
         for level in np.unique(levels):
-            if not self._is_boot(int(level)):
-                self._train_quantizers(U, X, level=int(level))
+            self._train_quantizers(U, level=int(level))
         codebook = self._codebook_bytes()
         if self.max_memory is not None and codebook + self.bytes_per_cap() > self.max_memory:
             raise InsufficientMemoryError(
                 f"max_memory={self.max_memory} bytes cannot hold one {self.quantize.value} cap "
                 f"plus its {codebook}-byte codebook.")
-        # Fit codes to the members each cap holds, re-settle the members
-        # around the new directions, and repeat: each round's members are
-        # the ones the last round's caps actually hold. A second round
-        # measured within 0.002 FPR of one.
-        owner = home
-        for _ in range(max(1, self.fit_rounds) if self.fit_codes else 1):
-            codes = self._fit_codes_by_level(U, X, owner, levels)
-            angles, owner = self._tight_angles(X, U, self._decode_levels(codes, levels), theta, home, neighbors)
+        # Fit codes to the members each cap holds, then settle the members
+        # around the fitted directions.
+        codes = self._fit_codes_by_level(U, X, home, levels)
+        angles, _ = self._tight_angles(X, U, self._decode_levels(codes, levels), theta, home, neighbors)
         ids, decoded = self._add_caps(U, theta, codes=codes, levels=levels)
         self._angle_lo, self._angle_hi = 0.0, float(np.pi)
         if self._narrow_angles() and len(angles):
@@ -1417,8 +972,6 @@ class CapCoverFilter(_CapScanMixin, Filter):
                                                   vectors=X[inverse])
         self._constructed = True
         self._dirs = None
-        if self._set_storage():
-            self._pack()
 
     # ----------------------------------------------------------------- query
     def query(self, vectors: np.ndarray, distance_threshold: float) -> List[bool]:
@@ -1426,7 +979,7 @@ class CapCoverFilter(_CapScanMixin, Filter):
             raise ValueError("CapCoverFilter has not been constructed.")
         if self._num_caps == 0 or len(vectors) == 0:
             return [False] * len(vectors)
-        return self._scan(vectors, float(distance_threshold)).tolist()
+        return self._scan(vectors, float(distance_threshold))
 
     def surface_angle(self, vectors: np.ndarray) -> np.ndarray:
         """Per query, min over caps of angle(q, u) - theta, in float64 (an
@@ -1457,6 +1010,7 @@ class CapCoverFilter(_CapScanMixin, Filter):
             raise ValueError("CapCoverFilter.insert() requires an insertion strategy: insert_method is None.")
         if len(vectors) == 0:
             return
+        self._invalidate()
         if self._num_caps == 0:
             raise ValueError("CapCoverFilter.insert() needs a non-empty construct() first (no codebook).")
         X = self._prepare_members(vectors)
@@ -1470,6 +1024,7 @@ class CapCoverFilter(_CapScanMixin, Filter):
     def remove(self, vectors: np.ndarray) -> List[bool]:
         if not self.insert_method:
             raise ValueError("CapCoverFilter.remove() requires an insertion strategy.")
+        self._invalidate()
         return self.insert_method.remove(self, self._prepare_members(vectors))
 
     # A static filter with caps at several encodings stores them grouped by
@@ -1482,16 +1037,9 @@ class CapCoverFilter(_CapScanMixin, Filter):
         levels = self._cap_level[self.all_caps]
         total = self._codebook_bytes()
         for level, n in zip(*np.unique(levels, return_counts=True)):
-            total += self._group_bytes(int(level), int(n))
+            total += int(n) * self.bytes_per_cap(int(level))
             if level != self._uniform:
                 total += self._quantizer_bytes(int(level)) + self._GROUP_BYTES
-        if self._packed is not None:
-            # What the groups actually hold (equal to the charge above).
-            held = sum(len(g.low) + len(g.high) + g.rem.nbytes + len(g.ids) * (self.angle_bits // 8)
-                       for g in self._packed.values())
-            charged = sum(self._group_bytes(int(l), int(n)) for l, n in zip(*np.unique(levels, return_counts=True)))
-            if held != charged:
-                raise AssertionError(f"set storage holds {held} B but charges {charged} B")
         if self.insert_method:
             total += self.insert_method.get_bytesize(self)
         return total

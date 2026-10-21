@@ -1,7 +1,7 @@
 # Rust query kernel for CapCoverFilter: running report
 
 Crate: `CapCoverRustFilter/` (`src/core.rs` pure-Rust kernel, `src/lib.rs` PyO3 glue),
-wrapper `cap_cover_rust_filter.py` (`CapCoverRustFilter(CapCoverFilter)`), bench scripts in `bench/`,
+wrapper (originally `CapCoverRustFilter(CapCoverFilter)`, now folded into `CapCoverFilter` via `src/filters/cap_cover/cap_scan.py`), bench scripts in `bench/`,
 raw numbers as `bench/*.json`, tests in `tests/`.
 
 Environment actually used on this machine: `.venv` (Python 3.14.5, faiss 1.14.3, numba 0.67, numpy 2.4.6;
@@ -143,3 +143,6 @@ mixed neg b1: v0 536 -> LUT 1,400 -> PQ build rewrite 3,770 -> persistent norm/a
 
 ## Falls back to Python
 Encodings without kernel (FP32, FP16, SQ4/6/8): original path via `super().query`, requires `_codes`, so the wrapper simply never freezes them. TQ8 and dims where the lane counts do not divide (e.g. d=48 with TQ1) use the Rust scalar f64 path.
+
+## Note (later)
+The numba query path was deleted and the Rust path is now `CapCoverFilter.query()`. `bench/` scripts that compare against `query_original`/numba (`compare.py`, `baseline.py`, `memory.py`) no longer run; the old path is in git at commit 40a3805. Their results (`bench/*.json`) stand.

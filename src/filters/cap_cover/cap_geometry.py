@@ -256,42 +256,6 @@ def remap_neighbors(neighbors: np.ndarray, kept: np.ndarray, n_before: int) -> n
     return np.take_along_axis(out, keep, axis=1)
 
 
-def min_enclosing_cap(P: np.ndarray, u0: np.ndarray, core: int = 64, rounds: int = 8) -> np.ndarray:
-    """Direction of the smallest cap holding the unit rows P (all within a
-    hemisphere of u0): the minimum-norm point of their convex hull,
-    normalized -- max_u min_i <p_i, u> is attained there -- found by NNLS
-    (min |P' lam|^2 over the simplex, the sum held by a heavily weighted
-    extra row) on a core set: the `core` rows farthest from u0, then every
-    row the solution leaves outside, for up to `rounds` rounds. Callers
-    re-measure the angle and keep whichever direction holds P tighter: the
-    result is exact once no row is left outside, otherwise a good start."""
-    from scipy.optimize import nnls
-    P = np.asarray(P, dtype=np.float64)
-    if len(P) <= 1:
-        return unit_rows(P)[0] if len(P) else unit_rows(u0[None])[0]
-    u = unit_rows(np.asarray(u0, dtype=np.float64)[None])[0]
-    rows = np.argsort(P @ u, kind="stable")[:core]
-    for _ in range(rounds):
-        S = P[rows]
-        w = 1e3
-        A = np.vstack([S.T, np.full((1, len(S)), w)])
-        b = np.zeros(A.shape[0])
-        b[-1] = w
-        lam, _ = nnls(A, b, maxiter=max(100, 30 * len(S)))
-        c = lam @ S
-        norm = float(np.sqrt(c @ c))
-        if norm <= 1e-12 or lam.sum() <= 0:
-            break
-        u = c / norm
-        ip = P @ u
-        held = ip[rows].min()
-        outside = np.flatnonzero(ip < held - 1e-12)
-        if len(outside) == 0:
-            break
-        rows = np.union1d(rows, outside[np.argsort(ip[outside])[:core]])
-    return u
-
-
 def enclosing_cap(ua: np.ndarray, ta: float, ub: np.ndarray, tb: float) -> Tuple[np.ndarray, float]:
     """Smallest cap holding caps (ua, ta) and (ub, tb): angle
     (phi + ta + tb) / 2 around the point on the great circle between them.

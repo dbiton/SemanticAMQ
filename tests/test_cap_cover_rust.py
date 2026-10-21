@@ -1,8 +1,7 @@
-"""CapCoverRustFilter vs the original CapCoverFilter path (same stored caps) and
-vs a float64 reference of the accept rule. Identical booleans are required."""
+"""CapCoverFilter.query() (Rust scan) vs a float64 reference of the accept rule,
+including boundary and non-unit queries. FNR must be 0."""
 import unittest
 import numpy as np
-from filters.cap_cover.cap_cover_rust_filter import CapCoverRustFilter
 from filters.cap_cover.cap_cover_filter import CapCoverFilter, Quantize
 from filters.cap_cover.cap_geometry import angle_between, unit_rows
 from filters.cap_cover.cap_merge_insert import CapMergeInsert
@@ -83,9 +82,6 @@ class Differential(unittest.TestCase):
         for tau in taus:
             for V in (Q, B):
                 new = np.array(f.query(V, tau))
-                old = np.array(f.query_original(V, tau))
-                f.freeze()
-                self.assertEqual(int((new != old).sum()), 0, f"rust vs original disagree at tau={tau}")
                 m = reference_margin(f, V, tau)
                 self.assertFalse(((m < -1e-9) & ~new).any(), f"false negative vs float64 reference, tau={tau}")
                 self.assertFalse(((m > 1e-9) & new).any(), f"false positive vs float64 reference, tau={tau}")
@@ -99,7 +95,7 @@ class Differential(unittest.TestCase):
         for q in (Quantize.TQ1, Quantize.TQ2, Quantize.TQ3, Quantize.TQ4, Quantize.TQ8,
                   Quantize.SPQ12, Quantize.SPQ16, Quantize.SPQ24, Quantize.SPQ36, Quantize.SPQ48, Quantize.SPQ64):
             with self.subTest(q=q.value):
-                f = CapCoverRustFilter(DIM, quantize=q, max_caps=150)
+                f = CapCoverFilter(DIM, quantize=q, max_caps=150)
                 f.construct(X)
                 self.check(f, X)
 
@@ -107,7 +103,7 @@ class Differential(unittest.TestCase):
         X = clustered()
         for budget in (6000, 14000):
             with self.subTest(budget=budget):
-                f = CapCoverRustFilter.auto(DIM, max_memory=budget)
+                f = CapCoverFilter.auto(DIM, max_memory=budget)
                 f.construct(X)
                 self.assertGreater(len(np.unique(f._cap_level[f.all_caps])), 1 if budget == 14000 else 0)
                 self.check(f, X)
@@ -116,25 +112,27 @@ class Differential(unittest.TestCase):
         X = clustered()
         for method in (NearestInsert, CapMergeInsert):
             with self.subTest(method=method.__name__):
-                f = CapCoverRustFilter(DIM, quantize=Quantize.TQ4, max_memory=40000, insert_method=method())
+                f = CapCoverFilter(DIM, quantize=Quantize.TQ4, max_memory=40000, insert_method=method())
                 f.construct(X[:600])
                 f.query(X[:5], 0.1)          # freeze, then make insert() thaw it
                 f.insert(X[600:])
                 self.check(f, X)
                 self.assertEqual(f.angle_bits, 16)
 
-    def test_fallback_encodings_use_original_path(self):
+    def test_fallback_encodings_use_float64_rule(self):
         X = clustered()
-        for q in (Quantize.SQ8, Quantize.FP16):
-            f = CapCoverRustFilter(DIM, quantize=q, max_caps=100)
+        for q in (Quantize.SQ8, Quantize.FP16, Quantize.FP32):
+            f = CapCoverFilter(DIM, quantize=q, max_caps=100)
             f.construct(X)
             Q = queries(f, X, np.random.default_rng(0))
-            self.assertEqual(f.query(Q, 0.1), CapCoverFilter.query(f, Q, 0.1))
+            got = np.array(f.query(Q, 0.1))
+            m = reference_margin(f, Q, 0.1)
+            self.assertFalse(((m < -1e-9) & ~got).any() or ((m > 1e-9) & got).any())
             self.assertIsNone(f._rust)
 
     def test_bytesize_and_buffers(self):
         X = clustered()
-        f = CapCoverRustFilter.auto(DIM, max_memory=14000)
+        f = CapCoverFilter.auto(DIM, max_memory=14000)
         f.construct(X)
         before = f.get_bytesize()
         f.query(X[:10], 0.1)
@@ -147,12 +145,12 @@ class Differential(unittest.TestCase):
 
     def test_degenerate_inputs(self):
         X = clustered()
-        f = CapCoverRustFilter(DIM, quantize=Quantize.TQ2, max_caps=50)
+        f = CapCoverFilter(DIM, quantize=Quantize.TQ2, max_caps=50)
         f.construct(X)
         self.assertEqual(f.query(np.zeros((3, DIM), np.float32), 0.1), [False] * 3)
         self.assertEqual(f.query(np.zeros((0, DIM), np.float32), 0.1), [])
         self.assertEqual(f.query(X[:2] * 5.0, 0.1), [False] * 2)       # |n - 1| > tau'
-        g = CapCoverRustFilter(DIM, quantize=Quantize.TQ2, max_caps=50)
+        g = CapCoverFilter(DIM, quantize=Quantize.TQ2, max_caps=50)
         g.construct(np.zeros((0, DIM), np.float32))
         self.assertEqual(g.query(X[:2], 0.1), [False] * 2)
 

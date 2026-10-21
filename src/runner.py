@@ -27,8 +27,7 @@ from logging_config import configure_logging
 from filters.filter import InsufficientMemoryError
 from filters.dsh_filter import DSHFilter
 from filters.cap_cover.cap_cover_filter import (CapCoverFilter, Quantize as CapQuantize,
-                                                AUTO_CANDIDATES as _CAP_AUTO_CANDIDATES,
-                                                DENSE10_LADDER as _CAP_DENSE10_LADDER)
+                                                AUTO_CANDIDATES as _CAP_AUTO_CANDIDATES)
 from filters.cap_cover.cap_geometry import log10_cap_measure, unit_rows
 from filters.cap_cover.nearest_insert import NearestInsert as CapNearestInsert
 from filters.cap_cover.cap_merge_insert import CapMergeInsert as CapCoverMergeInsert
@@ -94,12 +93,10 @@ CAP_INSERT_STRATEGIES = {
     "nearest": CapNearestInsert,
 }
 
-# The quantization evaluation's cap-cover sweep: the ~14 encodings
-# CapCoverFilter.auto() actually chooses among (AUTO_CANDIDATES +
-# DENSE10_LADDER), not every Quantize member -- auto()'s own candidate pool,
-# confirmed by its docstring, so the sweep tests what auto() actually picks
-# from rather than exotic opt-in-only rungs (BOOT_CANDIDATES).
-CAP_QUANTIZATION_SWEEP = tuple(_CAP_AUTO_CANDIDATES) + tuple(_CAP_DENSE10_LADDER)
+# The quantization evaluation's cap-cover sweep: the encodings
+# CapCoverFilter.auto() actually chooses among (AUTO_CANDIDATES), not every
+# Quantize member, so the sweep tests what auto() actually picks from.
+CAP_QUANTIZATION_SWEEP = tuple(_CAP_AUTO_CANDIDATES)
 
 VectorInput = Union[np.ndarray, VectorSource]
 _QUERY_BATCH = 32
@@ -671,9 +668,8 @@ def cap_quantization_worker(
     n_singleton: int,
 ) -> List[Dict[str, Any]]:
     """One CapCoverFilter cover per
-    (dataset, k, seed, quantize) over CAP_QUANTIZATION_SWEEP (AUTO_CANDIDATES
-    + DENSE10_LADDER, the ~14 encodings CapCoverFilter.auto() actually
-    chooses among -- not the full, much larger Quantize enum), evaluated at a single tau. Returns one
+    (dataset, k, seed, quantize) over CAP_QUANTIZATION_SWEEP (AUTO_CANDIDATES, the
+    encodings CapCoverFilter.auto() actually chooses among), evaluated at a single tau. Returns one
     row, tagged stage="quantizing" always (CAP_QUANTIZATION_SWEEP has no
     FP32/uncompressed member to single out as a baseline stage).
 
