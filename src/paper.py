@@ -97,11 +97,31 @@ PAPER_GENERATORS = (
 )
 
 
+def check_datasets() -> None:
+    """Stops before any job is submitted if a corpus is missing or too short.
+    The generators would instead skip it with a warning, and a run of hours
+    would end with a figure that quietly lacks a dataset."""
+    need = BLOCKLIST_FOLDS * main.WORKLOAD_NUM_VECTORS
+    problems = []
+    for name in main.BLOCKLIST_DATASETS:
+        path = main.dataset_filenames[name]
+        if not os.path.exists(path):
+            problems.append(f"{name}: {path} not found")
+            continue
+        rows = len(main.VectorSource(name))
+        if rows < need:
+            problems.append(f"{name}: {rows:,} rows, need {need:,} ({BLOCKLIST_FOLDS} folds x "
+                            f"{main.WORKLOAD_NUM_VECTORS:,})")
+    if problems:
+        raise SystemExit("cannot run the paper's evaluations:\n  " + "\n  ".join(problems))
+
+
 def generate_and_plot_all(out=None) -> None:
     """Submit the paper's evaluations to one shared Runner, run them as one
     shuffled batch (see main.generate_and_plot_all), then draw the figures.
     Each generator is guarded so one failing to submit doesn't take down the
     others."""
+    check_datasets()
     runner = Runner(num_workers=main.MAX_WORKERS)
     for generate in PAPER_GENERATORS:
         name = getattr(generate, "__name__", None) or generate.func.__name__
