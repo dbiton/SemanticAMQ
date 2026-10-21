@@ -100,7 +100,7 @@ def use_corpora(names):
     for i, name in enumerate(names):
         CORPUS_NAME[name.lower()] = name
         CORPUS_LABEL.setdefault(name, name)
-        CORPUS_STYLE.setdefault(name, (PALETTE[i % len(PALETTE)], MARKERS[i % len(MARKERS)]))
+        CORPUS_STYLE[name] = (PALETTE[i % len(PALETTE)], MARKERS[i % len(MARKERS)])   # distinct within this run
 
 
 QUANT_TOP_N = 5
@@ -498,8 +498,9 @@ def throughput():
         if logx:
             ax.set_xscale("log")
             ax.xaxis.set_major_formatter(PCT_FMT)
+            ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
         if x == "tau":
-            ax.set_xticks([0.05, 0.1, 0.2, 0.3, 0.4])
+            ax.set_xticks([0.1, 0.2, 0.3, 0.4])
         ax.set_xlabel(xlabel)
         ax.set_title(title, color=INK)
     axes[0, 0].set_ylabel("throughput improvement (%)")

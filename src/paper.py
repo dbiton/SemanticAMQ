@@ -12,6 +12,7 @@ plots/plot_paper.py's figures (written to suggestions/figures/).
                          the paper's five, e.g. those a machine has
       --workers N        parallel jobs (main.MAX_WORKERS)
       --out DIR          figure folder (default suggestions/figures)
+      --results DIR      (plot) read the CSVs from DIR instead of results/
     A smaller or different run needs a copy of the repo without results/ (generators
     truncate their CSVs -- see CLAUDE.md), e.g. a git worktree with datasets/ linked in.
 
@@ -114,9 +115,9 @@ def generate_and_plot_all(out=None) -> None:
     plot_all(out=out)
 
 
-def plot_all(figures=None, out=None) -> None:
+def plot_all(figures=None, out=None, results=None) -> None:
     """Re-draws the paper's figures (default all) from results/."""
-    plot_figures(figures, out=out)
+    plot_figures(figures, results=results, out=out)
 
 
 def configure(num_vectors=None, datasets=None, workers=None) -> None:
@@ -136,7 +137,7 @@ def configure(num_vectors=None, datasets=None, workers=None) -> None:
 
 
 def _parse(argv):
-    opts = {"--num-vectors": None, "--datasets": None, "--workers": None, "--out": None}
+    opts = {"--num-vectors": None, "--datasets": None, "--workers": None, "--out": None, "--results": None}
     rest = []
     it = iter(argv)
     for arg in it:
@@ -155,6 +156,6 @@ if __name__ == "__main__":
               opts["--datasets"].split(",") if opts["--datasets"] else None,
               int(opts["--workers"]) if opts["--workers"] else None)
     if rest[:1] == ["plot"]:
-        plot_all(rest[1:], opts["--out"])
+        plot_all(rest[1:], opts["--out"], opts["--results"])
     else:
         generate_and_plot_all(opts["--out"])
