@@ -474,14 +474,50 @@ def equal_memory():
 # fig:throughput  throughput-improvement
 # ---------------------------------------------------------------------------
 
+BACKEND_COSTS = np.logspace(-5, 0, 60)      # seconds per lookup: 10 us ... 1 s
+BACKEND_TICKS = {1e-5: "10 µs", 1e-4: "100 µs", 1e-3: "1 ms", 1e-2: "10 ms", 1e-1: "100 ms", 1.0: "1 s"}
+
+
+def _backend_cost_panel(ax, d):
+    """Improvement (%) against the cost L of one backend lookup, from each row's
+    measured t_f and p (see throughput()); mean over folds, one marker per
+    corpus at its measured flat-index cost. A fold that accepts nothing has p
+    floored at half a query, since the improvement is unbounded as p -> 0."""
+    p = np.maximum(d.positive_rate_pct / 100.0, 0.5 / d.n_queries)
+    l0 = 1.0 / d.throughput_without_qps
+    t_f = (1.0 / d.throughput_with_qps - p * l0).clip(lower=0.0)
+    d = d.assign(p=p, l0=l0, t_f=t_f)
+    for corpus in CORPORA:
+        g = d[d.corpus == corpus]
+        if g.empty:
+            continue
+        color, marker = CORPUS_STYLE[corpus]
+        curves = np.array([100.0 * (BACKEND_COSTS / (r.t_f + r.p * BACKEND_COSTS) - 1.0) for r in g.itertuples()])
+        ax.plot(BACKEND_COSTS, curves.mean(axis=0), color=color, lw=1.2)
+        ax.plot(g.l0.mean(), g.throughput_improvement_pct.mean(), color=color, marker=marker, ms=5,
+                ls="", markeredgecolor="white", markeredgewidth=0.5, zorder=3)
+    ax.axhline(0, color=INK_MUTED, lw=0.8)
+    ax.set_xscale("log")
+    ax.set_yscale("symlog", linthresh=100)
+    ax.set_ylim(bottom=-100)
+    ax.set_xticks(list(BACKEND_TICKS))
+    ax.set_xticklabels(list(BACKEND_TICKS.values()), fontsize=6, rotation=30, ha="right")
+    ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+
+
 def throughput():
     """End-to-end throughput improvement (%) of the filter in front of a flat
-    index over the index alone, one line per corpus, against tau as cosine
-    distance (budget
-    fixed), against the memory the filter actually uses, and against its
-    number of caps K (tau fixed). Memory and K both come from the budget
-    sweep, but differ: a compact encoding packs more caps into the same
-    bytes. Error bars: +-1 std over folds."""
+    index over the index alone, one line per corpus: against tau as cosine
+    distance (budget fixed), against the memory the filter uses (tau fixed),
+    and against the cost of one backend lookup (both fixed).
+
+    The last panel is the cost model behind the other two. Per query the index
+    alone costs L and the filter plus index costs t_f + p L, with p the share
+    of queries the filter accepts, so the improvement is L / (t_f + p L) - 1.
+    L0 (the measured flat-index lookup) and t_f come from the same run
+    (L0 = 1 / qps_without, t_f = 1 / qps_with - p L0); the curve then moves L to
+    costlier backends and the marker is the measurement. Error bars: +-1 std
+    over folds (not drawn on the model curve)."""
     d = pd.read_csv(RESULTS / "end_to_end.csv")
     d["corpus"] = to_corpus(d.dataset)
     d["tau_cos"] = cosine_distance(d.tau)
@@ -491,7 +527,8 @@ def throughput():
     panels = [
         (at_k, "tau_cos", TAU_LABEL, f"fixed $k={100 * E2E_K_FRACTION:g}\\%$ of $|X|$", False),
         (at_tau, "memory_pct_raw", "memory (% of raw fp32 index, log)", fixed_tau, True),
-        (at_tau, "n_caps", "caps $K$ (log)", fixed_tau, True),
+        (None, "backend", "backend cost $L$ (log)", f"fixed $\\tau={float(cosine_distance(E2E_TAU)):g}$, "
+         f"$k={100 * E2E_K_FRACTION:g}\\%$", True),
     ]
     width = len(panels) * PANEL + (len(panels) - 1) * GAP_LABELLED
     height = PANEL + MARGIN_TOP
@@ -500,6 +537,11 @@ def throughput():
                                               wspace=GAP_LABELLED / PANEL))
     for ax, (df, x, xlabel, title, logx) in zip(axes[0], panels):
         ax.set_box_aspect(1)
+        if x == "backend":
+            _backend_cost_panel(ax, d[np.isclose(d.tau, E2E_TAU) & np.isclose(d.k_fraction, E2E_K_FRACTION)])
+            ax.set_xlabel(xlabel)
+            ax.set_title(title, color=INK)
+            continue
         agg = (df.groupby(["corpus", "k_fraction", "tau"])
                .agg(x=(x, "mean"), y=("throughput_improvement_pct", "mean"),
                     sd=("throughput_improvement_pct", "std"))
