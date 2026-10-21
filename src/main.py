@@ -46,7 +46,13 @@ from vector_source import VectorSource
 configure_logging()
 logger = logging.getLogger(__name__)
 
-MAX_WORKERS = 16
+# The evaluation machine: AMD Ryzen Threadripper 3970X (32 cores / 64 threads), Ubuntu
+# 24.04, 896 GB RAM (paper.tex). Every job is single-threaded, and a job holds a few GB
+# at WORKLOAD_NUM_VECTORS = 100K, so threads, not memory, bound the pool: 60 workers
+# leave four threads for the coordinating process (which pickles each job's vectors
+# and writes the CSVs) and the OS. Timings under this load still want a pinned
+# sequential run, see CLAUDE.md.
+MAX_WORKERS = 60
 DATASET = 'ELI5'
 
 # Vectors/dataset, split 80% construction / 20% queries. One knob for every
@@ -54,13 +60,12 @@ DATASET = 'ELI5'
 # equal_memory, streaming, blocklist) and the throughput-only sweeps (scaling,
 # query_performance), which used to read a separate STREAM_SIZE.
 #
-# Capped well below the paper's nominal 100K by the blocklist workload, whose
-# reference set must come from duplicate clusters: CC-News holds only 31,696
-# usable vectors in clusters of >=3 at eps=0.4, so anything above ~36,018
-# drops that corpus and silently reduces the comparison to two. 2^15 leaves
-# ~10% headroom there; cap_cover_system_tau's non-wrapping folds need 1.8N = 58,982 rows
-# per dataset, which its shortest (HotpotQA, 97,852) clears comfortably.
-WORKLOAD_NUM_VECTORS = 10_000
+# The paper's size: |B| = 80,000 construct and 20,000 query vectors per fold. The
+# blocklist workload cuts BLOCKLIST_FOLDS disjoint windows of this many rows from
+# each corpus file (build_blocklist_workload), so a corpus needs
+# BLOCKLIST_FOLDS * WORKLOAD_NUM_VECTORS rows (500K) or it is skipped with an
+# error, and cap_cover_system_tau's non-wrapping folds need 1.8N rows.
+WORKLOAD_NUM_VECTORS = 100_000
 
 BLOCKLIST_FOLDS = 5
 # The blocklist's query/construct split of WORKLOAD_NUM_VECTORS: one total

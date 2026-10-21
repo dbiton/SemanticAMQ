@@ -43,8 +43,8 @@ classes run through pytest. Imports inside `src/` are top-level
 (`from filters.filter import Filter`, `from runner import Runner`), never
 `src.`-prefixed.
 
-Full evaluation runs happen on a separate machine (~700 GB RAM,
-`MAX_WORKERS=64`). The local box (64 GB, 28 threads, i7-14700 with P/E cores)
+Full evaluation runs happen on a separate machine (Threadripper 3970X, 32 cores / 64 threads, 896 GB RAM,
+`MAX_WORKERS=60`, `WORKLOAD_NUM_VECTORS=100_000`). The local box (64 GB, 28 threads, i7-14700 with P/E cores)
 is for tests and single-cell validation. Size per-job memory against
 ~10 GB/job, not local RAM.
 

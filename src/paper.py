@@ -7,7 +7,7 @@ plots/plot_paper.py's figures (written to suggestions/figures/).
     python src/paper.py plot         # re-draw the figures from existing results/
 
     options (both modes where they apply):
-      --num-vectors N    vectors per corpus (main.WORKLOAD_NUM_VECTORS, default 10,000)
+      --num-vectors N    vectors per corpus (main.WORKLOAD_NUM_VECTORS, default 100,000)
       --datasets A,B,..  registry names (util.dataset_paths) to run and draw instead of
                          the paper's five, e.g. those a machine has
       --workers N        parallel jobs (main.MAX_WORKERS)
@@ -76,13 +76,13 @@ def generate_end_to_end(runner: Runner) -> None:
             )
 
 
-PAPER_K_LADDER = [2 ** i for i in range(11, 17)]    # main.generate_cap_quantization's, sized for 10,000 vectors
+PAPER_K_LADDER = [2 ** i for i in range(11, 17)]    # main.generate_cap_quantization's: 2.6-82% of |B| = 80,000
 
 
 def generate_quantization(runner: Runner) -> None:
     """main.generate_cap_quantization with its k ladder scaled to the workload
     size, so a smaller run (--num-vectors) still has k below the reference set."""
-    scale = main.WORKLOAD_NUM_VECTORS / 10_000
+    scale = main.WORKLOAD_NUM_VECTORS / 100_000
     generate_cap_quantization(runner, k_values_nominal=[max(1, round(k * scale)) for k in PAPER_K_LADDER])
 
 
