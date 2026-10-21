@@ -75,10 +75,20 @@ def generate_end_to_end(runner: Runner) -> None:
             )
 
 
+PAPER_K_LADDER = [2 ** i for i in range(11, 17)]    # main.generate_cap_quantization's, sized for 10,000 vectors
+
+
+def generate_quantization(runner: Runner) -> None:
+    """main.generate_cap_quantization with its k ladder scaled to the workload
+    size, so a smaller run (--num-vectors) still has k below the reference set."""
+    scale = main.WORKLOAD_NUM_VECTORS / 10_000
+    generate_cap_quantization(runner, k_values_nominal=[max(1, round(k * scale)) for k in PAPER_K_LADDER])
+
+
 PAPER_GENERATORS = (
     generate_blocklist,
     generate_budget,
-    generate_cap_quantization,
+    generate_quantization,
     generate_construct_methods,
     partial(generate_streaming, construct_methods=[STREAM_BOOTSTRAP], k_sweep=False),
     partial(generate_equal_memory, filters=PAPER_EQUAL_MEMORY_FILTERS),

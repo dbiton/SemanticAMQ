@@ -779,7 +779,7 @@ def plot_budget(df: pd.DataFrame) -> None:
     generate_budget_figures(df)
 
 
-def generate_cap_quantization(runner: Runner) -> None:
+def generate_cap_quantization(runner: Runner, k_values_nominal: Optional[List[int]] = None) -> None:
     """CapCoverFilter.auto() per
     (dataset, k, seed, quantize) over CAP_QUANTIZATION_SWEEP (AUTO_CANDIDATES). Same k ladder, same
     fixed tau, same blocklist workloads/source-size split.
@@ -788,7 +788,7 @@ def generate_cap_quantization(runner: Runner) -> None:
     num_vectors      = WORKLOAD_NUM_VECTORS
     dim              = 384
     n_folds          = BLOCKLIST_FOLDS
-    k_values_nominal = [2 ** i for i in range(11, 17)]
+    k_values_nominal = k_values_nominal or [2 ** i for i in range(11, 17)]
     tau              = 0.1
 
     workloads = blocklist_workloads(num_vectors, n_folds=n_folds)
