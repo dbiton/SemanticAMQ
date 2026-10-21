@@ -18,6 +18,9 @@ Run from the repo root with the global Python 3.12:
 results-folder defaults to results/. Figure names are the keys of FIGURES
 (sweeps, quantization, construction, streaming, equal-memory, throughput); default is all.
 
+tau is drawn as cosine distance 1 - cos = tau_L2^2 / 2 (cosine_distance); the CSVs and
+the filters keep L2.
+
 The sweeps figure's FPR panels group the negatives by how related a query is
 to the indexed set -- the cosine similarity to its nearest construct vector:
 closely related (>= 0.8), related (0.6-0.8), unrelated (< 0.6)
@@ -153,6 +156,16 @@ MARGIN_TOP = 0.32
 PCT_FMT = matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:g}")
 
 
+def cosine_distance(tau_l2):
+    """The cosine distance 1 - cos a threshold of L2 distance tau is: the figures
+    state tau this way, the CSVs and the filters keep L2 (unit vectors, so
+    tau^2 = 2 (1 - cos))."""
+    return np.asarray(tau_l2, dtype=float) ** 2 / 2.0
+
+
+TAU_LABEL = "$\\tau$ (cosine distance)"
+
+
 def save(fig, name):
     OUT_FIG.mkdir(parents=True, exist_ok=True)
     fig.savefig(OUT_FIG / f"{name}.pdf")
@@ -217,7 +230,8 @@ def sweeps_grid():
     """Rows: ball-budget sweep (tau=0.1, budget.csv) and tau sweep (fixed k,
     blocklist.csv). Columns: FPR per query source, then accesses saved with
     each corpus's ceiling (its share of negative queries) as the only dashed
-    line. Error bars: +-1 std over folds."""
+    line. Error bars: +-1 std over folds. tau is shown as cosine distance
+    (cosine_distance), the CSVs keep L2."""
     frames = []
     for name in ("budget", "blocklist"):
         d = pd.read_csv(RESULTS / f"{name}.csv")
@@ -226,9 +240,11 @@ def sweeps_grid():
         d["k_pct"] = 100 * d.k_fraction  # memory varies by fold; k does not
         frames.append(d)
     budget, blocklist = frames
+    blocklist["tau_cos"] = cosine_distance(blocklist.tau)
     tau_mem = blocklist.pct_raw.mean()
-    sweeps = [(budget, "k_pct", "$k$ (% of $|X|$)","FPR\n($\\tau=0.1$)", PCT_FMT),
-              (blocklist, "tau", "$\\tau$", f"FPR\n(memory {tau_mem:.0f}% of raw)", None)]
+    budget_tau = float(cosine_distance(budget.tau.iloc[0]))
+    sweeps = [(budget, "k_pct", "$k$ (% of $|X|$)", f"FPR\n($\\tau={budget_tau:g}$)", PCT_FMT),
+              (blocklist, "tau_cos", TAU_LABEL, f"FPR\n(memory {tau_mem:.0f}% of raw)", None)]
 
     n_fpr, nrows = len(BAND_TITLE), len(sweeps)
     spacer = GAP_LABELLED - 2 * GAP_SHARED  # blank column before the accesses-saved panel
@@ -460,19 +476,22 @@ def equal_memory():
 
 def throughput():
     """End-to-end throughput improvement (%) of the filter in front of a flat
-    index over the index alone, one line per corpus, against tau (budget
+    index over the index alone, one line per corpus, against tau as cosine
+    distance (budget
     fixed), against the memory the filter actually uses, and against its
     number of caps K (tau fixed). Memory and K both come from the budget
     sweep, but differ: a compact encoding packs more caps into the same
     bytes. Error bars: +-1 std over folds."""
     d = pd.read_csv(RESULTS / "end_to_end.csv")
     d["corpus"] = to_corpus(d.dataset)
+    d["tau_cos"] = cosine_distance(d.tau)
     at_k = d[np.isclose(d.k_fraction, E2E_K_FRACTION)]
     at_tau = d[np.isclose(d.tau, E2E_TAU)]
+    fixed_tau = f"fixed $\\tau={float(cosine_distance(E2E_TAU)):g}$"
     panels = [
-        (at_k, "tau", "$\\tau$", f"fixed $k={100 * E2E_K_FRACTION:g}\\%$ of $|X|$", False),
-        (at_tau, "memory_pct_raw", "memory (% of raw fp32 index, log)", f"fixed $\\tau={E2E_TAU:g}$", True),
-        (at_tau, "n_caps", "caps $K$ (log)", f"fixed $\\tau={E2E_TAU:g}$", True),
+        (at_k, "tau_cos", TAU_LABEL, f"fixed $k={100 * E2E_K_FRACTION:g}\\%$ of $|X|$", False),
+        (at_tau, "memory_pct_raw", "memory (% of raw fp32 index, log)", fixed_tau, True),
+        (at_tau, "n_caps", "caps $K$ (log)", fixed_tau, True),
     ]
     width = len(panels) * PANEL + (len(panels) - 1) * GAP_LABELLED
     height = PANEL + MARGIN_TOP
@@ -499,8 +518,8 @@ def throughput():
             ax.set_xscale("log")
             ax.xaxis.set_major_formatter(PCT_FMT)
             ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
-        if x == "tau":
-            ax.set_xticks([0.1, 0.2, 0.3, 0.4])
+        if x == "tau_cos":
+            ax.set_xticks([0.02, 0.04, 0.06, 0.08])
         ax.set_xlabel(xlabel)
         ax.set_title(title, color=INK)
     axes[0, 0].set_ylabel("throughput improvement (%)")
