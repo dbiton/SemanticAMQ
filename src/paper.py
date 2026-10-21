@@ -6,6 +6,15 @@ plots/plot_paper.py's figures (written to suggestions/figures/).
     python src/paper.py              # generate_and_plot_all(): full run
     python src/paper.py plot         # re-draw the figures from existing results/
 
+    options (both modes where they apply):
+      --num-vectors N    vectors per corpus (main.WORKLOAD_NUM_VECTORS, default 10,000)
+      --datasets A,B,..  registry names (util.dataset_paths) to run and draw instead of
+                         the paper's five, e.g. those a machine has
+      --workers N        parallel jobs (main.MAX_WORKERS)
+      --out DIR          figure folder (default suggestions/figures)
+    A smaller or different run needs a copy of the repo without results/ (generators
+    truncate their CSVs -- see CLAUDE.md), e.g. a git worktree with datasets/ linked in.
+
 Each figure and what feeds it (the CSVs are main.py's, so a paper run and a
 main.py run write the same files -- and truncate them, see CLAUDE.md):
 
@@ -31,11 +40,10 @@ for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "
 from functools import partial
 
 import main
-from main import (Runner, MAX_WORKERS, CAP_COVER_CONSTRUCT, WORKLOAD_NUM_VECTORS, BLOCKLIST_FOLDS,
-                  blocklist_workloads, equal_memory_filters, logger,
+from main import (Runner, CAP_COVER_CONSTRUCT, BLOCKLIST_FOLDS, blocklist_workloads, equal_memory_filters, logger,
                   generate_blocklist, generate_budget, generate_cap_quantization,
                   generate_construct_methods, generate_streaming, generate_equal_memory)
-from plots.plot_paper import (plot_figures, CONFIG_TO_METHOD, EQUAL_MEMORY_HIDDEN, STREAM_BOOTSTRAP,
+from plots.plot_paper import (plot_figures, use_corpora, CONFIG_TO_METHOD, EQUAL_MEMORY_HIDDEN, STREAM_BOOTSTRAP,
                               E2E_TAU, E2E_K_FRACTION, E2E_TAUS, E2E_K_FRACTIONS)
 
 assert STREAM_BOOTSTRAP == CAP_COVER_CONSTRUCT, "the streaming figure bootstraps with the paper's construct method"
@@ -57,7 +65,7 @@ def generate_end_to_end(runner: Runner) -> None:
     Only submits 'end_to_end' jobs -- does not run `runner`."""
     dim = 384
     cells = sorted({(E2E_K_FRACTION, t) for t in E2E_TAUS} | {(kf, E2E_TAU) for kf in E2E_K_FRACTIONS})
-    for workload in blocklist_workloads(WORKLOAD_NUM_VECTORS, n_folds=BLOCKLIST_FOLDS):
+    for workload in blocklist_workloads(main.WORKLOAD_NUM_VECTORS, n_folds=BLOCKLIST_FOLDS):
         for fold, sel in enumerate(workload.selections):
             runner.submit(
                 'end_to_end', output_csv=END_TO_END_CSV,
@@ -78,12 +86,12 @@ PAPER_GENERATORS = (
 )
 
 
-def generate_and_plot_all() -> None:
+def generate_and_plot_all(out=None) -> None:
     """Submit the paper's evaluations to one shared Runner, run them as one
     shuffled batch (see main.generate_and_plot_all), then draw the figures.
     Each generator is guarded so one failing to submit doesn't take down the
     others."""
-    runner = Runner(num_workers=MAX_WORKERS)
+    runner = Runner(num_workers=main.MAX_WORKERS)
     for generate in PAPER_GENERATORS:
         name = getattr(generate, "__name__", None) or generate.func.__name__
         try:
@@ -93,16 +101,50 @@ def generate_and_plot_all() -> None:
     runner.shuffle()
     runner.run()
     logger.info("All submitted jobs completed.")
-    plot_all()
+    plot_all(out=out)
 
 
-def plot_all(figures=None) -> None:
+def plot_all(figures=None, out=None) -> None:
     """Re-draws the paper's figures (default all) from results/."""
-    plot_figures(figures)
+    plot_figures(figures, out=out)
+
+
+def configure(num_vectors=None, datasets=None, workers=None) -> None:
+    """Overrides main's workload size, corpora and pool size (and the figures'
+    corpora to match) before anything is submitted."""
+    if num_vectors:
+        main.WORKLOAD_NUM_VECTORS = num_vectors
+    if workers:
+        main.MAX_WORKERS = workers
+    if datasets:
+        unknown = [d for d in datasets if d not in main.dataset_filenames]
+        if unknown:
+            raise SystemExit(f"unknown dataset(s) {unknown}; choose from {sorted(main.dataset_filenames)}")
+        main.BLOCKLIST_DATASETS.clear()
+        main.BLOCKLIST_DATASETS.update({d: d.lower() for d in datasets})
+        use_corpora(list(datasets))
+
+
+def _parse(argv):
+    opts = {"--num-vectors": None, "--datasets": None, "--workers": None, "--out": None}
+    rest = []
+    it = iter(argv)
+    for arg in it:
+        if arg in opts:
+            opts[arg] = next(it, None)
+            if opts[arg] is None:
+                raise SystemExit(f"{arg} needs a value")
+        else:
+            rest.append(arg)
+    return opts, rest
 
 
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["plot"]:
-        plot_all(sys.argv[2:])
+    opts, rest = _parse(sys.argv[1:])
+    configure(int(opts["--num-vectors"]) if opts["--num-vectors"] else None,
+              opts["--datasets"].split(",") if opts["--datasets"] else None,
+              int(opts["--workers"]) if opts["--workers"] else None)
+    if rest[:1] == ["plot"]:
+        plot_all(rest[1:], opts["--out"])
     else:
-        generate_and_plot_all()
+        generate_and_plot_all(opts["--out"])

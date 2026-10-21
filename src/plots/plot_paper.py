@@ -93,6 +93,16 @@ CONFIG_TO_METHOD = {
 # Left out of the equal-memory figure.
 EQUAL_MEMORY_HIDDEN = {"QuantizedVector", "MLP", "HNSW", "Zero-FN LSH"}
 
+def use_corpora(names):
+    """Draw these corpora (display names) instead of the paper's five: for a
+    run on whatever corpora a machine has (src/paper.py --datasets)."""
+    CORPORA[:] = names
+    for i, name in enumerate(names):
+        CORPUS_NAME[name.lower()] = name
+        CORPUS_LABEL.setdefault(name, name)
+        CORPUS_STYLE.setdefault(name, (PALETTE[i % len(PALETTE)], MARKERS[i % len(MARKERS)]))
+
+
 QUANT_TOP_N = 5
 
 # End-to-end throughput (src/paper.py generates exactly these cells): the filter
