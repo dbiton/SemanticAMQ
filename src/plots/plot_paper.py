@@ -531,8 +531,15 @@ def plot_figures(requested=None, results=None, out=None):
     if unknown:
         raise SystemExit(f"unknown figure(s) {unknown}; choose from {list(FIGURES)}")
     print("reading", RESULTS, "-> writing", OUT_FIG)
+    failed = []
     for name in requested or FIGURES:
-        FIGURES[name]()
+        try:
+            FIGURES[name]()
+        except Exception as e:      # one figure's missing data must not stop the others
+            failed.append(name)
+            print(f"  {name}: not drawn ({type(e).__name__}: {e})")
+    if failed:
+        raise SystemExit(f"figures not drawn: {', '.join(failed)}")
 
 
 def main():
