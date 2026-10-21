@@ -1,4 +1,5 @@
-"""The figures paper.tex uses, built only from existing results/ CSVs.
+"""The figures paper.tex uses, built only from existing results/ CSVs
+(src/paper.py generates exactly the data they need).
 
 Nothing here runs a filter or a sweep. Outputs (PDF for the paper, PNG preview)
 go to suggestions/figures/ under the names paper.tex includes:
@@ -12,9 +13,14 @@ go to suggestions/figures/ under the names paper.tex includes:
 (figures/scheme.pdf is a hand-drawn diagram and is not produced here.)
 
 Run from the repo root with the global Python 3.12:
-    python suggestions/plot_paper.py [results-folder] [figure ...]
+    PYTHONPATH=src python src/plots/plot_paper.py [results-folder] [figure ...]
 results-folder defaults to results/. Figure names are the keys of FIGURES
 (sweeps, quantization, construction, streaming, equal-memory); default is all.
+
+The sweeps figure's FPR panels group the negatives by how related a query is
+to the indexed set -- the cosine similarity to its nearest construct vector:
+closely related (>= 0.8), related (0.6-0.8), unrelated (< 0.6)
+(runner.SIMILARITY_BANDS).
 
 Runs may be in progress, so every figure tolerates missing corpora and cells:
 a gap is drawn as a gap, never filled from a different subset.
@@ -30,10 +36,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parent.parent
-_args = [a for a in sys.argv[1:]]
-RESULTS = ROOT / (_args.pop(0) if _args and (ROOT / _args[0]).is_dir() else "results")
-REQUESTED = _args
+ROOT = Path(__file__).resolve().parent.parent.parent
+RESULTS = ROOT / "results"
 OUT_FIG = ROOT / "suggestions" / "figures"
 
 DIM = 384
@@ -103,8 +107,9 @@ INSERT_SHOWN = {
     "cap_merge": ("cap merge", BLUE, "D", "-"),
     "static_rebuild": ("static rebuild (oracle)", INK, None, "--"),
 }
-# FPR line style per query source on the sweeps.
-SOURCE_TITLE = {"withheld": "untracked cluster", "singleton": "isolated", "heldout": "sibling"}
+# FPR panel per similarity band on the sweeps (column suffix -> title).
+BAND_TITLE = {"close": "closely related\n($\\cos\\geq0.8$)", "related": "related\n($0.6\\leq\\cos<0.8$)",
+                "unrelated": "unrelated\n($\\cos<0.6$)"}
 
 plt.rcParams.update({
     "font.size": 8, "axes.titlesize": 8, "axes.labelsize": 8,
@@ -206,7 +211,7 @@ def sweeps_grid():
     sweeps = [(budget, "k_pct", "$k$ (% of $|X|$)","FPR\n($\\tau=0.1$)", PCT_FMT),
               (blocklist, "tau", "$\\tau$", f"FPR\n(memory {tau_mem:.0f}% of raw)", None)]
 
-    n_fpr, nrows = len(SOURCE_TITLE), len(sweeps)
+    n_fpr, nrows = len(BAND_TITLE), len(sweeps)
     spacer = GAP_LABELLED - 2 * GAP_SHARED  # blank column before the accesses-saved panel
     width = (n_fpr + 1) * PANEL + spacer + (n_fpr + 1) * GAP_SHARED
     height = nrows * PANEL + (nrows - 1) * GAP_LABELLED + MARGIN_TOP
@@ -228,8 +233,8 @@ def sweeps_grid():
     errkw = dict(ms=3, capsize=1.5, elinewidth=0.8)
     for i, (df, x, xlabel, row_label, xfmt) in enumerate(sweeps):
         agg = (df.groupby(["corpus", x])
-               .agg(**{f"fpr_{s}": (f"fpr_{s}", "mean") for s in SOURCE_TITLE},
-                    **{f"fpr_{s}_sd": (f"fpr_{s}", "std") for s in SOURCE_TITLE},
+               .agg(**{f"fpr_{s}": (f"fpr_{s}", "mean") for s in BAND_TITLE},
+                    **{f"fpr_{s}_sd": (f"fpr_{s}", "std") for s in BAND_TITLE},
                     saved=("accesses_saved_pct", "mean"), saved_sd=("accesses_saved_pct", "std"),
                     ceiling=("neg_share_pct", "mean"))
                .reset_index())
@@ -238,7 +243,7 @@ def sweeps_grid():
             if g.empty:
                 continue
             color, marker = CORPUS_STYLE[corpus]
-            for j, s in enumerate(SOURCE_TITLE):
+            for j, s in enumerate(BAND_TITLE):
                 axes[i, j].errorbar(g[x], g[f"fpr_{s}"], yerr=g[f"fpr_{s}_sd"].fillna(0),
                                     color=color, marker=marker, **errkw)
             axes[i, -1].errorbar(g[x], g.saved, yerr=g.saved_sd.fillna(0), color=color,
@@ -255,7 +260,7 @@ def sweeps_grid():
                 ax.set_ylim(-2, 102)
                 ax.set_ylabel("index accesses saved (%)")
         axes[i, 0].set_ylabel(row_label)
-    for j, title in enumerate(list(SOURCE_TITLE.values()) + ["accesses saved"]):
+    for j, title in enumerate(list(BAND_TITLE.values()) + ["accesses saved"]):
         axes[0, j].set_title(title, color=INK)
 
     present = [c for c in CORPORA if c in set(budget.corpus) | set(blocklist.corpus)]
@@ -439,13 +444,26 @@ FIGURES = {
 }
 
 
-def main():
-    unknown = [r for r in REQUESTED if r not in FIGURES]
+def plot_figures(requested=None, results=None, out=None):
+    """Draws the named figures (default: all) from `results`/ into `out`/."""
+    global RESULTS, OUT_FIG
+    if results is not None:
+        RESULTS = Path(results)
+    if out is not None:
+        OUT_FIG = Path(out)
+    requested = list(requested or [])
+    unknown = [r for r in requested if r not in FIGURES]
     if unknown:
         raise SystemExit(f"unknown figure(s) {unknown}; choose from {list(FIGURES)}")
     print("reading", RESULTS, "-> writing", OUT_FIG)
-    for name in REQUESTED or FIGURES:
+    for name in requested or FIGURES:
         FIGURES[name]()
+
+
+def main():
+    args = sys.argv[1:]
+    results = ROOT / args.pop(0) if args and (ROOT / args[0]).is_dir() else None
+    plot_figures(args, results)
 
 
 if __name__ == "__main__":

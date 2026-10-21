@@ -616,41 +616,54 @@ def _confusion_rates(predicted: List[bool], actual: np.ndarray) -> Dict[str, flo
     }
 
 
-# The blocklist workload's query stream is drawn from three sources, in this
-# order (main.BlocklistWorkload.query_vectors): held-out members of the
-# reference set's clusters, members of clusters withheld from it, and
-# singletons. Sources are strata of the query distribution, never labels --
-# every query is labeled by distance at tau, whichever source it came from.
-QUERY_SOURCES = ("heldout", "withheld", "singleton")
+# Queries are grouped by how related they are to the indexed set: the cosine
+# similarity of each to its nearest construct vector. Bands are strata of the
+# query distribution, never labels -- every query is labeled by distance at
+# tau, whichever band it falls in. Lower edge inclusive; (name, lower edge).
+SIMILARITY_BANDS = (("close", 0.8), ("related", 0.6), ("unrelated", -np.inf))
 
 
-def _per_source_rates(predicted: Any, actual: Any, n_heldout: int, n_withheld: int,
-                      n_singleton: int) -> Dict[str, Any]:
-    """FPR restricted to the negatives drawn from each source, those negative
-    counts, the positive count, and neg_share_pct -- the share of negative
-    queries, which bounds accesses saved for a zero-false-negative filter.
-    predicted/actual follow the QUERY_SOURCES layout; a source with no
+def _nn_cosine(construct: np.ndarray, queries: np.ndarray) -> np.ndarray:
+    """Cosine similarity of each query to its nearest construct vector (exact;
+    unit vectors, so 1 - d^2 / 2 of the nearest L2 distance)."""
+    queries = np.ascontiguousarray(queries, dtype=np.float32)
+    if len(construct) == 0 or len(queries) == 0:
+        return np.full(len(queries), -1.0)
+    index = faiss.IndexFlatL2(queries.shape[1])
+    index.add(np.ascontiguousarray(construct, dtype=np.float32))
+    d2, _ = index.search(queries, 1)
+    return 1.0 - np.clip(d2[:, 0], 0.0, None) / 2.0
+
+
+def _pos_neg_summary(actual: Any) -> Dict[str, Any]:
+    """n_pos and neg_share_pct -- the share of negative queries, which bounds
+    accesses saved for a zero-false-negative filter."""
+    actual = np.asarray(actual, dtype=bool)
+    return {"n_pos": int(actual.sum()),
+            "neg_share_pct": 100.0 * (1.0 - actual.mean()) if len(actual) else float("nan")}
+
+
+def _per_band_rates(predicted: Any, actual: Any, nn_cos: np.ndarray) -> Dict[str, Any]:
+    """FPR restricted to the negatives in each similarity band (SIMILARITY_BANDS,
+    by nn_cos, each query's cosine similarity to its nearest construct
+    vector), those negative counts, and _pos_neg_summary. A band with no
     negatives reports fpr NaN rather than 0."""
     predicted = np.asarray(predicted, dtype=bool)
     actual = np.asarray(actual, dtype=bool)
-    sizes = (n_heldout, n_withheld, n_singleton)
-    if sum(sizes) != len(actual) or len(predicted) != len(actual):
-        raise ValueError(f"Source sizes {sizes} do not partition {len(actual)} queries "
-                         f"({len(predicted)} predictions)")
+    nn_cos = np.asarray(nn_cos, dtype=np.float64)
+    if not len(predicted) == len(actual) == len(nn_cos):
+        raise ValueError(f"predicted ({len(predicted)}), actual ({len(actual)}) and nn_cos "
+                         f"({len(nn_cos)}) must have the same length")
     out: Dict[str, Any] = {}
-    start = 0
-    for source, n in zip(QUERY_SOURCES, sizes):
-        neg = ~actual[start:start + n]
-        out[f"fpr_{source}"] = float(predicted[start:start + n][neg].mean()) if neg.any() else float("nan")
-        out[f"n_neg_{source}"] = int(neg.sum())
-        start += n
-    out["n_pos"] = int(actual.sum())
-    out["neg_share_pct"] = 100.0 * (1.0 - actual.mean()) if len(actual) else float("nan")
+    upper = np.inf
+    for band, lower in SIMILARITY_BANDS:
+        in_band = (nn_cos >= lower) & (nn_cos < upper)
+        neg = in_band & ~actual
+        out[f"fpr_{band}"] = float(predicted[neg].mean()) if neg.any() else float("nan")
+        out[f"n_neg_{band}"] = int(neg.sum())
+        upper = lower
+    out.update(_pos_neg_summary(actual))
     return out
-
-
-
-
 
 
 def cap_quantization_worker(
@@ -663,9 +676,6 @@ def cap_quantization_worker(
     vectors_construct: VectorInput,
     vectors_query: VectorInput,
     actual_results: List[bool],
-    n_heldout: int,
-    n_withheld: int,
-    n_singleton: int,
 ) -> List[Dict[str, Any]]:
     """One CapCoverFilter cover per
     (dataset, k, seed, quantize) over CAP_QUANTIZATION_SWEEP (AUTO_CANDIDATES, the
@@ -688,9 +698,7 @@ def cap_quantization_worker(
         )
 
     actual = np.asarray(actual_results, dtype=bool)
-    if n_heldout + n_withheld + n_singleton != n_q:
-        raise ValueError(f"Source sizes ({n_heldout}, {n_withheld}, {n_singleton}) do not "
-                         f"partition n_queries ({n_q})")
+    nn_cos = _nn_cosine(construct_arr, query_arr)
 
     rows: List[Dict[str, Any]] = []
 
@@ -724,7 +732,7 @@ def cap_quantization_worker(
         "log10_J": log10_J,
         "log10_J_tau": _cap_log10_volume(filt, tau),
         "fpr": rates["fpr"], "fnr": rates["fnr"],
-        **_per_source_rates(predicted_arr, actual, n_heldout, n_withheld, n_singleton),
+        **_per_band_rates(predicted_arr, actual, nn_cos),
         "stage_time_s": stage_time, "cum_time_s": stage_time,
         "query_throughput_qps": n_q / max(query_time, 1e-9),
         "n_queries": n_q,
@@ -781,20 +789,14 @@ def construct_method_worker(
     vectors_construct: np.ndarray,
     vectors_query: np.ndarray,
     actual_results: np.ndarray,
-    n_heldout: int,
-    n_withheld: int,
-    n_singleton: int,
 ) -> Dict[str, Any]:
     """One CapCoverFilter built by CAP_CONSTRUCT_METHODS[method] at k caps,
     with the filter's default (FP32) quantization and no insert method, so
     the construction method is the only thing that varies between rows.
 
     Returns one row: cover volume, angles, FPR/FNR against distance ground
-    truth at tau, and construction time. vectors_query is the fold's
-    [held-out, withheld, singleton] query stream
-    (BlocklistWorkload.query_vectors), sized by n_heldout/n_withheld/
-    n_singleton, so fpr splits by source as budget_worker's does (see
-    _per_source_rates). Covers are unquantized, so a row is not comparable
+    truth at tau, and construction time. fpr also splits by similarity band
+    as budget_worker's does (see _per_band_rates). Covers are unquantized, so a row is not comparable
     with results/cap_quantization.csv's, which is built at a swept encoding.
     seed is the fold, reported as "fold".
 
@@ -833,7 +835,7 @@ def construct_method_worker(
         "fpr": fp / (fp + tn) if fp + tn else 0.0,
         "fnr": fn / (fn + tp) if fn + tp else 0.0,
         "tp": tp, "fp": fp, "fn": fn, "tn": tn,
-        **_per_source_rates(predicted, actual, n_heldout, n_withheld, n_singleton),
+        **_per_band_rates(predicted, actual, _nn_cosine(construct, queries)),
         "method_s": timed.seconds, "construct_s": construct_s, "volume_s": volume_s,
     }
     if fn:
@@ -972,9 +974,7 @@ def _blocklist_cover_rows(
     k_fractions: List[float],
     tau_values: List[float],
     vectors_reference: VectorInput,
-    vectors_heldout: VectorInput,
-    vectors_withheld: VectorInput,
-    vectors_singleton: VectorInput,
+    vectors_query: VectorInput,
     volume_bounds: bool,
 ) -> List[Dict[str, Any]]:
     """Shared core of blocklist_tau_worker and budget_worker: build a
@@ -982,21 +982,17 @@ def _blocklist_cover_rows(
     (k, tau) pair. Both callers read only these rows -- see each one's own
     docstring for which axis it treats as fixed and which it sweeps.
 
-    The query stream comes from three sources (QUERY_SOURCES): held-out
-    members of the reference set's clusters, members of clusters withheld from
-    it, and singletons. Sources decide what is asked, never the answer: a
-    query is positive iff its exact distance to the reference set is <= tau,
+    A query is positive iff its exact distance to the reference set is <= tau,
     recomputed per tau, so these rows mean what quantization_worker's and
     equal_memory_worker's do. Predictions use the filter's own acceptance rule
     (CapCoverFilter.surface_angle, thresholded at 2*arcsin(tau'/2) -- search
     once, threshold per tau), so a row says what query() would.
 
-    FPR is also split by source (_per_source_rates): withheld-cluster
-    negatives test whether the cover localizes to B's clusters rather than to
-    dense regions in general, singletons are background traffic, and held-out
-    cluster-mates farther than tau are the hardest negatives of all, since
-    they sit inside their own cluster's ball. A pooled FPR alone would be
-    dominated by whichever source is larger.
+    FPR is also split by how related a query is to B (_per_band_rates, by the
+    cosine similarity to its nearest reference vector, SIMILARITY_BANDS):
+    close negatives sit just outside the cover's reach, unrelated ones are
+    background traffic. A pooled FPR alone would be dominated by whichever
+    band is larger.
 
     volume_bounds adds the log10_vol_high column (_cap_log10_volume). Off by
     default to match blocklist_tau_worker/budget_worker's existing cost
@@ -1006,16 +1002,11 @@ def _blocklist_cover_rows(
     always, there being no cap counterpart of that lower bound.
     """
     B = np.ascontiguousarray(_to_construct_array(vectors_reference), dtype=np.float32)
-    by_source = [np.ascontiguousarray(_to_construct_array(v), dtype=np.float32)
-                 for v in (vectors_heldout, vectors_withheld, vectors_singleton)]
-    sizes = dict(zip(("n_heldout", "n_withheld", "n_singleton"), map(len, by_source)))
-    nonempty = [q for q in by_source if len(q)]
-    Q = np.concatenate(nonempty) if nonempty else np.zeros((0, dim), dtype=np.float32)
+    Q = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
     n_queries = len(Q)
 
     # Exact nearest-reference distance per query: the ground truth, and the
-    # workload's own geometry, reported per source so a row is interpretable
-    # without re-deriving it (the cover's margin vs d_withheld).
+    # bands' similarity.
     bix = faiss.IndexFlatL2(dim)
     bix.add(B)
     if n_queries:
@@ -1023,10 +1014,7 @@ def _blocklist_cover_rows(
         nn = np.sqrt(np.clip(d2[:, 0], 0, None))
     else:
         nn = np.zeros(0, dtype=np.float32)
-    heldout_nn = nn[:sizes["n_heldout"]]
-    withheld_nn = nn[sizes["n_heldout"]:sizes["n_heldout"] + sizes["n_withheld"]]
-    d_heldout_med = float(np.median(heldout_nn)) if len(heldout_nn) else float("nan")
-    d_withheld_med = float(np.median(withheld_nn)) if len(withheld_nn) else float("nan")
+    nn_cos = 1.0 - nn.astype(np.float64) ** 2 / 2.0
 
     rows: List[Dict[str, Any]] = []
 
@@ -1090,10 +1078,11 @@ def _blocklist_cover_rows(
                 "psi_med": psi_med, "psi_max": float(angles.max()) if len(angles) else 0.0,
                 "tau": tau,
                 "fpr": rates["fpr"], "fnr": rates["fnr"],
-                # fpr_<source>, n_neg_<source>, n_pos, and neg_share_pct --
+                # fpr_<band>, n_neg_<band>, n_pos, and neg_share_pct --
                 # the ceiling on accesses_saved_pct for a zero-FN filter.
-                **_per_source_rates(predicted, actual, **sizes),
-                **sizes,
+                **_per_band_rates(predicted, actual, nn_cos),
+                **{f"n_{band}": int(((nn_cos >= lo) & (nn_cos < hi)).sum())
+                   for (band, lo), hi in zip(SIMILARITY_BANDS, (np.inf,) + tuple(l for _, l in SIMILARITY_BANDS[:-1]))},
                 "n_queries": n_queries,
                 "accesses_saved_pct": saved,
                 "j_tau": j_tau,
@@ -1101,7 +1090,7 @@ def _blocklist_cover_rows(
                 "log10_vol_low": float('nan'),
                 "log10_vol_high": log10_vol_high,
                 "n_caps": len(angles),
-                "d_heldout_med": d_heldout_med, "d_withheld_med": d_withheld_med,
+                "nn_cos_med": float(np.median(nn_cos)) if n_queries else float("nan"),
                 "memory_bytes": filt.get_bytesize(),
             })
     return rows
@@ -1114,14 +1103,11 @@ def blocklist_tau_worker(
     k_fraction: float,
     tau_values: List[float],
     vectors_reference: VectorInput,
-    vectors_heldout: VectorInput,
-    vectors_withheld: VectorInput,
-    vectors_singleton: VectorInput,
+    vectors_query: VectorInput,
 ) -> List[Dict[str, Any]]:
     """Asymmetric blocklist workload (main.generate_blocklist): a tight
-    reference set B and a broad query stream drawn from held-out members of
-    B's own duplicate clusters, withheld clusters and singletons, labeled by
-    distance to B at each tau.
+    reference set B and a query stream, labeled by distance to B at each
+    tau and grouped by similarity band.
 
     Cap budget k is fixed (a single k_fraction, not a sweep -- varying it is
     budget_worker's job); tau is swept over tau_values so FPR/accesses saved
@@ -1129,7 +1115,7 @@ def blocklist_tau_worker(
     """
     return _blocklist_cover_rows(
         dim, dataset, seed, [k_fraction], tau_values,
-        vectors_reference, vectors_heldout, vectors_withheld, vectors_singleton,
+        vectors_reference, vectors_query,
         volume_bounds=False,
     )
 
@@ -1141,9 +1127,7 @@ def budget_worker(
     k_fractions: List[float],
     tau: float,
     vectors_reference: VectorInput,
-    vectors_heldout: VectorInput,
-    vectors_withheld: VectorInput,
-    vectors_singleton: VectorInput,
+    vectors_query: VectorInput,
 ) -> List[Dict[str, Any]]:
     """The same asymmetric blocklist workload as blocklist_tau_worker
     (main.generate_budget), read along the other axis: tau is fixed at a
@@ -1156,7 +1140,7 @@ def budget_worker(
     """
     return _blocklist_cover_rows(
         dim, dataset, seed, k_fractions, [tau],
-        vectors_reference, vectors_heldout, vectors_withheld, vectors_singleton,
+        vectors_reference, vectors_query,
         volume_bounds=True,
     )
 
@@ -1339,9 +1323,6 @@ def stream_rebuild_worker(
     vectors_stream: VectorInput,
     vectors_query: VectorInput,
     actual_at_checkpoint: Dict[int, List[bool]],
-    n_heldout: int,
-    n_withheld: int,
-    n_singleton: int,
     checkpoints: List[int],
     T: Optional[int] = None,
     insertion_level: Optional[str] = None,
@@ -1376,10 +1357,8 @@ def stream_rebuild_worker(
     insert_time_s the insert-only total (cumulative_time_s also counts the
     bootstrap construct()).
 
-    vectors_query is the fold's [held-out, withheld, singleton] query stream
-    (see main.BlocklistWorkload.query_vectors), sized by n_heldout/n_withheld/
-    n_singleton, with fpr split by source exactly as quantization_worker
-    does. actual_at_checkpoint[c] is its distance-based
+    vectors_query is the fold's query stream (see
+    main.BlocklistWorkload.query_vectors). actual_at_checkpoint[c] is its distance-based
     ground truth against vectors_stream[:c] -- computed once by the caller,
     since every policy and method on a fold shares it.
 
@@ -1394,9 +1373,6 @@ def stream_rebuild_worker(
     query_arr = _to_construct_array(vectors_query)
     n = len(stream_arr)
     n_q = len(query_arr)
-    if n_heldout + n_withheld + n_singleton != n_q:
-        raise ValueError(f"Source sizes ({n_heldout}, {n_withheld}, {n_singleton}) do not "
-                         f"partition n_queries ({n_q})")
     metric, method = _rebuild_policy_tags(policy, insertion_level)
     # By default pooled reserves a 20% pool and every other method constructs
     # at full capacity; insert_memory_percent overrides that for any method.
@@ -1442,9 +1418,7 @@ def stream_rebuild_worker(
             "dataset": dataset, "policy": policy, "T": T, "k": k, "seed": seed,
             "position": pos - bootstrap_n, "tau": tau,
             "fpr": rates["fpr"], "fnr": rates["fnr"],
-            # fpr_heldout: held-out cluster-mates farther than tau from what
-            # has arrived, which sit inside their cluster's ball.
-            **_per_source_rates(predicted, actual, n_heldout, n_withheld, n_singleton),
+            **_pos_neg_summary(actual),
             "n_queries": n_q, "n_duplicates": int(actual.sum()),
             "log10_j_tau": _cap_log10_volume(filt, tau),
             "n_caps": filt._num_caps,

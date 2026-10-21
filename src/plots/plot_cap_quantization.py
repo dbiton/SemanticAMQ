@@ -77,7 +77,7 @@ def _style_axes(ax: plt.Axes) -> None:
 
 _REQUIRED_COLUMNS = [
     "dataset", "k", "quantize", "stage", "tau", "log10_J", "log10_J_tau",
-    "fpr", "fpr_withheld", "fpr_singleton", "fnr", "stage_time_s", "cum_time_s",
+    "fpr", "fnr", "stage_time_s", "cum_time_s",
     "query_throughput_qps", "n_queries", "n_index_accesses", "index_accesses_saved_pct",
     "n_caps", "memory_bytes", "seed",
 ]
@@ -244,9 +244,9 @@ def panel_fpr(df: pd.DataFrame, cfg: Config, raw_pct: bool = False) -> pd.DataFr
 
 
 _FPR_SOURCE_PANELS = (
-    ("fpr_heldout", "FPR (held-out negatives)", "cap-quantization-false-positive-rate-heldout.png"),
-    ("fpr_withheld", "FPR (withheld negatives)", "cap-quantization-false-positive-rate-withheld.png"),
-    ("fpr_singleton", "FPR (singleton negatives)", "cap-quantization-false-positive-rate-singleton.png"),
+    ("fpr_close", "FPR (closely related negatives)", "cap-quantization-false-positive-rate-close.png"),
+    ("fpr_related", "FPR (related negatives)", "cap-quantization-false-positive-rate-related.png"),
+    ("fpr_unrelated", "FPR (unrelated negatives)", "cap-quantization-false-positive-rate-unrelated.png"),
 )
 
 

@@ -53,6 +53,8 @@ is for tests and single-cell validation. Size per-job memory against
 ```
 src/main.py            evaluation definitions: generate_*/save_*/plot_* per evaluation,
                        generate_and_plot_all() and plot_all()
+src/paper.py           paper.tex's data + figures only (subset of main.py's evaluations, trimmed to
+                       what each figure reads); `python src/paper.py [plot]`. Figures: plots/plot_paper.py
 src/runner.py          Runner (ProcessPoolExecutor job harness), one *_worker per mode,
                        filter registries, calibration/tuning of baseline dials
 src/filters/filter.py  Filter base: construct(), query(), insert() (optional), get_bytesize();
@@ -112,6 +114,11 @@ positionally against submission order (use `main.rows_for_mode`).
 `runner._build_calibrated_filter`. A filter that cannot fit its construct set
 in `max_memory` must raise `InsufficientMemoryError`; the equal-memory worker
 records it as an infeasible (NaN) row. Never ship an over-budget index.
+
+**Query bands.** FPR is also split by how related a query is to the indexed set: the
+cosine similarity to its nearest construct vector, in `runner.SIMILARITY_BANDS`
+(close >= 0.8, related 0.6-0.8, unrelated < 0.6; columns `fpr_<band>`, `n_neg_<band>`).
+Bands only group results; labels are always distance at tau.
 
 **Workload sizing.** `main.WORKLOAD_NUM_VECTORS` is the single size knob for
 every evaluation (80% construct / 20% queries). Ground truth is labelled by

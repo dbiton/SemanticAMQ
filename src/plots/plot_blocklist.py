@@ -7,17 +7,16 @@ that one fixed budget.
 
 Every query is labeled by its distance to the reference set at tau, so the
 labels change along the tau axis. FPR is reported pooled and restricted to the
-negatives drawn from each query source (runner.QUERY_SOURCES).
+negatives in each similarity band (runner.SIMILARITY_BANDS): queries whose
+nearest indexed vector has cosine similarity >= 0.8 (closely related), 0.6-0.8
+(related) or < 0.6 (unrelated).
 
 Panels:
   (a) FPR vs tau, pooled over every negative.
-  (b) FPR on held-out negatives -- members of B's own clusters farther than
-      tau from B. They sit inside their cluster's ball, so they are the
-      hardest negatives and where most false positives come from.
-  (c) FPR on withheld negatives -- members of duplicate clusters that were
-      NOT blocklisted. Same local geometry as B (tight, high-multiplicity),
-      so only a filter that actually localises B rejects them.
-  (d) FPR on singleton negatives -- background traffic.
+  (b) FPR on closely related negatives -- just outside tau of B, the hardest
+      negatives and where most false positives come from.
+  (c) FPR on related negatives.
+  (d) FPR on unrelated negatives -- background traffic.
   (e) Geometric objective log10 J_tau(C) = log10 sum_i (r_i + tau)^d vs tau --
       the overlap-blind sum of ball volumes once every ball is expanded by tau.
   (f) Index accesses saved vs tau, with each corpus's ceiling (the share of
@@ -69,8 +68,8 @@ BLOCKLIST_MARKERS = {
 
 _REQUIRED_COLUMNS = [
     "dataset", "seed", "sweep", "k", "k_fraction", "n_reference", "compression", "psi_med",
-    "tau", "fpr", "fnr", "fpr_heldout", "fpr_withheld", "fpr_singleton", "neg_share_pct",
-    "accesses_saved_pct", "log10_j_tau", "d_withheld_med", "d_heldout_med",
+    "tau", "fpr", "fnr", "fpr_close", "fpr_related", "fpr_unrelated", "neg_share_pct",
+    "accesses_saved_pct", "log10_j_tau", "nn_cos_med",
 ]
 
 # runner.blocklist_tau_worker (mode 'blocklist') only emits sweep="tau" rows:
@@ -270,19 +269,19 @@ def panel_fpr_vs_tau(df, cfg, k_fraction):
                       k_fraction, bounded_unit=True)
 
 
-def panel_fpr_heldout_vs_tau(df, cfg, k_fraction):
-    return _tau_panel(df, "fpr_heldout", "FPR (held-out negatives)",
-                      "blocklist-fpr-heldout-vs-tau.png", cfg, k_fraction, bounded_unit=True)
+def panel_fpr_close_vs_tau(df, cfg, k_fraction):
+    return _tau_panel(df, "fpr_close", "FPR (closely related negatives)",
+                      "blocklist-fpr-close-vs-tau.png", cfg, k_fraction, bounded_unit=True)
 
 
-def panel_fpr_withheld_vs_tau(df, cfg, k_fraction):
-    return _tau_panel(df, "fpr_withheld", "FPR (withheld negatives)",
-                      "blocklist-fpr-withheld-vs-tau.png", cfg, k_fraction, bounded_unit=True)
+def panel_fpr_related_vs_tau(df, cfg, k_fraction):
+    return _tau_panel(df, "fpr_related", "FPR (related negatives)",
+                      "blocklist-fpr-related-vs-tau.png", cfg, k_fraction, bounded_unit=True)
 
 
-def panel_fpr_singleton_vs_tau(df, cfg, k_fraction):
-    return _tau_panel(df, "fpr_singleton", "FPR (singleton negatives)",
-                      "blocklist-fpr-singleton-vs-tau.png", cfg, k_fraction, bounded_unit=True)
+def panel_fpr_unrelated_vs_tau(df, cfg, k_fraction):
+    return _tau_panel(df, "fpr_unrelated", "FPR (unrelated negatives)",
+                      "blocklist-fpr-unrelated-vs-tau.png", cfg, k_fraction, bounded_unit=True)
 
 
 def panel_geometric_objective_vs_tau(df, cfg, k_fraction):
@@ -305,21 +304,20 @@ def panel_saved_vs_tau(df, cfg, k_fraction):
 def print_summary(df: pd.DataFrame, k_fraction: float) -> None:
     sel = df[(df["sweep"] == SWEEP_TAU) & (np.isclose(df["k_fraction"], k_fraction))]
     print(f"\n--- Blocklist workload summary (tau sweep at k={k_fraction:g}) ---")
-    cols = ("fpr", "fpr_heldout", "fpr_withheld", "fpr_singleton", "accesses_saved_pct",
+    cols = ("fpr", "fpr_close", "fpr_related", "fpr_unrelated", "accesses_saved_pct",
             "neg_share_pct", "log10_j_tau")
     aggs = {c: mean_std(sel, ["dataset", "tau"], c) for c in cols}
     for dataset in BLOCKLIST_DATASETS:
         sub = sel[sel["dataset"] == dataset]
         if sub.empty:
             continue
-        print(f"\n{BLOCKLIST_LABELS[dataset]} (d_heldout={sub['d_heldout_med'].mean():.3f}, "
-              f"d_withheld={sub['d_withheld_med'].mean():.3f})")
+        print(f"\n{BLOCKLIST_LABELS[dataset]} (median nn cosine {sub['nn_cos_med'].mean():.3f})")
         for tau in sorted(sub["tau"].unique()):
             def _m(c):
                 row = aggs[c][(aggs[c]["dataset"] == dataset) & (aggs[c]["tau"] == tau)]
                 return float(row["mean"].iloc[0]) if len(row) else float("nan")
-            print(f"  tau={tau:.2f}  FPR={_m('fpr'):.3f} FPR_heldout={_m('fpr_heldout'):.3f} "
-                  f"FPR_withheld={_m('fpr_withheld'):.3f} FPR_singleton={_m('fpr_singleton'):.3f} "
+            print(f"  tau={tau:.2f}  FPR={_m('fpr'):.3f} FPR_close={_m('fpr_close'):.3f} "
+                  f"FPR_related={_m('fpr_related'):.3f} FPR_unrelated={_m('fpr_unrelated'):.3f} "
                   f"saved={_m('accesses_saved_pct'):5.1f}% of {_m('neg_share_pct'):5.1f}% "
                   f"log10_J={_m('log10_j_tau'):.2f}")
     print()
@@ -336,9 +334,9 @@ def generate_blocklist_figures(df: Optional[pd.DataFrame] = None, outdir: str = 
 
     kf = resolve_tau_kfraction(df, k_fraction)
     panel_fpr_vs_tau(df, cfg, kf)
-    panel_fpr_heldout_vs_tau(df, cfg, kf)
-    panel_fpr_withheld_vs_tau(df, cfg, kf)
-    panel_fpr_singleton_vs_tau(df, cfg, kf)
+    panel_fpr_close_vs_tau(df, cfg, kf)
+    panel_fpr_related_vs_tau(df, cfg, kf)
+    panel_fpr_unrelated_vs_tau(df, cfg, kf)
     panel_geometric_objective_vs_tau(df, cfg, kf)
     panel_saved_vs_tau(df, cfg, kf)
 
