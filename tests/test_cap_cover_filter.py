@@ -1,6 +1,7 @@
+import os
 import unittest
 import numpy as np
-from filters.cap_cover.cap_cover_filter import CapCoverFilter, Quantize, AUTO_CANDIDATES
+from filters.cap_cover.cap_cover_filter import CapCoverFilter, Quantize, AUTO_CANDIDATES, SCAN_NS_PER_BYTE
 from filters.cap_cover.cap_geometry import (angle_between, unit_rows, enclosing_cap, exact_cap_cover,
                                             knn_directions, log10_cap_measure, log_cap_measure)
 from filters.cap_cover.gonzales_construct import GonzalesConstruct
@@ -349,6 +350,36 @@ class TestCapCoverInsert(unittest.TestCase):
                     u, _ = enclosing_cap(P[0], t[0], P[1], t[1])
                     reach = lambda codes: (angle_between(f.decode(codes), P) + t).max()
                     self.assertLessEqual(reach(f.fit_cap_code(u, P, t)), reach(f.encode(u[None])) + 1e-12)
+
+
+class TestAutoScanLimit(unittest.TestCase):
+    """auto() drops encodings whose estimated scan of the whole budget is too slow."""
+
+    def test_no_limit_keeps_every_candidate(self):
+        self.assertEqual(len(CapCoverFilter.auto(384, 1_550_000).levels), len(AUTO_CANDIDATES))
+
+    def test_limit_drops_slow_encodings_only_at_large_budgets(self):
+        small = {q for q in CapCoverFilter.auto(384, 123_000, scan_limit_ms=1.0).levels}
+        large = {q for q in CapCoverFilter.auto(384, 6_000_000, scan_limit_ms=1.0).levels}
+        self.assertEqual(small, set(AUTO_CANDIDATES))
+        self.assertEqual(large, {Quantize.TQ2, Quantize.TQ4})
+        for q in large:
+            self.assertLessEqual(6_000_000 * SCAN_NS_PER_BYTE[q] / 1e6, 1.0)
+
+    def test_nothing_fits_keeps_the_cheapest(self):
+        self.assertEqual(CapCoverFilter.auto(384, 10 ** 9, scan_limit_ms=1.0).levels, (Quantize.TQ4,))
+
+    def test_environment_default(self):
+        old = os.environ.get("CAPCOVER_SCAN_LIMIT_MS")
+        os.environ["CAPCOVER_SCAN_LIMIT_MS"] = "1.0"
+        try:
+            self.assertEqual(len(CapCoverFilter.auto(384, 6_000_000).levels), 2)
+            self.assertEqual(len(CapCoverFilter.auto(384, 6_000_000, scan_limit_ms=1e9).levels), len(AUTO_CANDIDATES))
+        finally:
+            if old is None:
+                os.environ.pop("CAPCOVER_SCAN_LIMIT_MS")
+            else:
+                os.environ["CAPCOVER_SCAN_LIMIT_MS"] = old
 
 
 if __name__ == "__main__":

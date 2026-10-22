@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import multiprocessing
 import random
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
@@ -964,6 +965,17 @@ def cap_cover_system_tau_worker(
     return rows
 
 
+def _pin_to_own_core() -> None:
+    """If CAPCOVER_PIN_CORES=N, pin this worker process to core (its index in the
+    pool) mod N, so N timing workers never share a core or its SMT sibling
+    (cores 0..N-1 are distinct physical cores on Linux). Best effort."""
+    n = int(os.environ.get("CAPCOVER_PIN_CORES", "0") or 0)
+    if n <= 0 or not hasattr(os, "sched_setaffinity"):
+        return
+    ident = multiprocessing.current_process()._identity
+    os.sched_setaffinity(0, {(ident[0] - 1 if ident else 0) % n})
+
+
 def end_to_end_worker(
     dim: int,
     dataset: str,
@@ -984,7 +996,9 @@ def end_to_end_worker(
     the ratio is far steadier than either absolute qps when many workers share
     the machine (absolute timings still want a pinned run, see CLAUDE.md).
     The filter is warmed up before timing (the first query() hands the caps
-    to Rust). Raises on a false negative, as every worker does."""
+    to Rust). Raises on a false negative, as every worker does. Pins itself to
+    one core when CAPCOVER_PIN_CORES is set (_pin_to_own_core)."""
+    _pin_to_own_core()
     B = np.ascontiguousarray(_to_construct_array(vectors_reference), dtype=np.float32)
     Q = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
     n_q = len(Q)

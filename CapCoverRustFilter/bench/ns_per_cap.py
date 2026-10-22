@@ -41,9 +41,11 @@ centers = unit(rng.standard_normal((N_CAPS, DIM)))
 X = unit(np.repeat(centers, 3, axis=0) + 0.15 * rng.standard_normal((3 * N_CAPS, DIM)) / np.sqrt(DIM))
 Q = unit(rng.standard_normal((N_QUERIES, DIM)))
 print(f"{N_CAPS} caps requested from {len(X)} vectors, d={DIM}; {N_QUERIES} single queries each")
-print(f"{'encoding':8s} {'caps':>7s} {'ms/query':>9s} {'ns/cap':>8s}")
-for q in (Quantize.TQ1, Quantize.TQ2, Quantize.TQ4, Quantize.TQ8, Quantize.SPQ16, Quantize.SPQ24, Quantize.SPQ48,
-          Quantize.SPQ64):
+print("A filter's scan cost at a byte budget is caps x ns/cap, and caps = budget / bytes per cap, so the")
+print("encodings compare by ns per stored byte: lower = cheaper to scan at equal memory.")
+print(f"{'encoding':8s} {'caps':>7s} {'B/cap':>6s} {'ms/query':>9s} {'ns/cap':>8s} {'ns/byte':>8s}")
+for q in (Quantize.TQ1, Quantize.TQ2, Quantize.TQ3, Quantize.TQ4, Quantize.TQ8, Quantize.SPQ12, Quantize.SPQ16,
+          Quantize.SPQ24, Quantize.SPQ36, Quantize.SPQ48, Quantize.SPQ64):
     f = CapCoverFilter(DIM, quantize=q, max_caps=N_CAPS)
     f.construct(X)
     f.query(Q[:1], 0.1)                                  # freeze: hands the caps to Rust
@@ -52,4 +54,5 @@ for q in (Quantize.TQ1, Quantize.TQ2, Quantize.TQ4, Quantize.TQ8, Quantize.SPQ16
         f.query(Q[i:i + 1], 0.1)
     s = (time.perf_counter() - t) / N_QUERIES
     n = f._num_caps
-    print(f"{q.value:8s} {n:7d} {1000 * s:9.3f} {1e9 * s / n:8.1f}", flush=True)
+    b = f.bytes_per_cap()
+    print(f"{q.value:8s} {n:7d} {b:6d} {1000 * s:9.3f} {1e9 * s / n:8.1f} {1e9 * s / n / b:8.2f}", flush=True)

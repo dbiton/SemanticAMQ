@@ -27,6 +27,24 @@ def _fits(dim: int, q: Quantize) -> bool:
 AUTO_CANDIDATES = (Quantize.SPQ12, Quantize.SPQ16, Quantize.SPQ24, Quantize.SPQ36, Quantize.SPQ48,
                    Quantize.SPQ64, Quantize.TQ2, Quantize.TQ3, Quantize.TQ4)
 
+# What scanning a cap costs, per stored byte, in nanoseconds: one query against
+# the Rust scan, one core of an Apple M-series laptop at d = 384 (a Threadripper
+# 3970X is 1.0-2x slower; CapCoverRustFilter/bench/ns_per_cap.py measures it).
+# A scan costs caps x ns/cap and caps = budget / bytes per cap, so at a byte
+# budget the cost is budget x this number. The TurboQuant rungs run through the
+# SIMD table scan; the seeded-PQ ones through codebook tables.
+SCAN_NS_PER_BYTE = {
+    Quantize.TQ4: 0.09, Quantize.TQ2: 0.10, Quantize.TQ3: 0.32, Quantize.SPQ64: 0.39, Quantize.SPQ48: 0.53,
+    Quantize.SPQ16: 0.58, Quantize.SPQ36: 0.63, Quantize.SPQ24: 0.94, Quantize.SPQ12: 1.89,
+}
+
+
+def _scan_limit_ms() -> Optional[float]:
+    """auto()'s default scan_limit_ms: env CAPCOVER_SCAN_LIMIT_MS (read in
+    worker processes too), else none."""
+    value = os.environ.get("CAPCOVER_SCAN_LIMIT_MS")
+    return float(value) if value else None
+
 
 class CapCoverFilter(_CapScanMixin, Filter):
     """Ball-Cover for unit-norm vectors, with spherical caps in place of
@@ -191,8 +209,19 @@ class CapCoverFilter(_CapScanMixin, Filter):
     @classmethod
     def auto(cls, dim: int, max_memory: int, **kwargs) -> "CapCoverFilter":
         """A filter that picks its encodings for the budget at construct()
-        (by accept-region volume, see _choose_mixed) among AUTO_CANDIDATES."""
+        (by accept-region volume, see _choose_mixed) among AUTO_CANDIDATES.
+
+        scan_limit_ms (default: env CAPCOVER_SCAN_LIMIT_MS, else none) drops the
+        candidates whose estimated query scan of a full budget, max_memory x
+        SCAN_NS_PER_BYTE, exceeds it: a coarse code stores more caps per byte
+        but can cost several times more to scan, which only matters where the
+        budget is large. If none is left the cheapest candidate is kept."""
         candidates = [q for q in kwargs.pop("candidates", AUTO_CANDIDATES) if _fits(dim, q)]
+        limit = kwargs.pop("scan_limit_ms", None)
+        limit = _scan_limit_ms() if limit is None else limit
+        if limit is not None:
+            cheap = [q for q in candidates if max_memory * SCAN_NS_PER_BYTE[q] / 1e6 <= limit]
+            candidates = cheap or [min(candidates, key=SCAN_NS_PER_BYTE.__getitem__)]
         return cls(dim, quantize=candidates, max_memory=max_memory, **kwargs)
 
     # ------------------------------------------------------------ properties

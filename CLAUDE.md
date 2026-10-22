@@ -44,7 +44,8 @@ classes run through pytest. Imports inside `src/` are top-level
 `src.`-prefixed.
 
 Full evaluation runs happen on a separate machine (Threadripper 3970X, 32 cores / 64 threads, 896 GB RAM,
-`MAX_WORKERS=60`, `WORKLOAD_NUM_VECTORS=100_000`). The local box (64 GB, 28 threads, i7-14700 with P/E cores)
+`MAX_WORKERS=30` (one per physical core, less two), `WORKLOAD_NUM_VECTORS=100_000`; paper.py times its throughput
+evaluation afterwards on 8 pinned cores). The local box (64 GB, 28 threads, i7-14700 with P/E cores)
 is for tests and single-cell validation. Size per-job memory against
 ~10 GB/job, not local RAM.
 
@@ -114,6 +115,11 @@ positionally against submission order (use `main.rows_for_mode`).
 `runner._build_calibrated_filter`. A filter that cannot fit its construct set
 in `max_memory` must raise `InsufficientMemoryError`; the equal-memory worker
 records it as an infeasible (NaN) row. Never ship an over-budget index.
+
+**Scan cost.** At a byte budget a query scan costs budget x ns/byte of the encoding
+(`cap_cover_filter.SCAN_NS_PER_BYTE`; measure with `CapCoverRustFilter/bench/ns_per_cap.py`):
+TurboQuant 0.1-0.3, seeded PQ 0.4-1.9. `CapCoverFilter.auto(scan_limit_ms=...)` (default: env
+`CAPCOVER_SCAN_LIMIT_MS`, set to 1.0 by paper.py) drops candidates above the limit.
 
 **Query bands.** FPR is also split by how related a query is to the indexed set: the
 cosine similarity to its nearest construct vector, in `runner.SIMILARITY_BANDS`

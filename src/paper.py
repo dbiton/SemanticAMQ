@@ -37,6 +37,9 @@ import sys
 # Must happen before numpy/faiss are imported (see main.py).
 for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_env_var, "1")
+# auto() drops the encodings that cost too much to scan at a large budget (see
+# CapCoverFilter.auto); read in the worker processes too.
+os.environ.setdefault("CAPCOVER_SCAN_LIMIT_MS", "1.0")
 
 from functools import partial
 
@@ -116,15 +119,15 @@ def check_datasets() -> None:
         raise SystemExit("cannot run the paper's evaluations:\n  " + "\n  ".join(problems))
 
 
-def generate_and_plot_all(out=None) -> None:
-    """Submit the paper's evaluations to one shared Runner, run them as one
-    shuffled batch (see main.generate_and_plot_all), then draw the figures.
-    Each generator is guarded so one failing to submit doesn't take down the
-    others."""
-    set_thresholds()
-    check_datasets()
-    runner = Runner(num_workers=main.MAX_WORKERS)
-    for generate in PAPER_GENERATORS:
+# The throughput evaluation times a filter against a flat index, so it runs after the
+# rest, alone, on a few cores each pinned to its own (runner._pin_to_own_core): timings
+# taken beside dozens of other jobs read several times too slow.
+E2E_WORKERS = 8
+
+
+def _submit_and_run(generators, num_workers) -> None:
+    runner = Runner(num_workers=num_workers)
+    for generate in generators:
         name = getattr(generate, "__name__", None) or generate.func.__name__
         try:
             generate(runner)
@@ -132,6 +135,19 @@ def generate_and_plot_all(out=None) -> None:
             logger.exception(f"{name} failed to submit")
     runner.shuffle()
     runner.run()
+
+
+def generate_and_plot_all(out=None) -> None:
+    """Run the paper's evaluations as one shuffled batch on main.MAX_WORKERS (see
+    main.generate_and_plot_all), then the throughput evaluation alone on E2E_WORKERS
+    pinned cores, then draw the figures. Each generator is guarded so one failing to
+    submit doesn't take down the others."""
+    set_thresholds()
+    check_datasets()
+    _submit_and_run([g for g in PAPER_GENERATORS if g is not generate_end_to_end], main.MAX_WORKERS)
+    logger.info("Main batch completed; timing the throughput evaluation.")
+    os.environ["CAPCOVER_PIN_CORES"] = str(E2E_WORKERS)
+    _submit_and_run([generate_end_to_end], E2E_WORKERS)
     logger.info("All submitted jobs completed.")
     plot_all(out=out)
 

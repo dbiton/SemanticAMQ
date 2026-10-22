@@ -47,12 +47,14 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 # The evaluation machine: AMD Ryzen Threadripper 3970X (32 cores / 64 threads), Ubuntu
-# 24.04, 896 GB RAM (paper.tex). Every job is single-threaded, and a job holds a few GB
-# at WORKLOAD_NUM_VECTORS = 100K, so threads, not memory, bound the pool: 60 workers
-# leave four threads for the coordinating process (which pickles each job's vectors
-# and writes the CSVs) and the OS. Timings under this load still want a pinned
-# sequential run, see CLAUDE.md.
-MAX_WORKERS = 60
+# 24.04, 896 GB RAM (paper.tex). Every job is single-threaded and holds a few GB at
+# WORKLOAD_NUM_VECTORS = 100K. One worker per physical core, less two for the
+# coordinating process (which pickles each job's vectors and writes the CSVs) and
+# the OS: 60 workers on 32 cores oversubscribed the SMT siblings and the memory
+# bandwidth, and inflated every timing (a quiet pinned core scans a cap in 1-2x
+# the time of a laptop core; a loaded run measured 5-10x). src/paper.py times its
+# throughput evaluation separately, on a few pinned cores.
+MAX_WORKERS = 30
 DATASET = 'ELI5'
 
 # Vectors/dataset, split 80% construction / 20% queries. One knob for every
