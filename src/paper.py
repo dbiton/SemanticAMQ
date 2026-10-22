@@ -121,6 +121,7 @@ def generate_and_plot_all(out=None) -> None:
     shuffled batch (see main.generate_and_plot_all), then draw the figures.
     Each generator is guarded so one failing to submit doesn't take down the
     others."""
+    set_thresholds()
     check_datasets()
     runner = Runner(num_workers=main.MAX_WORKERS)
     for generate in PAPER_GENERATORS:
@@ -140,9 +141,17 @@ def plot_all(figures=None, out=None, results=None) -> None:
     plot_figures(figures, results=results, out=out)
 
 
+def set_thresholds() -> None:
+    """The paper's thresholds (plots.plot_paper.PAPER_TAU_COS and PAPER_TAUS_COS, in
+    cosine distance) into main's L2 knobs, before anything is submitted."""
+    main.FIXED_TAU = E2E_TAU
+    main.BLOCKLIST_TAUS = list(E2E_TAUS)
+
+
 def configure(num_vectors=None, datasets=None, workers=None) -> None:
     """Overrides main's workload size, corpora and pool size (and the figures'
     corpora to match) before anything is submitted."""
+    set_thresholds()
     if num_vectors:
         main.WORKLOAD_NUM_VECTORS = num_vectors
     if workers:

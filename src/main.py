@@ -67,6 +67,12 @@ DATASET = 'ELI5'
 # error, and cap_cover_system_tau's non-wrapping folds need 1.8N rows.
 WORKLOAD_NUM_VECTORS = 100_000
 
+# The distance threshold (L2, unit vectors: tau^2 = 2 * cosine distance) at which every
+# fixed-threshold evaluation runs, and the grid of the blocklist's tau sweep.
+# src/paper.py overrides both for the paper's figures.
+FIXED_TAU = 0.1
+BLOCKLIST_TAUS = [float(t) for t in np.linspace(0.0, 0.4, 8)]
+
 BLOCKLIST_FOLDS = 5
 # The blocklist's query/construct split of WORKLOAD_NUM_VECTORS: one total
 # size, cut into a q query part and a (1-q) construct part, with
@@ -311,7 +317,7 @@ def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None) -
     num_vectors            = WORKLOAD_NUM_VECTORS
     dim                    = 384
     n_folds                = 5
-    tau                    = 0.1
+    tau                    = FIXED_TAU
     # Log-spaced, not linear: the baselines' feasibility floors span more
     # than a decade below this range's top (IVF-PQ ~0.6%, quantized-point-set
     # RaBitQ ~3.6%, of raw storage at n=100K/dim=384 -- HNSW's ~30% floor
@@ -695,7 +701,7 @@ def generate_blocklist(runner: Runner) -> None:
     # by tau=0.3, so the bulk of that range carried no information. All the
     # structure is in [0, 0.4], and 8 points resolve it while leaving just
     # enough flat tail to show the saturation.
-    tau_values       = [float(t) for t in np.linspace(0.0, 0.4, 8)]
+    tau_values       = list(BLOCKLIST_TAUS)
     n_folds          = BLOCKLIST_FOLDS
 
     for workload in blocklist_workloads(num_vectors, n_folds=n_folds):
@@ -756,7 +762,7 @@ def generate_budget(runner: Runner) -> None:
     num_vectors     = WORKLOAD_NUM_VECTORS
     n_folds         = BLOCKLIST_FOLDS
     k_percentages   = [5, 7.5, 10, 12.5, 15, 17.5, 20]  # ball budget k, as a percentage of |B|
-    tau             = 0.1
+    tau             = FIXED_TAU
 
     k_fractions = [p / 100.0 for p in k_percentages]
 
@@ -794,7 +800,7 @@ def generate_cap_quantization(runner: Runner, k_values_nominal: Optional[List[in
     dim              = 384
     n_folds          = BLOCKLIST_FOLDS
     k_values_nominal = k_values_nominal or [2 ** i for i in range(11, 17)]
-    tau              = 0.1
+    tau              = FIXED_TAU
 
     workloads = blocklist_workloads(num_vectors, n_folds=n_folds)
     if not workloads:
@@ -1138,7 +1144,7 @@ def generate_streaming(runner: Runner, construct_methods: Optional[List[str]] = 
     # The fixed absolute tau generate_budget/generate_quantization/
     # generate_equal_memory use, so every blocklist-workload evaluation sits
     # at the same operating point.
-    tau                = 0.1
+    tau                = FIXED_TAU
     k_fraction         = 0.1  # generate_blocklist's fixed ball budget, as a fraction of |B|
     bootstrap_fraction = 0.5  # of B built by construct() before insert() takes over
     n_checkpoints      = 12
@@ -1256,7 +1262,7 @@ def generate_construct_methods(runner: Runner) -> None:
     dim         = 384
     num_vectors = WORKLOAD_NUM_VECTORS
     n_folds     = BLOCKLIST_FOLDS
-    tau         = 0.1
+    tau         = FIXED_TAU
     # k as a fraction of |B|, log-spaced from 0.5% to 20%. The top of the
     # range is generate_budget's; the bottom extends it into the budgets where
     # every ball is wide, which is where the construction method matters most.

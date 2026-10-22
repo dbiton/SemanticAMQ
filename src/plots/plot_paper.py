@@ -111,9 +111,18 @@ QUANT_TOP_N = 5
 # End-to-end throughput (src/paper.py generates exactly these cells): the filter
 # in front of a flat index vs the index alone. The tau panel fixes the budget,
 # the memory and K panels fix tau; the budget sweep is shared by those two.
-E2E_TAU = 0.1
+PAPER_TAU_COS = 0.02                                          # cosine distance (similarity 0.98)
+PAPER_TAUS_COS = (0.005, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2)    # the tau sweeps, same unit
+
+
+def l2_threshold(cosine_dist):
+    """The L2 threshold of unit vectors at this cosine distance (the filters and CSVs use L2)."""
+    return float(np.sqrt(2.0 * cosine_dist))
+
+
+E2E_TAU = l2_threshold(PAPER_TAU_COS)
 E2E_K_FRACTION = 0.1
-E2E_TAUS = (0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4)
+E2E_TAUS = tuple(l2_threshold(t) for t in PAPER_TAUS_COS)
 E2E_K_FRACTIONS = (0.005, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2)
 
 # Construction methods shown (CSV key -> label, color, marker, linestyle).
