@@ -283,7 +283,8 @@ def stratified_calibration_split(
             labels[calibration_idx].tolist(), labels[measurement_idx].tolist())
 
 
-def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None) -> None:
+def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None, n_folds: int = 5,
+                          count_memory_steps: int = 16) -> None:
     """Equal-memory (SOTA) comparison across equal_memory_filters. Sweeps
     count_memory_steps budgets from 10% to 100% of raw storage (storing the
     construct set as a plain list of float32 vectors, dim*4 bytes each) in
@@ -305,7 +306,8 @@ def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None) -
     flat percentage_calibration split of one dataset.
 
     filters narrows the compared set (default equal_memory_filters; CapCoverFilter
-    is always submitted).
+    is always submitted). n_folds and count_memory_steps (log-spaced budgets) scale the
+    sweep down for a smaller run.
 
     Runs over every blocklist corpus and fold; plot_equal_memory pools all of
     them into one line per filter at each memory budget, so -- like
@@ -318,7 +320,6 @@ def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None) -
     equal_memory_csv()), mirroring cap_quantization_csv/CAP_QUANTIZATION_DIR."""
     num_vectors            = WORKLOAD_NUM_VECTORS
     dim                    = 384
-    n_folds                = 5
     tau                    = FIXED_TAU
     # Log-spaced, not linear: the baselines' feasibility floors span more
     # than a decade below this range's top (IVF-PQ ~0.6%, quantized-point-set
@@ -328,7 +329,6 @@ def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None) -
     # and barely resolve the first two floors. 17 steps over this range's
     # 2 decades is ~8 points/decade, matching the resolution the wider
     # sweep used.
-    count_memory_steps     = 16
     # Sweep bounds, as a fraction of raw_storage_bytes (see below).
     min_memory_fraction    = 0.001
     max_memory_fraction    = 0.10

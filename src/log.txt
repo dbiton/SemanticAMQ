@@ -1,0 +1,4 @@
+2026-10-24 18:10:45 [INFO] datasets: PyTorch version 2.5.1+cu118 available.
+2026-10-24 18:10:45 [INFO] datasets: TensorFlow version 2.18.0 available.
+2026-10-24 18:10:50 [WARNING] tensorflow: From C:\Users\User\AppData\Local\Programs\Python\Python312\Lib\site-packages\tf_keras\src\losses.py:2976: The name tf.losses.sparse_softmax_cross_entropy is deprecated. Please use tf.compat.v1.losses.sparse_softmax_cross_entropy instead.
+
