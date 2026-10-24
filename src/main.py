@@ -1082,7 +1082,7 @@ def plot_scaling(df_query: pd.DataFrame, df_insert: pd.DataFrame, df_constructio
 
 
 def generate_streaming(runner: Runner, construct_methods: Optional[List[str]] = None,
-                       k_sweep: bool = True) -> None:
+                       k_sweep: bool = True, bootstrap_fraction: float = 0.5) -> None:
     """The paper's "dynamic evaluation" (Section 5.1/5.4, Figure 4): compares
     CapCoverFilter's insertion strategies (CAP_INSERT_STRATEGIES --
     cap_merge/nearest) via
@@ -1133,6 +1133,9 @@ def generate_streaming(runner: Runner, construct_methods: Optional[List[str]] = 
     construct_methods narrows the position sweep to those constructors and
     k_sweep=False skips panel (c)'s k sweep (src/paper.py needs neither).
 
+    bootstrap_fraction is the share of B built by construct(); the rest is the insert
+    stream, so it sets how far the set outgrows the fixed budget k.
+
     Only submits 'stream_rebuild' jobs -- does not run `runner`. Each corpus
     writes its own results/streaming/<dataset>/streaming.csv (see
     streaming_csv()), mirroring cap_quantization_csv/CAP_QUANTIZATION_DIR."""
@@ -1152,7 +1155,6 @@ def generate_streaming(runner: Runner, construct_methods: Optional[List[str]] = 
     # at the same operating point.
     tau                = FIXED_TAU
     k_fraction         = 0.1  # generate_blocklist's fixed ball budget, as a fraction of |B|
-    bootstrap_fraction = 0.5  # of B built by construct() before insert() takes over
     n_checkpoints      = 12
 
     workloads = blocklist_workloads(num_vectors, n_folds=n_folds)

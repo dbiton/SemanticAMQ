@@ -58,7 +58,7 @@ def table(q: pd.DataFrame) -> str:
     out = [f"{BS}begin{{tabular}}{{@{{}}lr" + "r" * len(budgets) + "r@{}}", f"{BS}toprule",
            f"& & {BS}multicolumn{{{len(budgets)}}}{{c}}{{Memory budget ({BS}% of raw)}} & {BS*2}",
            f"{BS}cmidrule(lr){{3-{2 + len(budgets)}}}",
-           "Encoding & b/dim & " + " & ".join(f"{b:.1f}" for b in budgets) + f" & q/s {BS*2}", f"{BS}midrule"]
+           "Encoding & b/dim & " + " & ".join(f"{b:g}" for b in budgets) + f" & q/s {BS*2}", f"{BS}midrule"]
     for r, name in rows:
         cells = []
         for b in budgets:

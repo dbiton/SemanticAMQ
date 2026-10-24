@@ -82,7 +82,10 @@ def generate_end_to_end(runner: Runner) -> None:
             )
 
 
-PAPER_K_LADDER = [2 ** i for i in range(11, 17)]    # main.generate_cap_quantization's: 2.6-82% of |B| = 80,000
+# Budgets of the quantization comparison, as % of the raw index (k FP32 caps / |B|): the
+# range the equal-memory comparison covers. Above ~10% every encoding has converged.
+PAPER_BUDGET_PCT = (0.1, 0.2, 0.5, 1, 2, 5, 10)
+PAPER_K_LADDER = [round(pct / 100 * 80_000) for pct in PAPER_BUDGET_PCT]    # k at |B| = 80,000
 
 
 # The encodings the quantization table compares: the full-precision, scalar and
@@ -101,12 +104,17 @@ def generate_quantization(runner: Runner) -> None:
                               quantizes=PAPER_QUANTIZE)
 
 
+# The stream is the rest of B: 80% bootstrap leaves inserts = 20% of |B| (16,000 at 100K) against a
+# budget k = 10% of |B|. At 50% the set doubled, and every method saturated at FPR 1.
+STREAM_BOOTSTRAP_FRACTION = 0.8
+
 PAPER_GENERATORS = (
     generate_blocklist,
     generate_budget,
     generate_quantization,
     generate_construct_methods,
-    partial(generate_streaming, construct_methods=[STREAM_BOOTSTRAP], k_sweep=False),
+    partial(generate_streaming, construct_methods=[STREAM_BOOTSTRAP], k_sweep=False,
+            bootstrap_fraction=STREAM_BOOTSTRAP_FRACTION),
     partial(generate_equal_memory, filters=PAPER_EQUAL_MEMORY_FILTERS),
     generate_end_to_end,
 )
