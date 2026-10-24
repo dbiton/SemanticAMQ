@@ -13,6 +13,10 @@ plots/plot_paper.py's figures (written to suggestions/figures/).
       --workers N        parallel jobs (main.MAX_WORKERS)
       --out DIR          figure folder (default suggestions/figures)
       --results DIR      (plot) read the CSVs from DIR instead of results/
+      --only A,B,..      generate just these evaluations (names: see GENERATORS); default all
+      --ablation-vectors N / --ablation-folds N     size of the ablation workloads (default 20,000 / 3)
+      --backend-vectors N / --backend-datasets A,B  size and corpora of the backend timing (default
+                                                    --num-vectors / all five)
     A smaller or different run needs a copy of the repo without results/ (generators
     truncate their CSVs -- see CLAUDE.md), e.g. a git worktree with datasets/ linked in.
 
@@ -29,6 +33,12 @@ main.py run write the same files -- and truncate them, see CLAUDE.md):
                                                            the two figures show: zero-FN FPR on
                                                            every corpus, FPR/FNR of the rest on one)
     throughput    end_to_end.csv                           generate_end_to_end (defined here)
+    ablation      ablation.csv                             generate_ablation: cap vs ball accept rule, construction,
+                                                           encoding, codes, sphere-merge t and p, selection delta
+    backends      backends.csv                             generate_backends: filter in front of flat/HNSW/IVF,
+                                                           per-query latency (pinned, sequential)
+    timing        timing.csv                               generate_timing: construction and per-arrival insert
+                                                           time (pinned, sequential)
 
 Not generated: scaling, cap_cover_system_tau, query_performance and the
 construct-method scale run, which no paper figure reads.
@@ -48,11 +58,12 @@ from functools import partial
 import main
 from runner import CAP_QUANTIZATION_SWEEP
 from filters.cap_cover.cap_quantizers import Quantize
+from runner import ABLATION_DELTAS
 from main import (Runner, CAP_COVER_CONSTRUCT, BLOCKLIST_FOLDS, blocklist_workloads, equal_memory_filters, logger,
                   generate_blocklist, generate_budget, generate_cap_quantization,
                   generate_construct_methods, generate_streaming, generate_equal_memory)
 from plots.plot_paper import (plot_figures, use_corpora, CONFIG_TO_METHOD, EQUAL_MEMORY_HIDDEN, STREAM_BOOTSTRAP,
-                              E2E_TAU, E2E_K_FRACTION, E2E_TAUS, E2E_K_FRACTIONS)
+                              E2E_TAU, E2E_K_FRACTION, E2E_TAUS, E2E_K_FRACTIONS, PAPER_TAUS_COS)
 
 assert STREAM_BOOTSTRAP == CAP_COVER_CONSTRUCT, "the streaming figure bootstraps with the paper's construct method"
 
@@ -83,6 +94,59 @@ def generate_end_to_end(runner: Runner) -> None:
             )
 
 
+ABLATION_CSV = "results/ablation.csv"
+BACKENDS_CSV = "results/backends.csv"
+TIMING_CSV = "results/timing.csv"
+
+# The ablation builds ~16 covers per (corpus, fold, budget), so it runs on smaller workloads than
+# the rest: ABLATION_NUM_VECTORS vectors per corpus (80% reference, 20% queries) and ABLATION_FOLDS folds.
+ABLATION_NUM_VECTORS = 20_000
+ABLATION_FOLDS = 3
+ABLATION_K_FRACTIONS = (0.02, 0.1)
+# The backend timing and the pinned construction/insertion timing: None = main.WORKLOAD_NUM_VECTORS.
+BACKEND_NUM_VECTORS = None
+BACKEND_DATASETS = None            # None = all of main.BLOCKLIST_DATASETS
+BACKEND_K_FRACTION = 0.1
+TIMING_NUM_VECTORS = 10_000
+TIMING_DATASET = "WikiAnswers"
+
+
+def generate_ablation(runner: Runner) -> None:
+    """The ablation table's data (runner.ablation_worker): per corpus, fold and budget, the
+    paper's configuration, its one-choice-at-a-time variants and the ball accept rules over its
+    own cover, at every cosine distance in ABLATION_DELTAS. Only submits 'ablation' jobs."""
+    for workload in blocklist_workloads(ABLATION_NUM_VECTORS, n_folds=ABLATION_FOLDS):
+        for fold, sel in enumerate(workload.selections):
+            reference, queries = workload.rows(sel["reference"]), workload.query_vectors(sel)
+            for kf in ABLATION_K_FRACTIONS:
+                runner.submit('ablation', output_csv=ABLATION_CSV, dim=384, dataset=workload.plot_key,
+                              seed=fold, k_fraction=kf, vectors_reference=reference, vectors_query=queries,
+                              deltas=ABLATION_DELTAS)
+
+
+def generate_backends(runner: Runner) -> None:
+    """The filter in front of flat / HNSW / IVF backends (runner.backend_latency_worker): one
+    fold per corpus at k = BACKEND_K_FRACTION |B|. Timed, so it runs alone on one pinned core
+    (generate_and_plot_all). Only submits 'backend_latency' jobs."""
+    n = BACKEND_NUM_VECTORS or main.WORKLOAD_NUM_VECTORS
+    for workload in blocklist_workloads(n, n_folds=1):
+        if BACKEND_DATASETS and workload.name not in BACKEND_DATASETS:
+            continue
+        sel = workload.selections[0]
+        runner.submit('backend_latency', output_csv=BACKENDS_CSV, dim=384, dataset=workload.plot_key,
+                      seed=0, k_fraction=BACKEND_K_FRACTION, deltas=PAPER_TAUS_COS,
+                      vectors_reference=workload.rows(sel["reference"]),
+                      vectors_query=workload.query_vectors(sel))
+
+
+def generate_timing(runner: Runner) -> None:
+    """Construction time per method and per-arrival insertion time per strategy
+    (runner.pinned_timing_worker) on TIMING_DATASET. Timed: one pinned core, alone."""
+    for workload in blocklist_workloads(TIMING_NUM_VECTORS, n_folds=1, only=TIMING_DATASET):
+        runner.submit('pinned_timing', output_csv=TIMING_CSV, dim=384, dataset=workload.plot_key,
+                      vectors_reference=workload.rows(workload.selections[0]["reference"]))
+
+
 # Budgets of the quantization comparison, as % of the raw index (k FP32 caps / |B|): the
 # range the equal-memory comparison covers. Above ~10% every encoding has converged.
 PAPER_BUDGET_PCT = (0.1, 0.2, 0.5, 1, 2, 5, 10)
@@ -109,16 +173,22 @@ def generate_quantization(runner: Runner) -> None:
 # budget k = 10% of |B|. At 50% the set doubled, and every method saturated at FPR 1.
 STREAM_BOOTSTRAP_FRACTION = 0.8
 
-PAPER_GENERATORS = (
-    generate_blocklist,
-    generate_budget,
-    generate_quantization,
-    generate_construct_methods,
-    partial(generate_streaming, construct_methods=[STREAM_BOOTSTRAP], k_sweep=False,
-            bootstrap_fraction=STREAM_BOOTSTRAP_FRACTION),
-    partial(generate_equal_memory, filters=PAPER_EQUAL_MEMORY_FILTERS),
-    generate_end_to_end,
-)
+GENERATORS = {
+    "blocklist": generate_blocklist,
+    "budget": generate_budget,
+    "quantization": generate_quantization,
+    "construction": generate_construct_methods,
+    "streaming": partial(generate_streaming, construct_methods=[STREAM_BOOTSTRAP], k_sweep=False,
+                         bootstrap_fraction=STREAM_BOOTSTRAP_FRACTION),
+    "equal-memory": partial(generate_equal_memory, filters=PAPER_EQUAL_MEMORY_FILTERS),
+    "ablation": generate_ablation,
+    "end-to-end": generate_end_to_end,
+    "backends": generate_backends,
+    "timing": generate_timing,
+}
+# Evaluations that time something: run after the rest, alone, one at a time (see generate_and_plot_all).
+TIMED = ("end-to-end", "backends", "timing")
+PAPER_GENERATORS = tuple(GENERATORS.values())
 
 
 def check_datasets() -> None:
@@ -158,19 +228,32 @@ def _submit_and_run(generators, num_workers) -> None:
     runner.run()
 
 
-def generate_and_plot_all(out=None) -> None:
+def generate_and_plot_all(out=None, only=None) -> None:
     """Run the paper's evaluations as one shuffled batch on main.MAX_WORKERS (see
     main.generate_and_plot_all), then the throughput evaluation alone on E2E_WORKERS
-    pinned cores, then draw the figures. Each generator is guarded so one failing to
-    submit doesn't take down the others."""
+    pinned cores, then the backend and construction/insertion timings sequentially on
+    one pinned core, then draw the figures. Each generator is guarded so one failing
+    to submit doesn't take down the others. `only` names the GENERATORS to run."""
     set_thresholds()
+    names = list(only) if only else list(GENERATORS)
+    unknown = [n for n in names if n not in GENERATORS]
+    if unknown:
+        raise SystemExit(f"unknown evaluation(s) {unknown}; choose from {sorted(GENERATORS)}")
     check_datasets()
-    _submit_and_run([g for g in PAPER_GENERATORS if g is not generate_end_to_end], main.MAX_WORKERS)
-    logger.info("Main batch completed; timing the throughput evaluation.")
-    os.environ["CAPCOVER_PIN_CORES"] = str(E2E_WORKERS)
-    _submit_and_run([generate_end_to_end], E2E_WORKERS)
+    batch = [GENERATORS[n] for n in names if n not in TIMED]
+    if batch:
+        _submit_and_run(batch, main.MAX_WORKERS)
+        logger.info("Main batch completed; timing the throughput evaluation.")
+    if "end-to-end" in names:
+        os.environ["CAPCOVER_PIN_CORES"] = str(E2E_WORKERS)
+        _submit_and_run([generate_end_to_end], E2E_WORKERS)
+    sequential = [GENERATORS[n] for n in ("backends", "timing") if n in names]
+    if sequential:
+        os.environ["CAPCOVER_PIN_CORES"] = "1"
+        _submit_and_run(sequential, 1)
     logger.info("All submitted jobs completed.")
-    plot_all(out=out)
+    if not only:
+        plot_all(out=out)
 
 
 def plot_all(figures=None, out=None, results=None) -> None:
@@ -185,14 +268,25 @@ def set_thresholds() -> None:
     main.BLOCKLIST_TAUS = list(E2E_TAUS)
 
 
-def configure(num_vectors=None, datasets=None, workers=None) -> None:
+def configure(num_vectors=None, datasets=None, workers=None, ablation_vectors=None, ablation_folds=None,
+              backend_vectors=None, backend_datasets=None) -> None:
     """Overrides main's workload size, corpora and pool size (and the figures'
-    corpora to match) before anything is submitted."""
+    corpora to match), and the ablation's and backend timing's own sizes, before
+    anything is submitted."""
+    global ABLATION_NUM_VECTORS, ABLATION_FOLDS, BACKEND_NUM_VECTORS, BACKEND_DATASETS
     set_thresholds()
     if num_vectors:
         main.WORKLOAD_NUM_VECTORS = num_vectors
     if workers:
         main.MAX_WORKERS = workers
+    if ablation_vectors:
+        ABLATION_NUM_VECTORS = ablation_vectors
+    if ablation_folds:
+        ABLATION_FOLDS = ablation_folds
+    if backend_vectors:
+        BACKEND_NUM_VECTORS = backend_vectors
+    if backend_datasets:
+        BACKEND_DATASETS = list(backend_datasets)
     if datasets:
         unknown = [d for d in datasets if d not in main.dataset_filenames]
         if unknown:
@@ -203,7 +297,9 @@ def configure(num_vectors=None, datasets=None, workers=None) -> None:
 
 
 def _parse(argv):
-    opts = {"--num-vectors": None, "--datasets": None, "--workers": None, "--out": None, "--results": None}
+    opts = {"--num-vectors": None, "--datasets": None, "--workers": None, "--out": None, "--results": None,
+            "--only": None, "--ablation-vectors": None, "--ablation-folds": None, "--backend-vectors": None,
+            "--backend-datasets": None}
     rest = []
     it = iter(argv)
     for arg in it:
@@ -216,12 +312,17 @@ def _parse(argv):
     return opts, rest
 
 
+def _int(value):
+    return int(value) if value else None
+
+
 if __name__ == "__main__":
     opts, rest = _parse(sys.argv[1:])
-    configure(int(opts["--num-vectors"]) if opts["--num-vectors"] else None,
-              opts["--datasets"].split(",") if opts["--datasets"] else None,
-              int(opts["--workers"]) if opts["--workers"] else None)
+    configure(_int(opts["--num-vectors"]), opts["--datasets"].split(",") if opts["--datasets"] else None,
+              _int(opts["--workers"]), _int(opts["--ablation-vectors"]), _int(opts["--ablation-folds"]),
+              _int(opts["--backend-vectors"]),
+              opts["--backend-datasets"].split(",") if opts["--backend-datasets"] else None)
     if rest[:1] == ["plot"]:
         plot_all(rest[1:], opts["--out"], opts["--results"])
     else:
-        generate_and_plot_all(opts["--out"])
+        generate_and_plot_all(opts["--out"], opts["--only"].split(",") if opts["--only"] else None)
