@@ -23,13 +23,13 @@ BS = chr(92)     # LaTeX backslash
 DELTA = 0.02
 # variant -> (component, label); first of each component is the paper's configuration
 ABLATION_ROWS = [
-    ("full", "Accept rule", "cap (paper)"),
+    ("full", "Rule", "cap (paper)"),
     ("ball_sphere", "", "ball at the cap direction"),
     ("ball_meb", "", "ball, minimum enclosing"),
-    ("full", "Construction", "sphere merge (paper)"),
+    ("full", "Build", "sphere merge (paper)"),
     ("minimax", "", "minimax"),
     ("gonzalez", "", "Gonzalez"),
-    ("full", "Encoding", "auto (paper)"),
+    ("full", "Enc.", "auto (paper)"),
     ("tq_only", "", "TurboQuant rungs only"),
     ("spq_only", "", "seeded-PQ rungs only"),
     ("tq4_fixed", "", "TQ4 only"),
@@ -141,9 +141,8 @@ def backends_table(b: pd.DataFrame, delta: float = DELTA) -> str:
         f = d.iloc[0]
         out.append(f"{BS}midrule")
         n_ref = f"{int(f.n_reference):,}".replace(",", "{,}")
-        out.append(f"{BS}multicolumn{{6}}{{@{{}}l}}{{{DATASET_ABBR[ds]}, {n_ref} indexed: filter "
-                   f"{f.filter_mean_ms:.2f} ms (p99 {f.filter_p99_ms:.2f}), {f.filter_bytes / 1e6:.2f} MB, "
-                   f"{f.filter_build_s:.0f} s build, accepts {f.accept_rate_all_pct:.0f}{BS}%}} {BS*2}")
+        out.append(f"{BS}multicolumn{{6}}{{@{{}}l}}{{{DATASET_ABBR[ds]} ({n_ref}): filter "
+                   f"{f.filter_mean_ms:.2f} ms, p99 {f.filter_p99_ms:.2f}, accepts {f.accept_rate_all_pct:.0f}{BS}%}} {BS*2}")
         for backend in ("flat", "hnsw", "ivf"):
             r = d[d.backend == backend]
             if r.empty:
