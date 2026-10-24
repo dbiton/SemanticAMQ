@@ -71,6 +71,8 @@ def ablation_table(d: pd.DataFrame) -> str:
            f"Component & Variant & FPR & {BS}multicolumn{{1}}{{c}}{{$\\Delta$}} & FPR & {BS}multicolumn{{1}}{{c}}{{$\\Delta$}} {BS*2}",
            f"{BS}midrule"]
     for i, (arm, comp, label) in enumerate(ABLATION_ROWS):
+        if arm not in set(d.arm):          # a variant the CSV predates
+            continue
         if comp and i:
             out.append(f"{BS}addlinespace[2pt]")
         cells = []
@@ -132,25 +134,22 @@ DATASET_ABBR = {"wildchat": "WildChat", "quora": "Quora", "wikianswers": "WikiAn
 
 def latency_table(b: pd.DataFrame, delta: float = DELTA) -> str:
     """One row per corpus: the filter's cost per query (mean, p99) and acceptance, the flat
-    index's lookup cost (mean, p99), the break-even lookup cost, and the throughput gain of the
+    index's mean lookup cost, the break-even lookup cost, and the throughput gain of the
     filtered system. `gain` is negative where the filter costs more than it saves."""
     g = b[np.isclose(b.delta, delta)]
-    out = [f"{BS}begin{{tabular}}{{@{{}}lrrrrrrr@{{}}}}", f"{BS}toprule",
-           f"& {BS}multicolumn{{3}}{{c}}{{Filter}} & {BS}multicolumn{{2}}{{c}}{{Flat lookup}} & & {BS*2}",
-           f"{BS}cmidrule(lr){{2-4}}{BS}cmidrule(lr){{5-6}}",
-           f"Corpus & ms & p99 & accepts {BS}% & ms & p99 & break-even ms & gain {BS}% {BS*2}", f"{BS}midrule"]
+    out = [f"{BS}begin{{tabular}}{{@{{}}lrrrrrr@{{}}}}", f"{BS}toprule",
+           f"& {BS}multicolumn{{3}}{{c}}{{Filter}} & {BS}multicolumn{{3}}{{c}}{{Flat index}} {BS*2}",
+           f"{BS}cmidrule(lr){{2-4}}{BS}cmidrule(lr){{5-7}}",
+           f"Corpus & ms & p99 & accepts {BS}% & lookup ms & break-even ms & gain {BS}% {BS*2}", f"{BS}midrule"]
     for ds in [x for x in DATASET_ABBR if x in set(g.dataset)]:
         r = g[g.dataset == ds].iloc[0]
         fmt = ",.1f" if abs(r.throughput_improvement_pct) < 10 else ",.0f"
         gain = f"{r.throughput_improvement_pct:{fmt}}".replace(",", "{,}").replace("-", BS + "textminus ")
         be = "--" if not np.isfinite(r.breakeven_backend_ms) else f"{r.breakeven_backend_ms:.2f}"
-        n_ref = f"{int(r.n_reference):,}".replace(",", "{,}")
-        out.append(f"{DATASET_ABBR[ds]} ({n_ref}) & {r.filter_mean_ms:.2f} & {r.filter_p99_ms:.2f} & "
-                   f"{r.accept_rate_all_pct:.0f} & {r.backend_mean_ms:.2f} & {r.backend_p99_ms:.2f} & {be} & {gain} {BS*2}")
+        out.append(f"{DATASET_ABBR[ds]} ({r.n_reference / 1000:g}K) & {r.filter_mean_ms:.2f} & {r.filter_p99_ms:.2f} & "
+                   f"{r.accept_rate_all_pct:.0f} & {r.backend_mean_ms:.2f} & {be} & {gain} {BS*2}")
     out += [f"{BS}bottomrule", f"{BS}end{{tabular}}"]
-    return "
-".join(out) + "
-"
+    return "\n".join(out) + "\n"
 
 
 def timing_table(t: pd.DataFrame) -> str:

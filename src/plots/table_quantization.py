@@ -90,8 +90,7 @@ def write(results: Path, out: Path) -> None:
         t = pd.read_csv(timing)
         t = t[t.kind == "scan"] if "kind" in t else t.iloc[0:0]
         if len(t):
-            pct = float(t.budget_pct.iloc[0])
-            qps, label = t.groupby("method").qps.median().to_dict(), f"q/s at {pct:g}{BS}%"
+            qps = t.groupby("method").qps.median().to_dict()      # measured at pct % of raw: the caption says which
     tex = table(pd.concat([pd.read_csv(p) for p in paths], ignore_index=True), qps, label)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(tex, encoding="utf-8")

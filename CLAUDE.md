@@ -56,7 +56,7 @@ src/main.py            evaluation definitions: generate_*/save_*/plot_* per eval
                        generate_and_plot_all() and plot_all()
 src/paper.py           paper.tex's data + figures only (subset of main.py's evaluations, trimmed to
                        what each figure reads); `python src/paper.py [plot]`. Figures: plots/plot_paper.py
-                       `--only a,b` runs a subset (GENERATORS); also ablation, backends (HNSW/IVF latency) and timing;
+                       `--only a,b` runs a subset (GENERATORS); also ablation, latency (filter in front of the flat index) and timing;
                        tables: plots/tables_paper.py; reduced-scale driver: suggestions/run_reduced_batch.py
 src/runner.py          Runner (ProcessPoolExecutor job harness), one *_worker per mode,
                        filter registries, calibration/tuning of baseline dials
@@ -67,7 +67,7 @@ src/filters/cap_cover/
   cap_interfaces.py    ConstructInterface / InsertInterface strategy ABCs
   cap_geometry.py      cap measure / angle helpers
   *_construct.py       construction strategies (gonzalez [file: gonzales_construct.py],
-                       minimax, sphere_merge)
+                       minimax, sphere_merge, soft_anneal = sphere merge + annealed refinement, ~5-13x the cost)
   *_insert.py          dynamic-insertion strategies (nearest, cap_merge)
   (CAP_COVER_EXPERIMENTS.md at the repo root: what was tried on CapCoverFilter and why variants were removed)
   cap_scan.py          query() path: accept-rule constants (_beta) and the bridge to the
@@ -167,6 +167,9 @@ true distance at tau, never by which sampling stratum a query came from.
 - **Timings need pinning.** Construction timings measured under many workers
   read 3-14x slow; unpinned runs vary 1.5-2x from E-core scheduling. For timing
   claims run sequentially with `psutil.Process().cpu_affinity([0])`.
+- **Never `git worktree remove` a worktree whose `datasets/` is a junction or symlink to the repo's.** On Windows it deleted
+  the repo's own `datasets/` contents once (they are not recoverable here: only 100K-row copies of 9 corpora exist elsewhere).
+  Copy the one or two files a throwaway worktree needs instead, or `rmdir` the link first.
 - **Outputs are gitignored** (`/results/`, `/plots/**` except `.gitkeep`,
   `*.csv`, `*.png`, `*.npz`, `*.npy`). When reporting a result, say which file
   it lives in; scratchpad files are temporary.
