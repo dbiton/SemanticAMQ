@@ -5,7 +5,7 @@ results/ CSVs (src/paper.py generates them):
     ablation-table.tex       tab:ablation       ablation.csv   FPR of each variant at delta = 0.02
     sensitivity-table.tex    tab:sensitivity    ablation.csv   change in FPR when the cover is built for another
                                                                threshold / sphere-merge parameter
-    backends-table.tex       tab:backends       backends.csv   the filter in front of flat / HNSW / IVF
+    latency-table.tex        tab:latency        latency.csv    the filter in front of the flat index
     timing-table.tex         tab:timing         timing.csv     construction and per-arrival insertion time
     jtau-correlation.csv     (text)             ablation.csv   rank correlation of J_tau with FPR across variants
 
@@ -29,6 +29,7 @@ ABLATION_ROWS = [
     ("full", "Build", "sphere merge (paper)"),
     ("minimax", "", "minimax"),
     ("gonzalez", "", "Gonzalez"),
+    ("soft_anneal", "", "sphere merge + soft anneal"),
     ("full", "Enc.", "auto (paper)"),
     ("tq_only", "", "TurboQuant rungs only"),
     ("spq_only", "", "seeded-PQ rungs only"),
@@ -125,38 +126,31 @@ def jtau_correlation(d: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-BACKEND_LABEL = {"flat": "flat (range search)", "hnsw": "HNSW", "ivf": "IVF-Flat"}
 DATASET_ABBR = {"wildchat": "WildChat", "quora": "Quora", "wikianswers": "WikiAnswers",
                 "chatgpt_paraphrases": "ChatGPT-Para.", "ccnews": "CC-News"}
 
 
-def backends_table(b: pd.DataFrame, delta: float = DELTA) -> str:
-    """One block per corpus: the filter's own cost and acceptance, then each backend's lookup
-    cost (mean, p99), build time, size, and the throughput gain the filter gives in front of it."""
+def latency_table(b: pd.DataFrame, delta: float = DELTA) -> str:
+    """One row per corpus: the filter's cost per query (mean, p99) and acceptance, the flat
+    index's lookup cost (mean, p99), the break-even lookup cost, and the throughput gain of the
+    filtered system. `gain` is negative where the filter costs more than it saves."""
     g = b[np.isclose(b.delta, delta)]
-    out = [f"{BS}begin{{tabular}}{{@{{}}lrrrrr@{{}}}}", f"{BS}toprule",
-           f"Backend & lookup ms & p99 ms & build s & MB & gain {BS}% {BS*2}"]
+    out = [f"{BS}begin{{tabular}}{{@{{}}lrrrrrrr@{{}}}}", f"{BS}toprule",
+           f"& {BS}multicolumn{{3}}{{c}}{{Filter}} & {BS}multicolumn{{2}}{{c}}{{Flat lookup}} & & {BS*2}",
+           f"{BS}cmidrule(lr){{2-4}}{BS}cmidrule(lr){{5-6}}",
+           f"Corpus & ms & p99 & accepts {BS}% & ms & p99 & break-even ms & gain {BS}% {BS*2}", f"{BS}midrule"]
     for ds in [x for x in DATASET_ABBR if x in set(g.dataset)]:
-        d = g[g.dataset == ds]
-        f = d.iloc[0]
-        out.append(f"{BS}midrule")
-        n_ref = f"{int(f.n_reference):,}".replace(",", "{,}")
-        out.append(f"{BS}multicolumn{{6}}{{@{{}}l}}{{{DATASET_ABBR[ds]} ({n_ref}): filter "
-                   f"{f.filter_mean_ms:.2f} ms, p99 {f.filter_p99_ms:.2f}, accepts {f.accept_rate_all_pct:.0f}{BS}%}} {BS*2}")
-        for backend in ("flat", "hnsw", "ivf"):
-            r = d[d.backend == backend]
-            if r.empty:
-                continue
-            r = r.iloc[0]
-            if backend != "flat" and r.positive_rate_pct == 0:      # nothing to tune the backend's recall on
-                out.append(f"{BACKEND_LABEL[backend]} & -- & -- & {r.backend_build_s:.1f} & {r.backend_bytes / 1e6:.1f} & -- {BS*2}")
-                continue
-            fmt = ",.1f" if r.throughput_improvement_pct < -99 else ",.0f"
-            gain = f"{r.throughput_improvement_pct:{fmt}}".replace(",", "{,}").replace("-", BS + "textminus ")
-            out.append(f"{BACKEND_LABEL[backend]} & {r.backend_mean_ms:.3f} & {r.backend_p99_ms:.3f} & "
-                       f"{r.backend_build_s:.1f} & {r.backend_bytes / 1e6:.1f} & {gain} {BS*2}")
+        r = g[g.dataset == ds].iloc[0]
+        fmt = ",.1f" if abs(r.throughput_improvement_pct) < 10 else ",.0f"
+        gain = f"{r.throughput_improvement_pct:{fmt}}".replace(",", "{,}").replace("-", BS + "textminus ")
+        be = "--" if not np.isfinite(r.breakeven_backend_ms) else f"{r.breakeven_backend_ms:.2f}"
+        n_ref = f"{int(r.n_reference):,}".replace(",", "{,}")
+        out.append(f"{DATASET_ABBR[ds]} ({n_ref}) & {r.filter_mean_ms:.2f} & {r.filter_p99_ms:.2f} & "
+                   f"{r.accept_rate_all_pct:.0f} & {r.backend_mean_ms:.2f} & {r.backend_p99_ms:.2f} & {be} & {gain} {BS*2}")
     out += [f"{BS}bottomrule", f"{BS}end{{tabular}}"]
-    return "\n".join(out) + "\n"
+    return "
+".join(out) + "
+"
 
 
 def timing_table(t: pd.DataFrame) -> str:
@@ -164,7 +158,7 @@ def timing_table(t: pd.DataFrame) -> str:
     ks = sorted(c.k_fraction.unique())
     out = [f"{BS}begin{{tabular}}{{@{{}}l" + "r" * len(ks) + "@{}}", f"{BS}toprule",
            f"Construction (s) & " + " & ".join(f"$k={100 * k:g}{BS}%$" for k in ks) + f" {BS*2}", f"{BS}midrule"]
-    for m in ("gonzalez", "minimax", "sphere_merge"):
+    for m in ("gonzalez", "minimax", "sphere_merge", "soft_anneal"):
         r = c[c.method == m].set_index("k_fraction").seconds
         out.append(f"{m.replace('_', ' ')} & " + " & ".join("--" if k not in r.index else f"{r[k]:.1f}" for k in ks) + f" {BS*2}")
     ins = t[t.kind == "insert"]
@@ -185,8 +179,8 @@ def write_all(results: Path, out: Path) -> None:
         (out / "ablation-table.tex").write_text(ablation_table(d), encoding="utf-8")
         (out / "sensitivity-table.tex").write_text(sensitivity_table(d), encoding="utf-8")
         jtau_correlation(d).to_csv(out / "jtau-correlation.csv", index=False)
-    if (results / "backends.csv").exists():
-        (out / "backends-table.tex").write_text(backends_table(pd.read_csv(results / "backends.csv")), encoding="utf-8")
+    if (results / "latency.csv").exists():
+        (out / "latency-table.tex").write_text(latency_table(pd.read_csv(results / "latency.csv")), encoding="utf-8")
     if (results / "timing.csv").exists():
         (out / "timing-table.tex").write_text(timing_table(pd.read_csv(results / "timing.csv")), encoding="utf-8")
 

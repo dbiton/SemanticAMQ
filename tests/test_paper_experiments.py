@@ -1,5 +1,5 @@
 """The paper's added experiments: the ball accept rules of the cap-vs-ball ablation
-(runner.ball_accept_thresholds), runner.ablation_worker, backend_latency_worker and
+(runner.ball_accept_thresholds), runner.ablation_worker, filter_latency_worker and
 pinned_timing_worker."""
 import unittest
 
@@ -85,7 +85,7 @@ class TestAblationWorker(unittest.TestCase):
         self.assertAlmostEqual(1.0 - by[("full", 0.05)]["accesses_saved_pct"] / 100.0, want, places=9)
 
 
-class TestBackendLatencyWorker(unittest.TestCase):
+class TestFilterLatencyWorker(unittest.TestCase):
 
     def test_rows_and_composition(self):
         dim = 384
@@ -94,10 +94,8 @@ class TestBackendLatencyWorker(unittest.TestCase):
         B = _unit(centers[rng.integers(0, 12, 900)] + 0.04 * rng.normal(size=(900, dim))).astype(np.float32)
         Q = _unit(np.vstack([centers[rng.integers(0, 12, 120)] + 0.05 * rng.normal(size=(120, dim)),
                              rng.normal(size=(80, dim))])).astype(np.float32)
-        rows = runner.backend_latency_worker(dim, "synthetic", 0, 0.2, (0.02, 0.1), B, Q,
-                                             n_timed=60, n_calibration=100)
-        self.assertEqual(len(rows), 3 * 2)
-        self.assertEqual({r["backend"] for r in rows}, {"flat", "hnsw", "ivf"})
+        rows = runner.filter_latency_worker(dim, "synthetic", 0, 0.2, (0.02, 0.1), B, Q, n_timed=60)
+        self.assertEqual(len(rows), 2)
         for r in rows:
             self.assertEqual(r["n_timed"], 60)
             self.assertGreaterEqual(r["accept_rate_all_pct"], r["positive_rate_pct"] - 1e-9)   # zero FN

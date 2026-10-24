@@ -12,9 +12,9 @@ go to suggestions/figures/ under the names paper.tex includes:
     equal-memory-zero-fn-fpr-vs-budget.*      fig:equal-memory          equal_memory/<corpus>/equal_memory.csv
     equal-memory-nonzero-fn-wikianswers.*     fig:equal-memory-nonzero-fn  (same)
     throughput-improvement.*           fig:throughput   end_to_end.csv
-    ablation-table.tex, sensitivity-table.tex, backends-table.tex, timing-table.tex,
-    jtau-correlation.csv               tab:ablation, tab:sensitivity, tab:backends, tab:timing
-                                       ablation.csv, backends.csv, timing.csv (plots/tables_paper.py)
+    ablation-table.tex, sensitivity-table.tex, latency-table.tex, timing-table.tex,
+    jtau-correlation.csv               tab:ablation, tab:sensitivity, tab:latency, tab:timing
+                                       ablation.csv, latency.csv, timing.csv (plots/tables_paper.py)
 
 (figures/scheme.pdf is a hand-drawn diagram and is not produced here.)
 
@@ -136,6 +136,7 @@ CONSTRUCT_SHOWN = {
     "gonzalez": ("Gonzalez", INK_MUTED, "o", ":"),
     "minimax": ("minimax", ORANGE, "s", "-"),
     "sphere_merge": ("sphere merge", BLUE, "^", "-"),
+    "soft_anneal": ("soft anneal", GREEN, "v", "-"),
 }
 # Insertion strategies shown. The initial cover is built with STREAM_BOOTSTRAP.
 STREAM_BOOTSTRAP = "sphere_merge"
@@ -629,7 +630,7 @@ def quantization_table():
 
 
 def paper_tables():
-    """tab:ablation, tab:sensitivity, tab:backends, tab:timing and the J_tau correlation
+    """tab:ablation, tab:sensitivity, tab:latency, tab:timing and the J_tau correlation
     (plots/tables_paper.py)."""
     from plots.tables_paper import write_all
     write_all(RESULTS, OUT_FIG)

@@ -4,13 +4,15 @@ LaTeX, from results/cap_quantization/<corpus>/*.csv (src/paper.py's generate_qua
 Per budget (k FP32 caps as a % of the construct set) a cell is the index accesses saved,
 averaged over corpora and folds. Per rate, the encoding with the best mean over the cells
 is listed. Bold: best in column. Dagger: the budget fits one cap per indexed vector.
-Optional last column (`qps=True`): median queries/s at the smallest budget; off by default, since the run that feeds
-this table is parallel and its timings are not pinned (CLAUDE.md).
+Last column (when `qps` is given, name -> queries/s): the query throughput of one batch call, measured by
+runner.pinned_timing_worker (one pinned core, results/timing.csv "scan" rows) rather than by the parallel
+quantization run, whose timings are not pinned (CLAUDE.md).
 
     PYTHONPATH=src python src/plots/table_quantization.py [results-folder] [out.tex]
 """
 import sys
 from pathlib import Path
+from typing import Dict, Optional
 
 import pandas as pd
 
@@ -43,12 +45,11 @@ def build(q: pd.DataFrame) -> pd.DataFrame:
     return q
 
 
-def table(q: pd.DataFrame, qps: bool = False) -> str:
+def table(q: pd.DataFrame, qps: Optional[Dict[str, float]] = None, qps_label: str = "q/s") -> str:
     q = build(q)
     budgets = sorted(q.budget_pct.unique())
     saved = q.pivot_table(index="quantize", columns="budget_pct", values="index_accesses_saved_pct", aggfunc="mean")
     single = q.pivot_table(index="quantize", columns="budget_pct", values="singleton", aggfunc="mean")
-    qps_by_name = q[q.budget_pct == budgets[0]].groupby("quantize").query_throughput_qps.median()
     rate = q.groupby("quantize").rate.first()
 
     best = saved.mean(axis=1).groupby(rate).idxmax()     # per rate: the encoding with the best mean
@@ -57,10 +58,11 @@ def table(q: pd.DataFrame, qps: bool = False) -> str:
     colmax = saved.loc[names].max()
 
     extra = "r" if qps else ""
+    qps = qps or {}
     out = [f"{BS}begin{{tabular}}{{@{{}}lr" + "r" * len(budgets) + extra + "@{}}", f"{BS}toprule",
-           f"& & {BS}multicolumn{{{len(budgets)}}}{{c}}{{Memory budget ({BS}% of raw)}}" + (" & " if qps else "") + f" {BS*2}",
+           f"& & {BS}multicolumn{{{len(budgets)}}}{{c}}{{Memory budget ({BS}% of raw)}}" + (" &" if extra else "") + f" {BS*2}",
            f"{BS}cmidrule(lr){{3-{2 + len(budgets)}}}",
-           "Encoding & b/dim & " + " & ".join(f"{b:g}" for b in budgets) + (" & q/s" if qps else "") + f" {BS*2}", f"{BS}midrule"]
+           "Encoding & b/dim & " + " & ".join(f"{b:g}" for b in budgets) + (f" & {qps_label}" if extra else "") + f" {BS*2}", f"{BS}midrule"]
     for r, name in rows:
         cells = []
         for b in budgets:
@@ -72,8 +74,8 @@ def table(q: pd.DataFrame, qps: bool = False) -> str:
             if v >= colmax[b] - 1e-9:
                 c = f"{BS}textbf{{{c}}}"
             cells.append(c + (f"$^{{{BS}dagger}}$" if single.loc[name, b] >= 0.5 else ""))
-        q_s = f"{qps_by_name[name]:,.0f}".replace(",", "{,}") if name in qps_by_name and pd.notna(qps_by_name[name]) else "--"
-        out.append(f"{_tex(_label(name))} & {_rate(r)} & " + " & ".join(cells) + (f" & {q_s}" if qps else "") + f" {BS*2}")
+        q_s = f"{qps[name]:,.0f}".replace(",", "{,}") if name in qps and pd.notna(qps[name]) else "--"
+        out.append(f"{_tex(_label(name))} & {_rate(r)} & " + " & ".join(cells) + (f" & {q_s}" if extra else "") + f" {BS*2}")
     out += [f"{BS}bottomrule", f"{BS}end{{tabular}}"]
     return "\n".join(out) + "\n"
 
@@ -82,7 +84,15 @@ def write(results: Path, out: Path) -> None:
     paths = sorted(Path(results).glob("cap_quantization/*/*.csv"))
     if not paths:
         raise FileNotFoundError(f"no files match {results / 'cap_quantization/*/*.csv'}")
-    tex = table(pd.concat([pd.read_csv(p) for p in paths], ignore_index=True))
+    qps, label = None, "q/s"
+    timing = Path(results) / "timing.csv"
+    if timing.exists():
+        t = pd.read_csv(timing)
+        t = t[t.kind == "scan"] if "kind" in t else t.iloc[0:0]
+        if len(t):
+            pct = float(t.budget_pct.iloc[0])
+            qps, label = t.groupby("method").qps.median().to_dict(), f"q/s at {pct:g}{BS}%"
+    tex = table(pd.concat([pd.read_csv(p) for p in paths], ignore_index=True), qps, label)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(tex, encoding="utf-8")
     print(f"  {out}")

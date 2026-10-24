@@ -35,6 +35,7 @@ from filters.cap_cover.cap_merge_insert import CapMergeInsert as CapCoverMergeIn
 from filters.cap_cover.gonzales_construct import GonzalesConstruct as CapGonzalesConstruct
 from filters.cap_cover.minimax_construct import MinimaxConstruct as CapMinimaxConstruct
 from filters.cap_cover.sphere_merge_construct import SphereMergeConstruct as CapSphereMergeConstruct
+from filters.cap_cover.soft_anneal_construct import SoftAnnealMerge as CapSoftAnnealConstruct
 from filters.cap_cover.cap_interfaces import ConstructInterface as CapConstructInterface
 from vector_source import VectorSource
 
@@ -79,12 +80,13 @@ def _cap_cover_insertable(dim: int, k: int) -> CapCoverFilter:
 # named default for call sites that need one rather than relying on the class's own default.
 CAP_COVER_CONSTRUCT = "sphere_merge"
 
-# CapCoverFilter's own construct-method registry: only the 3 strategies its
+# CapCoverFilter's own construct-method registry: only the strategies its
 # package implements.
 CAP_CONSTRUCT_METHODS = {
     "gonzalez": CapGonzalesConstruct,
     "minimax": CapMinimaxConstruct,
     "sphere_merge": CapSphereMergeConstruct,
+    "soft_anneal": CapSoftAnnealConstruct,
 }
 
 # CapCoverFilter's own insert-strategy registry: only the 2 its package
@@ -1676,6 +1678,7 @@ def _ablation_arms(dim: int, k: int) -> Dict[str, Any]:
         # construction
         "minimax": auto(construct_method=CapMinimaxConstruct()),
         "gonzalez": auto(construct_method=CapGonzalesConstruct()),
+        "soft_anneal": auto(construct_method=CapSoftAnnealConstruct()),
         # direction encoding
         "tq_only": auto(candidates=tq),
         "spq_only": auto(candidates=spq),
@@ -1773,26 +1776,9 @@ def ablation_worker(
     return rows
 
 
-# ---- throughput against flat / HNSW / IVF backends --------------------------
+# ---- per-query latency of the filter in front of the exact (flat) index ------
 
-def _tune_search_param(search_sq, params: Tuple[int, ...], queries: np.ndarray, tau: float,
-                       actual: np.ndarray, recall_target: float) -> Tuple[int, float]:
-    """The cheapest query-time parameter (smallest of `params`) whose decision --
-    "the returned nearest vector is within tau" -- finds at least `recall_target`
-    of the true positives among `queries`; the largest if none does, the smallest
-    (recall NaN) if `queries` has no true positive to tune on."""
-    if not actual.any():                # nothing to find: no recall to tune, so the cheapest setting
-        return params[0], float("nan")
-    recall = 0.0
-    for p in params:
-        found = search_sq(queries, p) <= tau * tau
-        recall = float((found & actual).sum() / actual.sum())
-        if recall >= recall_target:
-            return p, recall
-    return params[-1], recall
-
-
-def backend_latency_worker(
+def filter_latency_worker(
     dim: int,
     dataset: str,
     seed: int,
@@ -1801,31 +1787,19 @@ def backend_latency_worker(
     vectors_reference: VectorInput,
     vectors_query: VectorInput,
     n_timed: int = 1000,
-    n_calibration: int = 2000,
-    recall_target: float = 0.99,
-    tune_delta: float = 0.02,
-    hnsw_m: int = 32,
-    hnsw_ef_construction: int = 100,
-    ivf_nlist_per_sqrt_n: float = 4.0,
     timing_seed: int = 0,
 ) -> List[Dict[str, Any]]:
-    """A CapCoverFilter in front of three backends over the same reference set --
-    a flat index answering by range_search (the paper's default, a fairer
-    baseline than hand-computed distances), HNSW and IVF-Flat answering by
-    nearest-neighbour search -- timed one query at a time on one pinned core
-    (_pin_to_own_core; run with a single worker).
+    """A CapCoverFilter in front of the exact backend, a flat index answering by
+    range_search (a fairer baseline than hand-computed distances), timed one query
+    at a time on one pinned core (_pin_to_own_core; run with a single worker).
 
-    HNSW's efSearch and IVF's nprobe are the smallest that keep the backend's
-    decision ("a vector within tau") for at least `recall_target` of the true
-    positives of the first `n_calibration` queries at `tune_delta`; the timed
-    queries are a seeded sample of the rest. Each backend, and the filter, is
-    timed per query once; the filtered system's per-query latency is then
+    The filter and the backend are each timed per query once on a seeded sample of
+    `n_timed` queries; the filtered system's per-query latency is then
     filter_i + accept_i * backend_i, exactly what a sequential filter-then-backend
-    loop spends on query i. One row per (backend, delta): throughput and p50/p99
-    latency with and without the filter, the break-even backend cost
-    filter_mean / rejection_rate, and each structure's build time and bytes.
-    The filter is exact (zero false negatives, raised on); an approximate
-    backend keeps its own recall, which is reported."""
+    loop spends on query i. One row per delta: throughput and p50/p99 latency with
+    and without the filter, and the break-even backend cost filter_mean /
+    rejection_rate, the lookup cost above which the filter raises throughput. The
+    filter is exact (zero false negatives, raised on)."""
     _pin_to_own_core()
     B = np.ascontiguousarray(_to_construct_array(vectors_reference), dtype=np.float32)
     Q = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
@@ -1834,51 +1808,8 @@ def backend_latency_worker(
     flat.add(B)
     d2, _ = flat.search(Q, 1)
     nn = np.sqrt(np.clip(d2[:, 0], 0, None))
+    timed = np.sort(np.random.default_rng(timing_seed).choice(len(Q), size=min(n_timed, len(Q)), replace=False))
 
-    cal = np.arange(min(n_calibration, len(Q) // 2))        # the rest is where the timed queries come from
-    rest = np.arange(len(cal), len(Q))
-    rng = np.random.default_rng(timing_seed)
-    timed = np.sort(rng.choice(rest, size=min(n_timed, len(rest)), replace=False))
-    tune_tau = tau_of_cosine_distance(tune_delta)
-    tune_actual = nn[cal] <= tune_tau
-
-    # ---- build the backends
-    t0 = time.perf_counter()
-    hnsw = faiss.IndexHNSWFlat(dim, hnsw_m)
-    hnsw.hnsw.efConstruction = hnsw_ef_construction
-    hnsw.add(B)
-    hnsw_build_s = time.perf_counter() - t0
-    t0 = time.perf_counter()
-    nlist = max(1, int(ivf_nlist_per_sqrt_n * np.sqrt(n)))
-    ivf = faiss.IndexIVFFlat(faiss.IndexFlatL2(dim), dim, nlist)
-    ivf.train(B)
-    ivf.add(B)
-    ivf_build_s = time.perf_counter() - t0
-
-    def hnsw_sq(qs, ef):
-        hnsw.hnsw.efSearch = ef
-        return hnsw.search(qs, 1)[0][:, 0]
-
-    def ivf_sq(qs, nprobe):
-        ivf.nprobe = nprobe
-        return ivf.search(qs, 1)[0][:, 0]
-
-    ef, hnsw_recall = _tune_search_param(hnsw_sq, _HNSW_EF_SEARCH_CANDIDATES, Q[cal], tune_tau, tune_actual,
-                                         recall_target)
-    nprobe, ivf_recall = _tune_search_param(ivf_sq, _IVF_NPROBE_CANDIDATES, Q[cal], tune_tau, tune_actual,
-                                            recall_target)
-    hnsw.hnsw.efSearch = ef
-    ivf.nprobe = nprobe
-    backends = {
-        "flat": dict(param=None, recall=1.0, build_s=0.0, bytes=n * dim * 4,
-                     run=lambda v: flat.range_search(v, tune_tau * tune_tau)),
-        "hnsw": dict(param=ef, recall=hnsw_recall, build_s=hnsw_build_s,
-                     bytes=len(faiss.serialize_index(hnsw)), run=lambda v: hnsw.search(v, 1)),
-        "ivf": dict(param=nprobe, recall=ivf_recall, build_s=ivf_build_s,
-                    bytes=len(faiss.serialize_index(ivf)), run=lambda v: ivf.search(v, 1)),
-    }
-
-    # ---- the filter
     k = min(max(1, round(k_fraction * n)), n)
     filt = _cap_cover(dim, k)
     t0 = time.perf_counter()
@@ -1895,12 +1826,8 @@ def backend_latency_worker(
             out[i] = (time.perf_counter_ns() - t) / 1e6
         return out
 
-    filt.query(Q[:1], distance_threshold=tune_tau)     # hands the caps to Rust
-    for b in backends.values():
-        b["run"](Q[:1])
-    # one pass per backend, at tune_delta: the backends' cost does not depend on tau
-    backend_ms = {name: per_query_ms(b["run"], Q[timed]) for name, b in backends.items()}
-
+    filt.query(Q[:1], distance_threshold=0.2)          # hands the caps to Rust
+    flat.range_search(Q[:1], 0.04)
     rows: List[Dict[str, Any]] = []
     for delta in deltas:
         tau = tau_of_cosine_distance(delta)
@@ -1912,30 +1839,27 @@ def backend_latency_worker(
                                      f"(dataset={dataset}, fold={seed}, k={k}, delta={delta})")
         accept = accept_all[timed]
         filter_ms = per_query_ms(lambda v: filt.query(v, distance_threshold=tau), Q[timed])
+        without = per_query_ms(lambda v: flat.range_search(v, tau * tau), Q[timed])
+        with_f = filter_ms + accept * without
         reject = 1.0 - float(accept.mean())
-        for name, b in backends.items():
-            without = backend_ms[name]
-            with_f = filter_ms + accept * without
-            qps_without, qps_with = 1000.0 / without.mean(), 1000.0 / with_f.mean()
-            rows.append({
-                "dataset": dataset, "fold": seed, "backend": name, "delta": float(delta), "tau": tau,
-                "n_reference": n, "n_timed": len(timed), "k_fraction": float(k_fraction),
-                "backend_param": b["param"], "backend_recall": b["recall"],
-                "backend_build_s": b["build_s"], "backend_bytes": b["bytes"],
-                "filter_build_s": filter_build_s, "filter_bytes": filter_bytes,
-                "filter_pct_of_raw": 100.0 * filter_bytes / (n * dim * 4),
-                "accept_rate_pct": 100.0 * float(accept.mean()),
-                "accept_rate_all_pct": 100.0 * float(accept_all.mean()),
-                "positive_rate_pct": 100.0 * float(actual_all.mean()),
-                "filter_mean_ms": float(filter_ms.mean()), "filter_p99_ms": float(np.percentile(filter_ms, 99)),
-                "backend_mean_ms": float(without.mean()), "backend_p50_ms": float(np.percentile(without, 50)),
-                "backend_p99_ms": float(np.percentile(without, 99)),
-                "with_mean_ms": float(with_f.mean()), "with_p50_ms": float(np.percentile(with_f, 50)),
-                "with_p99_ms": float(np.percentile(with_f, 99)),
-                "qps_without": qps_without, "qps_with": qps_with,
-                "throughput_improvement_pct": 100.0 * (qps_with - qps_without) / qps_without,
-                "breakeven_backend_ms": float(filter_ms.mean() / reject) if reject > 0 else float("inf"),
-            })
+        qps_without, qps_with = 1000.0 / without.mean(), 1000.0 / with_f.mean()
+        rows.append({
+            "dataset": dataset, "fold": seed, "delta": float(delta), "tau": tau,
+            "n_reference": n, "n_timed": len(timed), "k_fraction": float(k_fraction),
+            "filter_build_s": filter_build_s, "filter_bytes": filter_bytes,
+            "filter_pct_of_raw": 100.0 * filter_bytes / (n * dim * 4),
+            "accept_rate_pct": 100.0 * float(accept.mean()),
+            "accept_rate_all_pct": 100.0 * float(accept_all.mean()),
+            "positive_rate_pct": 100.0 * float(actual_all.mean()),
+            "filter_mean_ms": float(filter_ms.mean()), "filter_p99_ms": float(np.percentile(filter_ms, 99)),
+            "backend_mean_ms": float(without.mean()), "backend_p50_ms": float(np.percentile(without, 50)),
+            "backend_p99_ms": float(np.percentile(without, 99)),
+            "with_mean_ms": float(with_f.mean()), "with_p50_ms": float(np.percentile(with_f, 50)),
+            "with_p99_ms": float(np.percentile(with_f, 99)),
+            "qps_without": qps_without, "qps_with": qps_with,
+            "throughput_improvement_pct": 100.0 * (qps_with - qps_without) / qps_without,
+            "breakeven_backend_ms": float(filter_ms.mean() / reject) if reject > 0 else float("inf"),
+        })
     return rows
 
 
@@ -1947,11 +1871,18 @@ def pinned_timing_worker(
     insert_k_fraction: float = 0.1,
     bootstrap_fraction: float = 0.8,
     max_inserts: int = 2000,
+    vectors_query: Optional[VectorInput] = None,
+    scan_quantizes: Tuple[CapQuantize, ...] = (),
+    scan_budget_pcts: Tuple[float, ...] = (2.0,),
+    scan_delta: float = 0.02,
 ) -> List[Dict[str, Any]]:
     """Construction time of each CAP_CONSTRUCT_METHODS entry (the configuration
-    of construct_method_worker: FP32 caps, max_caps=k) and per-arrival insertion
+    of construct_method_worker: FP32 caps, max_caps=k), per-arrival insertion
     time of each CAP_INSERT_STRATEGIES entry (TQ4 caps at the byte budget of
-    k = insert_k_fraction |B| nominal caps, as stream_rebuild_worker), on the
+    k = insert_k_fraction |B| nominal caps, as stream_rebuild_worker) and, given
+    vectors_query, the query throughput of one batch call of a cover in each of
+    `scan_quantizes` at each budget of `scan_budget_pcts` (% of the raw index, as
+    cap_quantization_worker's byte budgets) at cosine distance `scan_delta`, on the
     core _pin_to_own_core picks. Sequential by construction: run it with a
     single worker."""
     _pin_to_own_core()
@@ -1982,6 +1913,25 @@ def pinned_timing_worker(
                      "k": k, "n_reference": n, "n_inserts": len(times), "n_caps": filt._num_caps,
                      "mean_ms": float(times.mean()), "p50_ms": float(np.percentile(times, 50)),
                      "p99_ms": float(np.percentile(times, 99)), "max_ms": float(times.max())})
+    if vectors_query is not None:
+        Q = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
+        tau = tau_of_cosine_distance(scan_delta)
+        for quantize in scan_quantizes:
+            for pct in scan_budget_pcts:
+                k = min(max(1, round(pct / 100.0 * n)), n)
+                filt = CapCoverFilter(dim, max_memory=_cover_max_memory(dim, k, 32), quantize=quantize,
+                                      construct_method=CAP_CONSTRUCT_METHODS[CAP_COVER_CONSTRUCT]())
+                try:
+                    filt.construct(B)
+                except InsufficientMemoryError:
+                    continue
+                filt.query(Q[:1], distance_threshold=tau)      # hands the caps to Rust
+                t0 = time.perf_counter()
+                filt.query(Q, distance_threshold=tau)
+                seconds = time.perf_counter() - t0
+                rows.append({"dataset": dataset, "kind": "scan", "method": quantize.value, "budget_pct": float(pct),
+                             "k": k, "n_reference": n, "n_queries": len(Q), "n_caps": filt._num_caps,
+                             "memory_bytes": filt.get_bytesize(), "qps": len(Q) / max(seconds, 1e-9)})
     return rows
 
 
@@ -2004,7 +1954,7 @@ _WORKER_FNS: Dict[str, Any] = {
     'construct_method': construct_method_worker,
     'construct_method_scale': construct_method_scale_worker,
     'ablation': ablation_worker,
-    'backend_latency': backend_latency_worker,
+    'filter_latency': filter_latency_worker,
     'pinned_timing': pinned_timing_worker,
 }
 
