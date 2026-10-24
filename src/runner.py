@@ -970,10 +970,16 @@ def _pin_to_own_core() -> None:
     pool) mod N, so N timing workers never share a core or its SMT sibling
     (cores 0..N-1 are distinct physical cores on Linux). Best effort."""
     n = int(os.environ.get("CAPCOVER_PIN_CORES", "0") or 0)
-    if n <= 0 or not hasattr(os, "sched_setaffinity"):
+    if n <= 0:
         return
     ident = multiprocessing.current_process()._identity
-    os.sched_setaffinity(0, {(ident[0] - 1 if ident else 0) % n})
+    core = (ident[0] - 1 if ident else 0) % n
+    if hasattr(os, "sched_setaffinity"):
+        os.sched_setaffinity(0, {core})
+    else:                       # Windows/macOS: psutil, where it can pin at all
+        import psutil
+        if hasattr(psutil.Process(), "cpu_affinity"):
+            psutil.Process().cpu_affinity([core])
 
 
 def end_to_end_worker(
@@ -1431,6 +1437,7 @@ def stream_rebuild_worker(
     construct_method: Optional[str] = None,
     stream_order: Optional[str] = None,
     insert_memory_percent: Optional[float] = None,
+    quantize: CapQuantize = CapQuantize.TQ4,
 ) -> List[Dict[str, Any]]:
     """Simulates one rebuild policy over vectors_stream (a blocklist fold's
     reference set B, in arrival order -- see main.generate_streaming),
@@ -1445,6 +1452,12 @@ def stream_rebuild_worker(
     the policy makes: the oracle's rebuilds, and the streaming/periodic
     bootstrap. insertion_level sweeps CAP_INSERT_STRATEGIES, which only has
     2 members (cap_merge/nearest).
+
+    Every filter here stores its directions as `quantize` (default TQ4, the
+    4 bits/dim that _cover_max_memory counts a cap in), so the byte budget of
+    k caps really holds ~k caps. With the filter's FP32 default it held k/8,
+    and the oracle itself sat at FPR ~1 on corpora where the static
+    evaluations (which build with auto()) do not.
 
     Memory is held to one budget for every method: max_memory is the static
     filter's footprint at k caps, and CapCoverFilter sizes each insert
@@ -1490,7 +1503,8 @@ def stream_rebuild_worker(
     def _new_filter(insert_method: Any = None, **kwargs: Any) -> CapCoverFilter:
         if construct_method is not None:
             kwargs["construct_method"] = CAP_CONSTRUCT_METHODS[construct_method]()
-        return CapCoverFilter(dim=dim, max_memory=budget_bytes, insert_method=insert_method, **kwargs)
+        return CapCoverFilter(dim=dim, max_memory=budget_bytes, insert_method=insert_method,
+                              quantize=quantize, **kwargs)
 
     peak_memory_bytes = 0
     max_insert_s = 0.0
@@ -1588,6 +1602,386 @@ def stream_rebuild_worker(
     return rows
 
 
+# --------------------------------------------------------------------------
+# Paper experiments: ablation, backends, pinned timings
+# --------------------------------------------------------------------------
+
+# Thresholds (cosine distance) of the ablation: the paper's sweep, 0.005-0.2.
+ABLATION_DELTAS = (0.005, 0.01, 0.02, 0.05, 0.1, 0.2)
+
+
+def tau_of_cosine_distance(delta: float) -> float:
+    """The L2 threshold of unit vectors at cosine distance `delta` (||a-b||^2 = 2 delta)."""
+    return float(np.sqrt(2.0 * delta))
+
+
+def ball_accept_thresholds(theta: np.ndarray, tau_prime: float, rule: str) -> np.ndarray:
+    """cos(psi_i): the smallest cosine between a unit query and the direction
+    u_i of a cap (u_i, theta_i) at which a ball cover storing the same bytes
+    accepts the query. Both ball covers contain the cap, so both accept more
+    than the cap rule's psi <= theta + alpha (Theorem 3):
+      "ball_sphere": the ball centred on u_i with the cap's chord as radius,
+                     2 sin(theta/2); accept iff ||q - u_i|| <= r + tau';
+      "ball_meb":    the Euclidean minimum enclosing ball of the cap, centre
+                     cos(theta) u_i and radius sin(theta) (no extra bytes: the
+                     centre's length follows from the stored angle).
+    A cap wider than a quarter sphere has the whole unit ball as its MEB,
+    which accepts every unit query."""
+    theta = np.asarray(theta, dtype=np.float64)
+    if rule == "ball_sphere":
+        return np.cos(2.0 * np.arcsin(np.minimum(1.0, np.sin(theta / 2.0) + tau_prime / 2.0)))
+    if rule == "ball_meb":
+        c, s = np.cos(theta), np.sin(theta)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            thr = (1.0 + c * c - (s + tau_prime) ** 2) / (2.0 * c)
+        return np.where(c > 1e-9, thr, -np.inf)
+    raise ValueError(f"unknown ball rule {rule!r}")
+
+
+def _accept_cosines(theta: np.ndarray, tau: float, rule: str) -> np.ndarray:
+    """cos(psi_i) thresholds of `rule` ("cap", "ball_sphere" or "ball_meb") at tau,
+    with CapCoverFilter's own coverage slack added to tau."""
+    tau_prime = tau + CapCoverFilter._COVERAGE_EPSILON + CapCoverFilter._NORM_TOLERANCE
+    if rule == "cap":
+        return np.cos(np.minimum(theta + 2.0 * np.arcsin(min(1.0, tau_prime / 2.0)), np.pi))
+    return ball_accept_thresholds(theta, tau_prime, rule)
+
+
+def _accepted_by_rule(Qn: np.ndarray, D: np.ndarray, theta: np.ndarray, taus: List[float],
+                      rule: str, chunk: int = 512) -> np.ndarray:
+    """accepted[t, q]: unit query q is accepted at taus[t] by `rule` over the caps
+    (directions D, angles theta). float64 throughout."""
+    out = np.zeros((len(taus), len(Qn)), dtype=bool)
+    thr = [_accept_cosines(theta, tau, rule) for tau in taus]
+    for s in range(0, len(Qn), chunk):
+        C = Qn[s:s + chunk] @ D.T
+        for t in range(len(taus)):
+            out[t, s:s + chunk] = (C >= thr[t][None, :] - 1e-12).any(axis=1)
+    return out
+
+
+def _ablation_arms(dim: int, k: int) -> Dict[str, Any]:
+    """name -> zero-argument factory of the CapCoverFilter an ablation arm builds,
+    every one at the byte budget of k nominal caps (_cover_max_memory) and each
+    differing from "full" (the paper's configuration, _cap_cover) in one choice."""
+    mem = _cover_max_memory(dim, k)
+    tq = [q for q in _CAP_AUTO_CANDIDATES if q.value.startswith("TQ")]
+    spq = [q for q in _CAP_AUTO_CANDIDATES if q.value.startswith("SPQ")]
+
+    def auto(**kw):
+        return lambda: CapCoverFilter.auto(dim, max_memory=mem, **kw)
+
+    return {
+        "full": lambda: _cap_cover(dim, k),
+        # construction
+        "minimax": auto(construct_method=CapMinimaxConstruct()),
+        "gonzalez": auto(construct_method=CapGonzalesConstruct()),
+        # direction encoding
+        "tq_only": auto(candidates=tq),
+        "spq_only": auto(candidates=spq),
+        "tq4_fixed": lambda: CapCoverFilter(dim, max_memory=mem, quantize=CapQuantize.TQ4),
+        "fp32_fixed": lambda: CapCoverFilter(dim, max_memory=mem, quantize=CapQuantize.FP32),
+        "no_mixing": auto(mixed=False),
+        # fitted vs nearest codes
+        "nearest_codes": auto(fit_codes=False),
+        # sphere merge's offset t (default 0.1) and exponent p (default 8)
+        "t0.05": auto(construct_method=CapSphereMergeConstruct(cost_offset=0.05)),
+        "t0.2": auto(construct_method=CapSphereMergeConstruct(cost_offset=0.2)),
+        "t0.4": auto(construct_method=CapSphereMergeConstruct(cost_offset=0.4)),
+        "p4": auto(construct_method=CapSphereMergeConstruct(exponent=4.0)),
+        "p16": auto(construct_method=CapSphereMergeConstruct(exponent=16.0)),
+        # the threshold the encoding is chosen at (default tau = 0.1, delta = 0.005)
+        "select_delta0.02": auto(selection_tau=tau_of_cosine_distance(0.02)),
+        "select_delta0.1": auto(selection_tau=tau_of_cosine_distance(0.1)),
+    }
+
+
+def ablation_worker(
+    dim: int,
+    dataset: str,
+    seed: int,
+    k_fraction: float,
+    vectors_reference: VectorInput,
+    vectors_query: VectorInput,
+    deltas: Tuple[float, ...] = ABLATION_DELTAS,
+    arms: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """The ablation behind the paper's component table, for one (corpus, fold,
+    budget): the arms of _ablation_arms, each a CapCoverFilter built from the
+    same reference set at the same bytes and scored on the same queries at every
+    cosine distance in `deltas`; plus two accept rules over the "full" arm's
+    own cover, "ball_sphere" and "ball_meb" (ball_accept_thresholds): what a
+    ball cover storing the same bytes would accept, isolating cap vs ball.
+
+    Labels are the distance at each tau. One row per (arm, delta). Raises on
+    any false negative, ball rules included. Construction times here come from
+    a parallel run and are not timing claims."""
+    B = np.ascontiguousarray(_to_construct_array(vectors_reference), dtype=np.float32)
+    Q = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
+    bix = faiss.IndexFlatL2(dim)
+    bix.add(B)
+    d2, _ = bix.search(Q, 1)
+    nn = np.sqrt(np.clip(d2[:, 0], 0, None))
+    nn_cos = 1.0 - nn.astype(np.float64) ** 2 / 2.0
+    taus = [tau_of_cosine_distance(d) for d in deltas]
+    k = min(max(1, round(k_fraction * len(B))), len(B))
+    factories = _ablation_arms(dim, k)
+    if arms is not None:
+        factories = {a: factories[a] for a in arms}
+
+    rows: List[Dict[str, Any]] = []
+
+    def emit(arm: str, filt: CapCoverFilter, accepted: np.ndarray, accept_angle: np.ndarray,
+             build_s: float, theta: np.ndarray) -> None:
+        for t, (delta, tau) in enumerate(zip(deltas, taus)):
+            actual = nn <= tau
+            predicted = accepted[t]
+            fn = int(np.sum(actual & ~predicted))
+            if fn:
+                raise InvariantViolation(f"Zero-false-negative invariant violated: {fn} FN "
+                                         f"(arm={arm}, dataset={dataset}, fold={seed}, k={k}, delta={delta})")
+            rates = _confusion_rates(predicted.tolist(), actual)
+            psi = np.minimum(accept_angle[t], np.pi)
+            log10_j = float(logsumexp(log10_cap_measure(psi, dim) * _LN10)) / _LN10 if len(psi) else float("-inf")
+            rows.append({
+                "dataset": dataset, "fold": seed, "k_fraction": float(k_fraction), "k": k,
+                "n_reference": len(B), "n_queries": len(Q), "arm": arm, "delta": float(delta), "tau": tau,
+                "fpr": rates["fpr"], "fnr": rates["fnr"],
+                **_per_band_rates(predicted, actual, nn_cos),
+                "accesses_saved_pct": 100.0 * (1.0 - float(predicted.mean())),
+                "log10_j_tau": log10_j, "n_caps": filt._num_caps, "memory_bytes": filt.get_bytesize(),
+                "psi_med": float(np.median(theta)) if len(theta) else 0.0,
+                "build_s": build_s, "encoding": getattr(filt, "encoding_label", ""),
+            })
+
+    for arm, factory in factories.items():
+        filt = factory()
+        t0 = time.perf_counter()
+        try:
+            filt.construct(B)
+        except InsufficientMemoryError as e:
+            logger.warning(f"ablation arm {arm} infeasible ({dataset}, k={k}): {e}")
+            continue
+        build_s = time.perf_counter() - t0
+        theta = filt.all_angles
+        Qn = unit_rows(filt.to_working(Q))
+        D = filt.all_directions
+        for rule in (("cap", "ball_sphere", "ball_meb") if arm == "full" else ("cap",)):
+            accepted = _accepted_by_rule(Qn, D, theta, taus, rule)
+            angle = np.stack([np.arccos(np.clip(_accept_cosines(theta, tau, rule), -1.0, 1.0)) for tau in taus])
+            emit(arm if rule == "cap" else rule, filt, accepted, angle, build_s, theta)
+    return rows
+
+
+# ---- throughput against flat / HNSW / IVF backends --------------------------
+
+def _tune_search_param(search_sq, params: Tuple[int, ...], queries: np.ndarray, tau: float,
+                       actual: np.ndarray, recall_target: float) -> Tuple[int, float]:
+    """The cheapest query-time parameter (smallest of `params`) whose decision --
+    "the returned nearest vector is within tau" -- finds at least `recall_target`
+    of the true positives among `queries`; the largest if none does."""
+    recall = 0.0
+    for p in params:
+        found = search_sq(queries, p) <= tau * tau
+        recall = float((found & actual).sum() / max(actual.sum(), 1))
+        if recall >= recall_target:
+            return p, recall
+    return params[-1], recall
+
+
+def backend_latency_worker(
+    dim: int,
+    dataset: str,
+    seed: int,
+    k_fraction: float,
+    deltas: Tuple[float, ...],
+    vectors_reference: VectorInput,
+    vectors_query: VectorInput,
+    n_timed: int = 1000,
+    n_calibration: int = 2000,
+    recall_target: float = 0.99,
+    tune_delta: float = 0.02,
+    hnsw_m: int = 32,
+    hnsw_ef_construction: int = 100,
+    ivf_nlist_per_sqrt_n: float = 4.0,
+    timing_seed: int = 0,
+) -> List[Dict[str, Any]]:
+    """A CapCoverFilter in front of three backends over the same reference set --
+    a flat index answering by range_search (the paper's default, a fairer
+    baseline than hand-computed distances), HNSW and IVF-Flat answering by
+    nearest-neighbour search -- timed one query at a time on one pinned core
+    (_pin_to_own_core; run with a single worker).
+
+    HNSW's efSearch and IVF's nprobe are the smallest that keep the backend's
+    decision ("a vector within tau") for at least `recall_target` of the true
+    positives of the first `n_calibration` queries at `tune_delta`; the timed
+    queries are a seeded sample of the rest. Each backend, and the filter, is
+    timed per query once; the filtered system's per-query latency is then
+    filter_i + accept_i * backend_i, exactly what a sequential filter-then-backend
+    loop spends on query i. One row per (backend, delta): throughput and p50/p99
+    latency with and without the filter, the break-even backend cost
+    filter_mean / rejection_rate, and each structure's build time and bytes.
+    The filter is exact (zero false negatives, raised on); an approximate
+    backend keeps its own recall, which is reported."""
+    _pin_to_own_core()
+    B = np.ascontiguousarray(_to_construct_array(vectors_reference), dtype=np.float32)
+    Q = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
+    n = len(B)
+    flat = faiss.IndexFlatL2(dim)
+    flat.add(B)
+    d2, _ = flat.search(Q, 1)
+    nn = np.sqrt(np.clip(d2[:, 0], 0, None))
+
+    cal = np.arange(min(n_calibration, len(Q)))
+    rest = np.arange(len(cal), len(Q))
+    rng = np.random.default_rng(timing_seed)
+    timed = np.sort(rng.choice(rest, size=min(n_timed, len(rest)), replace=False))
+    tune_tau = tau_of_cosine_distance(tune_delta)
+    tune_actual = nn[cal] <= tune_tau
+
+    # ---- build the backends
+    t0 = time.perf_counter()
+    hnsw = faiss.IndexHNSWFlat(dim, hnsw_m)
+    hnsw.hnsw.efConstruction = hnsw_ef_construction
+    hnsw.add(B)
+    hnsw_build_s = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    nlist = max(1, int(ivf_nlist_per_sqrt_n * np.sqrt(n)))
+    ivf = faiss.IndexIVFFlat(faiss.IndexFlatL2(dim), dim, nlist)
+    ivf.train(B)
+    ivf.add(B)
+    ivf_build_s = time.perf_counter() - t0
+
+    def hnsw_sq(qs, ef):
+        hnsw.hnsw.efSearch = ef
+        return hnsw.search(qs, 1)[0][:, 0]
+
+    def ivf_sq(qs, nprobe):
+        ivf.nprobe = nprobe
+        return ivf.search(qs, 1)[0][:, 0]
+
+    ef, hnsw_recall = _tune_search_param(hnsw_sq, _HNSW_EF_SEARCH_CANDIDATES, Q[cal], tune_tau, tune_actual,
+                                         recall_target)
+    nprobe, ivf_recall = _tune_search_param(ivf_sq, _IVF_NPROBE_CANDIDATES, Q[cal], tune_tau, tune_actual,
+                                            recall_target)
+    hnsw.hnsw.efSearch = ef
+    ivf.nprobe = nprobe
+    backends = {
+        "flat": dict(param=None, recall=1.0, build_s=0.0, bytes=n * dim * 4,
+                     run=lambda v: flat.range_search(v, tune_tau * tune_tau)),
+        "hnsw": dict(param=ef, recall=hnsw_recall, build_s=hnsw_build_s,
+                     bytes=len(faiss.serialize_index(hnsw)), run=lambda v: hnsw.search(v, 1)),
+        "ivf": dict(param=nprobe, recall=ivf_recall, build_s=ivf_build_s,
+                    bytes=len(faiss.serialize_index(ivf)), run=lambda v: ivf.search(v, 1)),
+    }
+
+    # ---- the filter
+    k = min(max(1, round(k_fraction * n)), n)
+    filt = _cap_cover(dim, k)
+    t0 = time.perf_counter()
+    filt.construct(B)
+    filter_build_s = time.perf_counter() - t0
+    filter_bytes = filt.get_bytesize()
+
+    def per_query_ms(fn, queries: np.ndarray) -> np.ndarray:
+        out = np.empty(len(queries))
+        for i in range(len(queries)):
+            v = queries[i:i + 1]
+            t = time.perf_counter_ns()
+            fn(v)
+            out[i] = (time.perf_counter_ns() - t) / 1e6
+        return out
+
+    filt.query(Q[:1], distance_threshold=tune_tau)     # hands the caps to Rust
+    for b in backends.values():
+        b["run"](Q[:1])
+    # one pass per backend, at tune_delta: the backends' cost does not depend on tau
+    backend_ms = {name: per_query_ms(b["run"], Q[timed]) for name, b in backends.items()}
+
+    rows: List[Dict[str, Any]] = []
+    for delta in deltas:
+        tau = tau_of_cosine_distance(delta)
+        actual_all = nn <= tau
+        accept_all = np.asarray(filt.query(Q, distance_threshold=tau), dtype=bool)
+        fn = int(np.sum(actual_all & ~accept_all))
+        if fn:
+            raise InvariantViolation(f"Zero-false-negative invariant violated: {fn} FN "
+                                     f"(dataset={dataset}, fold={seed}, k={k}, delta={delta})")
+        accept = accept_all[timed]
+        filter_ms = per_query_ms(lambda v: filt.query(v, distance_threshold=tau), Q[timed])
+        reject = 1.0 - float(accept.mean())
+        for name, b in backends.items():
+            without = backend_ms[name]
+            with_f = filter_ms + accept * without
+            qps_without, qps_with = 1000.0 / without.mean(), 1000.0 / with_f.mean()
+            rows.append({
+                "dataset": dataset, "fold": seed, "backend": name, "delta": float(delta), "tau": tau,
+                "n_reference": n, "n_timed": len(timed), "k_fraction": float(k_fraction),
+                "backend_param": b["param"], "backend_recall": b["recall"],
+                "backend_build_s": b["build_s"], "backend_bytes": b["bytes"],
+                "filter_build_s": filter_build_s, "filter_bytes": filter_bytes,
+                "filter_pct_of_raw": 100.0 * filter_bytes / (n * dim * 4),
+                "accept_rate_pct": 100.0 * float(accept.mean()),
+                "accept_rate_all_pct": 100.0 * float(accept_all.mean()),
+                "positive_rate_pct": 100.0 * float(actual_all.mean()),
+                "filter_mean_ms": float(filter_ms.mean()), "filter_p99_ms": float(np.percentile(filter_ms, 99)),
+                "backend_mean_ms": float(without.mean()), "backend_p50_ms": float(np.percentile(without, 50)),
+                "backend_p99_ms": float(np.percentile(without, 99)),
+                "with_mean_ms": float(with_f.mean()), "with_p50_ms": float(np.percentile(with_f, 50)),
+                "with_p99_ms": float(np.percentile(with_f, 99)),
+                "qps_without": qps_without, "qps_with": qps_with,
+                "throughput_improvement_pct": 100.0 * (qps_with - qps_without) / qps_without,
+                "breakeven_backend_ms": float(filter_ms.mean() / reject) if reject > 0 else float("inf"),
+            })
+    return rows
+
+
+def pinned_timing_worker(
+    dim: int,
+    dataset: str,
+    vectors_reference: VectorInput,
+    k_fractions: Tuple[float, ...] = (0.01, 0.05, 0.2),
+    insert_k_fraction: float = 0.1,
+    bootstrap_fraction: float = 0.8,
+    max_inserts: int = 2000,
+) -> List[Dict[str, Any]]:
+    """Construction time of each CAP_CONSTRUCT_METHODS entry (the configuration
+    of construct_method_worker: FP32 caps, max_caps=k) and per-arrival insertion
+    time of each CAP_INSERT_STRATEGIES entry (TQ4 caps at the byte budget of
+    k = insert_k_fraction |B| nominal caps, as stream_rebuild_worker), on the
+    core _pin_to_own_core picks. Sequential by construction: run it with a
+    single worker."""
+    _pin_to_own_core()
+    B = np.ascontiguousarray(_to_construct_array(vectors_reference), dtype=np.float32)
+    n = len(B)
+    rows: List[Dict[str, Any]] = []
+    for method, cls in CAP_CONSTRUCT_METHODS.items():
+        for kf in k_fractions:
+            k = min(max(1, round(kf * n)), n)
+            filt = CapCoverFilter(dim, construct_method=cls(), max_caps=k, insert_method=None)
+            t0 = time.perf_counter()
+            filt.construct(B)
+            rows.append({"dataset": dataset, "kind": "construct", "method": method, "k_fraction": kf, "k": k,
+                         "n_reference": n, "seconds": time.perf_counter() - t0, "n_caps": filt._num_caps})
+    k = min(max(1, round(insert_k_fraction * n)), n)
+    boot = max(1, round(bootstrap_fraction * n))
+    for strategy, cls in CAP_INSERT_STRATEGIES.items():
+        filt = CapCoverFilter(dim, max_memory=_cover_max_memory(dim, k), quantize=CapQuantize.TQ4,
+                              insert_method=cls())
+        filt.construct(B[:boot])
+        times = []
+        for t in range(boot, min(n, boot + max_inserts)):
+            t0 = time.perf_counter_ns()
+            filt.insert(B[t:t + 1])
+            times.append((time.perf_counter_ns() - t0) / 1e6)
+        times = np.asarray(times)
+        rows.append({"dataset": dataset, "kind": "insert", "method": strategy, "k_fraction": insert_k_fraction,
+                     "k": k, "n_reference": n, "n_inserts": len(times), "n_caps": filt._num_caps,
+                     "mean_ms": float(times.mean()), "p50_ms": float(np.percentile(times, 50)),
+                     "p99_ms": float(np.percentile(times, 99)), "max_ms": float(times.max())})
+    return rows
+
+
 _WORKER_FNS: Dict[str, Any] = {
     'cap_cover_system_tau': cap_cover_system_tau_worker,
     'end_to_end': end_to_end_worker,
@@ -1606,6 +2000,9 @@ _WORKER_FNS: Dict[str, Any] = {
     'stream_rebuild': stream_rebuild_worker,
     'construct_method': construct_method_worker,
     'construct_method_scale': construct_method_scale_worker,
+    'ablation': ablation_worker,
+    'backend_latency': backend_latency_worker,
+    'pinned_timing': pinned_timing_worker,
 }
 
 
