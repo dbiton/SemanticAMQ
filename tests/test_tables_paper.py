@@ -64,6 +64,14 @@ class TestQuantizationTable(unittest.TestCase):
         self.assertIn("12{,}906", tex)
         self.assertNotIn("q/s", table_quantization.table(self._frame()))
 
+    def test_only_the_papers_budgets_are_columns(self):
+        f = self._frame()
+        extra = f.assign(k=f.k * 0 + 8, index_accesses_saved_pct=1.0)       # 0.1% of the raw index
+        tex = table_quantization.table(pd.concat([f, extra], ignore_index=True), budgets=(0.5, 2))
+        header = [ln for ln in tex.splitlines() if ln.startswith("Encoding")][0]
+        self.assertEqual(header.count("&"), 3)          # b/dim and the two budgets
+        self.assertNotIn("0.1 &", header)
+
 
 if __name__ == "__main__":
     unittest.main()

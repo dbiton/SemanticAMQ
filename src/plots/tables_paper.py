@@ -8,6 +8,7 @@ results/ CSVs (src/paper.py generates them):
     latency-table.tex        tab:latency        latency.csv    the filter in front of the flat index
     timing-table.tex         tab:timing         timing.csv     construction and per-arrival insertion time
     jtau-correlation.csv     (text)             ablation.csv   rank correlation of J_tau with FPR across variants
+    space_bound.csv          (remark)           budget.csv     the space lower bound at the measured accept-region measures
 
     PYTHONPATH=src python src/plots/tables_paper.py [results-folder] [out-folder]
 """
@@ -178,6 +179,9 @@ def write_all(results: Path, out: Path) -> None:
         (out / "ablation-table.tex").write_text(ablation_table(d), encoding="utf-8")
         (out / "sensitivity-table.tex").write_text(sensitivity_table(d), encoding="utf-8")
         jtau_correlation(d).to_csv(out / "jtau-correlation.csv", index=False)
+    if (results / "budget.csv").exists():
+        from util.space_bound import measured_points
+        measured_points(str(results / "budget.csv")).to_csv(out / "space_bound.csv", index=False)
     if (results / "latency.csv").exists():
         (out / "latency-table.tex").write_text(latency_table(pd.read_csv(results / "latency.csv")), encoding="utf-8")
     if (results / "timing.csv").exists():

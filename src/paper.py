@@ -43,6 +43,14 @@ main.py run write the same files -- and truncate them, see CLAUDE.md):
 
 Not generated: scaling, cap_cover_system_tau, query_performance and the
 construct-method scale run, which no paper figure reads.
+
+On the server (100,000 vectors per corpus), `python src/paper.py` runs every evaluation above in order: one shuffled
+batch on main.MAX_WORKERS (blocklist, budget, quantization, construction, streaming, equal-memory, ablation),
+then end-to-end on 8 pinned cores, then latency and timing sequentially on one pinned core, then draws the
+figures and tables (plots/plot_paper.py: suggestions/figures/, including space_bound.csv). `--only` runs a subset;
+`python src/paper.py plot` redraws without running. The soft-anneal construction is in the construction
+evaluation (every cell), the ablation (one arm) and the timing, and is the slowest method by 5-13x; budget its
+share of the batch accordingly (tests: tests/test_soft_anneal_construct.py).
 """
 import os
 import sys

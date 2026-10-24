@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 from typing import Dict, Optional
 
+import numpy as np
 import pandas as pd
 
 from filters.cap_cover.cap_quantizers import Quantize, _ENCODINGS
@@ -45,8 +46,17 @@ def build(q: pd.DataFrame) -> pd.DataFrame:
     return q
 
 
-def table(q: pd.DataFrame, qps: Optional[Dict[str, float]] = None, qps_label: str = "q/s") -> str:
+# The budgets (% of raw) the paper's table shows; the run covers more (paper.PAPER_BUDGET_PCT).
+TABLE_BUDGETS = (0.5, 2, 10)
+
+
+def table(q: pd.DataFrame, qps: Optional[Dict[str, float]] = None, qps_label: str = "q/s",
+          budgets: Optional[tuple] = TABLE_BUDGETS) -> str:
+    """`budgets` (% of raw; None: every one in `q`) selects the columns, and the best encoding per rate
+    is chosen over those columns only."""
     q = build(q)
+    if budgets:
+        q = q[np.isclose(q.budget_pct.to_numpy()[:, None], np.asarray(budgets, dtype=float)[None, :], rtol=0.02).any(axis=1)]
     budgets = sorted(q.budget_pct.unique())
     saved = q.pivot_table(index="quantize", columns="budget_pct", values="index_accesses_saved_pct", aggfunc="mean")
     single = q.pivot_table(index="quantize", columns="budget_pct", values="singleton", aggfunc="mean")
