@@ -26,7 +26,8 @@ main.py run write the same files -- and truncate them, see CLAUDE.md):
     streaming     streaming/<corpus>/streaming.csv         generate_streaming (position sweep,
                                                            sphere_merge bootstrap only)
     equal-memory  equal_memory/<corpus>/equal_memory.csv   generate_equal_memory (the baselines
-                                                           the figure shows only)
+                                                           the two figures show: zero-FN FPR on
+                                                           every corpus, FPR/FNR of the rest on one)
     throughput    end_to_end.csv                           generate_end_to_end (defined here)
 
 Not generated: scaling, cap_cover_system_tau, query_performance and the
@@ -55,7 +56,7 @@ from plots.plot_paper import (plot_figures, use_corpora, CONFIG_TO_METHOD, EQUAL
 
 assert STREAM_BOOTSTRAP == CAP_COVER_CONSTRUCT, "the streaming figure bootstraps with the paper's construct method"
 
-# The baselines equal-memory-fpr-fnr-vs-budget draws; the rest of
+# The baselines the two equal-memory figures draw; the rest of
 # main.equal_memory_filters would be run and discarded.
 PAPER_EQUAL_MEMORY_FILTERS = [cls for cls in equal_memory_filters
                               if CONFIG_TO_METHOD.get(cls.__name__) not in EQUAL_MEMORY_HIDDEN]

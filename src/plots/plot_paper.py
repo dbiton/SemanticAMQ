@@ -9,7 +9,8 @@ go to suggestions/figures/ under the names paper.tex includes:
     quantization-table.tex             tab:quantization cap_quantization/<corpus>/*.csv
     construction-fpr-vs-k.*            fig:construction construct_methods/<corpus>.csv
     streaming-fpr-vs-position.*        fig:streaming    streaming/<corpus>/streaming.csv
-    equal-memory-fpr-fnr-vs-budget.*   fig:equal-memory equal_memory/<corpus>/equal_memory.csv
+    equal-memory-zero-fn-fpr-vs-budget.*      fig:equal-memory          equal_memory/<corpus>/equal_memory.csv
+    equal-memory-nonzero-fn-wikianswers.*     fig:equal-memory-nonzero-fn  (same)
     throughput-improvement.*           fig:throughput   end_to_end.csv
 
 (figures/scheme.pdf is a hand-drawn diagram and is not produced here.)
@@ -17,7 +18,8 @@ go to suggestions/figures/ under the names paper.tex includes:
 Run from the repo root with the global Python 3.12:
     PYTHONPATH=src python src/plots/plot_paper.py [results-folder] [figure ...]
 results-folder defaults to results/. Figure names are the keys of FIGURES
-(sweeps, quantization, quantization-table, construction, streaming, equal-memory, throughput); default is all.
+(sweeps, quantization, quantization-table, construction, streaming, equal-memory-zero-fn,
+equal-memory-nonzero-fn, throughput); default is all.
 
 tau is drawn as cosine distance 1 - cos = tau_L2^2 / 2 (cosine_distance); the CSVs and
 the filters keep L2.
@@ -94,8 +96,8 @@ CONFIG_TO_METHOD = {
     "PacukLSHFilter": "Zero-FN LSH", "SankowskiWygockiFilter": "Zero-FN LSH",
     "VAPlusFilter": "VA+-file",
 }
-# Left out of the equal-memory figure.
-EQUAL_MEMORY_HIDDEN = {"QuantizedVector", "MLP", "HNSW", "Zero-FN LSH"}
+# Never drawn, so src/paper.py does not run them.
+EQUAL_MEMORY_HIDDEN = {"IVF-Radii"}
 
 def use_corpora(names):
     """Draw these corpora (display names) instead of the paper's five: for a
@@ -442,42 +444,78 @@ def streaming():
 
 
 # ---------------------------------------------------------------------------
-# fig:equal-memory  equal-memory-fpr-fnr-vs-budget
+# fig:equal-memory  equal-memory-zero-fn-fpr-vs-budget
+# fig:equal-memory-nonzero-fn  equal-memory-nonzero-fn-wikianswers
 # ---------------------------------------------------------------------------
 
-def equal_memory():
+# The methods each figure draws, in legend order. A method the run did not produce is skipped.
+ZERO_FN_METHODS = [CAP_COVER, "VA+-file", "Zero-FN LSH", "QuantizedVector"]
+NONZERO_FN_METHODS = [CAP_COVER, "DSH", "MLP", "IVF-PQ", "HNSW"]
+NONZERO_FN_CORPUS = "WikiAnswers"     # the one corpus the FPR/FNR figure shows (the first drawn one if absent)
+
+
+def _equal_memory_frame():
     e = read_all("equal_memory/*/equal_memory.csv")
     e = e[~e.Infeasible.astype(bool)].copy()
     e["Dataset"] = to_corpus(e.Dataset)
     e["pct_raw"] = (100 * e["Memory Budget"] / (e["Construct Size"] * DIM * FP32_BYTES)).round(3)
     e["method"] = e.Config.map(CONFIG_TO_METHOD)
     # Two configs feed "Zero-FN LSH": keep the lower-FPR one at each point.
-    e = e.sort_values("FPR").drop_duplicates(["method", "Dataset", "Memory Budget"], keep="first")
-    styles = {m: st for m, st in METHOD_STYLE.items()
-              if m in set(e.method) and m not in EQUAL_MEMORY_HIDDEN}
+    return e.sort_values("FPR").drop_duplicates(["method", "Dataset", "Memory Budget"], keep="first")
 
-    fig, axes = corpus_panels(2, sharex=True, sharey="row")
-    for j, corpus in enumerate(CORPORA):
+
+def _method_handles(e, methods):
+    styles = {m: METHOD_STYLE[m] for m in methods if m in set(e.method)}
+    return styles, [plt.Line2D([], [], color=c, marker=mk, ls=ls) for c, mk, ls in styles.values()]
+
+
+def equal_memory_zero_fn():
+    """FPR against memory of the filters that never miss a member: one column per corpus."""
+    e = _equal_memory_frame()
+    styles, handles = _method_handles(e, ZERO_FN_METHODS)
+    fig, axes = corpus_panels(1, sharex=True, sharey=True)
+    for ax, corpus in zip(axes[0], CORPORA):
         d = e[e.Dataset == corpus]
         if d.empty:
-            mark_empty(axes[0, j])
-            mark_empty(axes[1, j])
+            mark_empty(ax)
         for method, (color, marker, ls) in styles.items():
             g = d[d.method == method].sort_values("pct_raw")
-            if g.empty:
-                continue
-            axes[0, j].plot(g.pct_raw, g.FPR, color=color, marker=marker, ls=ls, ms=3)
-            axes[1, j].plot(g.pct_raw, g.FNR, color=color, marker=marker, ls=ls, ms=3)
-        axes[1, j].set_xscale("log")
-        axes[1, j].xaxis.set_major_formatter(PCT_FMT)
+            if not g.empty:
+                ax.plot(g.pct_raw, g.FPR, color=color, marker=marker, ls=ls, ms=3)
+        ax.set_xscale("log")
+        ax.xaxis.set_major_formatter(PCT_FMT)
     axes[0, 0].set_ylabel("FPR")
-    axes[1, 0].set_ylabel("FNR")
     axes[0, 0].set_ylim(-0.03, 1.05)
-    axes[1, 0].set_ylim(-0.03, 1.0)
-    handles = [plt.Line2D([], [], color=c, marker=mk, ls=ls) for c, mk, ls in styles.values()]
-    fig_legend(fig, handles, list(styles), ncol=min(len(styles), 8))
+    fig_legend(fig, handles, list(styles), ncol=len(styles))
     shared_xlabel(axes, "memory (% of raw fp32 index, log)")
-    save(fig, "equal-memory-fpr-fnr-vs-budget")
+    save(fig, "equal-memory-zero-fn-fpr-vs-budget")
+
+
+def equal_memory_nonzero_fn():
+    """FPR (left) and FNR (right) of the filters that miss members, on one corpus, with the
+    Cap-Cover as the zero-FN reference."""
+    e = _equal_memory_frame()
+    corpus = NONZERO_FN_CORPUS if NONZERO_FN_CORPUS in CORPORA else CORPORA[0]
+    d = e[e.Dataset == corpus]
+    styles, handles = _method_handles(e, NONZERO_FN_METHODS)
+    size = 1.5 * PANEL
+    fig, axes = plt.subplots(1, 2, figsize=(2 * size + GAP_LABELLED, size + MARGIN_TOP), squeeze=False,
+                             gridspec_kw=dict(left=0, right=1, bottom=0, wspace=GAP_LABELLED / size))
+    for ax, column, label in zip(axes[0], ("FPR", "FNR"), ("FPR", "FNR")):
+        ax.set_box_aspect(1)
+        if d.empty:
+            mark_empty(ax)
+        for method, (color, marker, ls) in styles.items():
+            g = d[d.method == method].sort_values("pct_raw")
+            if not g.empty:
+                ax.plot(g.pct_raw, g[column], color=color, marker=marker, ls=ls, ms=3)
+        ax.set_xscale("log")
+        ax.xaxis.set_major_formatter(PCT_FMT)
+        ax.set_ylabel(label)
+        ax.set_ylim(-0.03, 1.05)
+        ax.set_xlabel("memory (% of raw, log)")
+    fig_legend(fig, handles, list(styles), ncol=len(styles))
+    save(fig, f"equal-memory-nonzero-fn-{corpus.lower()}")
 
 
 # ---------------------------------------------------------------------------
@@ -593,7 +631,8 @@ FIGURES = {
     "quantization-table": quantization_table,
     "construction": construction,
     "streaming": streaming,
-    "equal-memory": equal_memory,
+    "equal-memory-zero-fn": equal_memory_zero_fn,
+    "equal-memory-nonzero-fn": equal_memory_nonzero_fn,
     "throughput": throughput,
 }
 
