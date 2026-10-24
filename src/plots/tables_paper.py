@@ -1,0 +1,198 @@
+"""The tables paper.tex adds beyond table_quantization.py, as LaTeX (written to
+suggestions/figures/), plus the numbers its text quotes from them. Built only from existing
+results/ CSVs (src/paper.py generates them):
+
+    ablation-table.tex       tab:ablation       ablation.csv   FPR of each variant at delta = 0.02
+    sensitivity-table.tex    tab:sensitivity    ablation.csv   change in FPR when the cover is built for another
+                                                               threshold / sphere-merge parameter
+    backends-table.tex       tab:backends       backends.csv   the filter in front of flat / HNSW / IVF
+    timing-table.tex         tab:timing         timing.csv     construction and per-arrival insertion time
+    jtau-correlation.csv     (text)             ablation.csv   rank correlation of J_tau with FPR across variants
+
+    PYTHONPATH=src python src/plots/tables_paper.py [results-folder] [out-folder]
+"""
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[2]
+BS = chr(92)     # LaTeX backslash
+
+DELTA = 0.02
+# variant -> (component, label); first of each component is the paper's configuration
+ABLATION_ROWS = [
+    ("full", "Accept rule", "cap (paper)"),
+    ("ball_sphere", "", "ball at the cap direction"),
+    ("ball_meb", "", "ball, minimum enclosing"),
+    ("full", "Construction", "sphere merge (paper)"),
+    ("minimax", "", "minimax"),
+    ("gonzalez", "", "Gonzalez"),
+    ("full", "Encoding", "auto (paper)"),
+    ("tq_only", "", "TurboQuant rungs only"),
+    ("spq_only", "", "seeded-PQ rungs only"),
+    ("tq4_fixed", "", "TQ4 only"),
+    ("fp32_fixed", "", "FP32 only"),
+    ("no_mixing", "", "one encoding for all caps"),
+    ("full", "Codes", "fitted (paper)"),
+    ("nearest_codes", "", "nearest to the direction"),
+]
+SENSITIVITY_ROWS = [
+    ("t0.05", "offset $t=0.05$"), ("t0.2", "offset $t=0.2$"), ("t0.4", "offset $t=0.4$"),
+    ("p4", "exponent $p=4$"), ("p16", "exponent $p=16$"),
+    ("select_delta0.02", "encoding chosen at $\\delta=0.02$"), ("select_delta0.1", "encoding chosen at $\\delta=0.1$"),
+]
+
+
+def _paired(d: pd.DataFrame, arm: str, kf: float, delta: float):
+    """(mean FPR over cells, mean paired difference to "full", number of cells worse, cells)."""
+    g = d[np.isclose(d.k_fraction, kf) & np.isclose(d.delta, delta)]
+    piv = g.pivot_table(index="arm", columns=["dataset", "fold"], values="fpr")
+    if arm not in piv.index or "full" not in piv.index:
+        return None
+    diff = (piv.loc[arm] - piv.loc["full"]).dropna()
+    return float(piv.loc[arm].mean()), float(diff.mean()), int((diff > 1e-9).sum()), len(diff)
+
+
+def _num(x: float, signed: bool = False) -> str:
+    if signed and abs(x) < 0.0005:
+        return ".000"
+    s = f"{x:+.3f}" if signed else f"{x:.3f}"
+    return s.replace("0.", ".", 1) if abs(x) < 1 else s
+
+
+def ablation_table(d: pd.DataFrame) -> str:
+    kfs = sorted(d.k_fraction.unique())[:2]
+    out = [f"{BS}begin{{tabular}}{{@{{}}llrrrr@{{}}}}", f"{BS}toprule",
+           f"& & {BS}multicolumn{{2}}{{c}}{{$k={100 * kfs[0]:g}{BS}%$}} & {BS}multicolumn{{2}}{{c}}{{$k={100 * kfs[1]:g}{BS}%$}} {BS*2}",
+           f"{BS}cmidrule(lr){{3-4}}{BS}cmidrule(lr){{5-6}}",
+           f"Component & Variant & FPR & {BS}multicolumn{{1}}{{c}}{{$\\Delta$}} & FPR & {BS}multicolumn{{1}}{{c}}{{$\\Delta$}} {BS*2}",
+           f"{BS}midrule"]
+    for i, (arm, comp, label) in enumerate(ABLATION_ROWS):
+        if comp and i:
+            out.append(f"{BS}addlinespace[2pt]")
+        cells = []
+        for kf in kfs:
+            r = _paired(d, arm, kf, DELTA)
+            if r is None:
+                cells += ["--", "--"]
+                continue
+            mean, diff, worse, n = r
+            cells.append(_num(mean))
+            cells.append("" if arm == "full" else f"{_num(diff, True)}$^{{{worse}}}$")
+        out.append(f"{comp} & {label} & " + " & ".join(cells) + f" {BS*2}")
+    out += [f"{BS}bottomrule", f"{BS}end{{tabular}}"]
+    return "\n".join(out) + "\n"
+
+
+def sensitivity_table(d: pd.DataFrame) -> str:
+    """Change in FPR (variant minus the paper's configuration, mean over cells) of a cover built
+    with another sphere-merge offset t / exponent p or another selection threshold, scored at
+    several query thresholds delta."""
+    deltas = [0.005, 0.02, 0.1]
+    kfs = sorted(d.k_fraction.unique())[:2]
+    n = len(deltas)
+    out = [f"{BS}begin{{tabular}}{{@{{}}l" + "r" * (n * len(kfs)) + "@{}}", f"{BS}toprule",
+           "& " + " & ".join(f"{BS}multicolumn{{{n}}}{{c}}{{$k={100 * kf:g}{BS}%$}}" for kf in kfs) + f" {BS*2}",
+           "".join(f"{BS}cmidrule(lr){{{2 + i * n}-{1 + (i + 1) * n}}}" for i in range(len(kfs))),
+           "Variant & " + " & ".join(f"{dl:g}" for _ in kfs for dl in deltas) + f" {BS*2}",
+           f"{BS}midrule"]
+    for arm, label in SENSITIVITY_ROWS:
+        cells = []
+        for kf in kfs:
+            for dl in deltas:
+                r = _paired(d, arm, kf, dl)
+                cells.append("--" if r is None else _num(r[1], True))
+        out.append(f"{label} & " + " & ".join(cells) + f" {BS*2}")
+    out += [f"{BS}bottomrule", f"{BS}end{{tabular}}"]
+    return "\n".join(out) + "\n"
+
+
+def jtau_correlation(d: pd.DataFrame) -> pd.DataFrame:
+    """Spearman rank correlation between log10 J_tau and FPR across the variants of one cell
+    (dataset, fold, budget) at DELTA, for all cap variants and for the competitive ones (those
+    within 0.1 FPR of the paper's configuration, where the volume has to rank near-equal covers)."""
+    from scipy.stats import spearmanr
+    g = d[np.isclose(d.delta, DELTA) & ~d.arm.isin(["ball_sphere", "ball_meb"])]
+    rows = []
+    for (ds, fold, kf), c in g.groupby(["dataset", "fold", "k_fraction"]):
+        full = float(c.loc[c.arm == "full", "fpr"].iloc[0])
+        for scope, cc in (("all", c), ("competitive", c[c.fpr <= full + 0.1])):
+            if cc.fpr.nunique() > 2 and cc.log10_j_tau.nunique() > 2:
+                rows.append({"dataset": ds, "fold": fold, "k_fraction": kf, "scope": scope, "n_variants": len(cc),
+                             "spearman": float(spearmanr(cc.log10_j_tau, cc.fpr)[0])})
+    return pd.DataFrame(rows)
+
+
+BACKEND_LABEL = {"flat": "flat (range search)", "hnsw": "HNSW", "ivf": "IVF-Flat"}
+DATASET_ABBR = {"wildchat": "WildChat", "quora": "Quora", "wikianswers": "WikiAnswers",
+                "chatgpt_paraphrases": "ChatGPT-Para.", "ccnews": "CC-News"}
+
+
+def backends_table(b: pd.DataFrame, delta: float = DELTA) -> str:
+    g = b[np.isclose(b.delta, delta)]
+    datasets = [x for x in DATASET_ABBR if x in set(g.dataset)]
+    cols = "@{}l" + "r" * 4 + "r" * len(datasets) + "r@{}"
+    out = [f"{BS}begin{{tabular}}{{{cols}}}", f"{BS}toprule",
+           f"& & & & & {BS}multicolumn{{{len(datasets)}}}{{c}}{{Throughput gain ({BS}%)}} & {BS*2}"]
+    out.append(f"{BS}cmidrule(lr){{6-{5 + len(datasets)}}}")
+    out.append("Backend & recall & ms (mean) & ms (p99) & build s & " + " & ".join(DATASET_ABBR[x] for x in datasets)
+               + f" & break-even ms {BS*2}")
+    out.append(f"{BS}midrule")
+    for backend in ("flat", "hnsw", "ivf"):
+        s = g[g.backend == backend]
+        if s.empty:
+            continue
+        gains = []
+        for ds in datasets:
+            r = s[s.dataset == ds]
+            gains.append("--" if r.empty else f"{r.throughput_improvement_pct.iloc[0]:,.0f}".replace(",", "{,}"))
+        out.append(f"{BACKEND_LABEL[backend]} & {s.backend_recall.mean():.2f} & {s.backend_mean_ms.mean():.2f} & "
+                   f"{s.backend_p99_ms.mean():.2f} & {s.backend_build_s.mean():.0f} & " + " & ".join(gains)
+                   + f" & {s.breakeven_backend_ms.mean():.2f} {BS*2}")
+    out.append(f"{BS}midrule")
+    f = g.drop_duplicates("dataset")
+    out.append(f"{BS}multicolumn{{5}}{{@{{}}l}}{{filter: {f.filter_mean_ms.mean():.2f} ms mean, {f.filter_p99_ms.mean():.2f} ms p99, "
+               f"{f.filter_pct_of_raw.mean():.1f}{BS}% of raw}} & " + " & ".join(
+                   f"{r.accept_rate_all_pct:.0f}" for ds in datasets for r in [f[f.dataset == ds].iloc[0]])
+               + f" & {BS}multicolumn{{1}}{{l}}{{{BS}% accepted}} {BS*2}")
+    out += [f"{BS}bottomrule", f"{BS}end{{tabular}}"]
+    return "\n".join(out) + "\n"
+
+
+def timing_table(t: pd.DataFrame) -> str:
+    c = t[t.kind == "construct"]
+    ks = sorted(c.k_fraction.unique())
+    out = [f"{BS}begin{{tabular}}{{@{{}}l" + "r" * len(ks) + "@{}}", f"{BS}toprule",
+           f"Construction (s) & " + " & ".join(f"$k={100 * k:g}{BS}%$" for k in ks) + f" {BS*2}", f"{BS}midrule"]
+    for m in ("gonzalez", "minimax", "sphere_merge"):
+        r = c[c.method == m].set_index("k_fraction").seconds
+        out.append(f"{m.replace('_', ' ')} & " + " & ".join("--" if k not in r.index else f"{r[k]:.1f}" for k in ks) + f" {BS*2}")
+    ins = t[t.kind == "insert"]
+    out += [f"{BS}midrule", f"Insertion (ms) & mean & p50 & p99 {BS*2}".replace("& mean & p50 & p99", "& mean & p99 &"),
+            f"{BS}midrule"]
+    for m in ("nearest", "cap_merge"):
+        r = ins[ins.method == m]
+        if len(r):
+            out.append(f"{m.replace('_', ' ')} & {r.mean_ms.iloc[0]:.2f} & {r.p99_ms.iloc[0]:.2f} & {BS*2}".replace(" & &", " &"))
+    out += [f"{BS}bottomrule", f"{BS}end{{tabular}}"]
+    return "\n".join(out) + "\n"
+
+
+def write_all(results: Path, out: Path) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    if (results / "ablation.csv").exists():
+        d = pd.read_csv(results / "ablation.csv")
+        (out / "ablation-table.tex").write_text(ablation_table(d), encoding="utf-8")
+        (out / "sensitivity-table.tex").write_text(sensitivity_table(d), encoding="utf-8")
+        jtau_correlation(d).to_csv(out / "jtau-correlation.csv", index=False)
+    if (results / "backends.csv").exists():
+        (out / "backends-table.tex").write_text(backends_table(pd.read_csv(results / "backends.csv")), encoding="utf-8")
+    if (results / "timing.csv").exists():
+        (out / "timing-table.tex").write_text(timing_table(pd.read_csv(results / "timing.csv")), encoding="utf-8")
+
+
+if __name__ == "__main__":
+    res = ROOT / (sys.argv[1] if len(sys.argv) > 1 else "results")
+    write_all(res, ROOT / (sys.argv[2] if len(sys.argv) > 2 else "suggestions/figures"))

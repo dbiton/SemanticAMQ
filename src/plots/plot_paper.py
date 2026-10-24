@@ -12,6 +12,9 @@ go to suggestions/figures/ under the names paper.tex includes:
     equal-memory-zero-fn-fpr-vs-budget.*      fig:equal-memory          equal_memory/<corpus>/equal_memory.csv
     equal-memory-nonzero-fn-wikianswers.*     fig:equal-memory-nonzero-fn  (same)
     throughput-improvement.*           fig:throughput   end_to_end.csv
+    ablation-table.tex, sensitivity-table.tex, backends-table.tex, timing-table.tex,
+    jtau-correlation.csv               tab:ablation, tab:sensitivity, tab:backends, tab:timing
+                                       ablation.csv, backends.csv, timing.csv (plots/tables_paper.py)
 
 (figures/scheme.pdf is a hand-drawn diagram and is not produced here.)
 
@@ -19,7 +22,7 @@ Run from the repo root with the global Python 3.12:
     PYTHONPATH=src python src/plots/plot_paper.py [results-folder] [figure ...]
 results-folder defaults to results/. Figure names are the keys of FIGURES
 (sweeps, quantization, quantization-table, construction, streaming, equal-memory-zero-fn,
-equal-memory-nonzero-fn, throughput); default is all.
+equal-memory-nonzero-fn, throughput, tables); default is all.
 
 tau is drawn as cosine distance 1 - cos = tau_L2^2 / 2 (cosine_distance); the CSVs and
 the filters keep L2.
@@ -625,6 +628,13 @@ def quantization_table():
     write(RESULTS, OUT_FIG / "quantization-table.tex")
 
 
+def paper_tables():
+    """tab:ablation, tab:sensitivity, tab:backends, tab:timing and the J_tau correlation
+    (plots/tables_paper.py)."""
+    from plots.tables_paper import write_all
+    write_all(RESULTS, OUT_FIG)
+
+
 FIGURES = {
     "sweeps": sweeps_grid,
     "quantization": quantization,
@@ -634,6 +644,7 @@ FIGURES = {
     "equal-memory-zero-fn": equal_memory_zero_fn,
     "equal-memory-nonzero-fn": equal_memory_nonzero_fn,
     "throughput": throughput,
+    "tables": paper_tables,
 }
 
 
