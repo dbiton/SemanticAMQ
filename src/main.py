@@ -28,7 +28,7 @@ from plots.plot_blocklist import generate_blocklist_figures
 from plots.plot_budget import generate_budget_figures
 from plots.plot_construct_methods import generate_construct_methods_figures, load_results as load_construct_methods
 from plots.plot_common import DATASETS, DATASET_LABELS
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from filters.cap_cover.cap_cover_filter import CapCoverFilter
 from filters.dsh_filter import DSHFilter
 from filters.hnsw_filter import HNSWFilter
@@ -792,15 +792,19 @@ def plot_budget(df: pd.DataFrame) -> None:
     generate_budget_figures(df)
 
 
-def generate_cap_quantization(runner: Runner, k_values_nominal: Optional[List[int]] = None) -> None:
+def generate_cap_quantization(runner: Runner, k_values_nominal: Optional[List[int]] = None,
+                              quantizes: Optional[Sequence[Any]] = None) -> None:
     """CapCoverFilter.auto() per
     (dataset, k, seed, quantize) over CAP_QUANTIZATION_SWEEP (AUTO_CANDIDATES). Same k ladder, same
     fixed tau, same blocklist workloads/source-size split.
+
+    `quantizes` overrides CAP_QUANTIZATION_SWEEP (paper.py adds the FP/SQ/TQ rungs).
 
     Only submits 'cap_quantization' jobs -- does not run `runner`."""
     num_vectors      = WORKLOAD_NUM_VECTORS
     dim              = 384
     n_folds          = BLOCKLIST_FOLDS
+    quantizes        = tuple(quantizes or CAP_QUANTIZATION_SWEEP)
     k_values_nominal = k_values_nominal or [2 ** i for i in range(11, 17)]
     tau              = FIXED_TAU
 
@@ -830,7 +834,7 @@ def generate_cap_quantization(runner: Runner, k_values_nominal: Optional[List[in
             actual_results = compute_static_actual_results(
                 vectors_construct, vectors_query, tau)
             for k in k_values:
-                for quantize in CAP_QUANTIZATION_SWEEP:
+                for quantize in quantizes:
                     runner.submit(
                         'cap_quantization',
                         output_csv=output_csv,

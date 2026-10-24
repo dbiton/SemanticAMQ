@@ -20,7 +20,8 @@ Each figure and what feeds it (the CSVs are main.py's, so a paper run and a
 main.py run write the same files -- and truncate them, see CLAUDE.md):
 
     sweeps        budget.csv, blocklist.csv                generate_budget, generate_blocklist
-    quantization  cap_quantization/<corpus>/*.csv          generate_cap_quantization
+    quantization  cap_quantization/<corpus>/*.csv          generate_cap_quantization (figure, and
+                                                           tab:quantization via plots/table_quantization.py)
     construction  construct_methods/<corpus>.csv           generate_construct_methods
     streaming     streaming/<corpus>/streaming.csv         generate_streaming (position sweep,
                                                            sphere_merge bootstrap only)
@@ -44,6 +45,8 @@ os.environ.setdefault("CAPCOVER_SCAN_LIMIT_MS", "1.0")
 from functools import partial
 
 import main
+from runner import CAP_QUANTIZATION_SWEEP
+from filters.cap_cover.cap_quantizers import Quantize
 from main import (Runner, CAP_COVER_CONSTRUCT, BLOCKLIST_FOLDS, blocklist_workloads, equal_memory_filters, logger,
                   generate_blocklist, generate_budget, generate_cap_quantization,
                   generate_construct_methods, generate_streaming, generate_equal_memory)
@@ -82,11 +85,20 @@ def generate_end_to_end(runner: Runner) -> None:
 PAPER_K_LADDER = [2 ** i for i in range(11, 17)]    # main.generate_cap_quantization's: 2.6-82% of |B| = 80,000
 
 
+# The encodings the quantization table compares: the full-precision, scalar and
+# TurboQuant rungs down to 1 bit/dim, plus the seeded-PQ rungs auto() chooses among.
+PAPER_QUANTIZE = tuple(dict.fromkeys(
+    (Quantize.FP32, Quantize.FP16, Quantize.SQ8, Quantize.TQ8, Quantize.SQ6, Quantize.SQ4, Quantize.TQ4,
+     Quantize.TQ3, Quantize.TQ2, Quantize.TQ1) + tuple(CAP_QUANTIZATION_SWEEP)))
+
+
 def generate_quantization(runner: Runner) -> None:
-    """main.generate_cap_quantization with its k ladder scaled to the workload
-    size, so a smaller run (--num-vectors) still has k below the reference set."""
+    """main.generate_cap_quantization over PAPER_QUANTIZE, with its k ladder scaled
+    to the workload size, so a smaller run (--num-vectors) still has k below the
+    reference set."""
     scale = main.WORKLOAD_NUM_VECTORS / 100_000
-    generate_cap_quantization(runner, k_values_nominal=[max(1, round(k * scale)) for k in PAPER_K_LADDER])
+    generate_cap_quantization(runner, k_values_nominal=[max(1, round(k * scale)) for k in PAPER_K_LADDER],
+                              quantizes=PAPER_QUANTIZE)
 
 
 PAPER_GENERATORS = (

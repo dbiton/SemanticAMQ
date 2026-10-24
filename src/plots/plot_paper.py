@@ -6,6 +6,7 @@ go to suggestions/figures/ under the names paper.tex includes:
 
     sweeps-grid.*                      fig:end-to-end   budget.csv + blocklist.csv
     quantization-saved-vs-memory.*     fig:quantization cap_quantization/<corpus>/*.csv
+    quantization-table.tex             tab:quantization cap_quantization/<corpus>/*.csv
     construction-fpr-vs-k.*            fig:construction construct_methods/<corpus>.csv
     streaming-fpr-vs-position.*        fig:streaming    streaming/<corpus>/streaming.csv
     equal-memory-fpr-fnr-vs-budget.*   fig:equal-memory equal_memory/<corpus>/equal_memory.csv
@@ -16,7 +17,7 @@ go to suggestions/figures/ under the names paper.tex includes:
 Run from the repo root with the global Python 3.12:
     PYTHONPATH=src python src/plots/plot_paper.py [results-folder] [figure ...]
 results-folder defaults to results/. Figure names are the keys of FIGURES
-(sweeps, quantization, construction, streaming, equal-memory, throughput); default is all.
+(sweeps, quantization, quantization-table, construction, streaming, equal-memory, throughput); default is all.
 
 tau is drawn as cosine distance 1 - cos = tau_L2^2 / 2 (cosine_distance); the CSVs and
 the filters keep L2.
@@ -580,9 +581,16 @@ def throughput():
     save(fig, "throughput-improvement")
 
 
+def quantization_table():
+    """tab:quantization, as LaTeX (plots/table_quantization.py)."""
+    from plots.table_quantization import write
+    write(RESULTS, OUT_FIG / "quantization-table.tex")
+
+
 FIGURES = {
     "sweeps": sweeps_grid,
     "quantization": quantization,
+    "quantization-table": quantization_table,
     "construction": construction,
     "streaming": streaming,
     "equal-memory": equal_memory,
