@@ -1779,11 +1779,14 @@ def _tune_search_param(search_sq, params: Tuple[int, ...], queries: np.ndarray, 
                        actual: np.ndarray, recall_target: float) -> Tuple[int, float]:
     """The cheapest query-time parameter (smallest of `params`) whose decision --
     "the returned nearest vector is within tau" -- finds at least `recall_target`
-    of the true positives among `queries`; the largest if none does."""
+    of the true positives among `queries`; the largest if none does, the smallest
+    (recall NaN) if `queries` has no true positive to tune on."""
+    if not actual.any():                # nothing to find: no recall to tune, so the cheapest setting
+        return params[0], float("nan")
     recall = 0.0
     for p in params:
         found = search_sq(queries, p) <= tau * tau
-        recall = float((found & actual).sum() / max(actual.sum(), 1))
+        recall = float((found & actual).sum() / actual.sum())
         if recall >= recall_target:
             return p, recall
     return params[-1], recall
@@ -1832,7 +1835,7 @@ def backend_latency_worker(
     d2, _ = flat.search(Q, 1)
     nn = np.sqrt(np.clip(d2[:, 0], 0, None))
 
-    cal = np.arange(min(n_calibration, len(Q)))
+    cal = np.arange(min(n_calibration, len(Q) // 2))        # the rest is where the timed queries come from
     rest = np.arange(len(cal), len(Q))
     rng = np.random.default_rng(timing_seed)
     timed = np.sort(rng.choice(rest, size=min(n_timed, len(rest)), replace=False))

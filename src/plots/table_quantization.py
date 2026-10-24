@@ -4,7 +4,8 @@ LaTeX, from results/cap_quantization/<corpus>/*.csv (src/paper.py's generate_qua
 Per budget (k FP32 caps as a % of the construct set) a cell is the index accesses saved,
 averaged over corpora and folds. Per rate, the encoding with the best mean over the cells
 is listed. Bold: best in column. Dagger: the budget fits one cap per indexed vector.
-Last column: median queries/s at the smallest budget.
+Optional last column (`qps=True`): median queries/s at the smallest budget; off by default, since the run that feeds
+this table is parallel and its timings are not pinned (CLAUDE.md).
 
     PYTHONPATH=src python src/plots/table_quantization.py [results-folder] [out.tex]
 """
@@ -42,12 +43,12 @@ def build(q: pd.DataFrame) -> pd.DataFrame:
     return q
 
 
-def table(q: pd.DataFrame) -> str:
+def table(q: pd.DataFrame, qps: bool = False) -> str:
     q = build(q)
     budgets = sorted(q.budget_pct.unique())
     saved = q.pivot_table(index="quantize", columns="budget_pct", values="index_accesses_saved_pct", aggfunc="mean")
     single = q.pivot_table(index="quantize", columns="budget_pct", values="singleton", aggfunc="mean")
-    qps = q[q.budget_pct == budgets[0]].groupby("quantize").query_throughput_qps.median()
+    qps_by_name = q[q.budget_pct == budgets[0]].groupby("quantize").query_throughput_qps.median()
     rate = q.groupby("quantize").rate.first()
 
     best = saved.mean(axis=1).groupby(rate).idxmax()     # per rate: the encoding with the best mean
@@ -55,10 +56,11 @@ def table(q: pd.DataFrame) -> str:
     names = [n for _, n in rows]
     colmax = saved.loc[names].max()
 
-    out = [f"{BS}begin{{tabular}}{{@{{}}lr" + "r" * len(budgets) + "r@{}}", f"{BS}toprule",
-           f"& & {BS}multicolumn{{{len(budgets)}}}{{c}}{{Memory budget ({BS}% of raw)}} & {BS*2}",
+    extra = "r" if qps else ""
+    out = [f"{BS}begin{{tabular}}{{@{{}}lr" + "r" * len(budgets) + extra + "@{}}", f"{BS}toprule",
+           f"& & {BS}multicolumn{{{len(budgets)}}}{{c}}{{Memory budget ({BS}% of raw)}}" + (" & " if qps else "") + f" {BS*2}",
            f"{BS}cmidrule(lr){{3-{2 + len(budgets)}}}",
-           "Encoding & b/dim & " + " & ".join(f"{b:g}" for b in budgets) + f" & q/s {BS*2}", f"{BS}midrule"]
+           "Encoding & b/dim & " + " & ".join(f"{b:g}" for b in budgets) + (" & q/s" if qps else "") + f" {BS*2}", f"{BS}midrule"]
     for r, name in rows:
         cells = []
         for b in budgets:
@@ -70,8 +72,8 @@ def table(q: pd.DataFrame) -> str:
             if v >= colmax[b] - 1e-9:
                 c = f"{BS}textbf{{{c}}}"
             cells.append(c + (f"$^{{{BS}dagger}}$" if single.loc[name, b] >= 0.5 else ""))
-        q_s = f"{qps[name]:,.0f}".replace(",", "{,}") if name in qps and pd.notna(qps[name]) else "--"
-        out.append(f"{_tex(_label(name))} & {_rate(r)} & " + " & ".join(cells) + f" & {q_s} {BS*2}")
+        q_s = f"{qps_by_name[name]:,.0f}".replace(",", "{,}") if name in qps_by_name and pd.notna(qps_by_name[name]) else "--"
+        out.append(f"{_tex(_label(name))} & {_rate(r)} & " + " & ".join(cells) + (f" & {q_s}" if qps else "") + f" {BS*2}")
     out += [f"{BS}bottomrule", f"{BS}end{{tabular}}"]
     return "\n".join(out) + "\n"
 

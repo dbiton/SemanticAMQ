@@ -131,32 +131,31 @@ DATASET_ABBR = {"wildchat": "WildChat", "quora": "Quora", "wikianswers": "WikiAn
 
 
 def backends_table(b: pd.DataFrame, delta: float = DELTA) -> str:
+    """One block per corpus: the filter's own cost and acceptance, then each backend's lookup
+    cost (mean, p99), build time, size, and the throughput gain the filter gives in front of it."""
     g = b[np.isclose(b.delta, delta)]
-    datasets = [x for x in DATASET_ABBR if x in set(g.dataset)]
-    cols = "@{}l" + "r" * 4 + "r" * len(datasets) + "r@{}"
-    out = [f"{BS}begin{{tabular}}{{{cols}}}", f"{BS}toprule",
-           f"& & & & & {BS}multicolumn{{{len(datasets)}}}{{c}}{{Throughput gain ({BS}%)}} & {BS*2}"]
-    out.append(f"{BS}cmidrule(lr){{6-{5 + len(datasets)}}}")
-    out.append("Backend & recall & ms (mean) & ms (p99) & build s & " + " & ".join(DATASET_ABBR[x] for x in datasets)
-               + f" & break-even ms {BS*2}")
-    out.append(f"{BS}midrule")
-    for backend in ("flat", "hnsw", "ivf"):
-        s = g[g.backend == backend]
-        if s.empty:
-            continue
-        gains = []
-        for ds in datasets:
-            r = s[s.dataset == ds]
-            gains.append("--" if r.empty else f"{r.throughput_improvement_pct.iloc[0]:,.0f}".replace(",", "{,}"))
-        out.append(f"{BACKEND_LABEL[backend]} & {s.backend_recall.mean():.2f} & {s.backend_mean_ms.mean():.2f} & "
-                   f"{s.backend_p99_ms.mean():.2f} & {s.backend_build_s.mean():.0f} & " + " & ".join(gains)
-                   + f" & {s.breakeven_backend_ms.mean():.2f} {BS*2}")
-    out.append(f"{BS}midrule")
-    f = g.drop_duplicates("dataset")
-    out.append(f"{BS}multicolumn{{5}}{{@{{}}l}}{{filter: {f.filter_mean_ms.mean():.2f} ms mean, {f.filter_p99_ms.mean():.2f} ms p99, "
-               f"{f.filter_pct_of_raw.mean():.1f}{BS}% of raw}} & " + " & ".join(
-                   f"{r.accept_rate_all_pct:.0f}" for ds in datasets for r in [f[f.dataset == ds].iloc[0]])
-               + f" & {BS}multicolumn{{1}}{{l}}{{{BS}% accepted}} {BS*2}")
+    out = [f"{BS}begin{{tabular}}{{@{{}}lrrrrr@{{}}}}", f"{BS}toprule",
+           f"Backend & lookup ms & p99 ms & build s & MB & gain {BS}% {BS*2}"]
+    for ds in [x for x in DATASET_ABBR if x in set(g.dataset)]:
+        d = g[g.dataset == ds]
+        f = d.iloc[0]
+        out.append(f"{BS}midrule")
+        n_ref = f"{int(f.n_reference):,}".replace(",", "{,}")
+        out.append(f"{BS}multicolumn{{6}}{{@{{}}l}}{{{DATASET_ABBR[ds]}, {n_ref} indexed: filter "
+                   f"{f.filter_mean_ms:.2f} ms (p99 {f.filter_p99_ms:.2f}), {f.filter_bytes / 1e6:.2f} MB, "
+                   f"{f.filter_build_s:.0f} s build, accepts {f.accept_rate_all_pct:.0f}{BS}%}} {BS*2}")
+        for backend in ("flat", "hnsw", "ivf"):
+            r = d[d.backend == backend]
+            if r.empty:
+                continue
+            r = r.iloc[0]
+            if backend != "flat" and r.positive_rate_pct == 0:      # nothing to tune the backend's recall on
+                out.append(f"{BACKEND_LABEL[backend]} & -- & -- & {r.backend_build_s:.1f} & {r.backend_bytes / 1e6:.1f} & -- {BS*2}")
+                continue
+            fmt = ",.1f" if r.throughput_improvement_pct < -99 else ",.0f"
+            gain = f"{r.throughput_improvement_pct:{fmt}}".replace(",", "{,}").replace("-", BS + "textminus ")
+            out.append(f"{BACKEND_LABEL[backend]} & {r.backend_mean_ms:.3f} & {r.backend_p99_ms:.3f} & "
+                       f"{r.backend_build_s:.1f} & {r.backend_bytes / 1e6:.1f} & {gain} {BS*2}")
     out += [f"{BS}bottomrule", f"{BS}end{{tabular}}"]
     return "\n".join(out) + "\n"
 

@@ -454,7 +454,7 @@ def streaming():
 # The methods each figure draws, in legend order. A method the run did not produce is skipped.
 ZERO_FN_METHODS = [CAP_COVER, "VA+-file", "Zero-FN LSH", "QuantizedVector"]
 NONZERO_FN_METHODS = [CAP_COVER, "DSH", "MLP", "IVF-PQ", "HNSW"]
-NONZERO_FN_CORPUS = "WikiAnswers"     # the one corpus the FPR/FNR figure shows (the first drawn one if absent)
+NONZERO_FN_CORPUS = "Quora"      # the corpus with the most positive queries in the reduced run (49 at delta 0.02)
 
 
 def _equal_memory_frame():
