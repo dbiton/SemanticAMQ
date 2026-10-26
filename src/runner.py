@@ -1036,6 +1036,7 @@ def end_to_end_worker(
         filt = _cap_cover(dim, k)
         filt.construct(B)
         memory_bytes = filt.get_bytesize()
+        encoding = filt.encoding_label
         for tau in sorted(float(t) for f, t in cells if float(f) == kf):
             predicted = np.zeros(n_q, dtype=bool)
             filt.query(Q[:1], distance_threshold=tau)
@@ -1060,6 +1061,7 @@ def end_to_end_worker(
             rows.append({
                 "dataset": dataset, "seed": seed, "k_fraction": kf, "k": k,
                 "n_caps": filt._num_caps, "n_reference": len(B), "memory_bytes": memory_bytes,
+                "encoding": encoding,
                 "memory_pct_raw": 100.0 * memory_bytes / (len(B) * dim * 4),
                 "tau": tau, "n_queries": n_q,
                 "positive_rate_pct": 100.0 * float(predicted.mean()),
@@ -1199,6 +1201,7 @@ def _blocklist_cover_rows(
                 "n_caps": len(angles),
                 "nn_cos_med": float(np.median(nn_cos)) if n_queries else float("nan"),
                 "memory_bytes": filt.get_bytesize(),
+                "encoding": filt.encoding_label,
             })
     return rows
 
