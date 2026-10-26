@@ -14,6 +14,8 @@ plots/plot_paper.py's figures (written to suggestions/figures/).
       --out DIR          figure folder (default suggestions/figures)
       --results DIR      (plot) read the CSVs from DIR instead of results/
       --only A,B,..      generate just these evaluations (names: see GENERATORS); default all
+      --missing          generate only the evaluations whose CSVs are not in results/ (see
+                         missing_evaluations), then draw the figures; runs nothing if none is missing
       --ablation-vectors N / --ablation-folds N     size of the ablation workloads (default 20,000 / 3)
       --latency-vectors N / --latency-datasets A,B  size and corpora of the latency timing (default
                                                     --num-vectors / all five)
@@ -47,8 +49,8 @@ construct-method scale run, which no paper figure reads.
 On the server (100,000 vectors per corpus), `python src/paper.py` runs every evaluation above in order: one shuffled
 batch on main.MAX_WORKERS (blocklist, budget, quantization, construction, streaming, equal-memory, ablation),
 then end-to-end on 8 pinned cores, then latency and timing sequentially on one pinned core, then draws the
-figures and tables (plots/plot_paper.py: suggestions/figures/, including space_bound.csv). `--only` runs a subset;
-`python src/paper.py plot` redraws without running. The soft-anneal construction is in the construction
+figures and tables (plots/plot_paper.py: suggestions/figures/, including space_bound.csv). `--only` runs a subset and
+`--missing` the ones with no CSVs yet; `python src/paper.py plot` redraws without running. The soft-anneal construction is in the construction
 evaluation (every cell), the ablation (one arm) and the timing, and is the slowest method by 5-13x; budget its
 share of the batch accordingly (tests: tests/test_soft_anneal_construct.py).
 """
@@ -63,6 +65,7 @@ for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "
 os.environ.setdefault("CAPCOVER_SCAN_LIMIT_MS", "1.0")
 
 from functools import partial
+from pathlib import Path
 
 import main
 from runner import CAP_QUANTIZATION_SWEEP
@@ -71,6 +74,7 @@ from runner import ABLATION_DELTAS
 from main import (Runner, CAP_COVER_CONSTRUCT, BLOCKLIST_FOLDS, blocklist_workloads, equal_memory_filters, logger,
                   generate_blocklist, generate_budget, generate_cap_quantization,
                   generate_construct_methods, generate_streaming, generate_equal_memory)
+from plots import plot_paper
 from plots.plot_paper import (plot_figures, use_corpora, CONFIG_TO_METHOD, EQUAL_MEMORY_HIDDEN, STREAM_BOOTSTRAP,
                               E2E_TAU, E2E_K_FRACTION, E2E_TAUS, E2E_K_FRACTIONS, PAPER_TAUS_COS)
 
@@ -204,6 +208,32 @@ GENERATORS = {
 TIMED = ("end-to-end", "latency", "timing")
 PAPER_GENERATORS = tuple(GENERATORS.values())
 
+# What each evaluation writes under results/ (what the figures and tables read), and whether it is
+# one file per corpus.
+OUTPUTS = {
+    "blocklist": ("blocklist.csv", False),
+    "budget": ("budget.csv", False),
+    "quantization": ("cap_quantization/*/*.csv", True),
+    "construction": ("construct_methods/*.csv", True),
+    "streaming": ("streaming/*/streaming.csv", True),
+    "equal-memory": ("equal_memory/*/equal_memory.csv", True),
+    "ablation": ("ablation.csv", False),
+    "end-to-end": ("end_to_end.csv", False),
+    "latency": ("latency.csv", False),
+    "timing": ("timing.csv", False),
+}
+assert OUTPUTS.keys() == GENERATORS.keys()
+
+
+def missing_evaluations(results=None, n_corpora=None) -> list:
+    """The evaluations (GENERATORS' names, in order) whose CSVs are not all in `results` (default
+    results/): one file for the single-file ones, one per corpus for the rest. An evaluation with
+    only some of its corpora counts as missing, and running it rewrites the files it has."""
+    results = Path(results) if results else plot_paper.RESULTS
+    n_corpora = n_corpora or len(main.BLOCKLIST_DATASETS)
+    return [name for name, (pattern, per_corpus) in OUTPUTS.items()
+            if len(list(results.glob(pattern))) < (n_corpora if per_corpus else 1)]
+
 
 def check_datasets() -> None:
     """Stops before any job is submitted if a corpus is missing or too short.
@@ -242,12 +272,13 @@ def _submit_and_run(generators, num_workers) -> None:
     runner.run()
 
 
-def generate_and_plot_all(out=None, only=None) -> None:
+def generate_and_plot_all(out=None, only=None, plot=None) -> None:
     """Run the paper's evaluations as one shuffled batch on main.MAX_WORKERS (see
     main.generate_and_plot_all), then the throughput evaluation alone on E2E_WORKERS
     pinned cores, then the latency and construction/insertion timings sequentially on
     one pinned core, then draw the figures. Each generator is guarded so one failing
-    to submit doesn't take down the others. `only` names the GENERATORS to run."""
+    to submit doesn't take down the others. `only` names the GENERATORS to run; the figures are drawn
+    after a full run, or after a subset when `plot` is True."""
     set_thresholds()
     names = list(only) if only else list(GENERATORS)
     unknown = [n for n in names if n not in GENERATORS]
@@ -266,7 +297,7 @@ def generate_and_plot_all(out=None, only=None) -> None:
         os.environ["CAPCOVER_PIN_CORES"] = "1"
         _submit_and_run(sequential, 1)
     logger.info("All submitted jobs completed.")
-    if not only:
+    if plot if plot is not None else not only:
         plot_all(out=out)
 
 
@@ -313,11 +344,13 @@ def configure(num_vectors=None, datasets=None, workers=None, ablation_vectors=No
 def _parse(argv):
     opts = {"--num-vectors": None, "--datasets": None, "--workers": None, "--out": None, "--results": None,
             "--only": None, "--ablation-vectors": None, "--ablation-folds": None, "--latency-vectors": None,
-            "--latency-datasets": None}
+            "--latency-datasets": None, "--missing": False}
     rest = []
     it = iter(argv)
     for arg in it:
-        if arg in opts:
+        if arg == "--missing":
+            opts[arg] = True
+        elif arg in opts:
             opts[arg] = next(it, None)
             if opts[arg] is None:
                 raise SystemExit(f"{arg} needs a value")
@@ -338,5 +371,12 @@ if __name__ == "__main__":
               opts["--latency-datasets"].split(",") if opts["--latency-datasets"] else None)
     if rest[:1] == ["plot"]:
         plot_all(rest[1:], opts["--out"], opts["--results"])
+    elif opts["--missing"]:
+        names = missing_evaluations()
+        logger.info(f"missing evaluations: {', '.join(names) or 'none'}")
+        if names:
+            generate_and_plot_all(opts["--out"], names, plot=True)
+        else:
+            plot_all(out=opts["--out"])
     else:
         generate_and_plot_all(opts["--out"], opts["--only"].split(",") if opts["--only"] else None)

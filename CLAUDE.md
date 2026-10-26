@@ -56,7 +56,8 @@ src/main.py            evaluation definitions: generate_*/save_*/plot_* per eval
                        generate_and_plot_all() and plot_all()
 src/paper.py           paper.tex's data + figures only (subset of main.py's evaluations, trimmed to
                        what each figure reads); `python src/paper.py [plot]`. Figures: plots/plot_paper.py
-                       `--only a,b` runs a subset (GENERATORS); also ablation, latency (filter in front of the flat index) and timing;
+                       `--only a,b` runs a subset (GENERATORS), `--missing` only those
+                       with no CSVs in results/ (then draws the figures); also ablation, latency (filter in front of the flat index) and timing;
                        tables: plots/tables_paper.py; reduced-scale driver: suggestions/run_reduced_batch.py
 src/runner.py          Runner (ProcessPoolExecutor job harness), one *_worker per mode,
                        filter registries, calibration/tuning of baseline dials

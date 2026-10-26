@@ -128,3 +128,25 @@ class TestPinnedTimingWorker(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMissingEvaluations(unittest.TestCase):
+
+    def test_names_the_evaluations_without_all_their_csvs(self):
+        import tempfile
+        from pathlib import Path
+        import paper
+        with tempfile.TemporaryDirectory() as tmp:
+            results = Path(tmp)
+            for name in ("budget.csv", "blocklist.csv", "ablation.csv", "end_to_end.csv", "latency.csv", "timing.csv"):
+                (results / name).touch()
+            for corpus in ("A", "B"):
+                (results / "construct_methods").mkdir(exist_ok=True)
+                (results / "construct_methods" / f"{corpus}.csv").touch()
+            self.assertEqual(paper.missing_evaluations(results, n_corpora=2),
+                             ["quantization", "streaming", "equal-memory"])
+            (results / "streaming" / "A").mkdir(parents=True)
+            (results / "streaming" / "A" / "streaming.csv").touch()      # one corpus of two: still missing
+            self.assertIn("streaming", paper.missing_evaluations(results, n_corpora=2))
+            self.assertEqual(paper.missing_evaluations(results, n_corpora=1),
+                             ["quantization", "equal-memory"])
