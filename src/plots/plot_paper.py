@@ -526,8 +526,10 @@ def equal_memory_nonzero_fn():
 # fig:throughput  throughput-improvement
 # ---------------------------------------------------------------------------
 
-BACKEND_COSTS = np.logspace(-5, 0, 60)      # seconds per lookup: 10 us ... 1 s
-BACKEND_TICKS = {1e-5: "10 µs", 1e-4: "100 µs", 1e-3: "1 ms", 1e-2: "10 ms", 1e-1: "100 ms", 1.0: "1 s"}
+Y_LINTHRESH = 10     # improvement (%) below which the throughput panels' y axis is linear
+Y_TOP = 1e4
+BACKEND_COSTS = np.logspace(-4, 0, 60)      # seconds per lookup: 0.1 ms ... 1 s
+BACKEND_TICKS = {1e-4: "100 µs", 1e-3: "1 ms", 1e-2: "10 ms", 1e-1: "100 ms", 1.0: "1 s"}
 
 
 def _backend_cost_panel(ax, d):
@@ -550,8 +552,7 @@ def _backend_cost_panel(ax, d):
                 ls="", markeredgecolor="white", markeredgewidth=0.5, zorder=3)
     ax.axhline(0, color=INK_MUTED, lw=0.8)
     ax.set_xscale("log")
-    ax.set_yscale("symlog", linthresh=100)
-    ax.set_ylim(bottom=-100)
+    ax.set_yscale("symlog", linthresh=Y_LINTHRESH)
     ax.set_xticks(list(BACKEND_TICKS))
     ax.set_xticklabels(list(BACKEND_TICKS.values()), fontsize=6, rotation=30, ha="right")
     ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
@@ -577,7 +578,7 @@ def throughput():
     at_tau = d[np.isclose(d.tau, E2E_TAU)]
     fixed_tau = f"fixed $\\tau={float(cosine_distance(E2E_TAU)):g}$"
     panels = [
-        (at_k, "tau_cos", TAU_LABEL, f"fixed $k={100 * E2E_K_FRACTION:g}\\%$ of $|X|$", False),
+        (at_k, "tau_cos", TAU_LABEL, f"fixed $k={100 * E2E_K_FRACTION:g}\\%$ of $|X|$", True),
         (at_tau, "memory_pct_raw", "memory (% of raw fp32 index, log)", fixed_tau, True),
         (None, "backend", "backend cost $L$ (log)", f"fixed $\\tau={float(cosine_distance(E2E_TAU)):g}$, "
          f"$k={100 * E2E_K_FRACTION:g}\\%$", True),
@@ -608,14 +609,19 @@ def throughput():
             ax.errorbar(g.x, g.y, yerr=g.sd.fillna(0), color=color, marker=marker, ms=3,
                         capsize=1.5, elinewidth=0.8)
         ax.axhline(0, color=INK_MUTED, lw=0.8)
+        ax.set_yscale("symlog", linthresh=Y_LINTHRESH)
         if logx:
             ax.set_xscale("log")
             ax.xaxis.set_major_formatter(PCT_FMT)
             ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
         if x == "tau_cos":
-            ax.set_xticks([0.02, 0.04, 0.06, 0.08])
+            ax.set_xlim(agg.x.min() * 0.9, agg.x.max() * 1.1)
+            ax.set_xticks([0.01, 0.1])
         ax.set_xlabel(xlabel)
         ax.set_title(title, color=INK)
+    # One y range for all panels, so the zero line sits at the same height.
+    for ax in axes[0]:
+        ax.set_ylim(-Y_LINTHRESH, Y_TOP)
     axes[0, 0].set_ylabel("throughput improvement (%)")
     present = [c for c in CORPORA if c in set(to_corpus(d.dataset))]
     handles = [plt.Line2D([], [], color=CORPUS_STYLE[c][0], marker=CORPUS_STYLE[c][1]) for c in present]
