@@ -9,7 +9,7 @@ from filters.cap_cover.cap_cover_filter import CapCoverFilter
 
 DIM = 16
 TAUS = [0.0, 0.05, 0.1, 0.2, 0.4]
-K_FRACTIONS = [0.1, 0.3]
+MEMORY_FRACTIONS = [0.02, 0.05]
 BANDS = [name for name, _ in runner.SIMILARITY_BANDS]
 
 
@@ -43,7 +43,7 @@ class TestBlocklistGroundTruth(unittest.TestCase):
     def setUp(self):
         self.B, self.Q = _workload()
         self.rows = runner._blocklist_cover_rows(
-            DIM, "synthetic", 0, K_FRACTIONS, TAUS, self.B, self.Q, volume_bounds=False)
+            DIM, "synthetic", 0, MEMORY_FRACTIONS, TAUS, self.B, self.Q, volume_bounds=False)
         self.nn = _nn(self.B, self.Q)
 
     def test_labels_and_bands_come_from_distance(self):
@@ -58,7 +58,7 @@ class TestBlocklistGroundTruth(unittest.TestCase):
         # The planted query is a negative at 0.1 yet lands in a populated band.
         self.assertGreater(self.nn[0], 0.1)
         self.assertGreaterEqual(sum(r[f"n_neg_{b}"] for r in self.rows if r["tau"] == 0.1
-                                    for b in BANDS) // len(K_FRACTIONS), 1)
+                                    for b in BANDS) // len(MEMORY_FRACTIONS), 1)
 
     def test_zero_fnr_and_saved_within_ceiling(self):
         for row in self.rows:
@@ -82,11 +82,11 @@ class TestBlocklistGroundTruth(unittest.TestCase):
         # directions.
         Qdir = _unit(self.Q)
         n_q = len(self.Q)
-        for kf in K_FRACTIONS:
-            k = min(max(1, round(kf * len(self.B))), len(self.B))
+        for mf in MEMORY_FRACTIONS:
+            k = runner._k_for_memory_fraction(DIM, len(self.B), mf)
             filt = runner._cap_cover(DIM, k)
             filt.construct(self.B)
-            for row in (r for r in self.rows if r["k_fraction"] == kf):
+            for row in (r for r in self.rows if r["memory_fraction"] == mf):
                 predicted = np.asarray(filt.query(Qdir, distance_threshold=row["tau"]), dtype=bool)
                 self.assertAlmostEqual(row["accesses_saved_pct"], 100.0 * (1.0 - predicted.mean()),
                                        delta=100.0 / n_q + 1e-9)

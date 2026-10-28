@@ -22,14 +22,14 @@ class TestEndToEndWorker(unittest.TestCase):
                              rng.normal(size=(40, DIM))]))
         cells = [(0.1, 0.1), (0.1, 0.3), (0.2, 0.1)]
         rows = runner.end_to_end_worker(DIM, "synthetic", 3, cells, B, Q, repeats=1)
-        self.assertEqual([(r["k_fraction"], r["tau"]) for r in rows], sorted(cells))
+        self.assertEqual([(r["memory_fraction"], r["tau"]) for r in rows], sorted(cells))
         for r in rows:
             self.assertEqual((r["dataset"], r["seed"], r["n_queries"]), ("synthetic", 3, 80))
             self.assertGreaterEqual(r["positive_rate_pct"], r["true_positive_rate_pct"] - 1e-9)  # zero FN
             want = 100.0 * (r["throughput_with_qps"] - r["throughput_without_qps"]) / r["throughput_without_qps"]
             self.assertAlmostEqual(r["throughput_improvement_pct"], want, places=6)
             self.assertGreater(r["n_caps"], 0)
-        # one cover per k_fraction, one no-filter timing per tau
+        # one cover per memory_fraction, one no-filter timing per tau
         a, b, c = rows
         self.assertEqual(a["n_caps"], b["n_caps"])
         self.assertEqual(a["memory_bytes"], b["memory_bytes"])

@@ -2,7 +2,7 @@
 suggestions/figures/), plus the numbers its text quotes from them. Built only from existing
 results/ CSVs (src/paper.py generates them):
 
-    ablation-table.tex       tab:ablation       ablation.csv   FPR of each variant at delta = 0.02
+    ablation-table.tex       tab:ablation       ablation.csv   FPR of each variant at delta = 0.05
     sensitivity-table.tex    tab:sensitivity    ablation.csv   change in FPR when the cover is built for another
                                                                threshold / sphere-merge parameter
     latency-table.tex        tab:latency        latency.csv    the filter in front of the flat index
@@ -21,7 +21,12 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[2]
 BS = chr(92)     # LaTeX backslash
 
-DELTA = 0.02
+
+def _memory_label(memory_fraction: float) -> str:
+    """A budget B/M (filter bytes over the raw FP32 embedding bytes) as a column header."""
+    return f"$B={memory_fraction:g}M$"
+
+DELTA = 0.05
 # variant -> (component, label); first of each component is the paper's configuration
 ABLATION_ROWS = [
     ("full", "Rule", "cap (paper)"),
@@ -49,7 +54,7 @@ SENSITIVITY_ROWS = [
 
 def _paired(d: pd.DataFrame, arm: str, kf: float, delta: float):
     """(mean FPR over cells, mean paired difference to "full", number of cells worse, cells)."""
-    g = d[np.isclose(d.k_fraction, kf) & np.isclose(d.delta, delta)]
+    g = d[np.isclose(d.memory_fraction, kf) & np.isclose(d.delta, delta)]
     piv = g.pivot_table(index="arm", columns=["dataset", "fold"], values="fpr")
     if arm not in piv.index or "full" not in piv.index:
         return None
@@ -65,9 +70,9 @@ def _num(x: float, signed: bool = False) -> str:
 
 
 def ablation_table(d: pd.DataFrame) -> str:
-    kfs = sorted(d.k_fraction.unique())[:2]
+    kfs = sorted(d.memory_fraction.unique())[:2]
     out = [f"{BS}begin{{tabular}}{{@{{}}llrrrr@{{}}}}", f"{BS}toprule",
-           f"& & {BS}multicolumn{{2}}{{c}}{{$k={100 * kfs[0]:g}{BS}%$}} & {BS}multicolumn{{2}}{{c}}{{$k={100 * kfs[1]:g}{BS}%$}} {BS*2}",
+           f"& & {BS}multicolumn{{2}}{{c}}{{{_memory_label(kfs[0])}}} & {BS}multicolumn{{2}}{{c}}{{{_memory_label(kfs[1])}}} {BS*2}",
            f"{BS}cmidrule(lr){{3-4}}{BS}cmidrule(lr){{5-6}}",
            f"Component & Variant & FPR & {BS}multicolumn{{1}}{{c}}{{$\\Delta$}} & FPR & {BS}multicolumn{{1}}{{c}}{{$\\Delta$}} {BS*2}",
            f"{BS}midrule"]
@@ -95,10 +100,10 @@ def sensitivity_table(d: pd.DataFrame) -> str:
     with another sphere-merge offset t / exponent p or another selection threshold, scored at
     several query thresholds delta."""
     deltas = [0.005, 0.02, 0.1]
-    kfs = sorted(d.k_fraction.unique())[:2]
+    kfs = sorted(d.memory_fraction.unique())[:2]
     n = len(deltas)
     out = [f"{BS}begin{{tabular}}{{@{{}}l" + "r" * (n * len(kfs)) + "@{}}", f"{BS}toprule",
-           "& " + " & ".join(f"{BS}multicolumn{{{n}}}{{c}}{{$k={100 * kf:g}{BS}%$}}" for kf in kfs) + f" {BS*2}",
+           "& " + " & ".join(f"{BS}multicolumn{{{n}}}{{c}}{{{_memory_label(kf)}}}" for kf in kfs) + f" {BS*2}",
            "".join(f"{BS}cmidrule(lr){{{2 + i * n}-{1 + (i + 1) * n}}}" for i in range(len(kfs))),
            "Variant & " + " & ".join(f"{dl:g}" for _ in kfs for dl in deltas) + f" {BS*2}",
            f"{BS}midrule"]
@@ -120,11 +125,11 @@ def jtau_correlation(d: pd.DataFrame) -> pd.DataFrame:
     from scipy.stats import spearmanr
     g = d[np.isclose(d.delta, DELTA) & ~d.arm.isin(["ball_sphere", "ball_meb"])]
     rows = []
-    for (ds, fold, kf), c in g.groupby(["dataset", "fold", "k_fraction"]):
+    for (ds, fold, kf), c in g.groupby(["dataset", "fold", "memory_fraction"]):
         full = float(c.loc[c.arm == "full", "fpr"].iloc[0])
         for scope, cc in (("all", c), ("competitive", c[c.fpr <= full + 0.1])):
             if cc.fpr.nunique() > 2 and cc.log10_j_tau.nunique() > 2:
-                rows.append({"dataset": ds, "fold": fold, "k_fraction": kf, "scope": scope, "n_variants": len(cc),
+                rows.append({"dataset": ds, "fold": fold, "memory_fraction": kf, "scope": scope, "n_variants": len(cc),
                              "spearman": float(spearmanr(cc.log10_j_tau, cc.fpr)[0])})
     return pd.DataFrame(rows)
 
@@ -143,7 +148,7 @@ def latency_table(b: pd.DataFrame, delta: float = DELTA) -> str:
            f"{BS}cmidrule(lr){{2-4}}{BS}cmidrule(lr){{5-7}}",
            f"Corpus & ms & p99 & accepts {BS}% & lookup ms & break-even ms & gain {BS}% {BS*2}", f"{BS}midrule"]
     for ds in [x for x in DATASET_ABBR if x in set(g.dataset)]:
-        r = g[g.dataset == ds].iloc[0]
+        r = g[g.dataset == ds].mean(numeric_only=True)      # over the folds
         fmt = ",.1f" if abs(r.throughput_improvement_pct) < 10 else ",.0f"
         gain = f"{r.throughput_improvement_pct:{fmt}}".replace(",", "{,}").replace("-", BS + "textminus ")
         be = "--" if not np.isfinite(r.breakeven_backend_ms) else f"{r.breakeven_backend_ms:.2f}"
@@ -155,11 +160,11 @@ def latency_table(b: pd.DataFrame, delta: float = DELTA) -> str:
 
 def timing_table(t: pd.DataFrame) -> str:
     c = t[t.kind == "construct"]
-    ks = sorted(c.k_fraction.unique())
+    ks = sorted(c.memory_fraction.unique())
     out = [f"{BS}begin{{tabular}}{{@{{}}l" + "r" * len(ks) + "@{}}", f"{BS}toprule",
-           f"Construction (s) & " + " & ".join(f"$k={100 * k:g}{BS}%$" for k in ks) + f" {BS*2}", f"{BS}midrule"]
+           f"Construction (s) & " + " & ".join(_memory_label(k) for k in ks) + f" {BS*2}", f"{BS}midrule"]
     for m in ("gonzalez", "minimax", "sphere_merge", "soft_anneal"):
-        r = c[c.method == m].set_index("k_fraction").seconds
+        r = c[c.method == m].groupby("memory_fraction").seconds.mean()
         out.append(f"{m.replace('_', ' ')} & " + " & ".join("--" if k not in r.index else f"{r[k]:.1f}" for k in ks) + f" {BS*2}")
     ins = t[t.kind == "insert"]
     out += [f"{BS}midrule", f"Insertion (ms) & mean & p50 & p99 {BS*2}".replace("& mean & p50 & p99", "& mean & p99 &"),

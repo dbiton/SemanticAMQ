@@ -1,9 +1,9 @@
 """tab:quantization: the best direction encoding at each rate (bits per dimension), as
 LaTeX, from results/cap_quantization/<corpus>/*.csv (src/paper.py's generate_quantization).
 
-Per budget (k FP32 caps as a % of the construct set) a cell is the index accesses saved,
+Per budget (B/M, % of the raw index) a cell is the index accesses saved,
 averaged over corpora and folds. Per rate, the encoding with the best mean over the cells
-is listed. Bold: best in column. Dagger: the budget fits one cap per indexed vector.
+is listed, then every encoding auto() chooses among, then auto() itself. Bold: best in column. Dagger: the budget fits one cap per indexed vector.
 Last column (when `qps` is given, name -> queries/s): the query throughput of one batch call, measured by
 runner.pinned_timing_worker (one pinned core, results/timing.csv "scan" rows) rather than by the parallel
 quantization run, whose timings are not pinned (CLAUDE.md).
@@ -42,14 +42,14 @@ def build(q: pd.DataFrame) -> pd.DataFrame:
     """One row per encoding: rate, saved/singleton per budget, qps; then the best per rate."""
     known = {m.value for m in Quantize} | {AUTO}
     q = q[q.quantize.isin(known)].copy()      # a CSV from an older encoding ladder may name rungs that no longer exist
-    q["budget_pct"] = 100 * q.k / q.n_construct
+    q["budget_pct"] = 100 * q.memory_fraction
     q["singleton"] = q.n_caps >= q.n_construct
     q["rate"] = q.quantize.map(lambda n: np.nan if n == AUTO else _ENCODINGS[Quantize(n)].rate)
     return q
 
 
-# The budgets (% of raw) the paper's table shows; the run covers more (paper.PAPER_BUDGET_PCT).
-TABLE_BUDGETS = (0.5, 2, 10)
+# The budgets (% of raw) the paper's table shows; the run covers more (main.BUDGET_MEMORY_FRACTIONS).
+TABLE_BUDGETS = (0.5, 2, 5)
 
 
 def table(q: pd.DataFrame, qps: Optional[Dict[str, float]] = None, qps_label: str = "q/s",

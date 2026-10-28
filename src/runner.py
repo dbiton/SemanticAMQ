@@ -56,6 +56,16 @@ def _cover_max_memory(dim: int, k: int, bits_per_dim: int = _BUDGET_BITS_PER_DIM
     return k * (dim * bits_per_dim // 8 + _BUDGET_BYTES_PER_FLOAT16)
 
 
+def _k_for_memory_fraction(dim: int, n: int, memory_fraction: float,
+                           bits_per_dim: int = _BUDGET_BITS_PER_DIM) -> int:
+    """The nominal cap count (at bits_per_dim, see _cover_max_memory) whose byte
+    budget is `memory_fraction` of the raw index, n float32 vectors (the paper's
+    B/M). Evaluations choose a budget as B/M; this is only how the cover sizes
+    itself from it."""
+    k = round(memory_fraction * n * dim * 4 / _cover_max_memory(dim, 1, bits_per_dim))
+    return min(max(1, k), n)
+
+
 
 def _cap_cover(dim: int, k: int) -> CapCoverFilter:
     """CapCoverFilter.auto() at the nominal k-cover byte budget
@@ -681,7 +691,7 @@ def _quantize_name(quantize: Any) -> str:
 def cap_quantization_worker(
     dim: int,
     dataset: str,
-    k: int,
+    memory_fraction: float,
     quantize: Any,   # a CapQuantize, or CAP_QUANTIZE_AUTO
     tau: float,
     seed: int,
@@ -690,14 +700,13 @@ def cap_quantization_worker(
     actual_results: List[bool],
 ) -> List[Dict[str, Any]]:
     """One CapCoverFilter cover per
-    (dataset, k, seed, quantize) over CAP_QUANTIZATION_SWEEP (AUTO_CANDIDATES, the
-    encodings CapCoverFilter.auto() actually chooses among), evaluated at a single tau. Returns one
+    (dataset, memory_fraction, seed, quantize), evaluated at a single tau. Returns one
     row, tagged stage="quantizing" always (CAP_QUANTIZATION_SWEEP has no
     FP32/uncompressed member to single out as a baseline stage).
 
-    max_memory is derived from k at 32 bits/dim (_cover_max_memory), held
-    fixed across every quantize candidate, so the sweep varies only the
-    encoding.
+    max_memory is memory_fraction of the raw index (B/M), held fixed across
+    every quantize candidate (and CAP_QUANTIZE_AUTO), so the sweep varies only
+    the encoding.
 
     log10_J/log10_J_tau use _cap_log10_volume. FNR is asserted (raises on
     violation), never plotted."""
@@ -714,7 +723,8 @@ def cap_quantization_worker(
 
     rows: List[Dict[str, Any]] = []
 
-    max_memory = _cover_max_memory(dim, k, 32)
+    max_memory = int(memory_fraction * len(construct_arr) * dim * 4)
+    k = _k_for_memory_fraction(dim, len(construct_arr), memory_fraction, 32)
     t0 = time.perf_counter()
     try:
         if quantize == CAP_QUANTIZE_AUTO:
@@ -725,7 +735,7 @@ def cap_quantization_worker(
         filt.construct(construct_arr)
     except Exception as e:
         logger.warning(
-            f"Skipping cap_quantization job (dataset={dataset}, k={k}, quantize={_quantize_name(quantize)}, "
+            f"Skipping cap_quantization job (dataset={dataset}, memory_fraction={memory_fraction}, quantize={_quantize_name(quantize)}, "
             f"seed={seed}): construction raised {type(e).__name__}: {e}"
         )
         return []
@@ -743,7 +753,8 @@ def cap_quantization_worker(
 
     rates = _confusion_rates(predicted, actual)
     rows.append({
-        "dataset": dataset, "k": k, "quantize": _quantize_name(quantize), "stage": "quantizing", "tau": tau,
+        "dataset": dataset, "memory_fraction": float(memory_fraction), "k": k,
+        "quantize": _quantize_name(quantize), "stage": "quantizing", "tau": tau,
         "encoding": filt.encoding_label,
         "log10_J": log10_J,
         "log10_J_tau": _cap_log10_volume(filt, tau),
@@ -762,7 +773,7 @@ def cap_quantization_worker(
     bad = [r for r in rows if r["fnr"] != 0]
     if bad:
         raise InvariantViolation(
-            f"Zero-false-negative invariant violated (dataset={dataset}, k={k}, quantize={quantize}, seed={seed}): "
+            f"Zero-false-negative invariant violated (dataset={dataset}, memory_fraction={memory_fraction}, quantize={quantize}, seed={seed}): "
             f"{bad[:3]}"
         )
 
@@ -798,16 +809,16 @@ def construct_method_worker(
     dim: int,
     dataset: str,
     method: str,
-    k: int,
-    k_fraction: float,
+    memory_fraction: float,
     tau: float,
     seed: int,
     vectors_construct: np.ndarray,
     vectors_query: np.ndarray,
     actual_results: np.ndarray,
 ) -> Dict[str, Any]:
-    """One CapCoverFilter built by CAP_CONSTRUCT_METHODS[method] at k caps,
-    with the filter's default (FP32) quantization and no insert method, so
+    """One CapCoverFilter built by CAP_CONSTRUCT_METHODS[method] with as many FP32
+    caps as fit in memory_fraction of the raw index (B/M), with the filter's
+    default (FP32) quantization and no insert method, so
     the construction method is the only thing that varies between rows.
 
     Returns one row: cover volume, angles, FPR/FNR against distance ground
@@ -822,6 +833,7 @@ def construct_method_worker(
     queries = np.ascontiguousarray(vectors_query, dtype=np.float32)
     actual = np.asarray(actual_results, dtype=bool)
     n = len(construct)
+    k = _k_for_memory_fraction(dim, n, memory_fraction, 32)
 
     timed = _TimedCapConstruct(CAP_CONSTRUCT_METHODS[method]())
     filt = CapCoverFilter(dim, construct_method=timed, max_caps=k, insert_method=None)
@@ -842,7 +854,8 @@ def construct_method_worker(
 
     row = {
         "dataset": dataset, "fold": seed, "method": method,
-        "k_fraction": float(k_fraction), "k": k, "n_caps": len(angles), "n_reference": n,
+        "memory_fraction": float(memory_fraction), "k": k, "k_fraction": k / n,
+        "n_caps": len(angles), "n_reference": n,
         "tau": tau,
         "log10_vol_low": float('nan'), "log10_vol_high": vol_high,
         "log10_j_tau": vol_high,
@@ -1009,8 +1022,8 @@ def end_to_end_worker(
     """End-to-end throughput of a CapCoverFilter in front of a flat L2 index
     over the same reference set, against the index alone: queries one at a
     time (the online setting), the index searched for every query without the
-    filter and only for the accepted ones with it. One row per (k_fraction,
-    tau) in `cells`; one cover per k_fraction (_cap_cover), built once.
+    filter and only for the accepted ones with it. One row per (memory_fraction,
+    tau) in `cells`; one cover per memory_fraction (_cap_cover), built once.
 
     throughput_improvement_pct = (with - without) / without. Both timings come
     from this one process back to back, each the best of `repeats` runs, so
@@ -1044,13 +1057,13 @@ def end_to_end_worker(
         without[tau] = best_time(search_all)
 
     rows: List[Dict[str, Any]] = []
-    for kf in sorted({float(f) for f, _ in cells}):
-        k = min(max(1, round(kf * len(B))), len(B))
+    for mf in sorted({float(f) for f, _ in cells}):
+        k = _k_for_memory_fraction(dim, len(B), mf)
         filt = _cap_cover(dim, k)
         filt.construct(B)
         memory_bytes = filt.get_bytesize()
         encoding = filt.encoding_label
-        for tau in sorted(float(t) for f, t in cells if float(f) == kf):
+        for tau in sorted(float(t) for f, t in cells if float(f) == mf):
             predicted = np.zeros(n_q, dtype=bool)
             filt.query(Q[:1], distance_threshold=tau)
 
@@ -1072,7 +1085,7 @@ def end_to_end_worker(
             qps_without = n_q / max(without[tau], 1e-9)
             qps_with = n_q / max(with_s, 1e-9)
             rows.append({
-                "dataset": dataset, "seed": seed, "k_fraction": kf, "k": k,
+                "dataset": dataset, "seed": seed, "memory_fraction": mf, "k": k,
                 "n_caps": filt._num_caps, "n_reference": len(B), "memory_bytes": memory_bytes,
                 "encoding": encoding,
                 "memory_pct_raw": 100.0 * memory_bytes / (len(B) * dim * 4),
@@ -1093,15 +1106,15 @@ def _blocklist_cover_rows(
     dim: int,
     dataset: str,
     seed: int,
-    k_fractions: List[float],
+    memory_fractions: List[float],
     tau_values: List[float],
     vectors_reference: VectorInput,
     vectors_query: VectorInput,
     volume_bounds: bool,
 ) -> List[Dict[str, Any]]:
     """Shared core of blocklist_tau_worker and budget_worker: build a
-    CapCoverFilter per k in k_fractions and emit one sweep="tau" row per
-    (k, tau) pair. Both callers read only these rows -- see each one's own
+    CapCoverFilter per memory budget (B/M) in memory_fractions and emit one
+    sweep="tau" row per (budget, tau) pair. Both callers read only these rows -- see each one's own
     docstring for which axis it treats as fixed and which it sweeps.
 
     A query is positive iff its exact distance to the reference set is <= tau,
@@ -1140,8 +1153,8 @@ def _blocklist_cover_rows(
 
     rows: List[Dict[str, Any]] = []
 
-    for kf in k_fractions:
-        k = min(max(1, round(kf * len(B))), len(B))
+    for mf in memory_fractions:
+        k = _k_for_memory_fraction(dim, len(B), mf)
         filt = _cap_cover(dim, k)
         filt.construct(B)
         angles = filt.all_angles
@@ -1188,14 +1201,13 @@ def _blocklist_cover_rows(
             rows.append({
                 "dataset": dataset, "seed": seed, "sweep": "tau",
                 "k": len(angles), "n_reference": len(B),
-                # k_fraction is the nominal knob and is identical across
+                # memory_fraction is the nominal knob and is identical across
                 # datasets and folds; `compression` is what it realised here,
-                # which is not (|B| differs per dataset and per fold, so k =
-                # round(kf*|B|) lands on a different ratio each time). Group
-                # and filter on k_fraction -- grouping on compression makes
+                # which is not (|B| differs per dataset and per fold). Group
+                # and filter on memory_fraction -- grouping on compression makes
                 # every fold its own singleton group, which silently drops the
                 # error bars and matches only one dataset when filtering.
-                "k_fraction": float(kf),
+                "memory_fraction": float(mf), "k_fraction": k / len(B),
                 "compression": len(B) / max(len(angles), 1),
                 "psi_med": psi_med, "psi_max": float(angles.max()) if len(angles) else 0.0,
                 "tau": tau,
@@ -1223,7 +1235,7 @@ def blocklist_tau_worker(
     dim: int,
     dataset: str,
     seed: int,
-    k_fraction: float,
+    memory_fraction: float,
     tau_values: List[float],
     vectors_reference: VectorInput,
     vectors_query: VectorInput,
@@ -1232,12 +1244,12 @@ def blocklist_tau_worker(
     reference set B and a query stream, labeled by distance to B at each
     tau and grouped by similarity band.
 
-    Cap budget k is fixed (a single k_fraction, not a sweep -- varying it is
+    The memory budget is fixed (a single memory_fraction, not a sweep -- varying it is
     budget_worker's job); tau is swept over tau_values so FPR/accesses saved
     are read as one corpus's response curve at that one budget.
     """
     return _blocklist_cover_rows(
-        dim, dataset, seed, [k_fraction], tau_values,
+        dim, dataset, seed, [memory_fraction], tau_values,
         vectors_reference, vectors_query,
         volume_bounds=False,
     )
@@ -1247,14 +1259,14 @@ def budget_worker(
     dim: int,
     dataset: str,
     seed: int,
-    k_fractions: List[float],
+    memory_fractions: List[float],
     tau: float,
     vectors_reference: VectorInput,
     vectors_query: VectorInput,
 ) -> List[Dict[str, Any]]:
     """The same asymmetric blocklist workload as blocklist_tau_worker
     (main.generate_budget), read along the other axis: tau is fixed at a
-    single value and the cap budget k is swept over k_fractions.
+    single value and the memory budget is swept over memory_fractions.
 
     Requests log10_vol_high (see _blocklist_cover_rows's volume_bounds):
     exposed here, where it is paid once per budget, rather than in
@@ -1262,7 +1274,7 @@ def budget_worker(
     computation out over a whole tau grid.
     """
     return _blocklist_cover_rows(
-        dim, dataset, seed, k_fractions, [tau],
+        dim, dataset, seed, memory_fractions, [tau],
         vectors_reference, vectors_query,
         volume_bounds=True,
     )
@@ -1719,7 +1731,7 @@ def ablation_worker(
     dim: int,
     dataset: str,
     seed: int,
-    k_fraction: float,
+    memory_fraction: float,
     vectors_reference: VectorInput,
     vectors_query: VectorInput,
     deltas: Tuple[float, ...] = ABLATION_DELTAS,
@@ -1743,7 +1755,7 @@ def ablation_worker(
     nn = np.sqrt(np.clip(d2[:, 0], 0, None))
     nn_cos = 1.0 - nn.astype(np.float64) ** 2 / 2.0
     taus = [tau_of_cosine_distance(d) for d in deltas]
-    k = min(max(1, round(k_fraction * len(B))), len(B))
+    k = _k_for_memory_fraction(dim, len(B), memory_fraction)
     factories = _ablation_arms(dim, k)
     if arms is not None:
         factories = {a: factories[a] for a in arms}
@@ -1763,7 +1775,7 @@ def ablation_worker(
             psi = np.minimum(accept_angle[t], np.pi)
             log10_j = float(logsumexp(log10_cap_measure(psi, dim) * _LN10)) / _LN10 if len(psi) else float("-inf")
             rows.append({
-                "dataset": dataset, "fold": seed, "k_fraction": float(k_fraction), "k": k,
+                "dataset": dataset, "fold": seed, "memory_fraction": float(memory_fraction), "k": k,
                 "n_reference": len(B), "n_queries": len(Q), "arm": arm, "delta": float(delta), "tau": tau,
                 "fpr": rates["fpr"], "fnr": rates["fnr"],
                 **_per_band_rates(predicted, actual, nn_cos),
@@ -1798,7 +1810,7 @@ def filter_latency_worker(
     dim: int,
     dataset: str,
     seed: int,
-    k_fraction: float,
+    memory_fraction: float,
     deltas: Tuple[float, ...],
     vectors_reference: VectorInput,
     vectors_query: VectorInput,
@@ -1826,7 +1838,7 @@ def filter_latency_worker(
     nn = np.sqrt(np.clip(d2[:, 0], 0, None))
     timed = np.sort(np.random.default_rng(timing_seed).choice(len(Q), size=min(n_timed, len(Q)), replace=False))
 
-    k = min(max(1, round(k_fraction * n)), n)
+    k = _k_for_memory_fraction(dim, n, memory_fraction)
     filt = _cap_cover(dim, k)
     t0 = time.perf_counter()
     filt.construct(B)
@@ -1861,7 +1873,7 @@ def filter_latency_worker(
         qps_without, qps_with = 1000.0 / without.mean(), 1000.0 / with_f.mean()
         rows.append({
             "dataset": dataset, "fold": seed, "delta": float(delta), "tau": tau,
-            "n_reference": n, "n_timed": len(timed), "k_fraction": float(k_fraction),
+            "n_reference": n, "n_timed": len(timed), "memory_fraction": float(memory_fraction),
             "filter_build_s": filter_build_s, "filter_bytes": filter_bytes,
             "filter_pct_of_raw": 100.0 * filter_bytes / (n * dim * 4),
             "accept_rate_pct": 100.0 * float(accept.mean()),
@@ -1883,19 +1895,19 @@ def pinned_timing_worker(
     dim: int,
     dataset: str,
     vectors_reference: VectorInput,
-    k_fractions: Tuple[float, ...] = (0.01, 0.05, 0.2),
-    insert_k_fraction: float = 0.1,
+    memory_fractions: Tuple[float, ...] = (0.01, 0.02, 0.05),
+    insert_memory_fraction: float = 0.02,
     bootstrap_fraction: float = 0.8,
     max_inserts: int = 2000,
     vectors_query: Optional[VectorInput] = None,
     scan_quantizes: Tuple[CapQuantize, ...] = (),
     scan_budget_pcts: Tuple[float, ...] = (2.0,),
-    scan_delta: float = 0.02,
+    scan_delta: float = 0.05,
 ) -> List[Dict[str, Any]]:
     """Construction time of each CAP_CONSTRUCT_METHODS entry (the configuration
     of construct_method_worker: FP32 caps, max_caps=k), per-arrival insertion
     time of each CAP_INSERT_STRATEGIES entry (TQ4 caps at the byte budget of
-    k = insert_k_fraction |B| nominal caps, as stream_rebuild_worker) and, given
+    the byte budget insert_memory_fraction of the raw index, as stream_rebuild_worker) and, given
     vectors_query, the query throughput of one batch call of a cover in each of
     `scan_quantizes` at each budget of `scan_budget_pcts` (% of the raw index, as
     cap_quantization_worker's byte budgets) at cosine distance `scan_delta`, on the
@@ -1906,14 +1918,14 @@ def pinned_timing_worker(
     n = len(B)
     rows: List[Dict[str, Any]] = []
     for method, cls in CAP_CONSTRUCT_METHODS.items():
-        for kf in k_fractions:
-            k = min(max(1, round(kf * n)), n)
+        for mf in memory_fractions:
+            k = _k_for_memory_fraction(dim, n, mf, 32)
             filt = CapCoverFilter(dim, construct_method=cls(), max_caps=k, insert_method=None)
             t0 = time.perf_counter()
             filt.construct(B)
-            rows.append({"dataset": dataset, "kind": "construct", "method": method, "k_fraction": kf, "k": k,
+            rows.append({"dataset": dataset, "kind": "construct", "method": method, "memory_fraction": mf, "k": k,
                          "n_reference": n, "seconds": time.perf_counter() - t0, "n_caps": filt._num_caps})
-    k = min(max(1, round(insert_k_fraction * n)), n)
+    k = _k_for_memory_fraction(dim, n, insert_memory_fraction)
     boot = max(1, round(bootstrap_fraction * n))
     for strategy, cls in CAP_INSERT_STRATEGIES.items():
         filt = CapCoverFilter(dim, max_memory=_cover_max_memory(dim, k), quantize=CapQuantize.TQ4,
@@ -1925,7 +1937,7 @@ def pinned_timing_worker(
             filt.insert(B[t:t + 1])
             times.append((time.perf_counter_ns() - t0) / 1e6)
         times = np.asarray(times)
-        rows.append({"dataset": dataset, "kind": "insert", "method": strategy, "k_fraction": insert_k_fraction,
+        rows.append({"dataset": dataset, "kind": "insert", "method": strategy, "memory_fraction": insert_memory_fraction,
                      "k": k, "n_reference": n, "n_inserts": len(times), "n_caps": filt._num_caps,
                      "mean_ms": float(times.mean()), "p50_ms": float(np.percentile(times, 50)),
                      "p99_ms": float(np.percentile(times, 99)), "max_ms": float(times.max())})

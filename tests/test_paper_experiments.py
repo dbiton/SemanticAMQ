@@ -64,7 +64,7 @@ class TestAblationWorker(unittest.TestCase):
                                  rng.normal(size=(40, cls.DIM))])).astype(np.float32)
 
     def test_rows_and_cap_vs_ball_ordering(self):
-        rows = runner.ablation_worker(self.DIM, "synthetic", 2, 0.2, self.B, self.Q,
+        rows = runner.ablation_worker(self.DIM, "synthetic", 2, 0.025, self.B, self.Q,
                                       deltas=(0.01, 0.05), arms=["full", "tq4_fixed"])
         self.assertEqual({r["arm"] for r in rows}, {"full", "ball_sphere", "ball_meb", "tq4_fixed"})
         self.assertEqual(len(rows), 4 * 2)
@@ -79,7 +79,7 @@ class TestAblationWorker(unittest.TestCase):
                 self.assertGreaterEqual(by[(ball, delta)]["log10_j_tau"], cap["log10_j_tau"])
                 self.assertEqual(by[(ball, delta)]["memory_bytes"], cap["memory_bytes"])    # same bytes
         # the cap arm's rule is the filter's own: its decisions match query()
-        filt = runner._cap_cover(self.DIM, 120)
+        filt = runner._cap_cover(self.DIM, runner._k_for_memory_fraction(self.DIM, len(self.B), 0.025))
         filt.construct(self.B)
         want = np.mean(filt.query(self.Q, distance_threshold=runner.tau_of_cosine_distance(0.05)))
         self.assertAlmostEqual(1.0 - by[("full", 0.05)]["accesses_saved_pct"] / 100.0, want, places=9)
@@ -94,7 +94,7 @@ class TestFilterLatencyWorker(unittest.TestCase):
         B = _unit(centers[rng.integers(0, 12, 900)] + 0.04 * rng.normal(size=(900, dim))).astype(np.float32)
         Q = _unit(np.vstack([centers[rng.integers(0, 12, 120)] + 0.05 * rng.normal(size=(120, dim)),
                              rng.normal(size=(80, dim))])).astype(np.float32)
-        rows = runner.filter_latency_worker(dim, "synthetic", 0, 0.2, (0.02, 0.1), B, Q, n_timed=60)
+        rows = runner.filter_latency_worker(dim, "synthetic", 0, 0.02, (0.02, 0.1), B, Q, n_timed=60)
         self.assertEqual(len(rows), 2)
         for r in rows:
             self.assertEqual(r["n_timed"], 60)
@@ -114,7 +114,7 @@ class TestPinnedTimingWorker(unittest.TestCase):
         rng = np.random.default_rng(4)
         centers = _unit(rng.normal(size=(8, dim)))
         B = _unit(centers[rng.integers(0, 8, 400)] + 0.05 * rng.normal(size=(400, dim))).astype(np.float32)
-        rows = runner.pinned_timing_worker(dim, "synthetic", B, k_fractions=(0.05,), max_inserts=20)
+        rows = runner.pinned_timing_worker(dim, "synthetic", B, memory_fractions=(0.05,), max_inserts=20)
         kinds = {(r["kind"], r["method"]) for r in rows}
         self.assertEqual(kinds, {("construct", m) for m in runner.CAP_CONSTRUCT_METHODS}
                          | {("insert", m) for m in runner.CAP_INSERT_STRATEGIES})

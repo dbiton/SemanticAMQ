@@ -116,9 +116,10 @@ QUANT_TOP_N = 5
 
 # End-to-end throughput (src/paper.py generates exactly these cells): the filter
 # in front of a flat index vs the index alone. The tau panel fixes the budget,
-# the memory and K panels fix tau; the budget sweep is shared by those two.
-PAPER_TAU_COS = 0.02                                          # cosine distance (similarity 0.98)
-PAPER_TAUS_COS = (0.005, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2)    # the tau sweeps, same unit
+# the memory panel fixes tau; the budget sweep is shared by the sweeps figure.
+PAPER_TAU_COS = 0.05                                          # cosine distance (similarity 0.95)
+PAPER_TAUS_COS = (0.005, 0.01, 0.02, 0.03, 0.05, 0.1, 0.15, 0.2)    # the tau sweeps (8 points), same unit
+TAU_TICKS = [0.8, 0.9, 0.95]                                  # cosine similarity ticks of the tau axes
 
 
 def l2_threshold(cosine_dist):
@@ -127,9 +128,11 @@ def l2_threshold(cosine_dist):
 
 
 E2E_TAU = l2_threshold(PAPER_TAU_COS)
-E2E_K_FRACTION = 0.1
+# Memory budgets are B/M: the filter's bytes over the raw index (float32 vectors). The values
+# must equal main.FIXED_MEMORY_FRACTION and main.BUDGET_MEMORY_FRACTIONS (src/paper.py asserts it).
+E2E_MEMORY_FRACTION = 0.02
 E2E_TAUS = tuple(l2_threshold(t) for t in PAPER_TAUS_COS)
-E2E_K_FRACTIONS = (0.005, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2)
+E2E_MEMORY_FRACTIONS = (0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05)
 
 # Construction methods shown (CSV key -> label, color, marker, linestyle).
 CONSTRUCT_SHOWN = {
@@ -178,11 +181,6 @@ def cosine_similarity(tau_l2):
 
 
 TAU_LABEL = "$\\tau$ (cosine similarity)"
-
-
-def nominal_memory_fraction(k_fraction, bits_per_dim=4):
-    """Byte budget / raw FP32 bytes, including the budget's angle allowance."""
-    return k_fraction * (DIM * bits_per_dim / 8 + 2) / (DIM * FP32_BYTES)
 
 
 def save(fig, name):
@@ -254,15 +252,13 @@ def sweeps_grid():
     for name in ("budget", "blocklist"):
         d = pd.read_csv(RESULTS / f"{name}.csv")
         d["corpus"] = to_corpus(d.dataset)
-        d["pct_raw"] = 100 * d.memory_bytes / (d.n_reference * DIM * FP32_BYTES)
-        d["budget_fraction"] = nominal_memory_fraction(d.k_fraction)
         frames.append(d)
     budget, blocklist = frames
     blocklist["tau_cos"] = cosine_similarity(blocklist.tau)
-    tau_mem = nominal_memory_fraction(float(blocklist.k_fraction.iloc[0]))
+    tau_mem = float(blocklist.memory_fraction.iloc[0])
     budget_tau = float(cosine_similarity(budget.tau.iloc[0]))
-    sweeps = [(budget, "budget_fraction", "memory budget $B/M$", f"FPR\n($\\tau={budget_tau:g}$)", PCT_FMT),
-              (blocklist, "tau_cos", TAU_LABEL, f"FPR\n($B\\approx{tau_mem:.4f}M$)", None)]
+    sweeps = [(budget, "memory_fraction", "memory budget $B/M$", f"FPR\n($\\tau={budget_tau:g}$)", PCT_FMT),
+              (blocklist, "tau_cos", TAU_LABEL, f"FPR\n($B={tau_mem:g}M$)", None)]
 
     n_fpr, nrows = len(BAND_TITLE), len(sweeps)
     spacer = GAP_LABELLED - 2 * GAP_SHARED  # blank column before the accesses-saved panel
@@ -309,7 +305,7 @@ def sweeps_grid():
                 ax.xaxis.set_major_formatter(xfmt)
             if x == "tau_cos":
                 ax.set_xlim(0.795, 1.005)
-                ax.set_xticks([0.8, 0.9, 0.98])
+                ax.set_xticks(TAU_TICKS)
                 ax.xaxis.set_major_formatter(PCT_FMT)
             if j < n_fpr:
                 ax.set_ylim(-0.03, 1.05)
@@ -336,8 +332,8 @@ def sweeps_grid():
 def quantization():
     q = read_all("cap_quantization/*/*.csv")
     q["corpus"] = to_corpus(q.dataset)
-    # The budget is k FP32 caps; compact encodings fit more caps in it, up to one per vector.
-    q["budget_pct"] = nominal_memory_fraction(q.k / q.n_construct, 32)
+    # The budget is B/M; compact encodings fit more caps in it, up to one per vector.
+    q["budget_pct"] = q.memory_fraction
     q["singleton"] = q.n_caps >= q.n_construct
     agg = (q.groupby(["corpus", "quantize", "budget_pct"])
            .agg(saved=("index_accesses_saved_pct", "mean"), singleton=("singleton", "mean"))
@@ -404,17 +400,15 @@ def construction():
     c = read_all("construct_methods/*.csv")
     c = c[~c.dataset.astype(str).str.startswith("scale_")].copy()
     c["corpus"] = to_corpus(c.dataset)
-    # FP32 direction, static 8-bit angle, and the shared angle-grid endpoints.
-    c["memory_fraction"] = (c.n_caps * (DIM * FP32_BYTES + 1) + 8) / (c.n_reference * DIM * FP32_BYTES)
-    agg = c.groupby(["corpus", "method", "k_fraction"]).agg(
-        mean=("fpr", "mean"), std=("fpr", "std"), memory_fraction=("memory_fraction", "mean")).reset_index()
+    agg = c.groupby(["corpus", "method", "memory_fraction"]).agg(
+        mean=("fpr", "mean"), std=("fpr", "std")).reset_index()
     fig, axes = corpus_panels(sharey=True)
     for ax, corpus in zip(axes[0], CORPORA):
         d = agg[agg.corpus == corpus]
         if d.empty:
             mark_empty(ax)
         for method, (_, color, marker, ls) in CONSTRUCT_SHOWN.items():
-            g = d[d.method == method].sort_values("k_fraction")
+            g = d[d.method == method].sort_values("memory_fraction")
             ax.errorbar(g.memory_fraction, g["mean"], yerr=g["std"].fillna(0), color=color,
                         marker=marker, ls=ls, ms=3, capsize=1.2, elinewidth=0.7)
         ax.set_xscale("log")
@@ -462,7 +456,7 @@ def streaming():
     handles = [plt.Line2D([], [], color=INSERT_SHOWN[m][1], marker=INSERT_SHOWN[m][2],
                           ls=INSERT_SHOWN[m][3]) for m in shown]
     fig_legend(fig, handles, [INSERT_SHOWN[m][0] for m in shown], ncol=len(shown))
-    shared_xlabel(axes, f"inserts after bootstrap (thousands), $B\\approx{budget_fraction:.4f}M$")
+    shared_xlabel(axes, f"inserts after bootstrap (thousands), $B\\approx{budget_fraction:.3g}M$")
     save(fig, "streaming-fpr-vs-position")
 
 
@@ -596,13 +590,12 @@ def throughput():
     d = pd.read_csv(RESULTS / "end_to_end.csv")
     d["corpus"] = to_corpus(d.dataset)
     d["tau_cos"] = cosine_similarity(d.tau)
-    d["memory_fraction"] = d.memory_pct_raw / 100
-    at_k = d[np.isclose(d.k_fraction, E2E_K_FRACTION)]
+    at_budget = d[np.isclose(d.memory_fraction, E2E_MEMORY_FRACTION)]
     at_tau = d[np.isclose(d.tau, E2E_TAU)]
     fixed_tau = f"fixed $\\tau={float(cosine_similarity(E2E_TAU)):g}$"
-    fixed_memory = f"$B\\approx{nominal_memory_fraction(E2E_K_FRACTION):.4f}M$"
+    fixed_memory = f"$B={E2E_MEMORY_FRACTION:g}M$"
     panels = [
-        (at_k, "tau_cos", TAU_LABEL, f"fixed {fixed_memory}", False),
+        (at_budget, "tau_cos", TAU_LABEL, f"fixed {fixed_memory}", False),
         (at_tau, "memory_fraction", "filter memory $B/M$ (log)", fixed_tau, True),
         (None, "backend", "backend cost $L$ (log)", fixed_tau + ", " + fixed_memory, True),
     ]
@@ -614,11 +607,11 @@ def throughput():
     for ax, (df, x, xlabel, title, logx) in zip(axes[0], panels):
         ax.set_box_aspect(1)
         if x == "backend":
-            _backend_cost_panel(ax, d[np.isclose(d.tau, E2E_TAU) & np.isclose(d.k_fraction, E2E_K_FRACTION)])
+            _backend_cost_panel(ax, d[np.isclose(d.tau, E2E_TAU) & np.isclose(d.memory_fraction, E2E_MEMORY_FRACTION)])
             ax.set_xlabel(xlabel)
             ax.set_title(title, color=INK)
             continue
-        agg = (df.groupby(["corpus", "k_fraction", "tau"])
+        agg = (df.groupby(["corpus", "memory_fraction", "tau"])
                .agg(x=(x, "mean"), y=("throughput_improvement_pct", "mean"),
                     sd=("throughput_improvement_pct", "std"))
                .reset_index())
@@ -639,7 +632,7 @@ def throughput():
             ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
         if x == "tau_cos":
             ax.set_xlim(agg.x.min() - 0.005, agg.x.max() + 0.005)
-            ax.set_xticks([0.8, 0.9, 0.98])
+            ax.set_xticks(TAU_TICKS)
             ax.xaxis.set_major_formatter(PCT_FMT)
         ax.set_xlabel(xlabel)
         ax.set_title(title, color=INK)

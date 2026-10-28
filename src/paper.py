@@ -16,9 +16,15 @@ plots/plot_paper.py's figures (written to suggestions/figures/).
       --only A,B,..      generate just these evaluations (names: see GENERATORS); default all
       --missing          generate only the evaluations whose CSVs are not in results/ (see
                          missing_evaluations), then draw the figures; runs nothing if none is missing
-      --ablation-vectors N / --ablation-folds N     size of the ablation workloads (default 20,000 / 3)
+      --ablation-vectors N / --ablation-folds N     size of the ablation workloads (default
+                                                    --num-vectors / main.BLOCKLIST_FOLDS)
       --latency-vectors N / --latency-datasets A,B  size and corpora of the latency timing (default
                                                     --num-vectors / all five)
+
+Every evaluation runs on the same workload: 80,000 construct and 20,000 query vectors per fold (main.
+WORKLOAD_NUM_VECTORS = 100,000 split 80/20) and main.BLOCKLIST_FOLDS = 5 folds. Memory budgets are B/M, the
+filter's bytes over the raw float32 index (never a cap count k): sweeps and quantization 0.005-0.05,
+construction 0.01-0.1, equal-memory 0.001-0.1, and 0.02 wherever one budget is fixed; 8 points per sweep.
     A smaller or different run needs a copy of the repo without results/ (generators
     truncate their CSVs -- see CLAUDE.md), e.g. a git worktree with datasets/ linked in.
 
@@ -76,9 +82,13 @@ from main import (Runner, CAP_COVER_CONSTRUCT, BLOCKLIST_FOLDS, blocklist_worklo
                   generate_construct_methods, generate_streaming, generate_equal_memory)
 from plots import plot_paper
 from plots.plot_paper import (plot_figures, use_corpora, CONFIG_TO_METHOD, EQUAL_MEMORY_HIDDEN, STREAM_BOOTSTRAP,
-                              E2E_TAU, E2E_K_FRACTION, E2E_TAUS, E2E_K_FRACTIONS, PAPER_TAUS_COS)
+                              E2E_TAU, E2E_MEMORY_FRACTION, E2E_TAUS, E2E_MEMORY_FRACTIONS, PAPER_TAUS_COS)
 
 assert STREAM_BOOTSTRAP == CAP_COVER_CONSTRUCT, "the streaming figure bootstraps with the paper's construct method"
+# The figures read the budgets plot_paper names; the generators use main's. They are one set of values.
+assert E2E_MEMORY_FRACTION == main.FIXED_MEMORY_FRACTION
+assert tuple(E2E_MEMORY_FRACTIONS) == tuple(main.BUDGET_MEMORY_FRACTIONS)
+assert len(main.BUDGET_MEMORY_FRACTIONS) == len(main.CONSTRUCT_MEMORY_FRACTIONS) == len(PAPER_TAUS_COS) == 8
 
 # The baselines the two equal-memory figures draw; the rest of
 # main.equal_memory_filters would be run and discarded.
@@ -92,11 +102,11 @@ def generate_end_to_end(runner: Runner) -> None:
     """The throughput figure's data: per corpus and fold, a CapCoverFilter in
     front of a flat index against the index alone (runner.end_to_end_worker),
     on the blocklist workload. Only the cells the three panels read: tau swept
-    at the fixed budget E2E_K_FRACTION, and the budget swept at E2E_TAU.
+    at the fixed budget E2E_MEMORY_FRACTION, and the budget swept at E2E_TAU.
 
     Only submits 'end_to_end' jobs -- does not run `runner`."""
     dim = 384
-    cells = sorted({(E2E_K_FRACTION, t) for t in E2E_TAUS} | {(kf, E2E_TAU) for kf in E2E_K_FRACTIONS})
+    cells = sorted({(E2E_MEMORY_FRACTION, t) for t in E2E_TAUS} | {(mf, E2E_TAU) for mf in E2E_MEMORY_FRACTIONS})
     for workload in blocklist_workloads(main.WORKLOAD_NUM_VECTORS, n_folds=BLOCKLIST_FOLDS):
         for fold, sel in enumerate(workload.selections):
             runner.submit(
@@ -111,16 +121,18 @@ ABLATION_CSV = "results/ablation.csv"
 LATENCY_CSV = "results/latency.csv"
 TIMING_CSV = "results/timing.csv"
 
-# The ablation builds ~16 covers per (corpus, fold, budget), so it runs on smaller workloads than
-# the rest: ABLATION_NUM_VECTORS vectors per corpus (80% reference, 20% queries) and ABLATION_FOLDS folds.
-ABLATION_NUM_VECTORS = 20_000
-ABLATION_FOLDS = 3
-ABLATION_K_FRACTIONS = (0.02, 0.1)
-# The latency timing: None = main.WORKLOAD_NUM_VECTORS.
+# The ablation builds ~16 covers per (corpus, fold, budget). Like every other evaluation it runs on
+# main.WORKLOAD_NUM_VECTORS vectors per corpus (80% reference, 20% queries) and main.BLOCKLIST_FOLDS
+# folds; None = those, and --ablation-vectors / --ablation-folds shrink it for a smaller run.
+ABLATION_NUM_VECTORS = None
+ABLATION_FOLDS = None
+ABLATION_MEMORY_FRACTIONS = (0.005, 0.02)
+# The latency timing: None = main.WORKLOAD_NUM_VECTORS, main.BLOCKLIST_FOLDS folds.
 LATENCY_NUM_VECTORS = None
 LATENCY_DATASETS = None            # None = all of main.BLOCKLIST_DATASETS
-LATENCY_K_FRACTION = 0.1
-TIMING_NUM_VECTORS = 10_000
+LATENCY_MEMORY_FRACTION = main.FIXED_MEMORY_FRACTION
+# The pinned timings run one fold of one corpus, at the evaluations' size (None = main.WORKLOAD_NUM_VECTORS).
+TIMING_NUM_VECTORS = None
 TIMING_DATASET = "WikiAnswers"
 QPS_BUDGET_PCT = 2.0               # the budget (% of raw) at which tab:quantization's q/s column is measured
 
@@ -129,46 +141,42 @@ def generate_ablation(runner: Runner) -> None:
     """The ablation table's data (runner.ablation_worker): per corpus, fold and budget, the
     paper's configuration, its one-choice-at-a-time variants and the ball accept rules over its
     own cover, at every cosine distance in ABLATION_DELTAS. Only submits 'ablation' jobs."""
-    for workload in blocklist_workloads(ABLATION_NUM_VECTORS, n_folds=ABLATION_FOLDS):
+    for workload in blocklist_workloads(ABLATION_NUM_VECTORS or main.WORKLOAD_NUM_VECTORS,
+                                        n_folds=ABLATION_FOLDS or BLOCKLIST_FOLDS):
         for fold, sel in enumerate(workload.selections):
             reference, queries = workload.rows(sel["reference"]), workload.query_vectors(sel)
-            for kf in ABLATION_K_FRACTIONS:
+            for mf in ABLATION_MEMORY_FRACTIONS:
                 runner.submit('ablation', output_csv=ABLATION_CSV, dim=384, dataset=workload.plot_key,
-                              seed=fold, k_fraction=kf, vectors_reference=reference, vectors_query=queries,
+                              seed=fold, memory_fraction=mf, vectors_reference=reference, vectors_query=queries,
                               deltas=ABLATION_DELTAS)
 
 
 def generate_latency(runner: Runner) -> None:
-    """The filter in front of the flat index, per-query latency (runner.filter_latency_worker): one
-    fold per corpus at k = LATENCY_K_FRACTION |B|. Timed, so it runs alone on one pinned core
+    """The filter in front of the flat index, per-query latency (runner.filter_latency_worker): every
+    fold of every corpus at B = LATENCY_MEMORY_FRACTION M. Timed, so it runs alone on one pinned core
     (generate_and_plot_all). Only submits 'filter_latency' jobs."""
     n = LATENCY_NUM_VECTORS or main.WORKLOAD_NUM_VECTORS
-    for workload in blocklist_workloads(n, n_folds=1):
+    for workload in blocklist_workloads(n, n_folds=BLOCKLIST_FOLDS):
         if LATENCY_DATASETS and workload.name not in LATENCY_DATASETS:
             continue
-        sel = workload.selections[0]
-        runner.submit('filter_latency', output_csv=LATENCY_CSV, dim=384, dataset=workload.plot_key,
-                      seed=0, k_fraction=LATENCY_K_FRACTION, deltas=PAPER_TAUS_COS,
-                      vectors_reference=workload.rows(sel["reference"]),
-                      vectors_query=workload.query_vectors(sel))
+        for fold, sel in enumerate(workload.selections):
+            runner.submit('filter_latency', output_csv=LATENCY_CSV, dim=384, dataset=workload.plot_key,
+                          seed=fold, memory_fraction=LATENCY_MEMORY_FRACTION, deltas=PAPER_TAUS_COS,
+                          vectors_reference=workload.rows(sel["reference"]),
+                          vectors_query=workload.query_vectors(sel))
 
 
 def generate_timing(runner: Runner) -> None:
     """Construction time per method, per-arrival insertion time per strategy and the query
     throughput of each of PAPER_QUANTIZE's encodings at QPS_BUDGET_PCT (runner.pinned_timing_worker,
     which tab:quantization's q/s column reads) on TIMING_DATASET. Timed: one pinned core, alone."""
-    for workload in blocklist_workloads(TIMING_NUM_VECTORS, n_folds=1, only=TIMING_DATASET):
+    for workload in blocklist_workloads(TIMING_NUM_VECTORS or main.WORKLOAD_NUM_VECTORS, n_folds=1,
+                                        only=TIMING_DATASET):
         sel = workload.selections[0]
         runner.submit('pinned_timing', output_csv=TIMING_CSV, dim=384, dataset=workload.plot_key,
                       vectors_reference=workload.rows(sel["reference"]),
                       vectors_query=workload.query_vectors(sel),
                       scan_quantizes=PAPER_QUANTIZE, scan_budget_pcts=(QPS_BUDGET_PCT,))
-
-
-# Budgets of the quantization comparison, as % of the raw index (k FP32 caps / |B|): the
-# range the equal-memory comparison covers. Above ~10% every encoding has converged.
-PAPER_BUDGET_PCT = (0.1, 0.2, 0.5, 1, 2, 5, 10)
-PAPER_K_LADDER = [round(pct / 100 * 80_000) for pct in PAPER_BUDGET_PCT]    # k at |B| = 80,000
 
 
 # The encodings the quantization table compares: the full-precision, scalar and
@@ -179,16 +187,14 @@ PAPER_QUANTIZE = tuple(dict.fromkeys(
 
 
 def generate_quantization(runner: Runner) -> None:
-    """main.generate_cap_quantization over PAPER_QUANTIZE, with its k ladder scaled
-    to the workload size, so a smaller run (--num-vectors) still has k below the
-    reference set."""
-    scale = main.WORKLOAD_NUM_VECTORS / 100_000
-    generate_cap_quantization(runner, k_values_nominal=[max(1, round(k * scale)) for k in PAPER_K_LADDER],
-                              quantizes=PAPER_QUANTIZE)
+    """main.generate_cap_quantization over PAPER_QUANTIZE at main.BUDGET_MEMORY_FRACTIONS
+    (0.005-0.05 of the raw index, like the sweeps figure): every rung, every encoding auto()
+    chooses among, and auto() itself."""
+    generate_cap_quantization(runner, quantizes=PAPER_QUANTIZE)
 
 
 # The stream is the rest of B: 80% bootstrap leaves inserts = 20% of |B| (16,000 at 100K) against a
-# budget k = 10% of |B|. At 50% the set doubled, and every method saturated at FPR 1.
+# budget B = 2% of the raw index. At 50% the set doubled, and every method saturated at FPR 1.
 STREAM_BOOTSTRAP_FRACTION = 0.8
 
 GENERATORS = {
@@ -198,7 +204,7 @@ GENERATORS = {
     "construction": generate_construct_methods,
     "streaming": partial(generate_streaming, construct_methods=[STREAM_BOOTSTRAP], k_sweep=False,
                          bootstrap_fraction=STREAM_BOOTSTRAP_FRACTION),
-    "equal-memory": partial(generate_equal_memory, filters=PAPER_EQUAL_MEMORY_FILTERS),
+    "equal-memory": partial(generate_equal_memory, filters=PAPER_EQUAL_MEMORY_FILTERS, count_memory_steps=8),
     "ablation": generate_ablation,
     "end-to-end": generate_end_to_end,
     "latency": generate_latency,

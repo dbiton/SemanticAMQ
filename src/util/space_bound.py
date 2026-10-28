@@ -59,11 +59,11 @@ def measured_points(budget_csv: str) -> "pd.DataFrame":
     import pandas as pd
     d = pd.read_csv(budget_csv)
     rows = []
-    for (dataset, kf, tau), g in d.groupby(["dataset", "k_fraction", "tau"]):
+    for (dataset, kf, tau), g in d.groupby(["dataset", "memory_fraction", "tau"]):
         n = int(g.n_reference.iloc[0])
         eps = 10.0 ** float(g.log10_j_tau.mean())
         b = space_lower_bound(384, float(tau), n, eps)
-        rows.append({"dataset": dataset, "k_fraction": kf, "tau": tau, "n": n,
+        rows.append({"dataset": dataset, "memory_fraction": kf, "tau": tau, "n": n,
                      "log10_eps": float(g.log10_j_tau.mean()), "filter_bits": 8.0 * float(g.memory_bytes.mean()),
                      **b})
     return pd.DataFrame(rows)
