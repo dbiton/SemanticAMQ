@@ -17,8 +17,10 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 
+from filters.cap_cover.cap_cover_filter import AUTO_CANDIDATES
 from filters.cap_cover.cap_quantizers import Quantize, _ENCODINGS
 
+AUTO = "auto"       # runner.CAP_QUANTIZE_AUTO: CapCoverFilter.auto() choosing among AUTO_CANDIDATES
 ROOT = Path(__file__).resolve().parents[2]
 BS = chr(92)      # LaTeX backslash
 
@@ -38,11 +40,11 @@ def _rate(r: float) -> str:
 
 def build(q: pd.DataFrame) -> pd.DataFrame:
     """One row per encoding: rate, saved/singleton per budget, qps; then the best per rate."""
-    known = {m.value for m in Quantize}
+    known = {m.value for m in Quantize} | {AUTO}
     q = q[q.quantize.isin(known)].copy()      # a CSV from an older encoding ladder may name rungs that no longer exist
     q["budget_pct"] = 100 * q.k / q.n_construct
     q["singleton"] = q.n_caps >= q.n_construct
-    q["rate"] = q.quantize.map(lambda n: _ENCODINGS[Quantize(n)].rate)
+    q["rate"] = q.quantize.map(lambda n: np.nan if n == AUTO else _ENCODINGS[Quantize(n)].rate)
     return q
 
 
@@ -62,18 +64,25 @@ def table(q: pd.DataFrame, qps: Optional[Dict[str, float]] = None, qps_label: st
     single = q.pivot_table(index="quantize", columns="budget_pct", values="singleton", aggfunc="mean")
     rate = q.groupby("quantize").rate.first()
 
-    best = saved.mean(axis=1).groupby(rate).idxmax()     # per rate: the encoding with the best mean
-    rows = sorted(best.items(), key=lambda kv: -kv[0])
+    fixed = saved.drop(index=AUTO, errors="ignore")
+    best = fixed.mean(axis=1).groupby(rate.drop(index=AUTO, errors="ignore")).idxmax()     # per rate: the encoding with the best mean
+    # The best at each rate, plus every encoding auto() chooses among, by rate; then auto() itself.
+    shown = set(best.values) | {c.value for c in AUTO_CANDIDATES if c.value in fixed.index}
+    rows = sorted(((rate[n], n) for n in shown), key=lambda kv: (-kv[0], kv[1]))
+    if AUTO in saved.index:
+        rows.append((np.nan, AUTO))
     names = [n for _, n in rows]
     colmax = saved.loc[names].max()
 
     extra = "r" if qps else ""
     qps = qps or {}
     out = [f"{BS}begin{{tabular}}{{@{{}}lr" + "r" * len(budgets) + extra + "@{}}", f"{BS}toprule",
-           f"& & {BS}multicolumn{{{len(budgets)}}}{{c}}{{Memory budget ({BS}% of raw)}}" + (" &" if extra else "") + f" {BS*2}",
+           f"& & {BS}multicolumn{{{len(budgets)}}}{{c}}{{Memory budget $B/M$}}" + (" &" if extra else "") + f" {BS*2}",
            f"{BS}cmidrule(lr){{3-{2 + len(budgets)}}}",
-           "Encoding & b/dim & " + " & ".join(f"{b:g}" for b in budgets) + (f" & {qps_label}" if extra else "") + f" {BS*2}", f"{BS}midrule"]
+           "Encoding & b/dim & " + " & ".join(f"{b / 100:.3g}" for b in budgets) + (f" & {qps_label}" if extra else "") + f" {BS*2}", f"{BS}midrule"]
     for r, name in rows:
+        if name == AUTO:
+            out.append(f"{BS}midrule")
         cells = []
         for b in budgets:
             v = saved.loc[name, b]
@@ -85,7 +94,7 @@ def table(q: pd.DataFrame, qps: Optional[Dict[str, float]] = None, qps_label: st
                 c = f"{BS}textbf{{{c}}}"
             cells.append(c + (f"$^{{{BS}dagger}}$" if single.loc[name, b] >= 0.5 else ""))
         q_s = f"{qps[name]:,.0f}".replace(",", "{,}") if name in qps and pd.notna(qps[name]) else "--"
-        out.append(f"{_tex(_label(name))} & {_rate(r)} & " + " & ".join(cells) + (f" & {q_s}" if extra else "") + f" {BS*2}")
+        out.append(f"{_tex(_label(name))} & {'--' if name == AUTO else _rate(r)} & " + " & ".join(cells) + (f" & {q_s}" if extra else "") + f" {BS*2}")
     out += [f"{BS}bottomrule", f"{BS}end{{tabular}}"]
     return "\n".join(out) + "\n"
 

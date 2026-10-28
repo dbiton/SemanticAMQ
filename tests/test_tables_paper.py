@@ -1,11 +1,13 @@
 """plots.tables_paper and plots.table_quantization: the LaTeX they write has one table row per line
 (no stray line breaks inside a cell) and the new columns and rows are present."""
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
 from plots import table_quantization, tables_paper
+from plots import plot_paper
 
 
 def _latency_rows():
@@ -64,6 +66,18 @@ class TestQuantizationTable(unittest.TestCase):
         self.assertIn("12{,}906", tex)
         self.assertNotIn("q/s", table_quantization.table(self._frame()))
 
+    def test_lists_every_auto_candidate_and_the_auto_row(self):
+        rows = []
+        for q in ("TQ4", "TQ3", "TQ2", "SPQ64", "SPQ12", "auto"):
+            rows.append(dict(quantize=q, k=40, n_construct=8000, n_caps=200,
+                             index_accesses_saved_pct=50.0, query_throughput_qps=1.0))
+        lines = table_quantization.table(pd.DataFrame(rows)).splitlines()
+        body = lines[lines.index(r"\midrule") + 1:]
+        self.assertTrue(body[-3].startswith("auto") and "-- &" in body[-3])      # then \bottomrule, \end{tabular}
+        self.assertEqual(body[-4], r"\midrule")
+        for enc in ("TQ4", "TQ3", "TQ2", "SPQ $6{\\times}8$", "SPQ $48{\\times}12$"):
+            self.assertTrue(any(ln.startswith(enc) for ln in body), enc)
+
     def test_only_the_papers_budgets_are_columns(self):
         f = self._frame()
         extra = f.assign(k=f.k * 0 + 8, index_accesses_saved_pct=1.0)       # 0.1% of the raw index
@@ -71,6 +85,23 @@ class TestQuantizationTable(unittest.TestCase):
         header = [ln for ln in tex.splitlines() if ln.startswith("Encoding")][0]
         self.assertEqual(header.count("&"), 3)          # b/dim and the two budgets
         self.assertNotIn("0.1 &", header)
+
+
+class TestPaperFoldAggregation(unittest.TestCase):
+
+    def test_averages_folds_before_combining_lsh_schemes(self):
+        rows = []
+        for config, fprs in (("CapCoverFilter", (0.2, 0.8)),
+                             ("PacukLSHFilter", (0.1, 0.9)),
+                             ("SankowskiWygockiFilter", (0.35, 0.45))):
+            for fpr in fprs:
+                rows.append({"Config": config, "Dataset": "quora", "Memory Budget": 1536,
+                             "Construct Size": 100, "FPR": fpr, "FNR": 0.0, "Infeasible": False})
+        with patch.object(plot_paper, "read_all", return_value=pd.DataFrame(rows)):
+            result = plot_paper._equal_memory_frame().set_index("method")
+        self.assertAlmostEqual(result.loc["Cap-Cover", "FPR"], 0.5)
+        self.assertAlmostEqual(result.loc["Zero-FN LSH", "FPR"], 0.4)
+        self.assertAlmostEqual(result.loc["Cap-Cover", "pct_raw"], 0.01)
 
 
 if __name__ == "__main__":

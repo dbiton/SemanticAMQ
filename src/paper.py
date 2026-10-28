@@ -68,7 +68,7 @@ from functools import partial
 from pathlib import Path
 
 import main
-from runner import CAP_QUANTIZATION_SWEEP
+from runner import CAP_QUANTIZATION_SWEEP, CAP_QUANTIZE_AUTO
 from filters.cap_cover.cap_quantizers import Quantize
 from runner import ABLATION_DELTAS
 from main import (Runner, CAP_COVER_CONSTRUCT, BLOCKLIST_FOLDS, blocklist_workloads, equal_memory_filters, logger,
@@ -175,7 +175,7 @@ PAPER_K_LADDER = [round(pct / 100 * 80_000) for pct in PAPER_BUDGET_PCT]    # k 
 # TurboQuant rungs down to 1 bit/dim, plus the seeded-PQ rungs auto() chooses among.
 PAPER_QUANTIZE = tuple(dict.fromkeys(
     (Quantize.FP32, Quantize.FP16, Quantize.SQ8, Quantize.TQ8, Quantize.SQ6, Quantize.SQ4, Quantize.TQ4,
-     Quantize.TQ3, Quantize.TQ2, Quantize.TQ1) + tuple(CAP_QUANTIZATION_SWEEP)))
+     Quantize.TQ3, Quantize.TQ2, Quantize.TQ1) + tuple(CAP_QUANTIZATION_SWEEP) + (CAP_QUANTIZE_AUTO,)))
 
 
 def generate_quantization(runner: Runner) -> None:

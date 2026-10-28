@@ -669,11 +669,20 @@ def _per_band_rates(predicted: Any, actual: Any, nn_cos: np.ndarray) -> Dict[str
     return out
 
 
+# cap_quantization's extra "encoding": CapCoverFilter.auto() choosing among AUTO_CANDIDATES for the
+# budget (the paper's configuration), next to the fixed encodings it chooses from.
+CAP_QUANTIZE_AUTO = "auto"
+
+
+def _quantize_name(quantize: Any) -> str:
+    return quantize if isinstance(quantize, str) else quantize.value
+
+
 def cap_quantization_worker(
     dim: int,
     dataset: str,
     k: int,
-    quantize: CapQuantize,
+    quantize: Any,   # a CapQuantize, or CAP_QUANTIZE_AUTO
     tau: float,
     seed: int,
     vectors_construct: VectorInput,
@@ -708,12 +717,15 @@ def cap_quantization_worker(
     max_memory = _cover_max_memory(dim, k, 32)
     t0 = time.perf_counter()
     try:
-        filt = CapCoverFilter(dim=dim, max_memory=max_memory, quantize=quantize,
-                              construct_method=CAP_CONSTRUCT_METHODS[CAP_COVER_CONSTRUCT]())
+        if quantize == CAP_QUANTIZE_AUTO:
+            filt = CapCoverFilter.auto(dim, max_memory=max_memory)
+        else:
+            filt = CapCoverFilter(dim=dim, max_memory=max_memory, quantize=quantize,
+                                  construct_method=CAP_CONSTRUCT_METHODS[CAP_COVER_CONSTRUCT]())
         filt.construct(construct_arr)
     except Exception as e:
         logger.warning(
-            f"Skipping cap_quantization job (dataset={dataset}, k={k}, quantize={quantize.value}, "
+            f"Skipping cap_quantization job (dataset={dataset}, k={k}, quantize={_quantize_name(quantize)}, "
             f"seed={seed}): construction raised {type(e).__name__}: {e}"
         )
         return []
@@ -731,7 +743,8 @@ def cap_quantization_worker(
 
     rates = _confusion_rates(predicted, actual)
     rows.append({
-        "dataset": dataset, "k": k, "quantize": quantize.value, "stage": "quantizing", "tau": tau,
+        "dataset": dataset, "k": k, "quantize": _quantize_name(quantize), "stage": "quantizing", "tau": tau,
+        "encoding": filt.encoding_label,
         "log10_J": log10_J,
         "log10_J_tau": _cap_log10_volume(filt, tau),
         "fpr": rates["fpr"], "fnr": rates["fnr"],
