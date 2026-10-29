@@ -7,23 +7,20 @@ go to suggestions/figures/ under the names paper.tex includes:
     sweeps-grid.*                      fig:end-to-end   budget.csv + blocklist.csv
     quantization-saved-vs-memory.*     fig:quantization cap_quantization/<corpus>/*.csv
     quantization-speedup-vs-memory.*, quantization-throughput-vs-memory.* (not in the paper) cap_quantization/<corpus>/*.csv
-    quantization-table.tex             tab:quantization cap_quantization/<corpus>/*.csv
     construction-fpr-vs-k.*            fig:construction construct_methods/<corpus>.csv
     streaming-fpr-vs-position.*        fig:streaming    streaming/<corpus>/streaming.csv
     equal-memory-zero-fn-fpr-vs-budget.*      fig:equal-memory          equal_memory/<corpus>/equal_memory.csv
     equal-memory-nonzero-fn-wikianswers.*     fig:equal-memory-nonzero-fn  (same)
     throughput-improvement.*           fig:throughput   end_to_end.csv
-    ablation-table.tex, sensitivity-table.tex, latency-table.tex, timing-table.tex,
-    jtau-correlation.csv               tab:ablation, tab:sensitivity, tab:latency, tab:timing
-                                       ablation.csv, latency.csv, timing.csv (plots/tables_paper.py)
+(The tables of plots/tables_paper.py and plots/table_quantization.py are not drawn here.)
 
 (figures/scheme.pdf is a hand-drawn diagram and is not produced here.)
 
 Run from the repo root with the global Python 3.12:
     PYTHONPATH=src python src/plots/plot_paper.py [results-folder] [figure ...]
 results-folder defaults to results/. Figure names are the keys of FIGURES
-(sweeps, quantization, quantization-table, construction, streaming, equal-memory-zero-fn,
-equal-memory-nonzero-fn, throughput, tables); default is all.
+(sweeps, quantization, construction, streaming, equal-memory-zero-fn,
+equal-memory-nonzero-fn, throughput, quantization-throughput, quantization-speedup); default is all.
 
 Thresholds are displayed as cosine distance; the stored CSV threshold values
 are converted only for presentation.
@@ -350,7 +347,7 @@ def quantization(mode="saved"):
         q["improvement"] = 100.0 * (lookup / (1.0 / q.query_throughput_qps + p * lookup) - 1.0)
         print(f"  simulated speedup at a flat-index lookup of {lookup * 1e3:.1f} ms")
     agg = (q.groupby(["corpus", "quantize", "budget_pct"])
-           .agg(saved=("index_accesses_saved_pct", "mean"), qps=("query_throughput_qps", "median"), gain=("improvement" if speedup else "saved", "mean"),
+           .agg(saved=("index_accesses_saved_pct", "mean"), qps=("query_throughput_qps", "median"), gain=("improvement" if speedup else "index_accesses_saved_pct", "mean"),
                 singleton=("singleton", "mean"))
            .reset_index())
     ceilings = q.groupby("corpus").neg_share_pct.median()
@@ -705,13 +702,11 @@ FIGURES = {
     "quantization": quantization,
     "quantization-throughput": quantization_throughput,
     "quantization-speedup": quantization_speedup,
-    "quantization-table": quantization_table,
     "construction": construction,
     "streaming": streaming,
     "equal-memory-zero-fn": equal_memory_zero_fn,
     "equal-memory-nonzero-fn": equal_memory_nonzero_fn,
     "throughput": throughput,
-    "tables": paper_tables,
 }
 
 

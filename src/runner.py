@@ -72,7 +72,9 @@ def _cap_cover(dim: int, k: int, quantize: Optional[CapQuantize] = None) -> CapC
     (_cover_max_memory); with `quantize`, that one encoding (auto() over a single
     candidate) in place of auto's choice."""
     candidates = None if quantize is None else [quantize]
-    return CapCoverFilter.auto(dim, max_memory=_cover_max_memory(dim, k), **({} if candidates is None else {"candidates": candidates}))
+    return CapCoverFilter.auto(dim, max_memory=_cover_max_memory(dim, k),
+                               construct_method=CAP_CONSTRUCT_METHODS[CAP_COVER_CONSTRUCT](),
+                               **({} if candidates is None else {"candidates": candidates}))
 
 
 def _cap_cover_insertable(dim: int, k: int) -> CapCoverFilter:
@@ -87,10 +89,10 @@ def _cap_cover_insertable(dim: int, k: int) -> CapCoverFilter:
                           quantize=CapQuantize.TQ4, insert_method=CapNearestInsert())
 
 
-# CapCoverFilter's default construct method (what CapCoverFilter()/
-# _cap_cover() already use when no construct_method is passed) -- a
-# named default for call sites that need one rather than relying on the class's own default.
-CAP_COVER_CONSTRUCT = "sphere_merge"
+# The construct method of the evaluations' covers (_cap_cover, the adapter, the
+# quantization sweep): soft anneal, minimax's cover refined against the accept-region
+# volume. CapCoverFilter's own default (no construct_method) is still sphere merge.
+CAP_COVER_CONSTRUCT = "soft_anneal"
 
 # CapCoverFilter's own construct-method registry: only the strategies its
 # package implements.
@@ -730,7 +732,8 @@ def cap_quantization_worker(
     t0 = time.perf_counter()
     try:
         if quantize == CAP_QUANTIZE_AUTO:
-            filt = CapCoverFilter.auto(dim, max_memory=max_memory)
+            filt = CapCoverFilter.auto(dim, max_memory=max_memory,
+                                       construct_method=CAP_CONSTRUCT_METHODS[CAP_COVER_CONSTRUCT]())
         else:
             filt = CapCoverFilter(dim=dim, max_memory=max_memory, quantize=quantize,
                                   construct_method=CAP_CONSTRUCT_METHODS[CAP_COVER_CONSTRUCT]())
