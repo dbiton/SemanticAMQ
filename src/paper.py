@@ -20,7 +20,7 @@ plots/plot_paper.py's figures (written to suggestions/figures/).
 Every evaluation runs on the same workload: 80,000 construct and 20,000 query vectors per fold (main.
 WORKLOAD_NUM_VECTORS = 100,000 split 80/20) and main.BLOCKLIST_FOLDS = 5 folds. Memory budgets are B/M, the
 filter's bytes over the raw float32 index (never a cap count k): sweeps and quantization 0.005-0.05,
-construction 0.01-0.1 unquantized and 0.005-0.05 at TQ2, equal-memory 0.001-0.1, and 0.02 wherever one budget is fixed; 8 points per sweep.
+construction 0.01-0.1, equal-memory 0.001-0.1, and 0.02 wherever one budget is fixed; 8 points per sweep.
     A smaller or different run needs a copy of the repo without results/ (generators
     truncate their CSVs -- see CLAUDE.md), e.g. a git worktree with datasets/ linked in.
 
@@ -73,7 +73,6 @@ from plots.plot_paper import (FIGURES, plot_figures, use_corpora, CONFIG_TO_METH
 assert E2E_MEMORY_FRACTION == main.FIXED_MEMORY_FRACTION
 assert tuple(E2E_MEMORY_FRACTIONS) == tuple(main.BUDGET_MEMORY_FRACTIONS)
 assert len(main.BUDGET_MEMORY_FRACTIONS) == len(main.CONSTRUCT_MEMORY_FRACTIONS) == len(PAPER_TAUS_COS) == 8
-assert max(main.CONSTRUCT_TQ2_MEMORY_FRACTIONS) <= 0.05
 
 # The baselines the two equal-memory figures draw; the rest of
 # main.equal_memory_filters would be run and discarded.
@@ -84,6 +83,7 @@ PAPER_EQUAL_MEMORY_FILTERS = [cls for cls in equal_memory_filters
 # this one encoding (not auto()'s choice); the equal-memory comparison at this cosine distance.
 PAPER_CAP_QUANTIZE = Quantize.TQ2
 EQUAL_MEMORY_TAU_COS = 0.02
+EQUAL_MEMORY_CAP_QUANTIZES = (Quantize.TQ2, Quantize.TQ4)     # one Cap-Cover line each
 
 END_TO_END_CSV = "results/end_to_end.csv"
 
@@ -127,7 +127,7 @@ GENERATORS = {
     "quantization": generate_quantization,
     "construction": generate_construct_methods,
     "equal-memory": partial(generate_equal_memory, filters=PAPER_EQUAL_MEMORY_FILTERS, count_memory_steps=8,
-                            tau=l2_threshold(EQUAL_MEMORY_TAU_COS), cap_quantize=PAPER_CAP_QUANTIZE),
+                            tau=l2_threshold(EQUAL_MEMORY_TAU_COS), cap_quantizes=EQUAL_MEMORY_CAP_QUANTIZES),
     "end-to-end": generate_end_to_end,
 }
 # Evaluations that time something: run after the rest, alone, one at a time (see generate_and_plot_all).

@@ -76,10 +76,12 @@ CORPUS_STYLE = {
     "ChatGPTParaphrases": (VIOLET, "D"), "CCNews": (MAGENTA, "v"),
 }
 
-# Equal-memory methods: Cap-Cover is always blue.
-CAP_COVER = "Cap-Cover"
+# Equal-memory methods: Cap-Cover is always blue, one line per encoding.
+CAP_COVER = "Cap-Cover (TQ2)"
+CAP_COVER_TQ4 = "Cap-Cover (TQ4)"
 METHOD_STYLE = {
     CAP_COVER: (BLUE, "o", "-"),
+    CAP_COVER_TQ4: (BLUE, "s", "--"),
     "QuantizedVector": (ORANGE, "s", "-"),
     "IVF-PQ": (AQUA, "^", "-"),
     "IVF-Radii": (INK_2, "h", "-"),
@@ -90,7 +92,7 @@ METHOD_STYLE = {
     "VA+-file": (MAGENTA, "*", "-"),
 }
 CONFIG_TO_METHOD = {
-    "CapCoverFilter": CAP_COVER,
+    "CapCoverFilter": CAP_COVER, "CapCoverFilter (TQ2)": CAP_COVER, "CapCoverFilter (TQ4)": CAP_COVER_TQ4,
     "QuantizedVectorFilter": "QuantizedVector",
     "IVFFilter": "IVF-PQ", "IVFRadiiFilter": "IVF-Radii", "HNSWFilter": "HNSW",
     "DSHFilter": "DSH", "MLPFilter": "MLP",
@@ -133,13 +135,14 @@ E2E_TAUS = tuple(l2_threshold(t) for t in PAPER_TAUS_COS)
 E2E_MEMORY_FRACTIONS = (0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05)
 
 # Construction methods shown (CSV key -> label, color, marker), each drawn unquantized (dashed,
-# open markers) and at TQ2 (solid): one line per method and encoding.
+# open markers), at TQ2 (solid) and at TQ4 (dash-dot): one line per method and encoding.
 CONSTRUCT_SHOWN = {
     "gonzalez": ("Gonzalez", INK_MUTED, "o"),
     "minimax": ("minimax", ORANGE, "s"),
     "soft_anneal": ("annealing", GREEN, "v"),
 }
-CONSTRUCT_ENCODINGS = {"FP32": ("unquantized", "--", True), "TQ2": ("TQ2", "-", False)}   # key -> label, linestyle, hollow
+CONSTRUCT_ENCODINGS = {"FP32": ("unquantized", "--", True), "TQ2": ("TQ2", "-", False),
+                       "TQ4": ("TQ4", "-.", False)}   # key -> label, linestyle, hollow
 # Insertion strategies shown. The initial cover is built with STREAM_BOOTSTRAP.
 STREAM_BOOTSTRAP = "sphere_merge"
 INSERT_SHOWN = {
@@ -455,7 +458,7 @@ def construction():
             handles.append(plt.Line2D([], [], color=color, marker=marker, ls=ls, ms=3,
                                       mfc="white" if hollow else color))
             labels.append(f"{name} ({enc_label})")
-    fig_legend(fig, handles, labels, ncol=len(labels))
+    fig_legend(fig, handles, labels, ncol=len(CONSTRUCT_ENCODINGS))
     shared_xlabel(axes, "filter memory $B/M$ (log)")
     save(fig, "construction-fpr-vs-k")
 
@@ -504,8 +507,8 @@ def streaming():
 # ---------------------------------------------------------------------------
 
 # The methods each figure draws, in legend order. A method the run did not produce is skipped.
-ZERO_FN_METHODS = [CAP_COVER, "VA+-file", "Zero-FN LSH", "QuantizedVector"]
-NONZERO_FN_METHODS = [CAP_COVER, "DSH", "MLP", "IVF-PQ", "HNSW"]
+ZERO_FN_METHODS = [CAP_COVER, CAP_COVER_TQ4, "VA+-file", "Zero-FN LSH", "QuantizedVector"]
+NONZERO_FN_METHODS = [CAP_COVER, CAP_COVER_TQ4, "DSH", "MLP", "IVF-PQ", "HNSW"]
 NONZERO_FN_CORPUS = "Quora"      # the corpus with the most positive queries in the reduced run (49 at delta 0.02)
 
 

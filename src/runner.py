@@ -180,6 +180,9 @@ class _CapCoverFilterEvalAdapter:
     def __init__(self, dim: int, max_memory: int, distance_threshold: float,
                  insert_mem_percent: Optional[float] = 0.0, **extra_kwargs: Any) -> None:
         self.distance_threshold = distance_threshold
+        quantize = extra_kwargs.pop("quantize", None)      # one encoding in place of auto()'s choice
+        if quantize is not None:
+            extra_kwargs["candidates"] = [quantize]
         extra_kwargs.setdefault("construct_method", CAP_CONSTRUCT_METHODS[CAP_COVER_CONSTRUCT]())
         self._filt = CapCoverFilter.auto(dim, max_memory=max_memory,
                                          insert_memory_percent=insert_mem_percent, **extra_kwargs)
