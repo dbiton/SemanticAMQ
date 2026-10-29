@@ -29,7 +29,7 @@ from plots.plot_budget import generate_budget_figures
 from plots.plot_construct_methods import generate_construct_methods_figures, load_results as load_construct_methods
 from plots.plot_common import DATASETS, DATASET_LABELS
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-from filters.cap_cover.cap_cover_filter import CapCoverFilter
+from filters.cap_cover.cap_cover_filter import CapCoverFilter, Quantize
 from filters.dsh_filter import DSHFilter
 from filters.hnsw_filter import HNSWFilter
 from filters.ivf_filter import IVFFilter
@@ -295,7 +295,8 @@ def stratified_calibration_split(
 
 
 def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None, n_folds: int = BLOCKLIST_FOLDS,
-                          count_memory_steps: int = 8) -> None:
+                          count_memory_steps: int = 8, tau: Optional[float] = None,
+                          cap_quantize: Optional[Quantize] = None) -> None:
     """Equal-memory (SOTA) comparison across equal_memory_filters. Sweeps
     count_memory_steps budgets from 10% to 100% of raw storage (storing the
     construct set as a plain list of float32 vectors, dim*4 bytes each) in
@@ -317,7 +318,8 @@ def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None, n
     flat percentage_calibration split of one dataset.
 
     filters narrows the compared set (default equal_memory_filters; CapCoverFilter
-    is always submitted). n_folds and count_memory_steps (log-spaced budgets) scale the
+    is always submitted). tau (L2; default FIXED_TAU) is the one threshold of the
+    comparison; cap_quantize fixes CapCoverFilter's encoding (default: auto()'s choice). n_folds and count_memory_steps (log-spaced budgets) scale the
     sweep down for a smaller run.
 
     Runs over every blocklist corpus and fold; plot_equal_memory pools all of
@@ -331,7 +333,8 @@ def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None, n
     equal_memory_csv()), mirroring cap_quantization_csv/CAP_QUANTIZATION_DIR."""
     num_vectors            = WORKLOAD_NUM_VECTORS
     dim                    = 384
-    tau                    = FIXED_TAU
+    tau                    = FIXED_TAU if tau is None else tau
+    cap_kwargs             = {} if cap_quantize is None else {"extra_kwargs": {"candidates": [cap_quantize]}}
     # Log-spaced, not linear: the baselines' feasibility floors span more
     # than a decade below this range's top (IVF-PQ ~0.6%, quantized-point-set
     # RaBitQ ~3.6%, of raw storage at n=100K/dim=384 -- HNSW's ~30% floor
@@ -415,7 +418,7 @@ def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None, n
                     vectors_construct=vectors_construct, vectors_calibration=vectors_calibration,
                     vectors_query=vectors_query,
                     actual_calibration=actual_calibration, actual_query=actual_query,
-                    dataset=workload.name,
+                    dataset=workload.name, **cap_kwargs,
                 )
 
 
@@ -1246,6 +1249,10 @@ def plot_streaming(df: pd.DataFrame, k_fixed: int) -> None:
 # generate_construct_methods_scale, whose "scale_" prefix keeps it out of
 # the sweep's figures.
 CONSTRUCT_METHODS_DIR = "results/construct_methods"
+# The construction evaluation compares these, each unquantized (FP32) and at TQ2; sphere_merge
+# (the paper's default) is not evaluated there, though soft_anneal starts from its cover.
+CONSTRUCT_EVALUATED = ("gonzalez", "minimax", "soft_anneal")
+CONSTRUCT_QUANTIZES = (Quantize.FP32, Quantize.TQ2)
 CONSTRUCT_METHODS_PLOT_DIR = "plots/construct_methods"
 
 
@@ -1258,14 +1265,14 @@ def construct_methods_scale_csv(dataset: str, n: int) -> str:
 
 
 def generate_construct_methods(runner: Runner) -> None:
-    """CapCoverFilter's construction methods (runner.CAP_CONSTRUCT_METHODS --
-    only the 3 its package implements: gonzalez/minimax/sphere_merge, no
-    split/merge) compared on the blocklist workload: the same construction
+    """CapCoverFilter's construction methods (CONSTRUCT_EVALUATED: gonzalez,
+    minimax, soft_anneal; sphere_merge is not evaluated here), each at
+    CONSTRUCT_QUANTIZES (unquantized and TQ2), compared on the blocklist workload: the same construction
     and query sets as generate_budget/generate_quantization, with ground
     truth defined as distance to the reference set at tau. Only the
     construction method varies (see runner.construct_method_worker).
 
-    One job per (corpus, fold, method, memory budget), so rows reach
+    One job per (corpus, fold, method, encoding, memory budget), so rows reach
     construct_methods_csv(corpus) as each cover finishes, and the slow
     large-k covers don't serialize one method's whole sweep onto a single
     worker.
@@ -1278,7 +1285,7 @@ def generate_construct_methods(runner: Runner) -> None:
     # B/M from 1% to 10% (8 points): the budgets where the covers are wide
     # enough for the construction method to matter and not yet saturated.
     memory_fractions = list(CONSTRUCT_MEMORY_FRACTIONS)
-    methods     = list(CAP_CONSTRUCT_METHODS)
+    methods     = list(CONSTRUCT_EVALUATED)
 
     for workload in blocklist_workloads(num_vectors, n_folds=n_folds):
         output_csv = construct_methods_csv(workload.plot_key)
@@ -1291,15 +1298,16 @@ def generate_construct_methods(runner: Runner) -> None:
             logger.info(f"{workload.name} fold {fold}: |B|={n}, {len(vectors_query)} queries, "
                         f"{int(actual_results.sum())} within tau={tau} of B")
             for method in methods:
-                for mf in memory_fractions:
-                    runner.submit(
-                        'construct_method',
-                        output_csv=output_csv,
-                        dim=dim, dataset=workload.plot_key, method=method,
-                        memory_fraction=mf, tau=tau, seed=fold,
-                        vectors_construct=vectors_construct, vectors_query=vectors_query,
-                        actual_results=actual_results,
-                    )
+                for quantize in CONSTRUCT_QUANTIZES:
+                    for mf in memory_fractions:
+                        runner.submit(
+                            'construct_method',
+                            output_csv=output_csv,
+                            dim=dim, dataset=workload.plot_key, method=method, quantize=quantize,
+                            memory_fraction=mf, tau=tau, seed=fold,
+                            vectors_construct=vectors_construct, vectors_query=vectors_query,
+                            actual_results=actual_results,
+                        )
 
 
 def generate_construct_methods_scale(runner: Runner, dataset: str = "WikiAnswers", n: int = 100_000,

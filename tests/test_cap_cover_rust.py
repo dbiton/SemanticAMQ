@@ -103,7 +103,7 @@ class Differential(unittest.TestCase):
         X = clustered()
         for budget in (6000, 14000):
             with self.subTest(budget=budget):
-                f = CapCoverFilter.auto(DIM, max_memory=budget)
+                f = CapCoverFilter.auto(DIM, max_memory=budget, mixed=True)
                 f.construct(X)
                 self.assertGreater(len(np.unique(f._cap_level[f.all_caps])), 1 if budget == 14000 else 0)
                 self.check(f, X)

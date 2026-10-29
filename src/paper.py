@@ -82,7 +82,8 @@ from main import (Runner, CAP_COVER_CONSTRUCT, BLOCKLIST_FOLDS, blocklist_worklo
                   generate_construct_methods, generate_streaming, generate_equal_memory)
 from plots import plot_paper
 from plots.plot_paper import (plot_figures, use_corpora, CONFIG_TO_METHOD, EQUAL_MEMORY_HIDDEN, STREAM_BOOTSTRAP,
-                              E2E_TAU, E2E_MEMORY_FRACTION, E2E_TAUS, E2E_MEMORY_FRACTIONS, PAPER_TAUS_COS)
+                              E2E_TAU, E2E_MEMORY_FRACTION, E2E_TAUS, E2E_MEMORY_FRACTIONS, PAPER_TAUS_COS,
+                              l2_threshold)
 
 assert STREAM_BOOTSTRAP == CAP_COVER_CONSTRUCT, "the streaming figure bootstraps with the paper's construct method"
 # The figures read the budgets plot_paper names; the generators use main's. They are one set of values.
@@ -95,11 +96,16 @@ assert len(main.BUDGET_MEMORY_FRACTIONS) == len(main.CONSTRUCT_MEMORY_FRACTIONS)
 PAPER_EQUAL_MEMORY_FILTERS = [cls for cls in equal_memory_filters
                               if CONFIG_TO_METHOD.get(cls.__name__) not in EQUAL_MEMORY_HIDDEN]
 
+# The throughput figure, the latency timing and the equal-memory comparison run CapCoverFilter at
+# this one encoding (not auto()'s choice); the equal-memory comparison at this cosine distance.
+PAPER_CAP_QUANTIZE = Quantize.TQ2
+EQUAL_MEMORY_TAU_COS = 0.02
+
 END_TO_END_CSV = "results/end_to_end.csv"
 
 
 def generate_end_to_end(runner: Runner) -> None:
-    """The throughput figure's data: per corpus and fold, a CapCoverFilter in
+    """The throughput figure's data: per corpus and fold, a CapCoverFilter (PAPER_CAP_QUANTIZE) in
     front of a flat index against the index alone (runner.end_to_end_worker),
     on the blocklist workload. Only the cells the three panels read: tau swept
     at the fixed budget E2E_MEMORY_FRACTION, and the budget swept at E2E_TAU.
@@ -111,7 +117,7 @@ def generate_end_to_end(runner: Runner) -> None:
         for fold, sel in enumerate(workload.selections):
             runner.submit(
                 'end_to_end', output_csv=END_TO_END_CSV,
-                dim=dim, dataset=workload.plot_key, seed=fold, cells=cells,
+                dim=dim, dataset=workload.plot_key, seed=fold, cells=cells, quantize=PAPER_CAP_QUANTIZE,
                 vectors_reference=workload.rows(sel["reference"]),
                 vectors_query=workload.query_vectors(sel),
             )
@@ -162,7 +168,7 @@ def generate_latency(runner: Runner) -> None:
         for fold, sel in enumerate(workload.selections):
             runner.submit('filter_latency', output_csv=LATENCY_CSV, dim=384, dataset=workload.plot_key,
                           seed=fold, memory_fraction=LATENCY_MEMORY_FRACTION, deltas=PAPER_TAUS_COS,
-                          vectors_reference=workload.rows(sel["reference"]),
+                          quantize=PAPER_CAP_QUANTIZE, vectors_reference=workload.rows(sel["reference"]),
                           vectors_query=workload.query_vectors(sel))
 
 
@@ -204,7 +210,8 @@ GENERATORS = {
     "construction": generate_construct_methods,
     "streaming": partial(generate_streaming, construct_methods=[STREAM_BOOTSTRAP], k_sweep=False,
                          bootstrap_fraction=STREAM_BOOTSTRAP_FRACTION),
-    "equal-memory": partial(generate_equal_memory, filters=PAPER_EQUAL_MEMORY_FILTERS, count_memory_steps=8),
+    "equal-memory": partial(generate_equal_memory, filters=PAPER_EQUAL_MEMORY_FILTERS, count_memory_steps=8,
+                            tau=l2_threshold(EQUAL_MEMORY_TAU_COS), cap_quantize=PAPER_CAP_QUANTIZE),
     "ablation": generate_ablation,
     "end-to-end": generate_end_to_end,
     "latency": generate_latency,

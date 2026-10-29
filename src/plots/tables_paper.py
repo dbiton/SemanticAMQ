@@ -163,7 +163,7 @@ def timing_table(t: pd.DataFrame) -> str:
     ks = sorted(c.memory_fraction.unique())
     out = [f"{BS}begin{{tabular}}{{@{{}}l" + "r" * len(ks) + "@{}}", f"{BS}toprule",
            f"Construction (s) & " + " & ".join(_memory_label(k) for k in ks) + f" {BS*2}", f"{BS}midrule"]
-    for m in ("gonzalez", "minimax", "sphere_merge", "soft_anneal"):
+    for m in ("gonzalez", "minimax", "soft_anneal"):
         r = c[c.method == m].groupby("memory_fraction").seconds.mean()
         out.append(f"{m.replace('_', ' ')} & " + " & ".join("--" if k not in r.index else f"{r[k]:.1f}" for k in ks) + f" {BS*2}")
     ins = t[t.kind == "insert"]

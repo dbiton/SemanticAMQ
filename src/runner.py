@@ -67,10 +67,12 @@ def _k_for_memory_fraction(dim: int, n: int, memory_fraction: float,
 
 
 
-def _cap_cover(dim: int, k: int) -> CapCoverFilter:
+def _cap_cover(dim: int, k: int, quantize: Optional[CapQuantize] = None) -> CapCoverFilter:
     """CapCoverFilter.auto() at the nominal k-cover byte budget
-    (_cover_max_memory)."""
-    return CapCoverFilter.auto(dim, max_memory=_cover_max_memory(dim, k))
+    (_cover_max_memory); with `quantize`, that one encoding (auto() over a single
+    candidate) in place of auto's choice."""
+    candidates = None if quantize is None else [quantize]
+    return CapCoverFilter.auto(dim, max_memory=_cover_max_memory(dim, k), **({} if candidates is None else {"candidates": candidates}))
 
 
 def _cap_cover_insertable(dim: int, k: int) -> CapCoverFilter:
@@ -815,15 +817,16 @@ def construct_method_worker(
     vectors_construct: np.ndarray,
     vectors_query: np.ndarray,
     actual_results: np.ndarray,
+    quantize: CapQuantize = CapQuantize.FP32,
 ) -> Dict[str, Any]:
-    """One CapCoverFilter built by CAP_CONSTRUCT_METHODS[method] with as many FP32
-    caps as fit in memory_fraction of the raw index (B/M), with the filter's
-    default (FP32) quantization and no insert method, so
-    the construction method is the only thing that varies between rows.
+    """One CapCoverFilter built by CAP_CONSTRUCT_METHODS[method] with as many caps
+    of the `quantize` encoding (FP32: unquantized) as fit in memory_fraction of the
+    raw index (B/M), and no insert method, so the construction method and the
+    encoding are the only things that vary between rows.
 
     Returns one row: cover volume, angles, FPR/FNR against distance ground
     truth at tau, and construction time. fpr also splits by similarity band
-    as budget_worker's does (see _per_band_rates). Covers are unquantized, so a row is not comparable
+    as budget_worker's does (see _per_band_rates). A FP32 row is an unquantized cover, so it is not comparable
     with results/cap_quantization.csv's, which is built at a swept encoding.
     seed is the fold, reported as "fold".
 
@@ -833,10 +836,12 @@ def construct_method_worker(
     queries = np.ascontiguousarray(vectors_query, dtype=np.float32)
     actual = np.asarray(actual_results, dtype=bool)
     n = len(construct)
-    k = _k_for_memory_fraction(dim, n, memory_fraction, 32)
+    k = _k_for_memory_fraction(dim, n, memory_fraction, 32)     # the nominal FP32 cap count
+    max_memory = int(memory_fraction * n * dim * 4)
 
     timed = _TimedCapConstruct(CAP_CONSTRUCT_METHODS[method]())
-    filt = CapCoverFilter(dim, construct_method=timed, max_caps=k, insert_method=None)
+    filt = CapCoverFilter(dim, construct_method=timed, max_memory=max_memory, quantize=quantize,
+                          insert_method=None)
     start = time.perf_counter()
     filt.construct(construct)
     construct_s = time.perf_counter() - start
@@ -853,7 +858,7 @@ def construct_method_worker(
     tn = int(np.sum(~predicted & ~actual))
 
     row = {
-        "dataset": dataset, "fold": seed, "method": method,
+        "dataset": dataset, "fold": seed, "method": method, "quantize": quantize.value,
         "memory_fraction": float(memory_fraction), "k": k, "k_fraction": k / n,
         "n_caps": len(angles), "n_reference": n,
         "tau": tau,
@@ -1018,8 +1023,9 @@ def end_to_end_worker(
     vectors_reference: VectorInput,
     vectors_query: VectorInput,
     repeats: int = 3,
+    quantize: Optional[CapQuantize] = None,
 ) -> List[Dict[str, Any]]:
-    """End-to-end throughput of a CapCoverFilter in front of a flat L2 index
+    """End-to-end throughput of a CapCoverFilter (`quantize`'s encoding, auto()'s choice if None) in front of a flat L2 index
     over the same reference set, against the index alone: queries one at a
     time (the online setting), the index searched for every query without the
     filter and only for the accepted ones with it. One row per (memory_fraction,
@@ -1059,7 +1065,7 @@ def end_to_end_worker(
     rows: List[Dict[str, Any]] = []
     for mf in sorted({float(f) for f, _ in cells}):
         k = _k_for_memory_fraction(dim, len(B), mf)
-        filt = _cap_cover(dim, k)
+        filt = _cap_cover(dim, k, quantize)
         filt.construct(B)
         memory_bytes = filt.get_bytesize()
         encoding = filt.encoding_label
@@ -1816,8 +1822,9 @@ def filter_latency_worker(
     vectors_query: VectorInput,
     n_timed: int = 1000,
     timing_seed: int = 0,
+    quantize: Optional[CapQuantize] = None,
 ) -> List[Dict[str, Any]]:
-    """A CapCoverFilter in front of the exact backend, a flat index answering by
+    """A CapCoverFilter (`quantize`'s encoding, auto()'s choice if None) in front of the exact backend, a flat index answering by
     range_search (a fairer baseline than hand-computed distances), timed one query
     at a time on one pinned core (_pin_to_own_core; run with a single worker).
 
@@ -1839,7 +1846,7 @@ def filter_latency_worker(
     timed = np.sort(np.random.default_rng(timing_seed).choice(len(Q), size=min(n_timed, len(Q)), replace=False))
 
     k = _k_for_memory_fraction(dim, n, memory_fraction)
-    filt = _cap_cover(dim, k)
+    filt = _cap_cover(dim, k, quantize)
     t0 = time.perf_counter()
     filt.construct(B)
     filter_build_s = time.perf_counter() - t0
@@ -1874,6 +1881,7 @@ def filter_latency_worker(
         rows.append({
             "dataset": dataset, "fold": seed, "delta": float(delta), "tau": tau,
             "n_reference": n, "n_timed": len(timed), "memory_fraction": float(memory_fraction),
+            "encoding": filt.encoding_label,
             "filter_build_s": filter_build_s, "filter_bytes": filter_bytes,
             "filter_pct_of_raw": 100.0 * filter_bytes / (n * dim * 4),
             "accept_rate_pct": 100.0 * float(accept.mean()),
@@ -1947,8 +1955,13 @@ def pinned_timing_worker(
         for quantize in scan_quantizes:
             for pct in scan_budget_pcts:
                 k = min(max(1, round(pct / 100.0 * n)), n)
-                filt = CapCoverFilter(dim, max_memory=_cover_max_memory(dim, k, 32), quantize=quantize,
-                                      construct_method=CAP_CONSTRUCT_METHODS[CAP_COVER_CONSTRUCT]())
+                max_memory = _cover_max_memory(dim, k, 32)
+                construct_method = CAP_CONSTRUCT_METHODS[CAP_COVER_CONSTRUCT]()
+                if quantize == CAP_QUANTIZE_AUTO:
+                    filt = CapCoverFilter.auto(dim, max_memory=max_memory, construct_method=construct_method)
+                else:
+                    filt = CapCoverFilter(dim, max_memory=max_memory, quantize=quantize,
+                                          construct_method=construct_method)
                 try:
                     filt.construct(B)
                 except InsufficientMemoryError:
@@ -1957,7 +1970,7 @@ def pinned_timing_worker(
                 t0 = time.perf_counter()
                 filt.query(Q, distance_threshold=tau)
                 seconds = time.perf_counter() - t0
-                rows.append({"dataset": dataset, "kind": "scan", "method": quantize.value, "budget_pct": float(pct),
+                rows.append({"dataset": dataset, "kind": "scan", "method": _quantize_name(quantize), "budget_pct": float(pct),
                              "k": k, "n_reference": n, "n_queries": len(Q), "n_caps": filt._num_caps,
                              "memory_bytes": filt.get_bytesize(), "qps": len(Q) / max(seconds, 1e-9)})
     return rows

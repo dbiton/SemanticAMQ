@@ -137,7 +137,7 @@ class TestCapCoverSoundness(unittest.TestCase):
         mixed_seen = False
         for budget in (1500, 4000, 12000):
             with self.subTest(budget=budget):
-                f = CapCoverFilter.auto(96, budget)
+                f = CapCoverFilter.auto(96, budget, mixed=True)
                 f.construct(X)
                 levels = f._cap_level[f.all_caps]
                 mixed_seen |= len(np.unique(levels)) > 1
@@ -193,7 +193,7 @@ class TestCapCoverBudget(unittest.TestCase):
     def test_auto_defaults(self):
         f = CapCoverFilter.auto(DIM, 20000)
         self.assertEqual(set(f.levels), set(AUTO_CANDIDATES))
-        self.assertTrue(f.mixed)
+        self.assertFalse(f.mixed)       # one encoding for every cap, the least-volume one
 
     def test_fast_nearest_codeword_matches_faiss(self):
         """compute_codes(fast=True) (scan_kernels.nearest_codeword, used to

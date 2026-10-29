@@ -208,14 +208,18 @@ class CapCoverFilter(_CapScanMixin, Filter):
 
     @classmethod
     def auto(cls, dim: int, max_memory: int, **kwargs) -> "CapCoverFilter":
-        """A filter that picks its encodings for the budget at construct()
-        (by accept-region volume, see _choose_mixed) among AUTO_CANDIDATES.
+        """A filter that picks one encoding for the budget at construct(): the
+        AUTO_CANDIDATES' covers are each built at that encoding's cap count and
+        the one with the least accept-region volume wins (_choose). Every cap
+        takes that encoding; pass mixed=True for per-cap encodings
+        (_choose_mixed).
 
         scan_limit_ms (default: env CAPCOVER_SCAN_LIMIT_MS, else none) drops the
         candidates whose estimated query scan of a full budget, max_memory x
         SCAN_NS_PER_BYTE, exceeds it: a coarse code stores more caps per byte
         but can cost several times more to scan, which only matters where the
         budget is large. If none is left the cheapest candidate is kept."""
+        kwargs.setdefault("mixed", False)
         candidates = [q for q in kwargs.pop("candidates", AUTO_CANDIDATES) if _fits(dim, q)]
         limit = kwargs.pop("scan_limit_ms", None)
         limit = _scan_limit_ms() if limit is None else limit

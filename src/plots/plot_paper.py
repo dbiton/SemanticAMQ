@@ -6,6 +6,7 @@ go to suggestions/figures/ under the names paper.tex includes:
 
     sweeps-grid.*                      fig:end-to-end   budget.csv + blocklist.csv
     quantization-saved-vs-memory.*     fig:quantization cap_quantization/<corpus>/*.csv
+    quantization-speedup-vs-memory.*, quantization-throughput-vs-memory.* (not in the paper) cap_quantization/<corpus>/*.csv
     quantization-table.tex             tab:quantization cap_quantization/<corpus>/*.csv
     construction-fpr-vs-k.*            fig:construction construct_methods/<corpus>.csv
     streaming-fpr-vs-position.*        fig:streaming    streaming/<corpus>/streaming.csv
@@ -134,13 +135,14 @@ E2E_MEMORY_FRACTION = 0.02
 E2E_TAUS = tuple(l2_threshold(t) for t in PAPER_TAUS_COS)
 E2E_MEMORY_FRACTIONS = (0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05)
 
-# Construction methods shown (CSV key -> label, color, marker, linestyle).
+# Construction methods shown (CSV key -> label, color, marker), each drawn unquantized (dashed,
+# open markers) and at TQ2 (solid): one line per method and encoding.
 CONSTRUCT_SHOWN = {
-    "gonzalez": ("Gonzalez", INK_MUTED, "o", ":"),
-    "minimax": ("minimax", ORANGE, "s", "-"),
-    "sphere_merge": ("sphere merge", BLUE, "^", "-"),
-    "soft_anneal": ("soft anneal", GREEN, "v", "-"),
+    "gonzalez": ("Gonzalez", INK_MUTED, "o"),
+    "minimax": ("minimax", ORANGE, "s"),
+    "soft_anneal": ("annealing", GREEN, "v"),
 }
+CONSTRUCT_ENCODINGS = {"FP32": ("unquantized", "--", True), "TQ2": ("TQ2", "-", False)}   # key -> label, linestyle, hollow
 # Insertion strategies shown. The initial cover is built with STREAM_BOOTSTRAP.
 STREAM_BOOTSTRAP = "sphere_merge"
 INSERT_SHOWN = {
@@ -329,14 +331,27 @@ def sweeps_grid():
 # fig:quantization  quantization-saved-vs-memory
 # ---------------------------------------------------------------------------
 
-def quantization():
+def quantization(mode="saved"):
+    """Per corpus, the QUANT_TOP_N encodings (ranked by accesses saved) against the budget:
+    accesses saved (%); mode="throughput": the median query throughput (qps, log); mode="speedup":
+    the simulated end-to-end improvement (%) of the filter in front of a flat index, by the cost
+    model of throughput(): L / (t_f + p L) - 1, with t_f = 1 / query throughput, p the share of
+    queries reaching the index, and L the flat-index lookup cost measured in end_to_end.csv."""
+    throughput, speedup = mode == "throughput", mode == "speedup"
     q = read_all("cap_quantization/*/*.csv")
     q["corpus"] = to_corpus(q.dataset)
     # The budget is B/M; compact encodings fit more caps in it, up to one per vector.
     q["budget_pct"] = q.memory_fraction
     q["singleton"] = q.n_caps >= q.n_construct
+    if speedup:
+        e2e = pd.read_csv(RESULTS / "end_to_end.csv")
+        lookup = float((1.0 / e2e.throughput_without_qps).mean())
+        p = np.maximum(q.n_index_accesses / q.n_queries, 0.5 / q.n_queries)
+        q["improvement"] = 100.0 * (lookup / (1.0 / q.query_throughput_qps + p * lookup) - 1.0)
+        print(f"  simulated speedup at a flat-index lookup of {lookup * 1e3:.1f} ms")
     agg = (q.groupby(["corpus", "quantize", "budget_pct"])
-           .agg(saved=("index_accesses_saved_pct", "mean"), singleton=("singleton", "mean"))
+           .agg(saved=("index_accesses_saved_pct", "mean"), qps=("query_throughput_qps", "median"), gain=("improvement" if speedup else "saved", "mean"),
+                singleton=("singleton", "mean"))
            .reset_index())
     ceilings = q.groupby("corpus").neg_share_pct.median()
 
@@ -363,13 +378,14 @@ def quantization():
             g = d[d.quantize == enc].sort_values("budget_pct")
             if g.empty:
                 continue
-            ax.plot(g.budget_pct, g.saved, color=color, ls=ls, lw=1.2, zorder=2)
+            y = g.qps if throughput else g.gain if speedup else g.saved
+            ax.plot(g.budget_pct, y, color=color, ls=ls, lw=1.2, zorder=2)
             full = g.singleton >= 0.5
-            ax.scatter(g.budget_pct[~full], g.saved[~full], color=color, marker=marker,
+            ax.scatter(g.budget_pct[~full], y[~full], color=color, marker=marker,
                        s=12, edgecolor="white", lw=0.5, zorder=3)
-            ax.scatter(g.budget_pct[full], g.saved[full], facecolor="white",
+            ax.scatter(g.budget_pct[full], y[full], facecolor="white",
                        edgecolor=color, marker=marker, s=12, lw=0.9, zorder=3)
-        if corpus in ceilings:
+        if corpus in ceilings and mode == "saved":
             ax.axhline(ceilings[corpus], color=INK_MUTED, ls="--", lw=0.8)
             ax.text(0.97, 0.04, f"ceiling {ceilings[corpus]:.0f}%", color=INK_2, fontsize=6.5,
                     ha="right", transform=ax.transAxes)
@@ -379,8 +395,16 @@ def quantization():
         ax.set_xticks(ticks)
         ax.set_xticklabels([f"{t:.2g}" for t in ticks], fontsize=6)
         ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
-    axes[0, 0].set_ylabel("index accesses saved (%)")
-    axes[0, 0].set_ylim(-2, 100)
+    if throughput:
+        axes[0, 0].set_yscale("log")
+        axes[0, 0].set_ylabel("query throughput (qps, log)")
+    elif speedup:
+        axes[0, 0].set_yscale("symlog", linthresh=Y_LINTHRESH)
+        axes[0, 0].axhline(0, color=INK_MUTED, lw=0.8)
+        axes[0, 0].set_ylabel("throughput improvement (%)")
+    else:
+        axes[0, 0].set_ylabel("index accesses saved (%)")
+        axes[0, 0].set_ylim(-2, 100)
     handles = [plt.Line2D([], [], color=c, marker=mk, ls=ls) for c, mk, ls in top_style.values()]
     handles.append(plt.Line2D([], [], color=INK_2, marker="o", mfc="white", ls=""))
     spq_labels = {"SPQ12": r"SPQ $48\times12$", "SPQ16": r"SPQ $24\times8$",
@@ -389,7 +413,16 @@ def quantization():
     labels = [spq_labels.get(enc, enc) for enc in top] + ["one cap per vector"]
     fig_legend(fig, handles, labels, ncol=len(labels))
     shared_xlabel(axes, "memory budget $B/M$ (log)")
-    save(fig, "quantization-saved-vs-memory")
+    save(fig, {"saved": "quantization-saved-vs-memory", "throughput": "quantization-throughput-vs-memory",
+               "speedup": "quantization-speedup-vs-memory"}[mode])
+
+
+def quantization_throughput():
+    quantization("throughput")
+
+
+def quantization_speedup():
+    quantization("speedup")
 
 
 # ---------------------------------------------------------------------------
@@ -400,24 +433,32 @@ def construction():
     c = read_all("construct_methods/*.csv")
     c = c[~c.dataset.astype(str).str.startswith("scale_")].copy()
     c["corpus"] = to_corpus(c.dataset)
-    agg = c.groupby(["corpus", "method", "memory_fraction"]).agg(
+    if "quantize" not in c:                  # runs from before the encodings were swept were unquantized
+        c["quantize"] = "FP32"
+    agg = c.groupby(["corpus", "method", "quantize", "memory_fraction"]).agg(
         mean=("fpr", "mean"), std=("fpr", "std")).reset_index()
     fig, axes = corpus_panels(sharey=True)
     for ax, corpus in zip(axes[0], CORPORA):
         d = agg[agg.corpus == corpus]
         if d.empty:
             mark_empty(ax)
-        for method, (_, color, marker, ls) in CONSTRUCT_SHOWN.items():
-            g = d[d.method == method].sort_values("memory_fraction")
-            ax.errorbar(g.memory_fraction, g["mean"], yerr=g["std"].fillna(0), color=color,
-                        marker=marker, ls=ls, ms=3, capsize=1.2, elinewidth=0.7)
+        for method, (_, color, marker) in CONSTRUCT_SHOWN.items():
+            for enc, (_, ls, hollow) in CONSTRUCT_ENCODINGS.items():
+                g = d[(d.method == method) & (d.quantize == enc)].sort_values("memory_fraction")
+                ax.errorbar(g.memory_fraction, g["mean"], yerr=g["std"].fillna(0), color=color,
+                            marker=marker, ls=ls, ms=3, capsize=1.2, elinewidth=0.7,
+                            mfc="white" if hollow else color)
         ax.set_xscale("log")
         ax.xaxis.set_major_formatter(PCT_FMT)
     axes[0, 0].set_ylabel("FPR")
     axes[0, 0].set_ylim(-0.03, 1.05)
-    handles = [plt.Line2D([], [], color=c_, marker=mk, ls=ls)
-               for _, c_, mk, ls in CONSTRUCT_SHOWN.values()]
-    fig_legend(fig, handles, [v[0] for v in CONSTRUCT_SHOWN.values()], ncol=len(CONSTRUCT_SHOWN))
+    handles, labels = [], []
+    for _, (name, color, marker) in CONSTRUCT_SHOWN.items():
+        for _, (enc_label, ls, hollow) in CONSTRUCT_ENCODINGS.items():
+            handles.append(plt.Line2D([], [], color=color, marker=marker, ls=ls, ms=3,
+                                      mfc="white" if hollow else color))
+            labels.append(f"{name} ({enc_label})")
+    fig_legend(fig, handles, labels, ncol=len(labels))
     shared_xlabel(axes, "filter memory $B/M$ (log)")
     save(fig, "construction-fpr-vs-k")
 
@@ -662,6 +703,8 @@ def paper_tables():
 FIGURES = {
     "sweeps": sweeps_grid,
     "quantization": quantization,
+    "quantization-throughput": quantization_throughput,
+    "quantization-speedup": quantization_speedup,
     "quantization-table": quantization_table,
     "construction": construction,
     "streaming": streaming,
