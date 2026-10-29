@@ -16,15 +16,11 @@ plots/plot_paper.py's figures (written to suggestions/figures/).
       --only A,B,..      generate just these evaluations (names: see GENERATORS); default all
       --missing          generate only the evaluations whose CSVs are not in results/ (see
                          missing_evaluations), then draw the figures; runs nothing if none is missing
-      --ablation-vectors N / --ablation-folds N     size of the ablation workloads (default
-                                                    --num-vectors / main.BLOCKLIST_FOLDS)
-      --latency-vectors N / --latency-datasets A,B  size and corpora of the latency timing (default
-                                                    --num-vectors / all five)
 
 Every evaluation runs on the same workload: 80,000 construct and 20,000 query vectors per fold (main.
 WORKLOAD_NUM_VECTORS = 100,000 split 80/20) and main.BLOCKLIST_FOLDS = 5 folds. Memory budgets are B/M, the
 filter's bytes over the raw float32 index (never a cap count k): sweeps and quantization 0.005-0.05,
-construction 0.01-0.1, equal-memory 0.001-0.1, and 0.02 wherever one budget is fixed; 8 points per sweep.
+construction 0.01-0.1 unquantized and 0.005-0.05 at TQ2, equal-memory 0.001-0.1, and 0.02 wherever one budget is fixed; 8 points per sweep.
     A smaller or different run needs a copy of the repo without results/ (generators
     truncate their CSVs -- see CLAUDE.md), e.g. a git worktree with datasets/ linked in.
 
@@ -32,31 +28,22 @@ Each figure and what feeds it (the CSVs are main.py's, so a paper run and a
 main.py run write the same files -- and truncate them, see CLAUDE.md):
 
     sweeps        budget.csv, blocklist.csv                generate_budget, generate_blocklist
-    quantization  cap_quantization/<corpus>/*.csv          generate_cap_quantization (figure, and
-                                                           tab:quantization via plots/table_quantization.py)
+    quantization  cap_quantization/<corpus>/*.csv          generate_cap_quantization
     construction  construct_methods/<corpus>.csv           generate_construct_methods
     equal-memory  equal_memory/<corpus>/equal_memory.csv   generate_equal_memory (the baselines
                                                            the two figures show: zero-FN FPR on
                                                            every corpus, FPR/FNR of the rest on one)
     throughput    end_to_end.csv                           generate_end_to_end (defined here)
-    ablation      ablation.csv                             generate_ablation: cap vs ball accept rule, construction,
-                                                           encoding, codes, sphere-merge t and p, selection delta
-    latency       latency.csv                              generate_latency: filter in front of the flat index,
-                                                           per-query latency and break-even cost (pinned, sequential)
-    timing        timing.csv                               generate_timing: construction time (every construct method),
-                                                           per-arrival insert time and per-encoding query throughput
-                                                           (pinned, sequential)
-
-Not generated: streaming (its figure is not drawn either), scaling, cap_cover_system_tau, query_performance and the
+Not generated: the tables and what only they read (ablation, latency, timing), streaming (its figure is not
+drawn either), scaling, cap_cover_system_tau, query_performance and the
 construct-method scale run, which no paper figure reads.
 
 On the server (100,000 vectors per corpus), `python src/paper.py` runs every evaluation above in order: one shuffled
-batch on main.MAX_WORKERS (blocklist, budget, quantization, construction, equal-memory, ablation),
-then end-to-end on 8 pinned cores, then latency and timing sequentially on one pinned core, then draws the
-figures and tables (plots/plot_paper.py: suggestions/figures/, including space_bound.csv). `--only` runs a subset and
-`--missing` the ones with no CSVs yet; `python src/paper.py plot` redraws without running. The soft-anneal construction is in the construction
-evaluation (every cell), the ablation (one arm) and the timing, and is the slowest method by 5-13x; budget its
-share of the batch accordingly (tests: tests/test_soft_anneal_construct.py).
+batch on main.MAX_WORKERS (blocklist, budget, quantization, construction, equal-memory),
+then end-to-end on 8 pinned cores, then draws the figures (plots/plot_paper.py: suggestions/figures/). `--only` runs a subset and
+`--missing` the ones with no CSVs yet; `python src/paper.py plot` redraws without running. Soft anneal (from minimax) is the construction method of every
+cover (runner.CAP_COVER_CONSTRUCT) and the slowest by far; budget the batch accordingly
+(tests: tests/test_soft_anneal_construct.py).
 """
 import os
 import sys
@@ -74,7 +61,6 @@ from pathlib import Path
 import main
 from runner import CAP_QUANTIZATION_SWEEP, CAP_QUANTIZE_AUTO
 from filters.cap_cover.cap_quantizers import Quantize
-from runner import ABLATION_DELTAS
 from main import (Runner, BLOCKLIST_FOLDS, blocklist_workloads, equal_memory_filters, logger,
                   generate_blocklist, generate_budget, generate_cap_quantization,
                   generate_construct_methods, generate_equal_memory)
@@ -87,13 +73,14 @@ from plots.plot_paper import (FIGURES, plot_figures, use_corpora, CONFIG_TO_METH
 assert E2E_MEMORY_FRACTION == main.FIXED_MEMORY_FRACTION
 assert tuple(E2E_MEMORY_FRACTIONS) == tuple(main.BUDGET_MEMORY_FRACTIONS)
 assert len(main.BUDGET_MEMORY_FRACTIONS) == len(main.CONSTRUCT_MEMORY_FRACTIONS) == len(PAPER_TAUS_COS) == 8
+assert max(main.CONSTRUCT_TQ2_MEMORY_FRACTIONS) <= 0.05
 
 # The baselines the two equal-memory figures draw; the rest of
 # main.equal_memory_filters would be run and discarded.
 PAPER_EQUAL_MEMORY_FILTERS = [cls for cls in equal_memory_filters
                               if CONFIG_TO_METHOD.get(cls.__name__) not in EQUAL_MEMORY_HIDDEN]
 
-# The sweeps grid (blocklist, budget), the throughput figure, the latency timing and the equal-memory comparison run CapCoverFilter at
+# The sweeps grid (blocklist, budget), the throughput figure and the equal-memory comparison run CapCoverFilter at
 # this one encoding (not auto()'s choice); the equal-memory comparison at this cosine distance.
 PAPER_CAP_QUANTIZE = Quantize.TQ2
 EQUAL_MEMORY_TAU_COS = 0.02
@@ -120,69 +107,7 @@ def generate_end_to_end(runner: Runner) -> None:
             )
 
 
-ABLATION_CSV = "results/ablation.csv"
-LATENCY_CSV = "results/latency.csv"
-TIMING_CSV = "results/timing.csv"
-
-# The ablation builds ~16 covers per (corpus, fold, budget). Like every other evaluation it runs on
-# main.WORKLOAD_NUM_VECTORS vectors per corpus (80% reference, 20% queries) and main.BLOCKLIST_FOLDS
-# folds; None = those, and --ablation-vectors / --ablation-folds shrink it for a smaller run.
-ABLATION_NUM_VECTORS = None
-ABLATION_FOLDS = None
-ABLATION_MEMORY_FRACTIONS = (0.005, 0.02)
-# The latency timing: None = main.WORKLOAD_NUM_VECTORS, main.BLOCKLIST_FOLDS folds.
-LATENCY_NUM_VECTORS = None
-LATENCY_DATASETS = None            # None = all of main.BLOCKLIST_DATASETS
-LATENCY_MEMORY_FRACTION = main.FIXED_MEMORY_FRACTION
-# The pinned timings run one fold of one corpus, at the evaluations' size (None = main.WORKLOAD_NUM_VECTORS).
-TIMING_NUM_VECTORS = None
-TIMING_DATASET = "WikiAnswers"
-QPS_BUDGET_PCT = 2.0               # the budget (% of raw) at which tab:quantization's q/s column is measured
-
-
-def generate_ablation(runner: Runner) -> None:
-    """The ablation table's data (runner.ablation_worker): per corpus, fold and budget, the
-    paper's configuration, its one-choice-at-a-time variants and the ball accept rules over its
-    own cover, at every cosine distance in ABLATION_DELTAS. Only submits 'ablation' jobs."""
-    for workload in blocklist_workloads(ABLATION_NUM_VECTORS or main.WORKLOAD_NUM_VECTORS,
-                                        n_folds=ABLATION_FOLDS or BLOCKLIST_FOLDS):
-        for fold, sel in enumerate(workload.selections):
-            reference, queries = workload.rows(sel["reference"]), workload.query_vectors(sel)
-            for mf in ABLATION_MEMORY_FRACTIONS:
-                runner.submit('ablation', output_csv=ABLATION_CSV, dim=384, dataset=workload.plot_key,
-                              seed=fold, memory_fraction=mf, vectors_reference=reference, vectors_query=queries,
-                              deltas=ABLATION_DELTAS)
-
-
-def generate_latency(runner: Runner) -> None:
-    """The filter in front of the flat index, per-query latency (runner.filter_latency_worker): every
-    fold of every corpus at B = LATENCY_MEMORY_FRACTION M. Timed, so it runs alone on one pinned core
-    (generate_and_plot_all). Only submits 'filter_latency' jobs."""
-    n = LATENCY_NUM_VECTORS or main.WORKLOAD_NUM_VECTORS
-    for workload in blocklist_workloads(n, n_folds=BLOCKLIST_FOLDS):
-        if LATENCY_DATASETS and workload.name not in LATENCY_DATASETS:
-            continue
-        for fold, sel in enumerate(workload.selections):
-            runner.submit('filter_latency', output_csv=LATENCY_CSV, dim=384, dataset=workload.plot_key,
-                          seed=fold, memory_fraction=LATENCY_MEMORY_FRACTION, deltas=PAPER_TAUS_COS,
-                          quantize=PAPER_CAP_QUANTIZE, vectors_reference=workload.rows(sel["reference"]),
-                          vectors_query=workload.query_vectors(sel))
-
-
-def generate_timing(runner: Runner) -> None:
-    """Construction time per method, per-arrival insertion time per strategy and the query
-    throughput of each of PAPER_QUANTIZE's encodings at QPS_BUDGET_PCT (runner.pinned_timing_worker,
-    which tab:quantization's q/s column reads) on TIMING_DATASET. Timed: one pinned core, alone."""
-    for workload in blocklist_workloads(TIMING_NUM_VECTORS or main.WORKLOAD_NUM_VECTORS, n_folds=1,
-                                        only=TIMING_DATASET):
-        sel = workload.selections[0]
-        runner.submit('pinned_timing', output_csv=TIMING_CSV, dim=384, dataset=workload.plot_key,
-                      vectors_reference=workload.rows(sel["reference"]),
-                      vectors_query=workload.query_vectors(sel),
-                      scan_quantizes=PAPER_QUANTIZE, scan_budget_pcts=(QPS_BUDGET_PCT,))
-
-
-# The encodings the quantization table compares: the full-precision, scalar and
+# The encodings the quantization figure compares: the full-precision, scalar and
 # TurboQuant rungs down to 1 bit/dim, plus the seeded-PQ rungs auto() chooses among.
 PAPER_QUANTIZE = tuple(dict.fromkeys(
     (Quantize.FP32, Quantize.FP16, Quantize.SQ8, Quantize.TQ8, Quantize.SQ6, Quantize.SQ4, Quantize.TQ4,
@@ -203,16 +128,13 @@ GENERATORS = {
     "construction": generate_construct_methods,
     "equal-memory": partial(generate_equal_memory, filters=PAPER_EQUAL_MEMORY_FILTERS, count_memory_steps=8,
                             tau=l2_threshold(EQUAL_MEMORY_TAU_COS), cap_quantize=PAPER_CAP_QUANTIZE),
-    "ablation": generate_ablation,
     "end-to-end": generate_end_to_end,
-    "latency": generate_latency,
-    "timing": generate_timing,
 }
 # Evaluations that time something: run after the rest, alone, one at a time (see generate_and_plot_all).
-TIMED = ("end-to-end", "latency", "timing")
+TIMED = ("end-to-end",)
 PAPER_GENERATORS = tuple(GENERATORS.values())
 
-# What each evaluation writes under results/ (what the figures and tables read), and whether it is
+# What each evaluation writes under results/ (what the figures read), and whether it is
 # one file per corpus.
 OUTPUTS = {
     "blocklist": ("blocklist.csv", False),
@@ -220,10 +142,7 @@ OUTPUTS = {
     "quantization": ("cap_quantization/*/*.csv", True),
     "construction": ("construct_methods/*.csv", True),
     "equal-memory": ("equal_memory/*/equal_memory.csv", True),
-    "ablation": ("ablation.csv", False),
     "end-to-end": ("end_to_end.csv", False),
-    "latency": ("latency.csv", False),
-    "timing": ("timing.csv", False),
 }
 assert OUTPUTS.keys() == GENERATORS.keys()
 
@@ -278,8 +197,7 @@ def _submit_and_run(generators, num_workers) -> None:
 def generate_and_plot_all(out=None, only=None, plot=None) -> None:
     """Run the paper's evaluations as one shuffled batch on main.MAX_WORKERS (see
     main.generate_and_plot_all), then the throughput evaluation alone on E2E_WORKERS
-    pinned cores, then the latency and construction/insertion timings sequentially on
-    one pinned core, then draw the figures. Each generator is guarded so one failing
+    pinned cores, then draw the figures. Each generator is guarded so one failing
     to submit doesn't take down the others. `only` names the GENERATORS to run; the figures are drawn
     after a full run, or after a subset when `plot` is True."""
     set_thresholds()
@@ -295,10 +213,6 @@ def generate_and_plot_all(out=None, only=None, plot=None) -> None:
     if "end-to-end" in names:
         os.environ["CAPCOVER_PIN_CORES"] = str(E2E_WORKERS)
         _submit_and_run([generate_end_to_end], E2E_WORKERS)
-    sequential = [GENERATORS[n] for n in ("latency", "timing") if n in names]
-    if sequential:
-        os.environ["CAPCOVER_PIN_CORES"] = "1"
-        _submit_and_run(sequential, 1)
     logger.info("All submitted jobs completed.")
     if plot if plot is not None else not only:
         plot_all(out=out)
@@ -317,25 +231,14 @@ def set_thresholds() -> None:
     main.BLOCKLIST_TAUS = list(E2E_TAUS)
 
 
-def configure(num_vectors=None, datasets=None, workers=None, ablation_vectors=None, ablation_folds=None,
-              latency_vectors=None, latency_datasets=None) -> None:
+def configure(num_vectors=None, datasets=None, workers=None) -> None:
     """Overrides main's workload size, corpora and pool size (and the figures'
-    corpora to match), and the ablation's and latency timing's own sizes, before
-    anything is submitted."""
-    global ABLATION_NUM_VECTORS, ABLATION_FOLDS, LATENCY_NUM_VECTORS, LATENCY_DATASETS
+    corpora to match) before anything is submitted."""
     set_thresholds()
     if num_vectors:
         main.WORKLOAD_NUM_VECTORS = num_vectors
     if workers:
         main.MAX_WORKERS = workers
-    if ablation_vectors:
-        ABLATION_NUM_VECTORS = ablation_vectors
-    if ablation_folds:
-        ABLATION_FOLDS = ablation_folds
-    if latency_vectors:
-        LATENCY_NUM_VECTORS = latency_vectors
-    if latency_datasets:
-        LATENCY_DATASETS = list(latency_datasets)
     if datasets:
         unknown = [d for d in datasets if d not in main.dataset_filenames]
         if unknown:
@@ -347,8 +250,7 @@ def configure(num_vectors=None, datasets=None, workers=None, ablation_vectors=No
 
 def _parse(argv):
     opts = {"--num-vectors": None, "--datasets": None, "--workers": None, "--out": None, "--results": None,
-            "--only": None, "--ablation-vectors": None, "--ablation-folds": None, "--latency-vectors": None,
-            "--latency-datasets": None, "--missing": False}
+            "--only": None, "--missing": False}
     rest = []
     it = iter(argv)
     for arg in it:
@@ -370,9 +272,7 @@ def _int(value):
 if __name__ == "__main__":
     opts, rest = _parse(sys.argv[1:])
     configure(_int(opts["--num-vectors"]), opts["--datasets"].split(",") if opts["--datasets"] else None,
-              _int(opts["--workers"]), _int(opts["--ablation-vectors"]), _int(opts["--ablation-folds"]),
-              _int(opts["--latency-vectors"]),
-              opts["--latency-datasets"].split(",") if opts["--latency-datasets"] else None)
+              _int(opts["--workers"]))
     if rest[:1] == ["plot"]:
         plot_all(rest[1:], opts["--out"], opts["--results"])
     elif opts["--missing"]:

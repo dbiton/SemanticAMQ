@@ -83,10 +83,12 @@ BLOCKLIST_FOLDS = 5
 #   BUDGET_MEMORY_FRACTIONS     generate_budget and the cap_quantization sweep
 #   FIXED_MEMORY_FRACTION       the one budget of the tau sweep, the streaming run, the throughput
 #                               tau panel, the latency timing and the insertion timing
-#   CONSTRUCT_MEMORY_FRACTIONS  the construction-method comparison
+#   CONSTRUCT_MEMORY_FRACTIONS  the construction-method comparison, unquantized covers; TQ2 covers
+#                               (a cap per vector from B/M = 6.3%) take BUDGET_MEMORY_FRACTIONS
 BUDGET_MEMORY_FRACTIONS = (0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05)
 FIXED_MEMORY_FRACTION = 0.02
 CONSTRUCT_MEMORY_FRACTIONS = (0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.07, 0.1)
+CONSTRUCT_TQ2_MEMORY_FRACTIONS = BUDGET_MEMORY_FRACTIONS
 # The blocklist's query/construct split of WORKLOAD_NUM_VECTORS: one total
 # size, cut into a q query part and a (1-q) construct part, with
 # k = k_fraction * |B|. Position-based (build_blocklist_workload): construct
@@ -1284,7 +1286,7 @@ def generate_construct_methods(runner: Runner) -> None:
     tau         = FIXED_TAU
     # B/M from 1% to 10% (8 points): the budgets where the covers are wide
     # enough for the construction method to matter and not yet saturated.
-    memory_fractions = list(CONSTRUCT_MEMORY_FRACTIONS)
+    fractions_of = {Quantize.FP32: list(CONSTRUCT_MEMORY_FRACTIONS), Quantize.TQ2: list(CONSTRUCT_TQ2_MEMORY_FRACTIONS)}
     methods     = list(CONSTRUCT_EVALUATED)
 
     for workload in blocklist_workloads(num_vectors, n_folds=n_folds):
@@ -1299,7 +1301,7 @@ def generate_construct_methods(runner: Runner) -> None:
                         f"{int(actual_results.sum())} within tau={tau} of B")
             for method in methods:
                 for quantize in CONSTRUCT_QUANTIZES:
-                    for mf in memory_fractions:
+                    for mf in fractions_of[quantize]:
                         runner.submit(
                             'construct_method',
                             output_csv=output_csv,
