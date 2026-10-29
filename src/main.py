@@ -1250,7 +1250,7 @@ def plot_streaming(df: pd.DataFrame, k_fixed: int) -> None:
 # the sweep's figures.
 CONSTRUCT_METHODS_DIR = "results/construct_methods"
 # The construction evaluation compares these, each unquantized (FP32) and at TQ2; sphere_merge
-# (the paper's default) is not evaluated there, though soft_anneal starts from its cover.
+# (the paper's default) is not evaluated there, and soft_anneal starts from minimax's cover.
 CONSTRUCT_EVALUATED = ("gonzalez", "minimax", "soft_anneal")
 CONSTRUCT_QUANTIZES = (Quantize.FP32, Quantize.TQ2)
 CONSTRUCT_METHODS_PLOT_DIR = "plots/construct_methods"
