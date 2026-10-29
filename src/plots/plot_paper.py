@@ -24,7 +24,7 @@ results-folder defaults to results/. Figure names are the keys of FIGURES
 (sweeps, quantization, quantization-table, construction, streaming, equal-memory-zero-fn,
 equal-memory-nonzero-fn, throughput, tables); default is all.
 
-Thresholds are displayed as cosine similarity; the stored CSV threshold values
+Thresholds are displayed as cosine distance; the stored CSV threshold values
 are converted only for presentation.
 
 The sweeps figure's FPR panels group the negatives by how related a query is
@@ -117,9 +117,9 @@ QUANT_TOP_N = 5
 # End-to-end throughput (src/paper.py generates exactly these cells): the filter
 # in front of a flat index vs the index alone. The tau panel fixes the budget,
 # the memory panel fixes tau; the budget sweep is shared by the sweeps figure.
-PAPER_TAU_COS = 0.05                                          # cosine distance (similarity 0.95)
+PAPER_TAU_COS = 0.05                                          # cosine distance
 PAPER_TAUS_COS = (0.005, 0.01, 0.02, 0.03, 0.05, 0.1, 0.15, 0.2)    # the tau sweeps (8 points), same unit
-TAU_TICKS = [0.8, 0.9, 0.95]                                  # cosine similarity ticks of the tau axes
+TAU_TICKS = [0.02, 0.05, 0.1, 0.2]                            # cosine distance ticks of the tau axes
 
 
 def l2_threshold(cosine_dist):
@@ -175,12 +175,12 @@ MARGIN_TOP = 0.32
 PCT_FMT = matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:g}")
 
 
-def cosine_similarity(tau_l2):
-    """Convert stored thresholds to cosine similarity for the paper figures."""
-    return 1.0 - np.asarray(tau_l2, dtype=float) ** 2 / 2.0
+def cosine_distance(tau_l2):
+    """Convert stored (L2) thresholds to cosine distance for the paper figures."""
+    return np.asarray(tau_l2, dtype=float) ** 2 / 2.0
 
 
-TAU_LABEL = "$\\tau$ (cosine similarity)"
+TAU_LABEL = "$\\tau$ (cosine distance)"
 
 
 def save(fig, name):
@@ -247,16 +247,16 @@ def sweeps_grid():
     """Rows: ball-budget sweep (tau=0.1, budget.csv) and tau sweep (fixed k,
     blocklist.csv). Columns: FPR per query source, then accesses saved with
     each corpus's ceiling (its share of negative queries) as the only dashed
-    line. Error bars: +-1 std over folds. thresholds are shown as cosine similarity."""
+    line. Error bars: +-1 std over folds. thresholds are shown as cosine distance."""
     frames = []
     for name in ("budget", "blocklist"):
         d = pd.read_csv(RESULTS / f"{name}.csv")
         d["corpus"] = to_corpus(d.dataset)
         frames.append(d)
     budget, blocklist = frames
-    blocklist["tau_cos"] = cosine_similarity(blocklist.tau)
+    blocklist["tau_cos"] = cosine_distance(blocklist.tau)
     tau_mem = float(blocklist.memory_fraction.iloc[0])
-    budget_tau = float(cosine_similarity(budget.tau.iloc[0]))
+    budget_tau = float(cosine_distance(budget.tau.iloc[0]))
     sweeps = [(budget, "memory_fraction", "memory budget $B/M$", f"FPR\n($\\tau={budget_tau:g}$)", PCT_FMT),
               (blocklist, "tau_cos", TAU_LABEL, f"FPR\n($B={tau_mem:g}M$)", None)]
 
@@ -304,7 +304,7 @@ def sweeps_grid():
             if xfmt:
                 ax.xaxis.set_major_formatter(xfmt)
             if x == "tau_cos":
-                ax.set_xlim(0.795, 1.005)
+                ax.set_xlim(-0.005, 0.205)
                 ax.set_xticks(TAU_TICKS)
                 ax.xaxis.set_major_formatter(PCT_FMT)
             if j < n_fpr:
@@ -577,7 +577,7 @@ def _backend_cost_panel(ax, d):
 def throughput():
     """End-to-end throughput improvement (%) of the filter in front of a flat
     index over the index alone, one line per corpus: against cosine
-    similarity (budget fixed), against the memory the filter uses (tau fixed),
+    distance (budget fixed), against the memory the filter uses (tau fixed),
     and against the cost of one backend lookup (both fixed).
 
     The last panel is the cost model behind the other two. Per query the index
@@ -589,10 +589,10 @@ def throughput():
     over folds (not drawn on the model curve)."""
     d = pd.read_csv(RESULTS / "end_to_end.csv")
     d["corpus"] = to_corpus(d.dataset)
-    d["tau_cos"] = cosine_similarity(d.tau)
+    d["tau_cos"] = cosine_distance(d.tau)
     at_budget = d[np.isclose(d.memory_fraction, E2E_MEMORY_FRACTION)]
     at_tau = d[np.isclose(d.tau, E2E_TAU)]
-    fixed_tau = f"fixed $\\tau={float(cosine_similarity(E2E_TAU)):g}$"
+    fixed_tau = f"fixed $\\tau={float(cosine_distance(E2E_TAU)):g}$"
     fixed_memory = f"$B={E2E_MEMORY_FRACTION:g}M$"
     panels = [
         (at_budget, "tau_cos", TAU_LABEL, f"fixed {fixed_memory}", False),
