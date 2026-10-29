@@ -83,12 +83,11 @@ BLOCKLIST_FOLDS = 5
 #   BUDGET_MEMORY_FRACTIONS     generate_budget and the cap_quantization sweep
 #   FIXED_MEMORY_FRACTION       the one budget of the tau sweep, the streaming run, the throughput
 #                               tau panel, the latency timing and the insertion timing
-#   CONSTRUCT_MEMORY_FRACTIONS  the construction-method comparison, unquantized covers; TQ2 covers
-#                               (a cap per vector from B/M = 6.3%) take BUDGET_MEMORY_FRACTIONS
+#   CONSTRUCT_MEMORY_FRACTIONS  the construction-method comparison (every encoding; a TQ2 cover has
+#                               a cap per vector from B/M = 6.3%, a TQ4 one from 12.6%)
 BUDGET_MEMORY_FRACTIONS = (0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05)
 FIXED_MEMORY_FRACTION = 0.02
 CONSTRUCT_MEMORY_FRACTIONS = (0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.07, 0.1)
-CONSTRUCT_TQ2_MEMORY_FRACTIONS = BUDGET_MEMORY_FRACTIONS
 # The blocklist's query/construct split of WORKLOAD_NUM_VECTORS: one total
 # size, cut into a q query part and a (1-q) construct part, with
 # k = k_fraction * |B|. Position-based (build_blocklist_workload): construct
@@ -298,7 +297,7 @@ def stratified_calibration_split(
 
 def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None, n_folds: int = BLOCKLIST_FOLDS,
                           count_memory_steps: int = 8, tau: Optional[float] = None,
-                          cap_quantize: Optional[Quantize] = None) -> None:
+                          cap_quantizes: Optional[Sequence[Quantize]] = None) -> None:
     """Equal-memory (SOTA) comparison across equal_memory_filters. Sweeps
     count_memory_steps budgets from 10% to 100% of raw storage (storing the
     construct set as a plain list of float32 vectors, dim*4 bytes each) in
@@ -321,7 +320,7 @@ def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None, n
 
     filters narrows the compared set (default equal_memory_filters; CapCoverFilter
     is always submitted). tau (L2; default FIXED_TAU) is the one threshold of the
-    comparison; cap_quantize fixes CapCoverFilter's encoding (default: auto()'s choice). n_folds and count_memory_steps (log-spaced budgets) scale the
+    comparison; cap_quantizes fixes CapCoverFilter's encoding, one line each (default: auto()'s choice). n_folds and count_memory_steps (log-spaced budgets) scale the
     sweep down for a smaller run.
 
     Runs over every blocklist corpus and fold; plot_equal_memory pools all of
@@ -336,7 +335,7 @@ def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None, n
     num_vectors            = WORKLOAD_NUM_VECTORS
     dim                    = 384
     tau                    = FIXED_TAU if tau is None else tau
-    cap_kwargs             = {} if cap_quantize is None else {"extra_kwargs": {"candidates": [cap_quantize]}}
+    cap_variants           = [{}] if not cap_quantizes else [{"extra_kwargs": {"quantize": q}} for q in cap_quantizes]
     # Log-spaced, not linear: the baselines' feasibility floors span more
     # than a decade below this range's top (IVF-PQ ~0.6%, quantized-point-set
     # RaBitQ ~3.6%, of raw storage at n=100K/dim=384 -- HNSW's ~30% floor
@@ -406,22 +405,21 @@ def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None, n
                         actual_calibration=actual_calibration, actual_query=actual_query,
                         dataset=workload.name,
                     )
-                # CapCoverFilter.auto() already chooses its own best encoding
-                # for a budget internally, so there is no second axis to
-                # sweep here -- one submission per budget, labelled plainly "CapCoverFilter" by
-                # equal_memory_worker's Config naming (no quantize in
-                # extra_kwargs).
-                runner.submit(
-                    'equal_memory',
-                    output_csv=output_csv,
-                    filter_cls=CapCoverFilter,
-                    dim=dim, distance_threshold=tau,
-                    memory_budget=int(memory_budget),
-                    vectors_construct=vectors_construct, vectors_calibration=vectors_calibration,
-                    vectors_query=vectors_query,
-                    actual_calibration=actual_calibration, actual_query=actual_query,
-                    dataset=workload.name, **cap_kwargs,
-                )
+                # CapCoverFilter: one submission per encoding in cap_quantizes, labelled
+                # "CapCoverFilter (TQ2)" etc. by equal_memory_worker's Config naming; with none,
+                # auto() chooses its encoding and the label is plainly "CapCoverFilter".
+                for cap_kwargs in cap_variants:
+                    runner.submit(
+                        'equal_memory',
+                        output_csv=output_csv,
+                        filter_cls=CapCoverFilter,
+                        dim=dim, distance_threshold=tau,
+                        memory_budget=int(memory_budget),
+                        vectors_construct=vectors_construct, vectors_calibration=vectors_calibration,
+                        vectors_query=vectors_query,
+                        actual_calibration=actual_calibration, actual_query=actual_query,
+                        dataset=workload.name, **cap_kwargs,
+                    )
 
 
 def save_equal_memory(job_results: List[Tuple[str, Any]]) -> list:
@@ -1251,10 +1249,10 @@ def plot_streaming(df: pd.DataFrame, k_fixed: int) -> None:
 # generate_construct_methods_scale, whose "scale_" prefix keeps it out of
 # the sweep's figures.
 CONSTRUCT_METHODS_DIR = "results/construct_methods"
-# The construction evaluation compares these, each unquantized (FP32) and at TQ2; sphere_merge
+# The construction evaluation compares these, each unquantized (FP32), at TQ2 and at TQ4; sphere_merge
 # (the paper's default) is not evaluated there, and soft_anneal starts from minimax's cover.
 CONSTRUCT_EVALUATED = ("gonzalez", "minimax", "soft_anneal")
-CONSTRUCT_QUANTIZES = (Quantize.FP32, Quantize.TQ2)
+CONSTRUCT_QUANTIZES = (Quantize.FP32, Quantize.TQ2, Quantize.TQ4)
 CONSTRUCT_METHODS_PLOT_DIR = "plots/construct_methods"
 
 
@@ -1269,7 +1267,7 @@ def construct_methods_scale_csv(dataset: str, n: int) -> str:
 def generate_construct_methods(runner: Runner) -> None:
     """CapCoverFilter's construction methods (CONSTRUCT_EVALUATED: gonzalez,
     minimax, soft_anneal; sphere_merge is not evaluated here), each at
-    CONSTRUCT_QUANTIZES (unquantized and TQ2), compared on the blocklist workload: the same construction
+    CONSTRUCT_QUANTIZES (unquantized, TQ2 and TQ4), compared on the blocklist workload: the same construction
     and query sets as generate_budget/generate_quantization, with ground
     truth defined as distance to the reference set at tau. Only the
     construction method varies (see runner.construct_method_worker).
@@ -1286,7 +1284,7 @@ def generate_construct_methods(runner: Runner) -> None:
     tau         = FIXED_TAU
     # B/M from 1% to 10% (8 points): the budgets where the covers are wide
     # enough for the construction method to matter and not yet saturated.
-    fractions_of = {Quantize.FP32: list(CONSTRUCT_MEMORY_FRACTIONS), Quantize.TQ2: list(CONSTRUCT_TQ2_MEMORY_FRACTIONS)}
+    memory_fractions = list(CONSTRUCT_MEMORY_FRACTIONS)
     methods     = list(CONSTRUCT_EVALUATED)
 
     for workload in blocklist_workloads(num_vectors, n_folds=n_folds):
@@ -1301,7 +1299,7 @@ def generate_construct_methods(runner: Runner) -> None:
                         f"{int(actual_results.sum())} within tau={tau} of B")
             for method in methods:
                 for quantize in CONSTRUCT_QUANTIZES:
-                    for mf in fractions_of[quantize]:
+                    for mf in memory_fractions:
                         runner.submit(
                             'construct_method',
                             output_csv=output_csv,
