@@ -35,7 +35,7 @@ from filters.cap_cover.cap_merge_insert import CapMergeInsert as CapCoverMergeIn
 from filters.cap_cover.gonzales_construct import GonzalesConstruct as CapGonzalesConstruct
 from filters.cap_cover.minimax_construct import MinimaxConstruct as CapMinimaxConstruct
 from filters.cap_cover.sphere_merge_construct import SphereMergeConstruct as CapSphereMergeConstruct
-from filters.cap_cover.soft_anneal_construct import SoftAnnealMerge as CapSoftAnnealConstruct
+from filters.cap_cover.soft_anneal_construct import SoftAnnealMinimax as CapSoftAnnealConstruct
 from filters.cap_cover.cap_interfaces import ConstructInterface as CapConstructInterface
 from vector_source import VectorSource
 

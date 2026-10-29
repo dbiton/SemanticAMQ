@@ -1,13 +1,13 @@
-"""SoftAnnealMerge: sphere merge whose final cover is annealed; the cover stays valid and the
-construct-set objective never gets worse than sphere merge's."""
+"""SoftAnnealMinimax: minimax's cover, annealed; the cover stays valid and the construct-set
+objective never gets worse than minimax's."""
 import unittest
 
 import numpy as np
 
 from filters.cap_cover.cap_cover_filter import CapCoverFilter
 from filters.cap_cover.cap_geometry import labelled_cap_cover
-from filters.cap_cover.soft_anneal_construct import SoftAnneal, SoftAnnealMerge, hard_eval
-from filters.cap_cover.sphere_merge_construct import SphereMergeConstruct
+from filters.cap_cover.soft_anneal_construct import SoftAnneal, SoftAnnealMinimax, hard_eval
+from filters.cap_cover.minimax_construct import MinimaxConstruct
 import runner
 
 
@@ -27,14 +27,14 @@ class TestSoftAnneal(unittest.TestCase):
         cls.Q = _unit(np.vstack([near, rng.normal(size=(60, cls.DIM))])).astype(np.float32)
 
     def test_registered(self):
-        self.assertIsInstance(runner.CAP_CONSTRUCT_METHODS["soft_anneal"](), SoftAnnealMerge)
+        self.assertIsInstance(runner.CAP_CONSTRUCT_METHODS["soft_anneal"](), SoftAnnealMinimax)
 
     def test_valid_cover_and_objective_not_worse(self):
         k = 60
         X = self.X.astype(np.float64)
         filt = CapCoverFilter(self.DIM, max_caps=k)
-        base_U, _ = SphereMergeConstruct().construct_filter(filt, X)
-        U, theta = SoftAnnealMerge(anneal=SoftAnneal(iters=40)).construct_filter(filt, X)
+        base_U, _ = MinimaxConstruct().construct_filter(filt, X)
+        U, theta = SoftAnnealMinimax(anneal=SoftAnneal(iters=40)).construct_filter(filt, X)
         self.assertLessEqual(len(U), k)
         # every vector lies in some cap, within its angle
         ang = np.arccos(np.clip(X @ U.T, -1, 1))
@@ -46,13 +46,25 @@ class TestSoftAnneal(unittest.TestCase):
 
     def test_filter_has_no_false_negatives(self):
         filt = CapCoverFilter.auto(self.DIM, max_memory=runner._cover_max_memory(self.DIM, 70),
-                                   construct_method=SoftAnnealMerge(anneal=SoftAnneal(iters=30)))
+                                   construct_method=SoftAnnealMinimax(anneal=SoftAnneal(iters=30)))
         filt.construct(self.X)
         tau = runner.tau_of_cosine_distance(0.05)
         actual = (2.0 - 2.0 * (self.Q @ self.X.T).max(axis=1)) <= tau * tau
         accepted = np.asarray(filt.query(self.Q, distance_threshold=tau), dtype=bool)
         self.assertTrue(actual.any())
         self.assertTrue(np.all(accepted[actual]))
+
+    def test_candidates_are_minimax_and_finish_anneals_the_chosen_one(self):
+        X = self.X.astype(np.float64)
+        filt = CapCoverFilter(self.DIM, max_caps=60)
+        method = SoftAnnealMinimax(anneal=SoftAnneal(iters=30))
+        (k, cover), = list(method.iter_candidates(filt, X, [60]))
+        base_U, _ = MinimaxConstruct().construct_filter(filt, X)
+        self.assertEqual(len(cover.directions), len(base_U))
+        done = method.finish(filt, X, cover)
+        alpha = float(filt._beta(np.ones(1), 0.1)[0][0])
+        self.assertLessEqual(hard_eval(X, done.directions, alpha, self.DIM)[0],
+                             hard_eval(X, cover.directions, alpha, self.DIM)[0] + 1e-9)
 
 
 if __name__ == "__main__":

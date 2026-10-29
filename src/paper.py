@@ -35,8 +35,6 @@ main.py run write the same files -- and truncate them, see CLAUDE.md):
     quantization  cap_quantization/<corpus>/*.csv          generate_cap_quantization (figure, and
                                                            tab:quantization via plots/table_quantization.py)
     construction  construct_methods/<corpus>.csv           generate_construct_methods
-    streaming     streaming/<corpus>/streaming.csv         generate_streaming (position sweep,
-                                                           sphere_merge bootstrap only)
     equal-memory  equal_memory/<corpus>/equal_memory.csv   generate_equal_memory (the baselines
                                                            the two figures show: zero-FN FPR on
                                                            every corpus, FPR/FNR of the rest on one)
@@ -49,11 +47,11 @@ main.py run write the same files -- and truncate them, see CLAUDE.md):
                                                            per-arrival insert time and per-encoding query throughput
                                                            (pinned, sequential)
 
-Not generated: scaling, cap_cover_system_tau, query_performance and the
+Not generated: streaming (its figure is not drawn either), scaling, cap_cover_system_tau, query_performance and the
 construct-method scale run, which no paper figure reads.
 
 On the server (100,000 vectors per corpus), `python src/paper.py` runs every evaluation above in order: one shuffled
-batch on main.MAX_WORKERS (blocklist, budget, quantization, construction, streaming, equal-memory, ablation),
+batch on main.MAX_WORKERS (blocklist, budget, quantization, construction, equal-memory, ablation),
 then end-to-end on 8 pinned cores, then latency and timing sequentially on one pinned core, then draws the
 figures and tables (plots/plot_paper.py: suggestions/figures/, including space_bound.csv). `--only` runs a subset and
 `--missing` the ones with no CSVs yet; `python src/paper.py plot` redraws without running. The soft-anneal construction is in the construction
@@ -77,15 +75,14 @@ import main
 from runner import CAP_QUANTIZATION_SWEEP, CAP_QUANTIZE_AUTO
 from filters.cap_cover.cap_quantizers import Quantize
 from runner import ABLATION_DELTAS
-from main import (Runner, CAP_COVER_CONSTRUCT, BLOCKLIST_FOLDS, blocklist_workloads, equal_memory_filters, logger,
+from main import (Runner, BLOCKLIST_FOLDS, blocklist_workloads, equal_memory_filters, logger,
                   generate_blocklist, generate_budget, generate_cap_quantization,
-                  generate_construct_methods, generate_streaming, generate_equal_memory)
+                  generate_construct_methods, generate_equal_memory)
 from plots import plot_paper
-from plots.plot_paper import (plot_figures, use_corpora, CONFIG_TO_METHOD, EQUAL_MEMORY_HIDDEN, STREAM_BOOTSTRAP,
+from plots.plot_paper import (FIGURES, plot_figures, use_corpora, CONFIG_TO_METHOD, EQUAL_MEMORY_HIDDEN,
                               E2E_TAU, E2E_MEMORY_FRACTION, E2E_TAUS, E2E_MEMORY_FRACTIONS, PAPER_TAUS_COS,
                               l2_threshold)
 
-assert STREAM_BOOTSTRAP == CAP_COVER_CONSTRUCT, "the streaming figure bootstraps with the paper's construct method"
 # The figures read the budgets plot_paper names; the generators use main's. They are one set of values.
 assert E2E_MEMORY_FRACTION == main.FIXED_MEMORY_FRACTION
 assert tuple(E2E_MEMORY_FRACTIONS) == tuple(main.BUDGET_MEMORY_FRACTIONS)
@@ -199,17 +196,11 @@ def generate_quantization(runner: Runner) -> None:
     generate_cap_quantization(runner, quantizes=PAPER_QUANTIZE)
 
 
-# The stream is the rest of B: 80% bootstrap leaves inserts = 20% of |B| (16,000 at 100K) against a
-# budget B = 2% of the raw index. At 50% the set doubled, and every method saturated at FPR 1.
-STREAM_BOOTSTRAP_FRACTION = 0.8
-
 GENERATORS = {
     "blocklist": partial(generate_blocklist, cap_quantize=PAPER_CAP_QUANTIZE),
     "budget": partial(generate_budget, cap_quantize=PAPER_CAP_QUANTIZE),
     "quantization": generate_quantization,
     "construction": generate_construct_methods,
-    "streaming": partial(generate_streaming, construct_methods=[STREAM_BOOTSTRAP], k_sweep=False,
-                         bootstrap_fraction=STREAM_BOOTSTRAP_FRACTION),
     "equal-memory": partial(generate_equal_memory, filters=PAPER_EQUAL_MEMORY_FILTERS, count_memory_steps=8,
                             tau=l2_threshold(EQUAL_MEMORY_TAU_COS), cap_quantize=PAPER_CAP_QUANTIZE),
     "ablation": generate_ablation,
@@ -228,7 +219,6 @@ OUTPUTS = {
     "budget": ("budget.csv", False),
     "quantization": ("cap_quantization/*/*.csv", True),
     "construction": ("construct_methods/*.csv", True),
-    "streaming": ("streaming/*/streaming.csv", True),
     "equal-memory": ("equal_memory/*/equal_memory.csv", True),
     "ablation": ("ablation.csv", False),
     "end-to-end": ("end_to_end.csv", False),
@@ -315,8 +305,9 @@ def generate_and_plot_all(out=None, only=None, plot=None) -> None:
 
 
 def plot_all(figures=None, out=None, results=None) -> None:
-    """Re-draws the paper's figures (default all) from results/."""
-    plot_figures(figures, results=results, out=out)
+    """Re-draws the paper's figures (default all but the streaming one, which the paper run does not
+    produce) from results/."""
+    plot_figures(figures or [name for name in FIGURES if name != "streaming"], results=results, out=out)
 
 
 def set_thresholds() -> None:

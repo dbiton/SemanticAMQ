@@ -1,8 +1,7 @@
-"""Soft-anneal construction: sphere merge's cover, then a continuous relaxation of
+"""Soft-anneal construction: minimax's cover, then a continuous relaxation of
 J = ln sum_i sigma(theta_i + alpha) minimised by annealed Riemannian Adam on the directions.
 
-Volume-only: no member counts enter the annealed objective (the start cover, sphere merge's,
-does use them).
+Volume-only: no member counts enter the annealed objective or the start cover.
 
 Relaxation (all on the n x m top-m nearest-cap lists, m = `topm`):
   D_xi        angle(x, u_i)
@@ -17,13 +16,12 @@ The analytic gradient was checked against finite differences and torch autograd.
 Safety: the hard objective J_hard(U) = ln sum_i sigma(max_{x -> i} angle(x,u_i) + alpha)
 (nearest-direction assignment, exact float64 angles) is evaluated on the start and every
 `eval_every` iterations; the best iterate (the start included) is kept, then polished with
-sphere merge's minimax round and kept only if its hard J is lower. The result is therefore
+a minimax round and kept only if its hard J is lower. The result is therefore
 never worse than the start on the construct-set criterion, and its angles are measured from
 the members (labelled_cap_cover), so the cover is valid.
 
-SoftAnnealMerge plugs this into CapCoverFilter (also through auto()): finish() anneals the
-cover sphere merge's finish() produced, so the merge hierarchy over the k grid is shared and
-only the chosen candidate is annealed, once. The annealed objective is the unencoded cover's;
+SoftAnnealMinimax plugs this into CapCoverFilter (also through auto()): the candidates over the
+k grid are minimax's covers and finish() anneals only the chosen one, once. The annealed objective is the unencoded cover's;
 the filter re-measures angles after coding, so the gain has to survive quantization.
 """
 import numpy as np
@@ -32,11 +30,10 @@ import scipy.sparse as sp
 from typing import Optional
 
 from filters.filter import Filter
-from filters.cap_cover.cap_interfaces import Cover
+from filters.cap_cover.cap_interfaces import ConstructInterface, Cover
 from filters.cap_cover.cap_geometry import (angle_between, labelled_cap_cover, log_cap_measure,
                                             nearest_directions, segments, segment_max, unit_rows)
-from filters.cap_cover.minimax_construct import badoiu_clarkson, reseed_empty
-from filters.cap_cover.sphere_merge_construct import SphereMergeConstruct
+from filters.cap_cover.minimax_construct import MinimaxConstruct, badoiu_clarkson, reseed_empty
 
 
 def _lse(a: np.ndarray, axis=None):
@@ -212,7 +209,7 @@ class SoftAnneal:
         return Up if Jp < best_J else best_U
 
     def _polish(self, X, U, alpha, dim):
-        """Sphere merge finish()'s minimax round: nearest reassignment, BC, reseed."""
+        """One minimax round: nearest reassignment, BC, reseed."""
         _, labels = nearest_directions(X, U)
         order, starts, counts = segments(labels, len(U))
         Up = badoiu_clarkson(X[order], labels[order], U, starts, counts, self.bc_steps)
@@ -221,19 +218,32 @@ class SoftAnneal:
         return Jp, Up
 
 
-class SoftAnnealMerge(SphereMergeConstruct):
-    """Sphere merge whose final cover is annealed (see the module docstring). Takes
-    SphereMergeConstruct's arguments and anneal=SoftAnneal(...)."""
+class SoftAnnealMinimax(ConstructInterface):
+    """Minimax's cover, annealed (see the module docstring). Takes anneal=SoftAnneal(...) and
+    minimax=MinimaxConstruct(...)."""
 
-    def __init__(self, anneal: Optional[SoftAnneal] = None, **merge_kwargs) -> None:
-        super().__init__(**merge_kwargs)
+    def __init__(self, anneal: Optional[SoftAnneal] = None, minimax: Optional[MinimaxConstruct] = None) -> None:
         self.anneal = anneal or SoftAnneal()
+        self.minimax = minimax or MinimaxConstruct()
+
+    def construct_filter(self, filter: Filter, vectors: np.ndarray):
+        X = np.ascontiguousarray(vectors, dtype=np.float64)
+        U, angles = self.minimax.construct_filter(filter, X)
+        if len(U) == 0 or len(U) >= len(X):
+            return U, angles                  # every vector is its own cap: nothing to anneal
+        U, angles, _, _ = labelled_cap_cover(X, self.anneal.refine(filter, X, U))
+        return U, angles
+
+    def iter_candidates(self, filter: Filter, vectors: np.ndarray, ks, weights=None):
+        """Minimax's covers at each k: only the chosen one is annealed, in finish()."""
+        return self.minimax.iter_candidates(filter, vectors, ks, weights)
 
     def finish(self, filter: Filter, vectors: np.ndarray, cover: Cover) -> Cover:
-        cover = super().finish(filter, vectors, cover)
         if len(cover.directions) == 0 or len(cover.directions) >= len(vectors):
-            return cover                      # every vector is its own cap: nothing to anneal
+            return cover
         X = np.ascontiguousarray(vectors, dtype=np.float64)
-        U = self.anneal.refine(filter, X, cover.directions)
-        U, angles, labels, kept = labelled_cap_cover(X, U)
+        U, angles, labels, kept = labelled_cap_cover(X, self.anneal.refine(filter, X, cover.directions))
         return Cover(U, angles, labels, kept=kept)    # neighbour lists dropped: the filter searches all caps
+
+    def get_bytesize(self) -> int:
+        return 0

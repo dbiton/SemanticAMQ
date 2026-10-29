@@ -144,9 +144,8 @@ class TestMissingEvaluations(unittest.TestCase):
                 (results / "construct_methods").mkdir(exist_ok=True)
                 (results / "construct_methods" / f"{corpus}.csv").touch()
             self.assertEqual(paper.missing_evaluations(results, n_corpora=2),
-                             ["quantization", "streaming", "equal-memory"])
-            (results / "streaming" / "A").mkdir(parents=True)
-            (results / "streaming" / "A" / "streaming.csv").touch()      # one corpus of two: still missing
-            self.assertIn("streaming", paper.missing_evaluations(results, n_corpora=2))
-            self.assertEqual(paper.missing_evaluations(results, n_corpora=1),
                              ["quantization", "equal-memory"])
+            (results / "equal_memory" / "A").mkdir(parents=True)
+            (results / "equal_memory" / "A" / "equal_memory.csv").touch()      # one corpus of two: still missing
+            self.assertIn("equal-memory", paper.missing_evaluations(results, n_corpora=2))
+            self.assertEqual(paper.missing_evaluations(results, n_corpora=1), ["quantization"])
