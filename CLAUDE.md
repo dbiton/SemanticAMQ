@@ -43,8 +43,9 @@ classes run through pytest. Imports inside `src/` are top-level
 (`from filters.filter import Filter`, `from runner import Runner`), never
 `src.`-prefixed.
 
-Full evaluation runs happen on a separate machine (~700 GB RAM,
-`MAX_WORKERS=64`). The local box (64 GB, 28 threads, i7-14700 with P/E cores)
+Full evaluation runs happen on a separate machine (Threadripper 3970X, 32 cores / 64 threads, 896 GB RAM,
+`MAX_WORKERS=30` (one per physical core, less two), `WORKLOAD_NUM_VECTORS=100_000`; paper.py times its throughput
+evaluation afterwards on 8 pinned cores). The local box (64 GB, 28 threads, i7-14700 with P/E cores)
 is for tests and single-cell validation. Size per-job memory against
 ~10 GB/job, not local RAM.
 
@@ -53,6 +54,11 @@ is for tests and single-cell validation. Size per-job memory against
 ```
 src/main.py            evaluation definitions: generate_*/save_*/plot_* per evaluation,
                        generate_and_plot_all() and plot_all()
+src/paper.py           paper.tex's data + figures only (subset of main.py's evaluations, trimmed to
+                       what each figure reads); `python src/paper.py [plot]`. Figures: plots/plot_paper.py
+                       `--only a,b` runs a subset (GENERATORS), `--missing` only those
+                       with no CSVs in results/ (then draws the figures); also ablation, latency (filter in front of the flat index) and timing;
+                       tables: plots/tables_paper.py; reduced-scale driver: suggestions/run_reduced_batch.py
 src/runner.py          Runner (ProcessPoolExecutor job harness), one *_worker per mode,
                        filter registries, calibration/tuning of baseline dials
 src/filters/filter.py  Filter base: construct(), query(), insert() (optional), get_bytesize();
@@ -62,10 +68,15 @@ src/filters/cap_cover/
   cap_interfaces.py    ConstructInterface / InsertInterface strategy ABCs
   cap_geometry.py      cap measure / angle helpers
   *_construct.py       construction strategies (gonzalez [file: gonzales_construct.py],
-                       minimax, sphere_merge)
+                       minimax, sphere_merge, soft_anneal = sphere merge + annealed refinement, ~5-13x the cost)
   *_insert.py          dynamic-insertion strategies (nearest, cap_merge)
-  scan_kernels.py      numba early-abandon accept kernels behind query()
-                       (compiled at import)
+  (CAP_COVER_EXPERIMENTS.md at the repo root: what was tried on CapCoverFilter and why variants were removed)
+  cap_scan.py          query() path: accept-rule constants (_beta) and the bridge to the
+                       Rust scan (freeze/thaw of the codes); float64 fallback for FP32/FP16/SQ*
+  scan_kernels.py      numba helper for construction planning (nearest_codeword)
+CapCoverRustFilter/    Rust crate capcover_rs (PyO3/maturin) behind CapCoverFilter.query();
+                       rust-improve.md = design/benchmark report. Build into the Python in use:
+                       `pip install maturin && cd CapCoverRustFilter && maturin develop --release`
 src/filters/           baselines: dsh, hnsw, ivf, quantized_vector, va_plus, race, mlp,
                        pacuk_lsh / sankowski_wygocki (zero-FN LSH, on _floor_lsh.FloorLSHFilter)
 src/plots/             one module per evaluation's figures; plot_common.py = shared style/datasets
@@ -108,6 +119,16 @@ positionally against submission order (use `main.rows_for_mode`).
 in `max_memory` must raise `InsufficientMemoryError`; the equal-memory worker
 records it as an infeasible (NaN) row. Never ship an over-budget index.
 
+**Scan cost.** At a byte budget a query scan costs budget x ns/byte of the encoding
+(`cap_cover_filter.SCAN_NS_PER_BYTE`; measure with `CapCoverRustFilter/bench/ns_per_cap.py`):
+TurboQuant 0.1-0.3, seeded PQ 0.4-1.9. `CapCoverFilter.auto(scan_limit_ms=...)` (default: env
+`CAPCOVER_SCAN_LIMIT_MS`, set to 1.0 by paper.py) drops candidates above the limit.
+
+**Query bands.** FPR is also split by how related a query is to the indexed set: the
+cosine similarity to its nearest construct vector, in `runner.SIMILARITY_BANDS`
+(close >= 0.8, related 0.6-0.8, unrelated < 0.6; columns `fpr_<band>`, `n_neg_<band>`).
+Bands only group results; labels are always distance at tau.
+
 **Workload sizing.** `main.WORKLOAD_NUM_VECTORS` is the single size knob for
 every evaluation (80% construct / 20% queries). Ground truth is labelled by
 true distance at tau, never by which sampling stratum a query came from.
@@ -147,6 +168,9 @@ true distance at tau, never by which sampling stratum a query came from.
 - **Timings need pinning.** Construction timings measured under many workers
   read 3-14x slow; unpinned runs vary 1.5-2x from E-core scheduling. For timing
   claims run sequentially with `psutil.Process().cpu_affinity([0])`.
+- **Never `git worktree remove` a worktree whose `datasets/` is a junction or symlink to the repo's.** On Windows it deleted
+  the repo's own `datasets/` contents once (they are not recoverable here: only 100K-row copies of 9 corpora exist elsewhere).
+  Copy the one or two files a throwaway worktree needs instead, or `rmdir` the link first.
 - **Outputs are gitignored** (`/results/`, `/plots/**` except `.gitkeep`,
   `*.csv`, `*.png`, `*.npz`, `*.npy`). When reporting a result, say which file
   it lives in; scratchpad files are temporary.

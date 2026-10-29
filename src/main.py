@@ -17,9 +17,9 @@ import pandas as pd
 faiss.omp_set_num_threads(1)  # belt-and-suspenders alongside the env vars above
 
 from logging_config import configure_logging
-from runner import (Runner, QUERY_SOURCES,
+from runner import (Runner,
                     CAP_QUANTIZATION_SWEEP, CAP_CONSTRUCT_METHODS, CAP_COVER_CONSTRUCT,
-                    system_tau_ground_truth_worker)
+                    system_tau_ground_truth_worker, _k_for_memory_fraction)
 from plots.plot_query_performance import generate_query_performance_figures
 from plots.plot_equal_memory import generate_equal_memory_figures
 from plots.plot_scaling import generate_scaling_figures
@@ -28,8 +28,8 @@ from plots.plot_blocklist import generate_blocklist_figures
 from plots.plot_budget import generate_budget_figures
 from plots.plot_construct_methods import generate_construct_methods_figures, load_results as load_construct_methods
 from plots.plot_common import DATASETS, DATASET_LABELS
-from typing import Any, Dict, List, Optional, Tuple
-from filters.cap_cover.cap_cover_filter import CapCoverFilter
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+from filters.cap_cover.cap_cover_filter import CapCoverFilter, Quantize
 from filters.dsh_filter import DSHFilter
 from filters.hnsw_filter import HNSWFilter
 from filters.ivf_filter import IVFFilter
@@ -46,7 +46,15 @@ from vector_source import VectorSource
 configure_logging()
 logger = logging.getLogger(__name__)
 
-MAX_WORKERS = 16
+# The evaluation machine: AMD Ryzen Threadripper 3970X (32 cores / 64 threads), Ubuntu
+# 24.04, 896 GB RAM (paper.tex). Every job is single-threaded and holds a few GB at
+# WORKLOAD_NUM_VECTORS = 100K. One worker per physical core, less two for the
+# coordinating process (which pickles each job's vectors and writes the CSVs) and
+# the OS: 60 workers on 32 cores oversubscribed the SMT siblings and the memory
+# bandwidth, and inflated every timing (a quiet pinned core scans a cap in 1-2x
+# the time of a laptop core; a loaded run measured 5-10x). src/paper.py times its
+# throughput evaluation separately, on a few pinned cores.
+MAX_WORKERS = 30
 DATASET = 'ELI5'
 
 # Vectors/dataset, split 80% construction / 20% queries. One knob for every
@@ -54,15 +62,31 @@ DATASET = 'ELI5'
 # equal_memory, streaming, blocklist) and the throughput-only sweeps (scaling,
 # query_performance), which used to read a separate STREAM_SIZE.
 #
-# Capped well below the paper's nominal 100K by the blocklist workload, whose
-# reference set must come from duplicate clusters: CC-News holds only 31,696
-# usable vectors in clusters of >=3 at eps=0.4, so anything above ~36,018
-# drops that corpus and silently reduces the comparison to two. 2^15 leaves
-# ~10% headroom there; cap_cover_system_tau's non-wrapping folds need 1.8N = 58,982 rows
-# per dataset, which its shortest (HotpotQA, 97,852) clears comfortably.
-WORKLOAD_NUM_VECTORS = 10_000
+# The paper's size: |B| = 80,000 construct and 20,000 query vectors per fold. The
+# blocklist workload cuts BLOCKLIST_FOLDS disjoint windows of this many rows from
+# each corpus file (build_blocklist_workload), so a corpus needs
+# BLOCKLIST_FOLDS * WORKLOAD_NUM_VECTORS rows (500K) or it is skipped with an
+# error, and cap_cover_system_tau's non-wrapping folds need 1.8N rows.
+WORKLOAD_NUM_VECTORS = 100_000
+
+# The distance threshold (L2, unit vectors: tau^2 = 2 * cosine distance) at which every
+# fixed-threshold evaluation runs, and the grid of the blocklist's tau sweep.
+# src/paper.py overrides both for the paper's figures.
+FIXED_TAU = 0.1
+BLOCKLIST_TAUS = [float(t) for t in np.linspace(0.0, 0.4, 8)]
 
 BLOCKLIST_FOLDS = 5
+
+# Memory budgets are chosen as B/M, the filter's bytes over the raw index (the |B| construct
+# vectors as float32, dim*4 bytes each), never as a cap count k: the cover sizes itself from
+# the bytes (runner._k_for_memory_fraction). 8 points per sweep.
+#   BUDGET_MEMORY_FRACTIONS     generate_budget and the cap_quantization sweep
+#   FIXED_MEMORY_FRACTION       the one budget of the tau sweep, the streaming run, the throughput
+#                               tau panel, the latency timing and the insertion timing
+#   CONSTRUCT_MEMORY_FRACTIONS  the construction-method comparison
+BUDGET_MEMORY_FRACTIONS = (0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05)
+FIXED_MEMORY_FRACTION = 0.02
+CONSTRUCT_MEMORY_FRACTIONS = (0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.07, 0.1)
 # The blocklist's query/construct split of WORKLOAD_NUM_VECTORS: one total
 # size, cut into a q query part and a (1-q) construct part, with
 # k = k_fraction * |B|. Position-based (build_blocklist_workload): construct
@@ -209,12 +233,10 @@ def stratified_calibration_split(
     (calibration_vectors, measurement_vectors, calibration_actual,
     measurement_actual).
 
-    Stratified on `actual`, and shuffled within each stratum, because
-    BlocklistWorkload.query_vectors hands back its three query sources
-    *concatenated in order* -- held-out cluster members, then withheld-cluster
-    members, then singletons. A prefix slice of that is not a sample of it. At
-    the sweep's own settings (build_blocklist_workload's frac_heldout=0.2 and
-    calibration_fraction=0.2) the prefix was exactly the held-out block, so:
+    Stratified on `actual`, and shuffled within each stratum, because a
+    prefix slice of a file-ordered stream is not a sample of it (earlier, the
+    stream was a concatenation of query sources and the prefix was exactly
+    one of them), so:
 
       - calibration saw a set that was ~91% duplicates on Quora, where F1 is
         maximised by answering "duplicate" unconditionally -- which is the
@@ -272,7 +294,9 @@ def stratified_calibration_split(
             labels[calibration_idx].tolist(), labels[measurement_idx].tolist())
 
 
-def generate_equal_memory(runner: Runner) -> None:
+def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None, n_folds: int = BLOCKLIST_FOLDS,
+                          count_memory_steps: int = 8, tau: Optional[float] = None,
+                          cap_quantize: Optional[Quantize] = None) -> None:
     """Equal-memory (SOTA) comparison across equal_memory_filters. Sweeps
     count_memory_steps budgets from 10% to 100% of raw storage (storing the
     construct set as a plain list of float32 vectors, dim*4 bytes each) in
@@ -293,6 +317,11 @@ def generate_equal_memory(runner: Runner) -> None:
     NOT a prefix cut, see stratified_calibration_split -- replacing the old
     flat percentage_calibration split of one dataset.
 
+    filters narrows the compared set (default equal_memory_filters; CapCoverFilter
+    is always submitted). tau (L2; default FIXED_TAU) is the one threshold of the
+    comparison; cap_quantize fixes CapCoverFilter's encoding (default: auto()'s choice). n_folds and count_memory_steps (log-spaced budgets) scale the
+    sweep down for a smaller run.
+
     Runs over every blocklist corpus and fold; plot_equal_memory pools all of
     them into one line per filter at each memory budget, so -- like
     generate_scaling -- the budget grid is bounded by the *smallest* corpus's
@@ -304,17 +333,15 @@ def generate_equal_memory(runner: Runner) -> None:
     equal_memory_csv()), mirroring cap_quantization_csv/CAP_QUANTIZATION_DIR."""
     num_vectors            = WORKLOAD_NUM_VECTORS
     dim                    = 384
-    n_folds                = 5
-    tau                    = 0.1
+    tau                    = FIXED_TAU if tau is None else tau
+    cap_kwargs             = {} if cap_quantize is None else {"extra_kwargs": {"candidates": [cap_quantize]}}
     # Log-spaced, not linear: the baselines' feasibility floors span more
     # than a decade below this range's top (IVF-PQ ~0.6%, quantized-point-set
     # RaBitQ ~3.6%, of raw storage at n=100K/dim=384 -- HNSW's ~30% floor
     # sits above max_memory_fraction entirely, so it is expected to stay
     # infeasible throughout), so a linear sweep would waste points at the top
-    # and barely resolve the first two floors. 17 steps over this range's
-    # 2 decades is ~8 points/decade, matching the resolution the wider
-    # sweep used.
-    count_memory_steps     = 16
+    # and barely resolve the first two floors. 8 steps over this range's
+    # 2 decades is 4 points/decade.
     # Sweep bounds, as a fraction of raw_storage_bytes (see below).
     min_memory_fraction    = 0.001
     max_memory_fraction    = 0.10
@@ -350,10 +377,9 @@ def generate_equal_memory(runner: Runner) -> None:
             vectors_construct = workload.rows(sel["reference"])
             stream = workload.query_vectors(sel)
             # Ground truth over the whole stream first, then a STRATIFIED cut
-            # into the two slices -- a prefix cut of query_vectors' ordered
-            # (heldout, withheld, singleton) concatenation put every positive in
-            # calibration and none in measurement. See
-            # stratified_calibration_split for what that did to the numbers.
+            # into the two slices -- a prefix cut of the file-ordered stream
+            # can put every positive in calibration and none in measurement.
+            # See stratified_calibration_split.
             actual_stream = compute_static_actual_results(vectors_construct, stream, tau)
             vectors_calibration, vectors_query, actual_calibration, actual_query = (
                 stratified_calibration_split(stream, actual_stream, calibration_fraction, seed=fold))
@@ -366,7 +392,7 @@ def generate_equal_memory(runner: Runner) -> None:
                 logger.info(
                     f"{workload.name} fold {fold}: submitting jobs for "
                     f"memory_budget={memory_budget} bytes...")
-                for filter_cls in equal_memory_filters:
+                for filter_cls in (equal_memory_filters if filters is None else filters):
                     runner.submit(
                         'equal_memory',
                         output_csv=output_csv,
@@ -392,7 +418,7 @@ def generate_equal_memory(runner: Runner) -> None:
                     vectors_construct=vectors_construct, vectors_calibration=vectors_calibration,
                     vectors_query=vectors_query,
                     actual_calibration=actual_calibration, actual_query=actual_query,
-                    dataset=workload.name,
+                    dataset=workload.name, **cap_kwargs,
                 )
 
 
@@ -552,7 +578,7 @@ BLOCKLIST_DATASETS = {
 def _selection_is_usable(selections: List[Dict[str, np.ndarray]]) -> bool:
     """Every fold needs a reference set and a query stream."""
     return bool(selections) and all(
-        len(sel["reference"]) and len(sel["singleton"]) for sel in selections)
+        len(sel["reference"]) and len(sel["queries"]) for sel in selections)
 
 
 _READ_WINDOW = 65_536  # rows per contiguous HDF5 read in _read_rows (~100 MB at d=384)
@@ -609,22 +635,10 @@ class BlocklistWorkload:
         return self._pool[idx] if self._pool is not None else _read_rows(self.name, idx)
 
     def query_vectors(self, sel: Dict[str, np.ndarray]) -> np.ndarray:
-        """A fold's queries as one array, by source: held-out members of the
-        reference set's clusters, then members of withheld clusters, then
-        singletons (runner.QUERY_SOURCES).
-
-        Sources are strata of the query distribution, not labels. Ground truth
-        is always distance to the reference set at tau
-        (compute_static_actual_results): a held-out member farther than tau is
-        a negative, a withheld-cluster member within tau a positive."""
-        parts = [self.rows(sel[key]) for key in QUERY_SOURCES if len(sel[key])]
-        return np.concatenate(parts) if parts else np.empty((0, 0), dtype=np.float32)
-
-    @staticmethod
-    def source_sizes(sel: Dict[str, np.ndarray]) -> Dict[str, int]:
-        """n_heldout/n_withheld/n_singleton, as the workers that split FPR by
-        source take them."""
-        return {f"n_{key}": len(sel[key]) for key in QUERY_SOURCES}
+        """A fold's queries as one array. Ground truth is always distance to
+        the reference set at tau (compute_static_actual_results); how related
+        a query is to the set (runner.SIMILARITY_BANDS) only groups FPR."""
+        return self.rows(sel["queries"])
 
 
 def build_blocklist_workload(name: str, plot_key: str,
@@ -635,8 +649,8 @@ def build_blocklist_workload(name: str, plot_key: str,
     No clustering and no sampling: fold f constructs from the f-th window of
     the first rows of the file and queries from the f-th window of its last
     rows, so the two regions never overlap and folds are disjoint. All
-    queries are carried as one stream (the "singleton" slot); strata are not
-    defined by file position, and ground truth is distance at tau regardless."""
+    queries are carried as one stream; strata are not defined by file
+    position, and ground truth is distance at tau regardless."""
     if not os.path.exists(dataset_filenames[name]):
         logger.warning(f"Skipping {name}: not found on disk")
         return None
@@ -650,11 +664,9 @@ def build_blocklist_workload(name: str, plot_key: str,
             f"query rows need {n_folds * num_vectors} rows but the file has {total}.")
         return None
 
-    empty = np.empty(0, dtype=np.int64)
     selections = [{
         "reference": np.arange(f * reference_target, (f + 1) * reference_target, dtype=np.int64),
-        "heldout": empty, "withheld": empty,
-        "singleton": np.arange(total - (f + 1) * stream_size, total - f * stream_size, dtype=np.int64),
+        "queries": np.arange(total - (f + 1) * stream_size, total - f * stream_size, dtype=np.int64),
     } for f in range(n_folds)]
 
     logger.info(f"{name}: |B|={reference_target} from the start of the file, "
@@ -675,7 +687,7 @@ def blocklist_workloads(num_vectors: int, n_folds: int = BLOCKLIST_FOLDS,
     return out
 
 
-def generate_blocklist(runner: Runner) -> None:
+def generate_blocklist(runner: Runner, cap_quantize: Optional[Quantize] = None) -> None:
     """Fixed-budget tau sweep. The reference set B is the first rows of each
     corpus's file and the query stream is the last rows of it
     (build_blocklist_workload): no clustering, no stratified sampling. Every
@@ -685,12 +697,12 @@ def generate_blocklist(runner: Runner) -> None:
     structure (e.g. paraphrase groups stored together), which this split
     does not correct.
 
-    A single fixed ball budget (k_fraction, not a sweep) -- varying the
-    budget is generate_budget's job now, at its own fixed tau.
-    This evaluation is the complementary view: fix k, sweep tau, and read
-    how FPR/accesses-saved respond at that one representative budget.
-    k_fraction=0.1 sits in the middle of generate_budget's own 5%-20% range,
-    so the two evaluations are anchored at a comparable operating point.
+    A single fixed memory budget (FIXED_MEMORY_FRACTION of the raw index, not a
+    sweep) -- varying the budget is generate_budget's job now, at its own fixed
+    tau. This evaluation is the complementary view: fix the budget, sweep tau,
+    and read how FPR/accesses-saved respond at that one representative budget.
+    FIXED_MEMORY_FRACTION sits inside generate_budget's own range, so the two
+    evaluations are anchored at a comparable operating point.
 
     Only submits 'blocklist' jobs (output_csv=BLOCKLIST_CSV) -- does not run
     `runner`. Cluster discovery runs eagerly here, since it needs the whole
@@ -698,13 +710,13 @@ def generate_blocklist(runner: Runner) -> None:
     """
     dim              = 384
     num_vectors      = WORKLOAD_NUM_VECTORS
-    k_fraction       = 0.1  # fixed ball budget; see docstring
+    memory_fraction  = FIXED_MEMORY_FRACTION  # fixed budget B/M; see docstring
     # Shared absolute grid for the tau-swept panels. Stops at 0.4: measured on
     # a 0..1.2 grid, every corpus was already pinned at FPR 1.000 and 0% saved
     # by tau=0.3, so the bulk of that range carried no information. All the
     # structure is in [0, 0.4], and 8 points resolve it while leaving just
     # enough flat tail to show the saturation.
-    tau_values       = [float(t) for t in np.linspace(0.0, 0.4, 8)]
+    tau_values       = list(BLOCKLIST_TAUS)
     n_folds          = BLOCKLIST_FOLDS
 
     for workload in blocklist_workloads(num_vectors, n_folds=n_folds):
@@ -713,11 +725,9 @@ def generate_blocklist(runner: Runner) -> None:
                 'blocklist',
                 output_csv=BLOCKLIST_CSV,
                 dim=dim, dataset=workload.plot_key, seed=fold,
-                k_fraction=k_fraction, tau_values=tau_values,
+                memory_fraction=memory_fraction, tau_values=tau_values, quantize=cap_quantize,
                 vectors_reference=workload.rows(sel["reference"]),
-                vectors_heldout=workload.rows(sel["heldout"]),
-                vectors_withheld=workload.rows(sel["withheld"]),
-                vectors_singleton=workload.rows(sel["singleton"]),
+                vectors_query=workload.query_vectors(sel),
             )
 
 
@@ -731,18 +741,19 @@ def plot_blocklist(df: pd.DataFrame) -> None:
     generate_blocklist_figures(df)
 
 
-def generate_budget(runner: Runner) -> None:
-    """The blocklist workload read along its other axis: the ball budget k is
-    the swept variable and tau is held at one fixed value, where
-    generate_blocklist instead sweeps tau at one fixed budget.
+def generate_budget(runner: Runner, cap_quantize: Optional[Quantize] = None) -> None:
+    """The blocklist workload read along its other axis: the memory budget B/M
+    (BUDGET_MEMORY_FRACTIONS) is the swept variable and tau is held at one
+    fixed value, where generate_blocklist instead sweeps tau at one fixed
+    budget.
 
     Holding tau fixed holds the labels fixed, so FPR and accesses saved move
     with the budget alone and the sweep shows where paying for more balls
     stops buying either. The band is deliberately
-    narrow (5%-20% of |B|): below it the cover is too coarse to localise B at
-    a fixed threshold, and above it the budget approaches saturation, where
-    each ball stands in for so few reference vectors that there is nothing
-    left to compress.
+    narrow (0.5%-5% of the raw index): below it the cover is too coarse to
+    localise B at a fixed threshold, and above it the budget approaches
+    saturation, where each cap stands in for so few reference vectors that
+    there is nothing left to compress.
 
     tau is one absolute value across every corpus, which is NOT comparable
     between them -- the distance a duplicate sits at is a property of each
@@ -766,10 +777,8 @@ def generate_budget(runner: Runner) -> None:
     dim             = 384
     num_vectors     = WORKLOAD_NUM_VECTORS
     n_folds         = BLOCKLIST_FOLDS
-    k_percentages   = [5, 7.5, 10, 12.5, 15, 17.5, 20]  # ball budget k, as a percentage of |B|
-    tau             = 0.1
-
-    k_fractions = [p / 100.0 for p in k_percentages]
+    memory_fractions = list(BUDGET_MEMORY_FRACTIONS)
+    tau             = FIXED_TAU
 
     for workload in blocklist_workloads(num_vectors, n_folds=n_folds):
         for fold, sel in enumerate(workload.selections):
@@ -777,11 +786,9 @@ def generate_budget(runner: Runner) -> None:
                 'budget',
                 output_csv=BUDGET_CSV,
                 dim=dim, dataset=workload.plot_key, seed=fold,
-                k_fractions=k_fractions, tau=tau,
+                memory_fractions=memory_fractions, tau=tau, quantize=cap_quantize,
                 vectors_reference=workload.rows(sel["reference"]),
-                vectors_heldout=workload.rows(sel["heldout"]),
-                vectors_withheld=workload.rows(sel["withheld"]),
-                vectors_singleton=workload.rows(sel["singleton"]),
+                vectors_query=workload.query_vectors(sel),
             )
 
 
@@ -797,18 +804,23 @@ def plot_budget(df: pd.DataFrame) -> None:
     generate_budget_figures(df)
 
 
-def generate_cap_quantization(runner: Runner) -> None:
-    """CapCoverFilter.auto() per
-    (dataset, k, seed, quantize) over CAP_QUANTIZATION_SWEEP (AUTO_CANDIDATES
-    + DENSE10_LADDER). Same k ladder, same
-    fixed tau, same blocklist workloads/source-size split.
+def generate_cap_quantization(runner: Runner, memory_fractions: Optional[Sequence[float]] = None,
+                              quantizes: Optional[Sequence[Any]] = None) -> None:
+    """One CapCoverFilter per (dataset, memory budget, seed, quantize) over
+    CAP_QUANTIZATION_SWEEP (AUTO_CANDIDATES), at the same budgets as
+    generate_budget (BUDGET_MEMORY_FRACTIONS), the same fixed tau and the same
+    blocklist workloads/source-size split.
+
+    `quantizes` overrides CAP_QUANTIZATION_SWEEP (paper.py adds the FP/SQ/TQ rungs
+    and CAP_QUANTIZE_AUTO).
 
     Only submits 'cap_quantization' jobs -- does not run `runner`."""
     num_vectors      = WORKLOAD_NUM_VECTORS
     dim              = 384
     n_folds          = BLOCKLIST_FOLDS
-    k_values_nominal = [2 ** i for i in range(11, 17)]
-    tau              = 0.1
+    quantizes        = tuple(quantizes or CAP_QUANTIZATION_SWEEP)
+    memory_fractions = tuple(memory_fractions or BUDGET_MEMORY_FRACTIONS)
+    tau              = FIXED_TAU
 
     workloads = blocklist_workloads(num_vectors, n_folds=n_folds)
     if not workloads:
@@ -819,14 +831,7 @@ def generate_cap_quantization(runner: Runner) -> None:
 
     for workload in workloads:
         reference_len = len(workload.selections[0]["reference"])
-        k_values = [k for k in k_values_nominal if k < reference_len]
-        if not k_values:
-            raise RuntimeError(
-                f"No k in {k_values_nominal} is below the reference set of "
-                f"{workload.name} ({reference_len} vectors). Raise "
-                "WORKLOAD_NUM_VECTORS or lower k_values_nominal.")
-
-        logger.info(f"{workload.name}: k_values={k_values} (|B|={reference_len}), tau={tau:.4f}")
+        logger.info(f"{workload.name}: memory_fractions={list(memory_fractions)} (|B|={reference_len}), tau={tau:.4f}")
 
         output_csv = cap_quantization_csv(workload.name)
         os.makedirs(os.path.dirname(output_csv), exist_ok=True)
@@ -835,16 +840,15 @@ def generate_cap_quantization(runner: Runner) -> None:
             vectors_query = workload.query_vectors(sel)
             actual_results = compute_static_actual_results(
                 vectors_construct, vectors_query, tau)
-            for k in k_values:
-                for quantize in CAP_QUANTIZATION_SWEEP:
+            for memory_fraction in memory_fractions:
+                for quantize in quantizes:
                     runner.submit(
                         'cap_quantization',
                         output_csv=output_csv,
                         dim=dim, dataset=workload.name,
-                        k=k, quantize=quantize, tau=tau, seed=fold,
+                        memory_fraction=memory_fraction, quantize=quantize, tau=tau, seed=fold,
                         vectors_construct=vectors_construct, vectors_query=vectors_query,
                         actual_results=actual_results,
-                        **workload.source_sizes(sel),
                     )
 
 
@@ -978,8 +982,8 @@ def generate_scaling(runner: Runner) -> None:
     # before comparing), so this only has to be a valid tau, not a tuned one;
     # 0.1 anyway, the operating point of every other evaluation.
     tau_mid          = 0.1
-    # Fractions of each fold's blocklist query stream (held-out + withheld +
-    # singleton -- see BlocklistWorkload.query_vectors) consumed by the
+    # Fractions of each fold's blocklist query stream (see
+    # BlocklistWorkload.query_vectors) consumed by the
     # query and insert sweeps. Both draw from the same stream since neither
     # cares about overlap: only timing is measured, not correctness.
     # insert_vector_fraction stays smaller: insert() mutates the cover, so
@@ -1084,7 +1088,8 @@ def plot_scaling(df_query: pd.DataFrame, df_insert: pd.DataFrame, df_constructio
     generate_scaling_figures(df_query, df_insert, df_construction)
 
 
-def generate_streaming(runner: Runner) -> None:
+def generate_streaming(runner: Runner, construct_methods: Optional[List[str]] = None,
+                       k_sweep: bool = True, bootstrap_fraction: float = 0.5) -> None:
     """The paper's "dynamic evaluation" (Section 5.1/5.4, Figure 4): compares
     CapCoverFilter's insertion strategies (CAP_INSERT_STRATEGIES --
     cap_merge/nearest) via
@@ -1110,9 +1115,9 @@ def generate_streaming(runner: Runner) -> None:
     construct(), the way the static evaluations build all of it, and the rest
     arrives through insert() one vector at a time. B is kept in the fold's own
     order rather than reshuffled, so at the last checkpoint the oracle is the
-    very filter generate_blocklist builds at the same k_fraction.
+    very filter generate_blocklist builds at the same memory budget.
 
-    Queries are the fold's query_vectors() (held-out, withheld, singleton),
+    Queries are the fold's query_vectors(),
     scored at every checkpoint against the distance-based ground truth
     compute_static_actual_results gives for the part of B that has arrived so
     far -- the definition every evaluation uses, and the one under which zero
@@ -1124,13 +1129,19 @@ def generate_streaming(runner: Runner) -> None:
     hence zero-radius balls at position 0 -- a degenerate starting point that
     saturates FPR within a few dozen insertions regardless of method.
 
-    k is the blocklist workload's own budget, round(k_fraction * |B|), and
+    k is the blocklist workload's own budget, the caps that fit FIXED_MEMORY_FRACTION of the raw index, and
     |B| is trimmed to the same size on every corpus (see _fold_selections), so
     k and the checkpoint positions are identical across corpora, which is
     what makes plot_streaming's pooling meaningful.
 
     FNR=0 is asserted per checkpoint inside stream_rebuild_worker (raises,
     not recorded) -- a correctness requirement, not a plotted quantity.
+
+    construct_methods narrows the position sweep to those constructors and
+    k_sweep=False skips panel (c)'s k sweep (src/paper.py needs neither).
+
+    bootstrap_fraction is the share of B built by construct(); the rest is the insert
+    stream, so it sets how far the set outgrows the fixed budget k.
 
     Only submits 'stream_rebuild' jobs -- does not run `runner`. Each corpus
     writes its own results/streaming/<dataset>/streaming.csv (see
@@ -1145,13 +1156,12 @@ def generate_streaming(runner: Runner) -> None:
     # filter's own built-in fallback; runner.CAP_COVER_CONSTRUCT
     # (sphere_merge) is CapCoverFilter's actual default. The k sweep uses
     # CAP_COVER_CONSTRUCT only, unquantized like the position sweep.
-    construct_methods  = ["gonzalez", CAP_COVER_CONSTRUCT]
+    construct_methods  = construct_methods or ["gonzalez", CAP_COVER_CONSTRUCT]
     # The fixed absolute tau generate_budget/generate_quantization/
     # generate_equal_memory use, so every blocklist-workload evaluation sits
     # at the same operating point.
-    tau                = 0.1
-    k_fraction         = 0.1  # generate_blocklist's fixed ball budget, as a fraction of |B|
-    bootstrap_fraction = 0.5  # of B built by construct() before insert() takes over
+    tau                = FIXED_TAU
+    memory_fraction    = FIXED_MEMORY_FRACTION  # generate_blocklist's fixed budget B/M
     n_checkpoints      = 12
 
     workloads = blocklist_workloads(num_vectors, n_folds=n_folds)
@@ -1168,7 +1178,7 @@ def generate_streaming(runner: Runner) -> None:
             vectors_stream = workload.rows(sel["reference"])
             vectors_query = workload.query_vectors(sel)
             n = len(vectors_stream)
-            k = min(max(1, round(k_fraction * n)), n)  # as runner._blocklist_cover_rows sizes it
+            k = _k_for_memory_fraction(dim, n, memory_fraction)  # as runner._blocklist_cover_rows sizes it
             bootstrap_n = max(1, round(bootstrap_fraction * n))
 
             # construct() covers positions [0, bootstrap_n); the position
@@ -1193,7 +1203,6 @@ def generate_streaming(runner: Runner) -> None:
                 output_csv=output_csv, dim=dim, dataset=workload.name, seed=fold, tau=tau, T=None,
                 vectors_stream=vectors_stream, vectors_query=vectors_query,
                 actual_at_checkpoint=actual_at_checkpoint,
-                **workload.source_sizes(sel),
                 checkpoints=checkpoints, bootstrap_n=bootstrap_n, fold_offset=fold,
             )
 
@@ -1207,7 +1216,7 @@ def generate_streaming(runner: Runner) -> None:
 
             # --- panel (c): filter size (k) sweep for insertion throughput ---
             max_p = max(4, int(round(np.log2(k))))
-            for method in methods:
+            for method in methods if k_sweep else []:
                 for k_val in [2 ** p for p in range(4, max_p + 1)]:
                     runner.submit('stream_rebuild', k=k_val, policy="streaming", insertion_level=method,
                                   sweep="k", construct_method=CAP_COVER_CONSTRUCT, **common)
@@ -1240,6 +1249,10 @@ def plot_streaming(df: pd.DataFrame, k_fixed: int) -> None:
 # generate_construct_methods_scale, whose "scale_" prefix keeps it out of
 # the sweep's figures.
 CONSTRUCT_METHODS_DIR = "results/construct_methods"
+# The construction evaluation compares these, each unquantized (FP32) and at TQ2; sphere_merge
+# (the paper's default) is not evaluated there, though soft_anneal starts from its cover.
+CONSTRUCT_EVALUATED = ("gonzalez", "minimax", "soft_anneal")
+CONSTRUCT_QUANTIZES = (Quantize.FP32, Quantize.TQ2)
 CONSTRUCT_METHODS_PLOT_DIR = "plots/construct_methods"
 
 
@@ -1252,14 +1265,14 @@ def construct_methods_scale_csv(dataset: str, n: int) -> str:
 
 
 def generate_construct_methods(runner: Runner) -> None:
-    """CapCoverFilter's construction methods (runner.CAP_CONSTRUCT_METHODS --
-    only the 3 its package implements: gonzalez/minimax/sphere_merge, no
-    split/merge) compared on the blocklist workload: the same construction
+    """CapCoverFilter's construction methods (CONSTRUCT_EVALUATED: gonzalez,
+    minimax, soft_anneal; sphere_merge is not evaluated here), each at
+    CONSTRUCT_QUANTIZES (unquantized and TQ2), compared on the blocklist workload: the same construction
     and query sets as generate_budget/generate_quantization, with ground
     truth defined as distance to the reference set at tau. Only the
     construction method varies (see runner.construct_method_worker).
 
-    One job per (corpus, fold, method, k), so rows reach
+    One job per (corpus, fold, method, encoding, memory budget), so rows reach
     construct_methods_csv(corpus) as each cover finishes, and the slow
     large-k covers don't serialize one method's whole sweep onto a single
     worker.
@@ -1268,12 +1281,11 @@ def generate_construct_methods(runner: Runner) -> None:
     dim         = 384
     num_vectors = WORKLOAD_NUM_VECTORS
     n_folds     = BLOCKLIST_FOLDS
-    tau         = 0.1
-    # k as a fraction of |B|, log-spaced from 0.5% to 20%. The top of the
-    # range is generate_budget's; the bottom extends it into the budgets where
-    # every ball is wide, which is where the construction method matters most.
-    k_fractions = [0.005, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2]
-    methods     = list(CAP_CONSTRUCT_METHODS)
+    tau         = FIXED_TAU
+    # B/M from 1% to 10% (8 points): the budgets where the covers are wide
+    # enough for the construction method to matter and not yet saturated.
+    memory_fractions = list(CONSTRUCT_MEMORY_FRACTIONS)
+    methods     = list(CONSTRUCT_EVALUATED)
 
     for workload in blocklist_workloads(num_vectors, n_folds=n_folds):
         output_csv = construct_methods_csv(workload.plot_key)
@@ -1286,16 +1298,16 @@ def generate_construct_methods(runner: Runner) -> None:
             logger.info(f"{workload.name} fold {fold}: |B|={n}, {len(vectors_query)} queries, "
                         f"{int(actual_results.sum())} within tau={tau} of B")
             for method in methods:
-                for kf in k_fractions:
-                    runner.submit(
-                        'construct_method',
-                        output_csv=output_csv,
-                        dim=dim, dataset=workload.plot_key, method=method,
-                        k=min(max(1, round(kf * n)), n), k_fraction=kf, tau=tau, seed=fold,
-                        vectors_construct=vectors_construct, vectors_query=vectors_query,
-                        actual_results=actual_results,
-                        **workload.source_sizes(sel),
-                    )
+                for quantize in CONSTRUCT_QUANTIZES:
+                    for mf in memory_fractions:
+                        runner.submit(
+                            'construct_method',
+                            output_csv=output_csv,
+                            dim=dim, dataset=workload.plot_key, method=method, quantize=quantize,
+                            memory_fraction=mf, tau=tau, seed=fold,
+                            vectors_construct=vectors_construct, vectors_query=vectors_query,
+                            actual_results=actual_results,
+                        )
 
 
 def generate_construct_methods_scale(runner: Runner, dataset: str = "WikiAnswers", n: int = 100_000,

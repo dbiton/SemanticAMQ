@@ -157,5 +157,7 @@ def plot_dataset(df: pd.DataFrame, dataset: str, outdir: str, dpi: int = DPI) ->
 
 
 def generate_construct_methods_figures(df: pd.DataFrame, outdir: str) -> None:
+    if "quantize" in df:                      # one line per method: the unquantized covers
+        df = df[df["quantize"] == "FP32"]
     for dataset, sub in df.groupby("dataset"):
         plot_dataset(sub, dataset, outdir)

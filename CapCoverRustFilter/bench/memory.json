@@ -1,0 +1,28 @@
+{
+ "TQ4 x 12000 caps": {
+  "caps": 12000,
+  "charged_bytes": 2316136,
+  "rust_code_bytes": 2304000,
+  "rust_angle_bytes": 24000,
+  "rust_const_bytes": 7232,
+  "py_codes_after_freeze": 0,
+  "rss_before_freeze_MB": 1984.872448,
+  "rss_after_freeze_MB": 1984.954368,
+  "rss_delta_freeze_MB": 0.08191999999985455,
+  "peak_rss_growth_big_batch_MB": 0.049152000000049156,
+  "batch": 60000
+ },
+ "mixed auto 2.3 MB": {
+  "caps": 46938,
+  "charged_bytes": 2222670,
+  "rust_code_bytes": 2175708,
+  "rust_angle_bytes": 93876,
+  "rust_const_bytes": 497664,
+  "py_codes_after_freeze": 0,
+  "rss_before_freeze_MB": 3089.793024,
+  "rss_after_freeze_MB": 3089.809408,
+  "rss_delta_freeze_MB": 0.016384000000016385,
+  "peak_rss_growth_big_batch_MB": 0.06553600000006554,
+  "batch": 60000
+ }
+}

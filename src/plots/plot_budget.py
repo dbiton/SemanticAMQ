@@ -14,11 +14,11 @@ linear band (5%-20%) where a reciprocal log axis would compress the whole
 range into one corner.
 
 Panels:
-  (a) FPR on held-out negatives: members of B's own clusters farther than tau
-      from B, inside their cluster's ball -- where most false positives live.
-  (b) FPR on withheld negatives: members of duplicate clusters that were NOT
-      blocklisted, i.e. B's own local geometry.
-  (c) FPR on singleton negatives: background traffic.
+  (a) FPR on closely related negatives: queries with cosine similarity >= 0.8
+      to their nearest indexed vector but farther than tau -- where most
+      false positives live.
+  (b) FPR on related negatives (cosine similarity 0.6-0.8).
+  (c) FPR on unrelated negatives (< 0.6): background traffic.
   (d) Index accesses saved over the unfiltered baseline, with each corpus's
       ceiling (the share of negative queries) as a thin dashed line.
   (e) Geometric objective log10 J_tau(C) = log10 sum_i (r_i + tau)^d -- the
@@ -177,11 +177,11 @@ def _budget_panel_raw_pct(df: pd.DataFrame, value_col: str, ylabel: str, filenam
     )
 
 
-# One FPR panel per query source: (column, label, filename stem).
+# One FPR panel per similarity band: (column, label, filename stem).
 _FPR_PANELS = (
-    ("fpr_heldout", "FPR (held-out negatives)", "budget-fpr-heldout"),
-    ("fpr_withheld", "FPR (withheld negatives)", "budget-fpr-withheld"),
-    ("fpr_singleton", "FPR (singleton negatives)", "budget-fpr-singleton"),
+    ("fpr_close", "FPR (closely related negatives)", "budget-fpr-close"),
+    ("fpr_related", "FPR (related negatives)", "budget-fpr-related"),
+    ("fpr_unrelated", "FPR (unrelated negatives)", "budget-fpr-unrelated"),
 )
 
 
@@ -278,7 +278,7 @@ def panel_volume_bounds_raw_pct(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 def print_summary(df: pd.DataFrame, tau: float) -> None:
     sel = df[df["sweep"] == SWEEP_TAU]
     print(f"\n--- Ball-budget sweep (tau fixed at {tau:g}) ---")
-    cols = ("fpr", "fpr_heldout", "fpr_withheld", "fpr_singleton", "accesses_saved_pct",
+    cols = ("fpr", "fpr_close", "fpr_related", "fpr_unrelated", "accesses_saved_pct",
             "neg_share_pct", "psi_med", "log10_j_tau", "log10_vol_low", "log10_vol_high")
     aggs = {c: mean_std(sel, ["dataset", "k_fraction"], c) for c in cols}
     for dataset in BLOCKLIST_DATASETS:
@@ -287,16 +287,15 @@ def print_summary(df: pd.DataFrame, tau: float) -> None:
             continue
         n_ref = int(sub["n_reference"].iloc[0])
         print(f"\n{BLOCKLIST_LABELS[dataset]} (|X|={n_ref}, "
-              f"d_heldout={sub['d_heldout_med'].mean():.3f}, "
-              f"d_withheld={sub['d_withheld_med'].mean():.3f}, "
+              f"median nn cosine={sub['nn_cos_med'].mean():.3f}, "
               f"negatives={sub['neg_share_pct'].mean():.1f}%)")
         for kf in sorted(sub["k_fraction"].unique()):
             def _m(c):
                 row = aggs[c][(aggs[c]["dataset"] == dataset) & (aggs[c]["k_fraction"] == kf)]
                 return float(row["mean"].iloc[0]) if len(row) else float("nan")
             print(f"  k={100.0*kf:>5.1f}%  psi_med={_m('psi_med'):.3f} FPR={_m('fpr'):.3f} "
-                  f"FPR_heldout={_m('fpr_heldout'):.3f} FPR_withheld={_m('fpr_withheld'):.3f} "
-                  f"FPR_singleton={_m('fpr_singleton'):.3f} "
+                  f"FPR_close={_m('fpr_close'):.3f} FPR_related={_m('fpr_related'):.3f} "
+                  f"FPR_unrelated={_m('fpr_unrelated'):.3f} "
                   f"saved={_m('accesses_saved_pct'):5.1f}% log10_J={_m('log10_j_tau'):.2f} "
                   f"vol=[{_m('log10_vol_low'):.2f}, {_m('log10_vol_high'):.2f}]")
     print()
