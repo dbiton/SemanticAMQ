@@ -96,7 +96,7 @@ assert len(main.BUDGET_MEMORY_FRACTIONS) == len(main.CONSTRUCT_MEMORY_FRACTIONS)
 PAPER_EQUAL_MEMORY_FILTERS = [cls for cls in equal_memory_filters
                               if CONFIG_TO_METHOD.get(cls.__name__) not in EQUAL_MEMORY_HIDDEN]
 
-# The throughput figure, the latency timing and the equal-memory comparison run CapCoverFilter at
+# The sweeps grid (blocklist, budget), the throughput figure, the latency timing and the equal-memory comparison run CapCoverFilter at
 # this one encoding (not auto()'s choice); the equal-memory comparison at this cosine distance.
 PAPER_CAP_QUANTIZE = Quantize.TQ2
 EQUAL_MEMORY_TAU_COS = 0.02
@@ -204,8 +204,8 @@ def generate_quantization(runner: Runner) -> None:
 STREAM_BOOTSTRAP_FRACTION = 0.8
 
 GENERATORS = {
-    "blocklist": generate_blocklist,
-    "budget": generate_budget,
+    "blocklist": partial(generate_blocklist, cap_quantize=PAPER_CAP_QUANTIZE),
+    "budget": partial(generate_budget, cap_quantize=PAPER_CAP_QUANTIZE),
     "quantization": generate_quantization,
     "construction": generate_construct_methods,
     "streaming": partial(generate_streaming, construct_methods=[STREAM_BOOTSTRAP], k_sweep=False,

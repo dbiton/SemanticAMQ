@@ -1117,9 +1117,10 @@ def _blocklist_cover_rows(
     vectors_reference: VectorInput,
     vectors_query: VectorInput,
     volume_bounds: bool,
+    quantize: Optional[CapQuantize] = None,
 ) -> List[Dict[str, Any]]:
     """Shared core of blocklist_tau_worker and budget_worker: build a
-    CapCoverFilter per memory budget (B/M) in memory_fractions and emit one
+    CapCoverFilter (`quantize`'s encoding, auto()'s choice if None) per memory budget (B/M) in memory_fractions and emit one
     sweep="tau" row per (budget, tau) pair. Both callers read only these rows -- see each one's own
     docstring for which axis it treats as fixed and which it sweeps.
 
@@ -1161,7 +1162,7 @@ def _blocklist_cover_rows(
 
     for mf in memory_fractions:
         k = _k_for_memory_fraction(dim, len(B), mf)
-        filt = _cap_cover(dim, k)
+        filt = _cap_cover(dim, k, quantize)
         filt.construct(B)
         angles = filt.all_angles
 
@@ -1245,6 +1246,7 @@ def blocklist_tau_worker(
     tau_values: List[float],
     vectors_reference: VectorInput,
     vectors_query: VectorInput,
+    quantize: Optional[CapQuantize] = None,
 ) -> List[Dict[str, Any]]:
     """Asymmetric blocklist workload (main.generate_blocklist): a tight
     reference set B and a query stream, labeled by distance to B at each
@@ -1257,7 +1259,7 @@ def blocklist_tau_worker(
     return _blocklist_cover_rows(
         dim, dataset, seed, [memory_fraction], tau_values,
         vectors_reference, vectors_query,
-        volume_bounds=False,
+        volume_bounds=False, quantize=quantize,
     )
 
 
@@ -1269,6 +1271,7 @@ def budget_worker(
     tau: float,
     vectors_reference: VectorInput,
     vectors_query: VectorInput,
+    quantize: Optional[CapQuantize] = None,
 ) -> List[Dict[str, Any]]:
     """The same asymmetric blocklist workload as blocklist_tau_worker
     (main.generate_budget), read along the other axis: tau is fixed at a
@@ -1282,7 +1285,7 @@ def budget_worker(
     return _blocklist_cover_rows(
         dim, dataset, seed, memory_fractions, [tau],
         vectors_reference, vectors_query,
-        volume_bounds=True,
+        volume_bounds=True, quantize=quantize,
     )
 
 

@@ -687,7 +687,7 @@ def blocklist_workloads(num_vectors: int, n_folds: int = BLOCKLIST_FOLDS,
     return out
 
 
-def generate_blocklist(runner: Runner) -> None:
+def generate_blocklist(runner: Runner, cap_quantize: Optional[Quantize] = None) -> None:
     """Fixed-budget tau sweep. The reference set B is the first rows of each
     corpus's file and the query stream is the last rows of it
     (build_blocklist_workload): no clustering, no stratified sampling. Every
@@ -725,7 +725,7 @@ def generate_blocklist(runner: Runner) -> None:
                 'blocklist',
                 output_csv=BLOCKLIST_CSV,
                 dim=dim, dataset=workload.plot_key, seed=fold,
-                memory_fraction=memory_fraction, tau_values=tau_values,
+                memory_fraction=memory_fraction, tau_values=tau_values, quantize=cap_quantize,
                 vectors_reference=workload.rows(sel["reference"]),
                 vectors_query=workload.query_vectors(sel),
             )
@@ -741,7 +741,7 @@ def plot_blocklist(df: pd.DataFrame) -> None:
     generate_blocklist_figures(df)
 
 
-def generate_budget(runner: Runner) -> None:
+def generate_budget(runner: Runner, cap_quantize: Optional[Quantize] = None) -> None:
     """The blocklist workload read along its other axis: the memory budget B/M
     (BUDGET_MEMORY_FRACTIONS) is the swept variable and tau is held at one
     fixed value, where generate_blocklist instead sweeps tau at one fixed
@@ -786,7 +786,7 @@ def generate_budget(runner: Runner) -> None:
                 'budget',
                 output_csv=BUDGET_CSV,
                 dim=dim, dataset=workload.plot_key, seed=fold,
-                memory_fractions=memory_fractions, tau=tau,
+                memory_fractions=memory_fractions, tau=tau, quantize=cap_quantize,
                 vectors_reference=workload.rows(sel["reference"]),
                 vectors_query=workload.query_vectors(sel),
             )
