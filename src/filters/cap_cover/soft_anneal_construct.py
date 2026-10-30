@@ -1,19 +1,19 @@
 """Soft-anneal construction: minimax's cover, then a continuous relaxation of
-J = ln sum_i sigma(theta_i + alpha) minimised by annealed Riemannian Adam on the directions.
+J = ln sum_i sigma(theta_i) minimised by annealed Riemannian Adam on the directions.
 
-Volume-only: no member counts enter the annealed objective or the start cover.
+Volume-only: no query threshold or member counts enter the annealed objective or the start cover.
 
 Relaxation (all on the n x m top-m nearest-cap lists, m = `topm`):
   D_xi        angle(x, u_i)
   R_xi        softmax_i(-D_xi / Ta)                    soft membership  (Ta annealed to a small value)
   theta_i     Tm * [ LSE_x(ln R_xi + D_xi/Tm) - LSE_x(ln R_xi) ]   weighted soft-max of
               member angles (-> max over members as Tm -> 0, R -> hard)
-  J_soft      (1/g) * LSE_i( g * ln sigma(theta_i + alpha) )       cap-level temperature:
+  J_soft      (1/g) * LSE_i( g * ln sigma(theta_i) )       cap-level temperature:
               g = p_eff / (d-1); p_eff = 30 at the start (a flat power cost, like sphere
               merge's), annealed to d-1 (the true measure).
 The analytic gradient was checked against finite differences and torch autograd.
 
-Safety: the hard objective J_hard(U) = ln sum_i sigma(max_{x -> i} angle(x,u_i) + alpha)
+Safety: the hard objective J_hard(U) = ln sum_i sigma(max_{x -> i} angle(x,u_i))
 (nearest-direction assignment, exact float64 angles) is evaluated on the start and every
 `eval_every` iterations; the best iterate (the start included) is kept, then polished with
 a minimax round and kept only if its hard J is lower. The result is therefore
@@ -52,7 +52,7 @@ def lnsig_and_grad(psi: np.ndarray, dim: int):
     return f, df
 
 
-def hard_eval(X: np.ndarray, U: np.ndarray, alpha: float, dim: int):
+def hard_eval(X: np.ndarray, U: np.ndarray, dim: int):
     """(J_hard, theta, labels, counts): nearest-direction assignment, exact angles; empty caps ignored."""
     _, labels = nearest_directions(X, U)
     labels = labels.astype(np.int64)
@@ -60,16 +60,15 @@ def hard_eval(X: np.ndarray, U: np.ndarray, alpha: float, dim: int):
     order, starts, counts = segments(labels, len(U))
     theta = segment_max(theta_x[order], starts, counts)
     live = counts > 0
-    psi = np.minimum(theta[live] + alpha, np.pi)
-    J = float(_lse(log_cap_measure(psi, dim)).item())
+    J = float(_lse(log_cap_measure(theta[live], dim)).item())
     return J, theta, labels, counts
 
 
 class SoftState:
     """Sparse relaxation on top-m cap lists. Holds no copies of X."""
 
-    def __init__(self, X32: np.ndarray, dim: int, alpha: float, topm: int, Ta: float, Tm: float, p_eff: float):
-        self.X32, self.dim, self.alpha, self.topm = X32, dim, alpha, topm
+    def __init__(self, X32: np.ndarray, dim: int, topm: int, Ta: float, Tm: float, p_eff: float):
+        self.X32, self.dim, self.topm = X32, dim, topm
         self.Ta, self.Tm, self.p_eff = Ta, Tm, p_eff
         self.gemm_max_k = 500
 
@@ -123,10 +122,9 @@ class SoftState:
         lseR, eR, sR = seg_lse(lnRs)
         theta = np.zeros(k)
         theta[nonempty] = Tm * (lseL - lseR)[nonempty]
-        theta = np.clip(theta, 0.0, np.pi - self.alpha - 1e-3)
+        theta = np.clip(theta, 0.0, np.pi - 1e-3)
         g = self.p_eff / (self.dim - 1.0)
-        psi = theta + self.alpha
-        f, df = lnsig_and_grad(psi, self.dim)
+        f, df = lnsig_and_grad(theta, self.dim)
         live = nonempty & (sR > 1e-12)
         fl = np.where(live, f, -np.inf)
         J = float((_lse(g * fl) / g).item())
@@ -154,29 +152,28 @@ class SoftAnneal:
 
     def __init__(self, iters: int = 300, Ta0: float = 0.1, Ta1: float = 0.002, tm_ratio: float = 1.0,
                  p0: float = 30.0, p1: Optional[float] = None, lr0: float = 0.1, lr1: float = 0.005,
-                 topm: int = 16, refresh: int = 4, eval_every: int = 10, obj_tau: float = 0.1,
+                 topm: int = 16, refresh: int = 4, eval_every: int = 10,
                  bc_steps: int = 64, beta1: float = 0.9, beta2: float = 0.99) -> None:
         self.iters = iters
         self.Ta0, self.Ta1, self.tm_ratio = Ta0, Ta1, tm_ratio
         self.p0, self.p1 = p0, p1
         self.lr0, self.lr1 = lr0, lr1
         self.topm, self.refresh, self.eval_every = topm, refresh, eval_every
-        self.obj_tau, self.bc_steps = obj_tau, bc_steps
+        self.bc_steps = bc_steps
         self.beta1, self.beta2 = beta1, beta2
 
-    def refine(self, filter: Filter, X: np.ndarray, U0: np.ndarray) -> np.ndarray:
+    def refine(self, X: np.ndarray, U0: np.ndarray) -> np.ndarray:
         """Anneal from the unit directions U0 (k x d); returns directions whose hard
         construct-set objective is <= U0's."""
         n, dim = X.shape
-        alpha = float(filter._beta(np.ones(1), self.obj_tau)[0][0])
         U0 = unit_rows(U0)
         U = U0.copy()
         k = len(U)
         X32 = np.ascontiguousarray(X, dtype=np.float32)
         p1 = self.p1 if self.p1 is not None else dim - 1.0
-        best_J, _, _, _ = hard_eval(X, U0, alpha, dim)
+        best_J, _, _, _ = hard_eval(X, U0, dim)
         best_U = U0.copy()
-        st = SoftState(X32, dim, alpha, self.topm, self.Ta0, self.Ta0 * self.tm_ratio, self.p0)
+        st = SoftState(X32, dim, self.topm, self.Ta0, self.Ta0 * self.tm_ratio, self.p0)
         m1 = np.zeros_like(U)
         v = np.zeros(k)
         cand = None
@@ -202,19 +199,19 @@ class SoftAnneal:
             m1 = m1 - np.sum(m1 * Un, axis=1, keepdims=True) * Un
             U = Un
             if (it + 1) % self.eval_every == 0 or it == self.iters - 1:
-                Jh, _, _, _ = hard_eval(X, U, alpha, dim)
+                Jh, _, _, _ = hard_eval(X, U, dim)
                 if Jh < best_J:
                     best_J, best_U = Jh, U.copy()
-        Jp, Up = self._polish(X, best_U, alpha, dim)
+        Jp, Up = self._polish(X, best_U, dim)
         return Up if Jp < best_J else best_U
 
-    def _polish(self, X, U, alpha, dim):
+    def _polish(self, X, U, dim):
         """One minimax round: nearest reassignment, BC, reseed."""
         _, labels = nearest_directions(X, U)
         order, starts, counts = segments(labels, len(U))
         Up = badoiu_clarkson(X[order], labels[order], U, starts, counts, self.bc_steps)
         Up = reseed_empty(X, Up, counts, labels)
-        Jp, _, _, _ = hard_eval(X, Up, alpha, dim)
+        Jp, _, _, _ = hard_eval(X, Up, dim)
         return Jp, Up
 
 
@@ -231,7 +228,7 @@ class SoftAnnealMinimax(ConstructInterface):
         U, angles = self.minimax.construct_filter(filter, X)
         if len(U) == 0 or len(U) >= len(X):
             return U, angles                  # every vector is its own cap: nothing to anneal
-        U, angles, _, _ = labelled_cap_cover(X, self.anneal.refine(filter, X, U))
+        U, angles, _, _ = labelled_cap_cover(X, self.anneal.refine(X, U))
         return U, angles
 
     def iter_candidates(self, filter: Filter, vectors: np.ndarray, ks, weights=None):
@@ -242,7 +239,7 @@ class SoftAnnealMinimax(ConstructInterface):
         if len(cover.directions) == 0 or len(cover.directions) >= len(vectors):
             return cover
         X = np.ascontiguousarray(vectors, dtype=np.float64)
-        U, angles, labels, kept = labelled_cap_cover(X, self.anneal.refine(filter, X, cover.directions))
+        U, angles, labels, kept = labelled_cap_cover(X, self.anneal.refine(X, cover.directions))
         return Cover(U, angles, labels, kept=kept)    # neighbour lists dropped: the filter searches all caps
 
     def get_bytesize(self) -> int:

@@ -39,20 +39,30 @@ class TestSoftAnneal(unittest.TestCase):
         # every vector lies in some cap, within its angle
         ang = np.arccos(np.clip(X @ U.T, -1, 1))
         self.assertTrue(np.all((ang <= theta[None, :] + 1e-6).any(axis=1)))
-        alpha = float(filt._beta(np.ones(1), 0.1)[0][0])
-        j_base = hard_eval(X, base_U, alpha, self.DIM)[0]
-        j_new = hard_eval(X, U, alpha, self.DIM)[0]
+        j_base = hard_eval(X, base_U, self.DIM)[0]
+        j_new = hard_eval(X, U, self.DIM)[0]
         self.assertLessEqual(j_new, j_base + 1e-9)
 
     def test_filter_has_no_false_negatives(self):
         filt = CapCoverFilter.auto(self.DIM, max_memory=runner._cover_max_memory(self.DIM, 70),
                                    construct_method=SoftAnnealMinimax(anneal=SoftAnneal(iters=30)))
         filt.construct(self.X)
-        tau = runner.tau_of_cosine_distance(0.05)
-        actual = (2.0 - 2.0 * (self.Q @ self.X.T).max(axis=1)) <= tau * tau
-        accepted = np.asarray(filt.query(self.Q, distance_threshold=tau), dtype=bool)
-        self.assertTrue(actual.any())
-        self.assertTrue(np.all(accepted[actual]))
+        for cosine_distance in (0.005, 0.02, 0.05):
+            with self.subTest(cosine_distance=cosine_distance):
+                tau = runner.tau_of_cosine_distance(cosine_distance)
+                actual = (2.0 - 2.0 * (self.Q @ self.X.T).max(axis=1)) <= tau * tau
+                accepted = np.asarray(filt.query(self.Q, distance_threshold=tau), dtype=bool)
+                self.assertTrue(actual.any())
+                self.assertTrue(np.all(accepted[actual]))
+
+    def test_refinement_does_not_use_query_expansion(self):
+        X = self.X.astype(np.float64)
+        filt = CapCoverFilter(self.DIM, max_caps=60)
+        def unexpected_expansion(*args, **kwargs):
+            self.fail("soft anneal must not consult the query expansion")
+        filt._beta = unexpected_expansion
+        U, _ = SoftAnnealMinimax(anneal=SoftAnneal(iters=10)).construct_filter(filt, X)
+        self.assertTrue(np.isfinite(U).all())
 
     def test_candidates_are_minimax_and_finish_anneals_the_chosen_one(self):
         X = self.X.astype(np.float64)
@@ -62,9 +72,8 @@ class TestSoftAnneal(unittest.TestCase):
         base_U, _ = MinimaxConstruct().construct_filter(filt, X)
         self.assertEqual(len(cover.directions), len(base_U))
         done = method.finish(filt, X, cover)
-        alpha = float(filt._beta(np.ones(1), 0.1)[0][0])
-        self.assertLessEqual(hard_eval(X, done.directions, alpha, self.DIM)[0],
-                             hard_eval(X, cover.directions, alpha, self.DIM)[0] + 1e-9)
+        self.assertLessEqual(hard_eval(X, done.directions, self.DIM)[0],
+                             hard_eval(X, cover.directions, self.DIM)[0] + 1e-9)
 
 
 if __name__ == "__main__":
