@@ -13,25 +13,24 @@ Relaxation (all on the n x m top-m nearest-cap lists, m = `topm`):
               merge's), annealed to d-1 (the true measure).
 The analytic gradient was checked against finite differences and torch autograd.
 
-Safety: the hard objective J_hard(U) = ln sum_i sigma(max_{x -> i} angle(x,u_i))
-(nearest-direction assignment, exact float64 angles) is evaluated on the start and every
-`eval_every` iterations; the best iterate (the start included) is kept, then polished with
-a minimax round and kept only if its hard J is lower. The result is therefore
-never worse than the start on the construct-set criterion, and its angles are measured from
-the members (labelled_cap_cover), so the cover is valid.
+SoftAnnealMinimax refines after the filter has chosen its encoding levels and trained
+its codebooks. Gradients use decoded directions with a straight-through approximation
+to the discrete encoding. Checkpoints fit codes, reassign members, fit again to those
+assignments and score the actual rounded stored angles. The original encoded minimax
+cover is a candidate, so the stored unexpanded-volume objective cannot get worse.
+Cap count, encoding levels and codebooks stay fixed. Query tau is never used.
 
-SoftAnnealMinimax plugs this into CapCoverFilter (also through auto()): the candidates over the
-k grid are minimax's covers and finish() anneals only the chosen one, once. The annealed objective is the unencoded cover's;
-the filter re-measures angles after coding, so the gain has to survive quantization.
+The standalone SoftAnneal.refine also supports continuous refinement: without projection
+or a supplied objective it keeps the best exact nearest-assignment cap volume.
 """
 import numpy as np
 import faiss
 import scipy.sparse as sp
-from typing import Optional
+from typing import Callable, Optional
 
 from filters.filter import Filter
-from filters.cap_cover.cap_interfaces import ConstructInterface, Cover
-from filters.cap_cover.cap_geometry import (angle_between, labelled_cap_cover, log_cap_measure,
+from filters.cap_cover.cap_interfaces import ConstructInterface, EncodedCover
+from filters.cap_cover.cap_geometry import (angle_between, log_cap_measure,
                                             nearest_directions, segments, segment_max, unit_rows)
 from filters.cap_cover.minimax_construct import MinimaxConstruct, badoiu_clarkson, reseed_empty
 
@@ -121,7 +120,7 @@ class SoftState:
         lseL, eL, sL = seg_lse(Ls)
         lseR, eR, sR = seg_lse(lnRs)
         theta = np.zeros(k)
-        theta[nonempty] = Tm * (lseL - lseR)[nonempty]
+        theta[nonempty] = Tm * (lseL[nonempty] - lseR[nonempty])
         theta = np.clip(theta, 0.0, np.pi - 1e-3)
         g = self.p_eff / (self.dim - 1.0)
         f, df = lnsig_and_grad(theta, self.dim)
@@ -147,8 +146,11 @@ class SoftState:
 
 
 class SoftAnneal:
-    """The annealing refinement; see the module docstring. Defaults are the frozen
-    hyperparameters (chosen on the construct sets of five development cells, without queries)."""
+    """Annealing refinement with the original continuous annealing schedule.
+
+    Quantized refinement uses this schedule with decoded-direction gradients
+    and an exact encoded objective at checkpoints; see the module docstring.
+    """
 
     def __init__(self, iters: int = 300, Ta0: float = 0.1, Ta1: float = 0.002, tm_ratio: float = 1.0,
                  p0: float = 30.0, p1: Optional[float] = None, lr0: float = 0.1, lr1: float = 0.005,
@@ -162,16 +164,23 @@ class SoftAnneal:
         self.bc_steps = bc_steps
         self.beta1, self.beta2 = beta1, beta2
 
-    def refine(self, X: np.ndarray, U0: np.ndarray) -> np.ndarray:
-        """Anneal from the unit directions U0 (k x d); returns directions whose hard
-        construct-set objective is <= U0's."""
+    def refine(self, X: np.ndarray, U0: np.ndarray,
+               objective: Optional[Callable[[np.ndarray], float]] = None,
+               project: Optional[Callable[[np.ndarray], np.ndarray]] = None) -> np.ndarray:
+        """Anneal directions, retaining the best checkpoint under `objective`.
+
+        With `project`, evaluate smooth gradients at decoded directions and pass
+        them to the latent directions (straight-through); discrete acceptance
+        still uses the supplied hard objective, not the smooth surrogate.
+        """
         n, dim = X.shape
         U0 = unit_rows(U0)
         U = U0.copy()
         k = len(U)
         X32 = np.ascontiguousarray(X, dtype=np.float32)
         p1 = self.p1 if self.p1 is not None else dim - 1.0
-        best_J, _, _, _ = hard_eval(X, U0, dim)
+        score = objective if objective is not None else lambda V: hard_eval(X, V, dim)[0]
+        best_J = score(U0)
         best_U = U0.copy()
         st = SoftState(X32, dim, self.topm, self.Ta0, self.Ta0 * self.tm_ratio, self.p0)
         m1 = np.zeros_like(U)
@@ -183,9 +192,12 @@ class SoftAnneal:
             st.Tm = st.Ta * self.tm_ratio
             st.p_eff = self.p0 * (p1 / self.p0) ** f
             lr = self.lr0 * (self.lr1 / self.lr0) ** f
+            decoded = U if project is None else project(U)
             if cand is None or it % self.refresh == 0:
-                cand = st.search(U)
-            _, G, _ = st.value_and_grad(U, cand)
+                cand = st.search(decoded)
+            _, G, _ = st.value_and_grad(decoded, cand)
+            if not np.isfinite(G).all():
+                break  # preserve the best valid checkpoint if the relaxation fails
             # Riemannian Adam (per-cap scalar second moment): tangent gradient, step in radians
             G = G - np.sum(G * U, axis=1, keepdims=True) * U
             gn2 = np.sum(G * G, axis=1)
@@ -199,10 +211,11 @@ class SoftAnneal:
             m1 = m1 - np.sum(m1 * Un, axis=1, keepdims=True) * Un
             U = Un
             if (it + 1) % self.eval_every == 0 or it == self.iters - 1:
-                Jh, _, _, _ = hard_eval(X, U, dim)
+                Jh = score(U)
                 if Jh < best_J:
                     best_J, best_U = Jh, U.copy()
-        Jp, Up = self._polish(X, best_U, dim)
+        _, Up = self._polish(X, best_U, dim)
+        Jp = score(Up)
         return Up if Jp < best_J else best_U
 
     def _polish(self, X, U, dim):
@@ -216,31 +229,53 @@ class SoftAnneal:
 
 
 class SoftAnnealMinimax(ConstructInterface):
-    """Minimax's cover, annealed (see the module docstring). Takes anneal=SoftAnneal(...) and
-    minimax=MinimaxConstruct(...)."""
+    """Minimax followed by annealing after encoding selection and reassignment."""
 
-    def __init__(self, anneal: Optional[SoftAnneal] = None, minimax: Optional[MinimaxConstruct] = None) -> None:
+    def __init__(self, anneal: Optional[SoftAnneal] = None, minimax: Optional[MinimaxConstruct] = None,
+                 reassign_passes: int = 2) -> None:
+        if reassign_passes < 1:
+            raise ValueError("reassign_passes must be positive")
         self.anneal = anneal or SoftAnneal()
         self.minimax = minimax or MinimaxConstruct()
+        self.reassign_passes = reassign_passes
 
     def construct_filter(self, filter: Filter, vectors: np.ndarray):
-        X = np.ascontiguousarray(vectors, dtype=np.float64)
-        U, angles = self.minimax.construct_filter(filter, X)
-        if len(U) == 0 or len(U) >= len(X):
-            return U, angles                  # every vector is its own cap: nothing to anneal
-        U, angles, _, _ = labelled_cap_cover(X, self.anneal.refine(X, U))
-        return U, angles
+        return self.minimax.construct_filter(filter, vectors)
 
     def iter_candidates(self, filter: Filter, vectors: np.ndarray, ks, weights=None):
-        """Minimax's covers at each k: only the chosen one is annealed, in finish()."""
+        """Minimax candidates; annealing waits for the final encoding plan."""
         return self.minimax.iter_candidates(filter, vectors, ks, weights)
 
-    def finish(self, filter: Filter, vectors: np.ndarray, cover: Cover) -> Cover:
+    def refine_encoded(self, filter: Filter, vectors: np.ndarray,
+                       cover: EncodedCover, levels: np.ndarray) -> EncodedCover:
         if len(cover.directions) == 0 or len(cover.directions) >= len(vectors):
             return cover
         X = np.ascontiguousarray(vectors, dtype=np.float64)
-        U, angles, labels, kept = labelled_cap_cover(X, self.anneal.refine(X, cover.directions))
-        return Cover(U, angles, labels, kept=kept)    # neighbour lists dropped: the filter searches all caps
+        best, best_score = cover, filter._encoded_volume(cover.angles)
+
+        def objective(U):
+            nonlocal best, best_score
+            _, theta, owner, _ = hard_eval(X, U, X.shape[1])
+            candidate_score = np.inf
+            for _ in range(self.reassign_passes):
+                candidate = filter._encode_cover(X, U, theta, owner, levels)
+                value = filter._encoded_volume(candidate.angles)
+                candidate_score = min(candidate_score, value)
+                if value < best_score:
+                    best, best_score = candidate, value
+                owner = candidate.owner
+            return candidate_score
+
+        def project(U):
+            codes = np.zeros((len(U), int(filter._code_sizes.max())), dtype=np.uint8)
+            for level in np.unique(levels):
+                caps = np.flatnonzero(levels == level)
+                c = filter.encode(U[caps], int(level))
+                codes[caps, :c.shape[1]] = c
+            return filter._decode_levels(codes, levels)
+
+        self.anneal.refine(X, cover.directions, objective=objective, project=project)
+        return best
 
     def get_bytesize(self) -> int:
         return 0

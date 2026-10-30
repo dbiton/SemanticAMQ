@@ -796,8 +796,8 @@ class _TimedCapConstruct(CapConstructInterface):
     among several encodings' cap counts at once), but construct_method_worker
     only ever asks for one cap count, so the inherited default
     iter_candidates (which calls construct_filter once) and finish
-    (identity) are exactly what's wanted -- only construct_filter itself
-    needs timing, same as _TimedConstruct."""
+    (identity) are exactly what's wanted. Time construct_filter and forward
+    refine_encoded so quantization-aware methods run and are timed too."""
 
     def __init__(self, inner: Any) -> None:
         self.inner = inner
@@ -807,6 +807,12 @@ class _TimedCapConstruct(CapConstructInterface):
         start = time.perf_counter()
         out = self.inner.construct_filter(filter, vectors)
         self.seconds = time.perf_counter() - start
+        return out
+
+    def refine_encoded(self, filter, vectors, cover, levels):
+        start = time.perf_counter()
+        out = self.inner.refine_encoded(filter, vectors, cover, levels)
+        self.seconds += time.perf_counter() - start
         return out
 
     def get_bytesize(self) -> int:

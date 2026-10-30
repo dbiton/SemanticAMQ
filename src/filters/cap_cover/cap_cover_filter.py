@@ -6,7 +6,7 @@ from typing import List, Optional, Sequence, Tuple, Union
 from filters.filter import Filter, InsufficientMemoryError
 from filters.cap_cover.cap_quantizers import Quantize, _ENCODINGS, _SeededPQ, _fit_scalar_codes, _PROBE_RNG  # noqa: F401
 from filters.cap_cover.cap_scan import _CapScanMixin
-from filters.cap_cover.cap_interfaces import ConstructInterface, Cover, InsertInterface
+from filters.cap_cover.cap_interfaces import ConstructInterface, Cover, EncodedCover, InsertInterface
 from filters.cap_cover.cap_geometry import (angle_between, log_cap_measure, nearest_directions, segments,
                                             segment_max, unit_rows)
 
@@ -990,8 +990,9 @@ class CapCoverFilter(_CapScanMixin, Filter):
                 f"plus its {codebook}-byte codebook.")
         # Fit codes to the members each cap holds, then settle the members
         # around the fitted directions.
-        codes = self._fit_codes_by_level(U, X, home, levels)
-        angles, _ = self._tight_angles(X, U, self._decode_levels(codes, levels), theta, home, neighbors)
+        encoded = self._encode_cover(X, U, theta, home, levels, neighbors)
+        encoded = self.construct_method.refine_encoded(self, X, encoded, levels)
+        U, codes, angles, _ = encoded
         ids, decoded = self._add_caps(U, theta, codes=codes, levels=levels)
         self._angle_lo, self._angle_hi = 0.0, float(np.pi)
         if self._narrow_angles() and len(angles):
@@ -1005,6 +1006,30 @@ class CapCoverFilter(_CapScanMixin, Filter):
                                                   vectors=X[inverse])
         self._constructed = True
         self._dirs = None
+
+    def _encode_cover(self, X, U, theta, home, levels, neighbors=None) -> EncodedCover:
+        """Fit codes and reassign members using the already trained codebooks."""
+        codes = self._fit_codes_by_level(U, X, home, levels)
+        angles, owner = self._tight_angles(
+            X, U, self._decode_levels(codes, levels), theta, home, neighbors)
+        return EncodedCover(U, codes, angles, owner)
+
+    def _encoded_volume(self, angles: np.ndarray) -> float:
+        """Unexpanded volume using the exact angle rounding used by storage.
+
+        Candidate evaluation must not change the eventual filter's angle grid.
+        """
+        if not len(angles):
+            return -np.inf
+        saved = self._angle_lo, self._angle_hi
+        try:
+            self._angle_lo, self._angle_hi = 0.0, float(np.pi)
+            if self._narrow_angles():
+                self._fit_angle_grid(angles)
+            stored = self._angle_value(self._angle_code(angles))
+            return float(np.logaddexp.reduce(log_cap_measure(stored, self.dim)))
+        finally:
+            self._angle_lo, self._angle_hi = saved
 
     # ----------------------------------------------------------------- query
     def query(self, vectors: np.ndarray, distance_threshold: float) -> List[bool]:

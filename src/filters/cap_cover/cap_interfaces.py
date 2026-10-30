@@ -19,6 +19,14 @@ class Cover(NamedTuple):
     kept: Optional[np.ndarray] = None
 
 
+class EncodedCover(NamedTuple):
+    """A fixed-encoding cover after code fitting and member reassignment."""
+    directions: np.ndarray
+    codes: np.ndarray
+    angles: np.ndarray
+    owner: np.ndarray
+
+
 class ConstructInterface(ABC):
     @abstractmethod
     def construct_filter(self, filter: 'Filter', vectors: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -54,6 +62,15 @@ class ConstructInterface(ABC):
 
     def finish(self, filter: 'Filter', vectors: np.ndarray, cover: Cover) -> Cover:
         """The final cover from a candidate iter_candidates() produced."""
+        return cover
+
+    def refine_encoded(self, filter: 'Filter', vectors: np.ndarray,
+                       cover: EncodedCover, levels: np.ndarray) -> EncodedCover:
+        """Optional refinement after encoding selection and quantizer training.
+
+        Keep the cap count, encoding levels and trained codebooks fixed. Return
+        codes and measured angles covering every member; no query tau is needed.
+        """
         return cover
 
     @abstractmethod
