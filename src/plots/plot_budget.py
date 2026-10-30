@@ -14,11 +14,11 @@ linear band (5%-20%) where a reciprocal log axis would compress the whole
 range into one corner.
 
 Panels:
-  (a) FPR on closely related negatives: queries with cosine similarity >= 0.8
+  (a) FPR on closely related negatives: queries with cosine distance <= 0.2
       to their nearest indexed vector but farther than tau -- where most
       false positives live.
-  (b) FPR on related negatives (cosine similarity 0.6-0.8).
-  (c) FPR on unrelated negatives (< 0.6): background traffic.
+  (b) FPR on related negatives (cosine distance in (0.2, 0.4]).
+  (c) FPR on unrelated negatives (cosine distance > 0.4): background traffic.
   (d) Index accesses saved over the unfiltered baseline, with each corpus's
       ceiling (the share of negative queries) as a thin dashed line.
   (e) Geometric objective log10 J_tau(C) = log10 sum_i (r_i + tau)^d -- the
@@ -177,7 +177,7 @@ def _budget_panel_raw_pct(df: pd.DataFrame, value_col: str, ylabel: str, filenam
     )
 
 
-# One FPR panel per similarity band: (column, label, filename stem).
+# One FPR panel per cosine-distance band: (column, label, filename stem).
 _FPR_PANELS = (
     ("fpr_close", "FPR (closely related negatives)", "budget-fpr-close"),
     ("fpr_related", "FPR (related negatives)", "budget-fpr-related"),
@@ -287,7 +287,7 @@ def print_summary(df: pd.DataFrame, tau: float) -> None:
             continue
         n_ref = int(sub["n_reference"].iloc[0])
         print(f"\n{BLOCKLIST_LABELS[dataset]} (|X|={n_ref}, "
-              f"median nn cosine={sub['nn_cos_med'].mean():.3f}, "
+              f"median nn cosine distance={1 - sub['nn_cos_med'].mean():.3f}, "
               f"negatives={sub['neg_share_pct'].mean():.1f}%)")
         for kf in sorted(sub["k_fraction"].unique()):
             def _m(c):

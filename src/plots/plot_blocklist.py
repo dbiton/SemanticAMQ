@@ -7,9 +7,9 @@ that one fixed budget.
 
 Every query is labeled by its distance to the reference set at tau, so the
 labels change along the tau axis. FPR is reported pooled and restricted to the
-negatives in each similarity band (runner.SIMILARITY_BANDS): queries whose
-nearest indexed vector has cosine similarity >= 0.8 (closely related), 0.6-0.8
-(related) or < 0.6 (unrelated).
+negatives in each cosine-distance band (runner.SIMILARITY_BANDS): queries whose
+nearest indexed vector has cosine distance <= 0.2 (closely related), (0.2, 0.4]
+(related) or > 0.4 (unrelated).
 
 Panels:
   (a) FPR vs tau, pooled over every negative.
@@ -40,7 +40,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from plots.plot_common import apply_style, style_axes, save_figure, mean_std, wrap_label
+from plots.plot_common import TAU_LABEL, cosine_distance, apply_style, style_axes, save_figure, mean_std, wrap_label
 
 INPUT_PATH = "results/blocklist.csv"
 OUTDIR = "plots/blocklist/"
@@ -236,25 +236,28 @@ def _tau_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cfg
     """
     sel = df[(df["sweep"] == SWEEP_TAU) & (np.isclose(df["k_fraction"], k_fraction))]
     agg = mean_std(sel, ["dataset", "tau"], value_col)
+    agg["tau_cos"] = cosine_distance(agg["tau"])
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots()
     if ceiling_col is not None:
-        _draw_ceiling(ax, mean_std(sel, ["dataset", "tau"], ceiling_col), "tau")
+        ceiling = mean_std(sel, ["dataset", "tau"], ceiling_col)
+        ceiling["tau_cos"] = cosine_distance(ceiling["tau"])
+        _draw_ceiling(ax, ceiling, "tau_cos")
     for dataset in BLOCKLIST_DATASETS:
         sub = agg[agg["dataset"] == dataset].sort_values("tau")
         if sub.empty:
             continue
-        ax.plot(sub["tau"], sub["mean"], color=BLOCKLIST_COLORS[dataset],
+        ax.plot(sub["tau_cos"], sub["mean"], color=BLOCKLIST_COLORS[dataset],
                 marker=BLOCKLIST_MARKERS[dataset], markersize=2.5, linewidth=0.8, zorder=2)
         if (sub["std"] > 0).any():
-            ax.errorbar(sub["tau"], sub["mean"], yerr=sub["std"], fmt="none",
+            ax.errorbar(sub["tau_cos"], sub["mean"], yerr=sub["std"], fmt="none",
                         ecolor=BLOCKLIST_COLORS[dataset], elinewidth=0.5, capsize=1.5,
                         capthick=0.5, zorder=3)
 
     if bounded_unit:
         ax.set_ylim(-0.05, 1.05)
-    ax.set_xlabel(r"$\tau$")
+    ax.set_xlabel(TAU_LABEL)
     ax.set_ylabel(wrap_label(ylabel))
     style_axes(ax)
     ax.grid(visible=False, axis="y")  # no horizontal gridlines
@@ -311,7 +314,7 @@ def print_summary(df: pd.DataFrame, k_fraction: float) -> None:
         sub = sel[sel["dataset"] == dataset]
         if sub.empty:
             continue
-        print(f"\n{BLOCKLIST_LABELS[dataset]} (median nn cosine {sub['nn_cos_med'].mean():.3f})")
+        print(f"\n{BLOCKLIST_LABELS[dataset]} (median nn cosine distance {1 - sub['nn_cos_med'].mean():.3f})")
         for tau in sorted(sub["tau"].unique()):
             def _m(c):
                 row = aggs[c][(aggs[c]["dataset"] == dataset) & (aggs[c]["tau"] == tau)]

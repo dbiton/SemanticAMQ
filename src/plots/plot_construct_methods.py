@@ -48,7 +48,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from plots.plot_blocklist import BLOCKLIST_LABELS
-from plots.plot_common import apply_style, mean_std, save_figure, style_axes
+from plots.plot_common import apply_style, cosine_distance, mean_std, save_figure, style_axes
 
 DPI = 300
 EMIT_PDF = False
@@ -126,8 +126,8 @@ def plot_dataset(df: pd.DataFrame, dataset: str, outdir: str, dpi: int = DPI) ->
 
     _line(ax_fpr, df, "fpr")
     ax_fpr.set_ylim(-0.05, 1.05)
-    tau = float(df["tau"].iloc[0])
-    ax_fpr.set_ylabel(rf"FPR at $\tau={tau:g}$")
+    tau = float(cosine_distance(df["tau"].iloc[0]))
+    ax_fpr.set_ylabel(rf"FPR at $\tau={tau:g}$" + "\n(cosine distance)")
 
     _line(ax_time, df, "method_s")
     ax_time.set_yscale("log")

@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from plots.plot_common import DATASETS, DATASET_COLORS, DATASET_MARKERS, apply_style, style_axes, save_figure, save_dataset_legend, mean_std, wrap_label
+from plots.plot_common import DATASETS, DATASET_COLORS, DATASET_MARKERS, TAU_LABEL, cosine_distance, apply_style, style_axes, save_figure, save_dataset_legend, mean_std, wrap_label
 
 INPUT_PATH = "results/cap_cover_system_tau.csv"
 OUTDIR = "plots/cap_cover_system_tau/"
@@ -81,6 +81,7 @@ def _line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cf
                 bounded_unit: bool = False) -> pd.DataFrame:
     sel = df[df["k"] == cfg.k_fixed]
     agg = mean_std(sel, ["dataset", "tau"], value_col)
+    agg["tau_cos"] = cosine_distance(agg["tau"])
 
     apply_style(cfg.dpi)
     fig, ax = plt.subplots()
@@ -88,16 +89,16 @@ def _line_panel(df: pd.DataFrame, value_col: str, ylabel: str, filename: str, cf
         sub = agg[agg["dataset"] == dataset].sort_values("tau")
         if sub.empty:
             continue
-        ax.plot(sub["tau"], sub["mean"], color=DATASET_COLORS[dataset], marker=DATASET_MARKERS[dataset],
+        ax.plot(sub["tau_cos"], sub["mean"], color=DATASET_COLORS[dataset], marker=DATASET_MARKERS[dataset],
                markersize=2.5, linewidth=0.8, zorder=2)
         if (sub["std"] > 0).any():
-            ax.errorbar(sub["tau"], sub["mean"], yerr=sub["std"], fmt="none",
+            ax.errorbar(sub["tau_cos"], sub["mean"], yerr=sub["std"], fmt="none",
                        ecolor=DATASET_COLORS[dataset], elinewidth=0.5, capsize=1.5, capthick=0.5, zorder=3)
 
     if bounded_unit:
         ax.set_ylim(-0.05, 1.05)
 
-    ax.set_xlabel(r"$\tau$")
+    ax.set_xlabel(TAU_LABEL)
     ax.set_ylabel(wrap_label(ylabel))
     style_axes(ax)
 

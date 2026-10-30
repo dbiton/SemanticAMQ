@@ -31,6 +31,14 @@ DATASET_COLORS = {
 DATASET_MARKERS = {"eli5": "o", "mmlu": "s", "wildchat": "^", "msmarco": "D", "hotpotqa": "v"}
 
 
+TAU_LABEL = r"$\tau$ (cosine distance)"
+
+
+def cosine_distance(tau_l2):
+    """Convert stored L2 distances between unit vectors for plot presentation."""
+    return np.asarray(tau_l2, dtype=float) ** 2 / 2.0
+
+
 def apply_style(dpi: int = 300) -> None:
     plt.rcParams.update({
         # Scaled by the same 1.2x as the font sizes below, so the ratio of

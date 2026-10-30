@@ -26,8 +26,8 @@ Thresholds are displayed as cosine distance; the stored CSV threshold values
 are converted only for presentation.
 
 The sweeps figure's FPR panels group the negatives by how related a query is
-to the indexed set -- the cosine similarity to its nearest construct vector:
-closely related (>= 0.8), related (0.6-0.8), unrelated (< 0.6)
+to the indexed set -- the cosine distance to its nearest construct vector:
+closely related (<= 0.2), related (0.2-0.4, excluding 0.2), unrelated (> 0.4)
 (runner.SIMILARITY_BANDS).
 
 Runs may be in progress, so every figure tolerates missing corpora and cells:
@@ -43,6 +43,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+from plots.plot_common import TAU_LABEL, cosine_distance
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 RESULTS = ROOT / "results"
@@ -156,9 +158,12 @@ INSERT_SHOWN = {
     "cap_merge": ("cap merge", BLUE, "D", "-"),
     "static_rebuild": ("static rebuild (oracle)", INK, None, "--"),
 }
-# FPR panel per similarity band on the sweeps (column suffix -> title).
-BAND_TITLE = {"close": "closely related\n($\\cos\\geq0.8$)", "related": "related\n($0.6\\leq\\cos<0.8$)",
-                "unrelated": "unrelated\n($\\cos<0.6$)"}
+# FPR panel per cosine-distance band (the stored band columns are unchanged).
+BAND_TITLE = {
+    "close": "closely related\ncosine distance\n$\\leq0.2$",
+    "related": "related\ncosine distance\n$(0.2,0.4]$",
+    "unrelated": "unrelated\ncosine distance\n$>0.4$",
+}
 
 plt.rcParams.update({
     "font.size": 8, "axes.titlesize": 8, "axes.labelsize": 8,
@@ -181,14 +186,6 @@ GAP_LABELLED = 0.62
 MARGIN_TOP = 0.32
 
 PCT_FMT = matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:g}")
-
-
-def cosine_distance(tau_l2):
-    """Convert stored (L2) thresholds to cosine distance for the paper figures."""
-    return np.asarray(tau_l2, dtype=float) ** 2 / 2.0
-
-
-TAU_LABEL = "$\\tau$ (cosine distance)"
 
 
 def save(fig, name):
@@ -271,10 +268,11 @@ def sweeps_grid():
     n_fpr, nrows = len(BAND_TITLE), len(sweeps)
     spacer = GAP_LABELLED - 2 * GAP_SHARED  # blank column before the accesses-saved panel
     width = (n_fpr + 1) * PANEL + spacer + (n_fpr + 1) * GAP_SHARED
-    height = nrows * PANEL + (nrows - 1) * GAP_LABELLED + MARGIN_TOP
+    title_margin = MARGIN_TOP + 0.14  # one extra line for explicit cosine-distance units
+    height = nrows * PANEL + (nrows - 1) * GAP_LABELLED + title_margin
     fig, grid = plt.subplots(
         nrows, n_fpr + 2, figsize=(width, height), squeeze=False,
-        gridspec_kw=dict(left=0, right=1, bottom=0, top=1 - MARGIN_TOP / height,
+        gridspec_kw=dict(left=0, right=1, bottom=0, top=1 - title_margin / height,
                          width_ratios=[1] * n_fpr + [spacer / PANEL, 1],
                          wspace=GAP_SHARED / PANEL, hspace=GAP_LABELLED / PANEL))
     for ax in grid[:, n_fpr]:

@@ -28,7 +28,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullFormatter
 
 from filters.cap_cover.cap_cover_filter import AUTO_CANDIDATES
-from plots.plot_common import apply_style as _apply_style, collapse_duplicate_x, save_figure
+from plots.plot_common import apply_style as _apply_style, collapse_duplicate_x, cosine_distance, save_figure
 
 # CONFIG
 
@@ -229,7 +229,8 @@ def panel_geometric_objective(df: pd.DataFrame, cfg: Config, raw_pct: bool = Fal
 
 def panel_threshold_objective(df: pd.DataFrame, cfg: Config, raw_pct: bool = False) -> pd.DataFrame:
     def annotate(ax: plt.Axes) -> None:
-        ax.text(0.97, 0.95, rf"$\tau = {cfg.tau:g}$", transform=ax.transAxes, ha="right", va="top", fontsize=6.6)
+        ax.text(0.97, 0.95, rf"$\tau = {float(cosine_distance(cfg.tau)):g}$" + "\n(cosine distance)",
+                transform=ax.transAxes, ha="right", va="top", fontsize=6.6)
 
     filename = "cap-quantization-threshold-expanded-objective.png"
     return _line_panel(df, "log10_J_tau", r"$\log_{10} J_\tau(\mathcal{C})$",
@@ -278,7 +279,8 @@ def panel_index_accesses_saved(df: pd.DataFrame, cfg: Config, raw_pct: bool = Fa
     def annotate(ax: plt.Axes) -> None:
         if ceiling is not None:
             ax.axhline(ceiling, color="0.4", linestyle="--", linewidth=0.5, zorder=1)
-        ax.text(0.03, 0.95, rf"$\tau = {cfg.tau:g}$", transform=ax.transAxes, ha="left", va="top", fontsize=6.6)
+        ax.text(0.03, 0.95, rf"$\tau = {float(cosine_distance(cfg.tau)):g}$" + "\n(cosine distance)",
+                transform=ax.transAxes, ha="left", va="top", fontsize=6.6)
 
     filename = "cap-quantization-index-accesses-saved.png"
     return _line_panel(df, "index_accesses_saved_pct", "Index Accesses Saved (%)",
