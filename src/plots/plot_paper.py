@@ -51,6 +51,12 @@ OUT_FIG = ROOT / "suggestions" / "figures"
 DIM = 384
 FP32_BYTES = 4
 
+# Filter allocation relative to the raw FP32 embedding storage.
+MEMORY_RATIO = r"M_{\mathrm{filter}}/M_{\mathrm{raw}}"
+MEMORY_AXIS = f"${MEMORY_RATIO}$ (%)"
+MEMORY_AXIS_LOG = MEMORY_AXIS + "\nlog scale"
+MEMORY_FMT = matplotlib.ticker.FuncFormatter(lambda value, _: f"{100 * value:g}")
+
 CORPORA = ["WildChat", "Quora", "WikiAnswers", "ChatGPTParaphrases", "CCNews"]
 CORPUS_NAME = {
     "wildchat": "WildChat", "quora": "Quora", "wikianswers": "WikiAnswers",
@@ -259,8 +265,8 @@ def sweeps_grid():
     blocklist["tau_cos"] = cosine_distance(blocklist.tau)
     tau_mem = float(blocklist.memory_fraction.iloc[0])
     budget_tau = float(cosine_distance(budget.tau.iloc[0]))
-    sweeps = [(budget, "memory_fraction", "memory budget $B/M$", f"FPR\n($\\tau={budget_tau:g}$)", PCT_FMT),
-              (blocklist, "tau_cos", TAU_LABEL, f"FPR\n($B={tau_mem:g}M$)", None)]
+    sweeps = [(budget, "memory_fraction", MEMORY_AXIS, f"FPR\n($\\tau={budget_tau:g}$)", MEMORY_FMT),
+              (blocklist, "tau_cos", TAU_LABEL, f"FPR\n(${MEMORY_RATIO}={100 * tau_mem:g}\\%$)", None)]
 
     n_fpr, nrows = len(BAND_TITLE), len(sweeps)
     spacer = GAP_LABELLED - 2 * GAP_SHARED  # blank column before the accesses-saved panel
@@ -393,7 +399,7 @@ def quantization(mode="saved"):
         all_ticks = sorted(q.budget_pct.unique())
         ticks = [all_ticks[i] for i in sorted({0, len(all_ticks) // 2, len(all_ticks) - 1})]
         ax.set_xticks(ticks)
-        ax.set_xticklabels([f"{t:.2g}" for t in ticks], fontsize=6)
+        ax.set_xticklabels([f"{100 * t:.2g}" for t in ticks], fontsize=6)
         ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
     if throughput:
         axes[0, 0].set_yscale("log")
@@ -412,7 +418,7 @@ def quantization(mode="saved"):
                   "SPQ48": r"SPQ $12\times12$", "SPQ64": r"SPQ $6\times8$"}
     labels = [spq_labels.get(enc, enc) for enc in top] + ["one cap per vector"]
     fig_legend(fig, handles, labels, ncol=len(labels))
-    shared_xlabel(axes, "memory budget $B/M$ (log)")
+    shared_xlabel(axes, MEMORY_AXIS_LOG)
     save(fig, {"saved": "quantization-saved-vs-memory", "throughput": "quantization-throughput-vs-memory",
                "speedup": "quantization-speedup-vs-memory"}[mode])
 
@@ -449,7 +455,7 @@ def construction():
                             marker=marker, ls=ls, ms=3, capsize=1.2, elinewidth=0.7,
                             mfc="white" if hollow else color)
         ax.set_xscale("log")
-        ax.xaxis.set_major_formatter(PCT_FMT)
+        ax.xaxis.set_major_formatter(MEMORY_FMT)
     axes[0, 0].set_ylabel("FPR")
     axes[0, 0].set_ylim(-0.03, 1.05)
     handles, labels = [], []
@@ -459,7 +465,7 @@ def construction():
                                       mfc="white" if hollow else color))
             labels.append(f"{name} ({enc_label})")
     fig_legend(fig, handles, labels, ncol=len(CONSTRUCT_ENCODINGS))
-    shared_xlabel(axes, "filter memory $B/M$ (log)")
+    shared_xlabel(axes, MEMORY_AXIS_LOG)
     save(fig, "construction-fpr-vs-k")
 
 
@@ -544,11 +550,11 @@ def equal_memory_zero_fn():
             if not g.empty:
                 ax.plot(g.pct_raw, g.FPR, color=color, marker=marker, ls=ls, ms=3)
         ax.set_xscale("log")
-        ax.xaxis.set_major_formatter(PCT_FMT)
+        ax.xaxis.set_major_formatter(MEMORY_FMT)
     axes[0, 0].set_ylabel("FPR")
     axes[0, 0].set_ylim(-0.03, 1.05)
     fig_legend(fig, handles, list(styles), ncol=len(styles))
-    shared_xlabel(axes, "memory budget $B/M$ (log)")
+    shared_xlabel(axes, MEMORY_AXIS_LOG)
     save(fig, "equal-memory-zero-fn-fpr-vs-budget")
 
 
@@ -571,10 +577,10 @@ def equal_memory_nonzero_fn():
             if not g.empty:
                 ax.plot(g.pct_raw, g[column], color=color, marker=marker, ls=ls, ms=3)
         ax.set_xscale("log")
-        ax.xaxis.set_major_formatter(PCT_FMT)
+        ax.xaxis.set_major_formatter(MEMORY_FMT)
         ax.set_ylabel(label)
         ax.set_ylim(-0.03, 1.05)
-        ax.set_xlabel("memory budget $B/M$ (log)")
+        ax.set_xlabel(MEMORY_AXIS_LOG)
     fig_legend(fig, handles, list(styles), ncol=len(styles))
     save(fig, f"equal-memory-nonzero-fn-{corpus.lower()}")
 
@@ -634,10 +640,10 @@ def throughput():
     at_budget = d[np.isclose(d.memory_fraction, E2E_MEMORY_FRACTION)]
     at_tau = d[np.isclose(d.tau, E2E_TAU)]
     fixed_tau = f"fixed $\\tau={float(cosine_distance(E2E_TAU)):g}$"
-    fixed_memory = f"$B={E2E_MEMORY_FRACTION:g}M$"
+    fixed_memory = f"${MEMORY_RATIO}={100 * E2E_MEMORY_FRACTION:g}\\%$"
     panels = [
         (at_budget, "tau_cos", TAU_LABEL, f"fixed {fixed_memory}", False),
-        (at_tau, "memory_fraction", "filter memory $B/M$ (log)", fixed_tau, True),
+        (at_tau, "memory_fraction", MEMORY_AXIS_LOG, fixed_tau, True),
         (None, "backend", "backend cost $L$ (log)", fixed_tau + ", " + fixed_memory, True),
     ]
     width = len(panels) * PANEL + (len(panels) - 1) * GAP_LABELLED
@@ -669,12 +675,15 @@ def throughput():
         ax.set_yscale("symlog", linthresh=Y_LINTHRESH)
         if logx:
             ax.set_xscale("log")
-            ax.xaxis.set_major_formatter(PCT_FMT)
+            ax.xaxis.set_major_formatter(MEMORY_FMT)
             ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
         if x == "tau_cos":
             ax.set_xlim(agg.x.min() - 0.005, agg.x.max() + 0.005)
             ax.set_xticks(TAU_TICKS)
             ax.xaxis.set_major_formatter(PCT_FMT)
+        if x == "memory_fraction":
+            ax.set_xlim(0.005, 0.05)
+            ax.set_xticks([0.005, 0.01, 0.02, 0.03, 0.05])
         ax.set_xlabel(xlabel)
         ax.set_title(title, color=INK)
     # One y range for all panels, so the zero line sits at the same height.
