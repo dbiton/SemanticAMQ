@@ -497,8 +497,8 @@ def construction():
         labels.append(name)
     fig_legend(fig, handles, labels, ncol=len(labels))
     axes[0, len(CORPORA) // 2].set_title(
-        CORPUS_LABEL[CORPORA[len(CORPORA) // 2]]
-        + f"\n$\\tau={float(cosine_distance(c.tau.iloc[0])):g}$ (unquantized)", color=INK)
+        f"$\\tau={float(cosine_distance(c.tau.iloc[0])):g}$ (unquantized)\n"
+        + CORPUS_LABEL[CORPORA[len(CORPORA) // 2]], color=INK)
     shared_xlabel(axes, MEMORY_AXIS_LOG)
     save(fig, "construction-fpr-vs-k")
 

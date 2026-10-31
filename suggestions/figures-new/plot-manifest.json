@@ -1,7 +1,7 @@
 {
-  "generated_at_utc": "2026-10-31T17:35:36.301012+00:00",
+  "generated_at_utc": "2026-10-31T17:38:43.838863+00:00",
   "source_root": "/Users/bitondvir-david/Desktop/results",
-  "plot_script_sha256": "02abaf2de7b1ad3b1a37cd8252dad0430a5a060579d6f051b37746a8e61223cd",
+  "plot_script_sha256": "91de9cc12ee142b0f8cbb5e23cc8ea4a12ccdb08b251b1b7951529db0f53129d",
   "threshold_units": "stored L2 thresholds are displayed as cosine distance = L2 squared / 2",
   "paper_caption_checks": [
     "Figure 4 reports modeled speedup, not a direct end-to-end timing measurement.",
@@ -166,8 +166,8 @@
         }
       ],
       "outputs": {
-        "construction-fpr-vs-k.pdf": "939be1f9d590c94c94aa64037791afe2097932a92027d78be6d93586acb6d314",
-        "construction-fpr-vs-k.png": "465550b9c0cb33e26ebf3ec6b9fecdd25ec57be65095ca99b409b8fc24850d30"
+        "construction-fpr-vs-k.pdf": "3cca60ab721efa60f15360075b9153dac7ab54f0fc59a387a364662ac61c35de",
+        "construction-fpr-vs-k.png": "d048fc0af25d91f0b50c6cf68265c39ae80e2de5c6d61dc20acb46f9f4c5caee"
       }
     },
     "streaming": {
