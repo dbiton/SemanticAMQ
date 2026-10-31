@@ -683,13 +683,10 @@ def throughput():
     at_budget = d[np.isclose(d.budget, fixed_budget)]
     if at_budget.empty:
         raise ValueError(f"no throughput rows at fixed budget {fixed_budget:g}")
-    # Do not manufacture a memory sweep at a threshold with only one budget.
+    # Keep both fixed-threshold panels at the requested threshold, even when
+    # the available data contains only one measured budget per corpus.
     sweep_tau = E2E_TAU
     at_tau = d[np.isclose(d.tau, sweep_tau)]
-    if at_tau.budget.nunique() < 2:
-        sweep_tau = float(d.groupby("tau").budget.nunique().idxmax())
-        at_tau = d[np.isclose(d.tau, sweep_tau)]
-        print(f"  throughput memory sweep available at cosine distance {float(cosine_distance(sweep_tau)):g}")
     fixed_tau = f"fixed $\\tau={float(cosine_distance(E2E_TAU)):g}$"
     # A fixed cap budget can have different stored footprints across corpora.
     # Show the measured memory range rather than relabelling a cap fraction.
@@ -846,7 +843,7 @@ def plot_figures(requested=None, results=None, out=None):
             "Figure 4 reports modeled speedup, not a direct end-to-end timing measurement.",
             "Figure 6 uses only FP32 rows; its threshold is taken from the source CSV, not the PDF caption.",
             "Fixed TQ2 and TQ4 baselines retain their encoding labels and are not named automatic selection.",
-            "The throughput memory sweep uses an observed multi-budget threshold; see its panel title.",
+            "Both fixed-threshold throughput panels use the configured cosine distance; a single available budget is plotted as a point.",
         ],
         "figures": {},
     }

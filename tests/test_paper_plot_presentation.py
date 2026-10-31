@@ -37,7 +37,7 @@ class TestPaperPlotPresentation(unittest.TestCase):
             np.testing.assert_allclose(np.asarray(line.get_ydata(), dtype=float), 0.7)
         self.assertIn("soft anneal", [t.get_text() for t in fig.legends[0].texts])
 
-    def test_legacy_throughput_uses_actual_memory_and_observed_threshold(self):
+    def test_legacy_throughput_keeps_requested_threshold_with_one_budget(self):
         data = pd.DataFrame([
             {"dataset": "quora", "seed": 0, "k_fraction": kf, "n_reference": 100,
              "memory_bytes": memory, "tau": tau, "n_queries": 100,
@@ -50,14 +50,14 @@ class TestPaperPlotPresentation(unittest.TestCase):
         with patch.object(plots.pd, "read_csv", return_value=data.copy()), patch.object(plots, "save") as save:
             plots.throughput()
         fig = save.call_args.args[0]
-        self.assertIn("0.02", fig.axes[1].get_title())
+        self.assertIn("0.05", fig.axes[1].get_title())
         self.assertIn("0.05", fig.axes[2].get_title())
         for ax in (fig.axes[0], fig.axes[2]):
             self.assertIn(plots.MEMORY_RATIO, ax.get_title())
             self.assertIn("1.30", ax.get_title())
             self.assertNotIn("k/|X|", ax.get_title())
         np.testing.assert_allclose(np.asarray(fig.axes[1].lines[0].get_xdata(), dtype=float),
-                                   np.array([1000, 2000]) / (100 * 384 * 4))
+                                   np.array([2000]) / (100 * 384 * 4))
         pd.testing.assert_frame_equal(data, original)
 
     def test_crowded_ticks_are_pruned_without_changing_the_curve(self):
