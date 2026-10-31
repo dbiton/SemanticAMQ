@@ -1,7 +1,7 @@
 {
-  "generated_at_utc": "2026-10-31T15:46:39.940256+00:00",
+  "generated_at_utc": "2026-10-31T15:51:31.269067+00:00",
   "source_root": "/Users/bitondvir-david/Desktop/results",
-  "plot_script_sha256": "ec7396bc46829076117c17b99f83352652ab9bb97b8ed26d09b1d3010a8715f8",
+  "plot_script_sha256": "88f733e8be38ddfc31e6d9ea856c6a8137218a447c954d0bb5fe0fbf7d494f23",
   "threshold_units": "stored L2 thresholds are displayed as cosine distance = L2 squared / 2",
   "paper_caption_checks": [
     "Figure 4 reports modeled speedup, not a direct end-to-end timing measurement.",
@@ -25,7 +25,7 @@
         }
       ],
       "outputs": {
-        "sweeps-grid.pdf": "eecba931e03eac0855894843f50501ab550511beac0c15dc36df3404070f2cb6",
+        "sweeps-grid.pdf": "20b920446a5de0ccb3600915dfa0dfcc6afe9ddde0066c8fbd4bd156e4bf4e8d",
         "sweeps-grid.png": "a156d41da0805e059903ed941baded0e18be3f86753dbdad54e640eec18f1678"
       }
     },
@@ -59,7 +59,7 @@
         }
       ],
       "outputs": {
-        "quantization-saved-vs-memory.pdf": "aa360f172aabff2af67ecfca21813423b64ec0e978a73a0acb0ee6ebbcf32755",
+        "quantization-saved-vs-memory.pdf": "75e557dad72f20475bc63a584da306ff18e1bbea95298493411bf3171e7cdb2a",
         "quantization-saved-vs-memory.png": "09dcd3f7673e239c6a512e626d198e58f3d69400bca7bbd6b26275babb5704a2"
       }
     },
@@ -93,7 +93,7 @@
         }
       ],
       "outputs": {
-        "quantization-throughput-vs-memory.pdf": "98c89f724cbc82757218d6cd99bd5ea7b01ab49ec79741e94e263f7be4d52dbd",
+        "quantization-throughput-vs-memory.pdf": "b5af77ccc0158700ac374da3ed03dd14da8292c233834185e7efe8ad1f49eca0",
         "quantization-throughput-vs-memory.png": "92417e6a1887dc32cf5de19a1f11cd00db6f84e135304066275aee8f4bb089b1"
       }
     },
@@ -132,7 +132,7 @@
         }
       ],
       "outputs": {
-        "quantization-speedup-vs-memory.pdf": "c35512a1afb500be454b80d8c92b31b8aa6c194c674d55e5972401f7c830209b",
+        "quantization-speedup-vs-memory.pdf": "ef1197354ad9e01a8c97ba125e482bc2ae81c9e607f127eb04d6b522e010e9a2",
         "quantization-speedup-vs-memory.png": "251d93f4d1efb0039330c71e866a7ac8d3517c9e49a5444a0018fda6c8302ba5"
       }
     },
@@ -166,7 +166,7 @@
         }
       ],
       "outputs": {
-        "construction-fpr-vs-k.pdf": "10d38436e3ee611c79955cf4a653663d930c143143a2988ed236f2b0bc0bb489",
+        "construction-fpr-vs-k.pdf": "534c6acff179caf2c471201d44b8fbaba39fd68609e2d54b809c4055c47cc26a",
         "construction-fpr-vs-k.png": "465550b9c0cb33e26ebf3ec6b9fecdd25ec57be65095ca99b409b8fc24850d30"
       }
     },
@@ -200,7 +200,7 @@
         }
       ],
       "outputs": {
-        "streaming-fpr-vs-position.pdf": "ad6563ae160916407520f194261f387c304366c020428b91c81b68d0fff97770",
+        "streaming-fpr-vs-position.pdf": "b45105c480afcbc80f492170311f2d37faa5eda234a5dfc85e4a7446058082e7",
         "streaming-fpr-vs-position.png": "ab422c68968e87f3712aec30909593179d27bdb23c0b3177e9be3d94124b273a"
       }
     },
@@ -234,7 +234,7 @@
         }
       ],
       "outputs": {
-        "equal-memory-zero-fn-fpr-vs-budget.pdf": "9097f9c4f8aff88fb9d14526233e5148f111f26f6351a9b4a0ee33268270446f",
+        "equal-memory-zero-fn-fpr-vs-budget.pdf": "23c6f209966311a135924d221f3915fa34f7d307eae7f15553b45305a82b882a",
         "equal-memory-zero-fn-fpr-vs-budget.png": "102b35c53f92819f2a09ed39191c23a76dee0f4f12052a8d655dac5545b9656e"
       }
     },
@@ -268,7 +268,7 @@
         }
       ],
       "outputs": {
-        "equal-memory-nonzero-fn-quora.pdf": "b4c6c1e77e22258fb465b0f30e6df5a392353aebcd45ebd9067b482ecb530f7a",
+        "equal-memory-nonzero-fn-quora.pdf": "1faac420d85eaba289021b511c93d4beaeb435949f52c779b6b1b6f092c9836a",
         "equal-memory-nonzero-fn-quora.png": "d6eb626186850c69f51582d86a4468f288959ab29c1e0a6f23da83b04a1516e1"
       }
     },
@@ -282,8 +282,8 @@
         }
       ],
       "outputs": {
-        "throughput-improvement.pdf": "ebf498268fd0bf7c1a8235dc52f13e38d54004b8420503497852683d65462061",
-        "throughput-improvement.png": "04b82757388145dfcd1c286c2d742694aa679752d156d01f69940d9c0d12a0d8"
+        "throughput-improvement.pdf": "2cceb8d86af3b5e6763c5e91775c175b1ba2b18025f958b350caee3899ebdb56",
+        "throughput-improvement.png": "278dccf53917c4e98114b6237e718a361182c0c7bec1cd60a8e220fe956a7baa"
       }
     }
   }

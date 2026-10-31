@@ -691,10 +691,14 @@ def throughput():
         at_tau = d[np.isclose(d.tau, sweep_tau)]
         print(f"  throughput memory sweep available at cosine distance {float(cosine_distance(sweep_tau)):g}")
     fixed_tau = f"fixed $\\tau={float(cosine_distance(E2E_TAU)):g}$"
-    fixed_memory = (f"$k/|X|={100 * fixed_budget:g}\\%$" if legacy
-                    else f"memory budget {100 * fixed_budget:g}\\%")
+    # A fixed cap budget can have different stored footprints across corpora.
+    # Show the measured memory range rather than relabelling a cap fraction.
+    memory_low = f"{100 * at_budget.memory_ratio.min():.2f}"
+    memory_high = f"{100 * at_budget.memory_ratio.max():.2f}"
+    memory_value = memory_low if memory_low == memory_high else f"{memory_low}–{memory_high}"
+    fixed_memory = f"${MEMORY_RATIO}$\n${memory_value}\\%$"
     panels = [
-        (at_budget, "tau_cos", TAU_LABEL, f"fixed {fixed_memory}", False),
+        (at_budget, "tau_cos", TAU_LABEL, fixed_memory, False),
         (at_tau, "memory_ratio", MEMORY_AXIS_LOG,
          f"fixed $\\tau={float(cosine_distance(sweep_tau)):g}$", True),
         (None, "backend", "backend lookup cost $L$", fixed_tau + "\n" + fixed_memory, True),

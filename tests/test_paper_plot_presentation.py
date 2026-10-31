@@ -52,6 +52,10 @@ class TestPaperPlotPresentation(unittest.TestCase):
         fig = save.call_args.args[0]
         self.assertIn("0.02", fig.axes[1].get_title())
         self.assertIn("0.05", fig.axes[2].get_title())
+        for ax in (fig.axes[0], fig.axes[2]):
+            self.assertIn(plots.MEMORY_RATIO, ax.get_title())
+            self.assertIn("1.30", ax.get_title())
+            self.assertNotIn("k/|X|", ax.get_title())
         np.testing.assert_allclose(np.asarray(fig.axes[1].lines[0].get_xdata(), dtype=float),
                                    np.array([1000, 2000]) / (100 * 384 * 4))
         pd.testing.assert_frame_equal(data, original)
