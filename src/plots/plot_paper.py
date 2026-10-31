@@ -163,11 +163,11 @@ INSERT_SHOWN = {
     "cap_merge": ("cap merge", BLUE, "D", "-"),
     "static_rebuild": ("static rebuild (oracle)", INK, None, "--"),
 }
-# FPR panel per cosine-distance band (the stored band columns are unchanged).
+# Query bands use cosine similarity to the nearest indexed vector.
 BAND_TITLE = {
-    "close": "min cos distance to $X$\n$\\leq0.2$",
-    "related": "min cos distance to $X$\n$(0.2,0.4]$",
-    "unrelated": "min cos distance to $X$\n$>0.4$",
+    "close": "Very related to $X$\n$\\mathrm{cos\\_sim}\\geq0.8$",
+    "related": "Moderately related to $X$\n$0.6\\leq\\mathrm{cos\\_sim}<0.8$",
+    "unrelated": "Least related to $X$\n$\\mathrm{cos\\_sim}<0.6$",
 }
 
 plt.rcParams.update({
