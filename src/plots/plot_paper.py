@@ -165,9 +165,9 @@ INSERT_SHOWN = {
 }
 # FPR panel per cosine-distance band (the stored band columns are unchanged).
 BAND_TITLE = {
-    "close": "closely related\ncosine distance\n$\\leq0.2$",
-    "related": "related\ncosine distance\n$(0.2,0.4]$",
-    "unrelated": "unrelated\ncosine distance\n$>0.4$",
+    "close": "Nearest cosine\ndistance to $X$\n$\\leq0.2$",
+    "related": "Nearest cosine\ndistance to $X$\n$(0.2,0.4]$",
+    "unrelated": "Nearest cosine\ndistance to $X$\n$>0.4$",
 }
 
 plt.rcParams.update({
