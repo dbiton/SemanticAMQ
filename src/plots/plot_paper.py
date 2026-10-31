@@ -1,4 +1,4 @@
-"""The figures paper.tex uses, built only from existing results/ CSVs
+"""The paper's figures, built only from existing results/ CSVs
 (src/paper.py generates exactly the data they need).
 
 Nothing here runs a filter or a sweep. Outputs (PDF for the paper, PNG preview)
@@ -6,18 +6,22 @@ go to suggestions/figures/ under the names paper.tex includes:
 
     sweeps-grid.*                      fig:end-to-end   budget.csv + blocklist.csv
     quantization-saved-vs-memory.*     fig:quantization cap_quantization/<corpus>/*.csv
-    quantization-speedup-vs-memory.*, quantization-throughput-vs-memory.* (not in the paper) cap_quantization/<corpus>/*.csv
+    quantization-speedup-vs-memory.*  PDF Figure 4    cap_quantization/<corpus>/*.csv
+    quantization-throughput-vs-memory.* (supplement) cap_quantization/<corpus>/*.csv
     construction-fpr-vs-k.*            fig:construction construct_methods/<corpus>.csv
     streaming-fpr-vs-position.*        fig:streaming    streaming/<corpus>/streaming.csv
     equal-memory-zero-fn-fpr-vs-budget.*      fig:equal-memory          equal_memory/<corpus>/equal_memory.csv
-    equal-memory-nonzero-fn-wikianswers.*     fig:equal-memory-nonzero-fn  (same)
+    equal-memory-nonzero-fn-quora.*     PDF Figure 5    (same)
     throughput-improvement.*           fig:throughput   end_to_end.csv
 (The tables of plots/tables_paper.py and plots/table_quantization.py are not drawn here.)
 
 (figures/scheme.pdf is a hand-drawn diagram and is not produced here.)
 
 Run from the repo root with the global Python 3.12:
-    PYTHONPATH=src python src/plots/plot_paper.py [results-folder] [figure ...]
+    PYTHONPATH=src python src/plots/plot_paper.py [results-folder] [figure ...] [--out directory]
+Use --paper-only to render data Figures 2–7 in the current paper.pdf.
+Each run writes plot-manifest.json with input row counts, SHA-256 hashes,
+output hashes, and the mapping from paper figure numbers to filenames.
 results-folder defaults to results/. Figure names are the keys of FIGURES
 (sweeps, quantization, construction, streaming, equal-memory-zero-fn,
 equal-memory-nonzero-fn, throughput, quantization-throughput, quantization-speedup); default is all.
@@ -34,7 +38,9 @@ Runs may be in progress, so every figure tolerates missing corpora and cells:
 a gap is drawn as a gap, never filled from a different subset.
 """
 
-import sys
+import hashlib
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import matplotlib
@@ -84,11 +90,13 @@ CORPUS_STYLE = {
     "ChatGPTParaphrases": (VIOLET, "D"), "CCNews": (MAGENTA, "v"),
 }
 
-# Equal-memory methods: Cap-Cover is always blue, one line per encoding.
-CAP_COVER = "Cap-Cover (TQ2)"
-CAP_COVER_TQ4 = "Cap-Cover (TQ4)"
+# Keep automatic selection distinct from explicitly fixed encodings.
+CAP_COVER = "CapCover Filter"
+CAP_COVER_TQ2 = "CapCover Filter (TQ2)"
+CAP_COVER_TQ4 = "CapCover Filter (TQ4)"
 METHOD_STYLE = {
     CAP_COVER: (BLUE, "o", "-"),
+    CAP_COVER_TQ2: (BLUE, "o", "-"),
     CAP_COVER_TQ4: (BLUE, "s", "--"),
     "QuantizedVector": (ORANGE, "s", "-"),
     "IVF-PQ": (AQUA, "^", "-"),
@@ -100,7 +108,7 @@ METHOD_STYLE = {
     "VA+-file": (MAGENTA, "*", "-"),
 }
 CONFIG_TO_METHOD = {
-    "CapCoverFilter": CAP_COVER, "CapCoverFilter (TQ2)": CAP_COVER, "CapCoverFilter (TQ4)": CAP_COVER_TQ4,
+    "CapCoverFilter": CAP_COVER, "CapCoverFilter (TQ2)": CAP_COVER_TQ2, "CapCoverFilter (TQ4)": CAP_COVER_TQ4,
     "QuantizedVectorFilter": "QuantizedVector",
     "IVFFilter": "IVF-PQ", "IVFRadiiFilter": "IVF-Radii", "HNSWFilter": "HNSW",
     "DSHFilter": "DSH", "MLPFilter": "MLP",
@@ -142,15 +150,12 @@ E2E_MEMORY_FRACTION = 0.02
 E2E_TAUS = tuple(l2_threshold(t) for t in PAPER_TAUS_COS)
 E2E_MEMORY_FRACTIONS = (0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05)
 
-# Construction methods shown (CSV key -> label, color, marker), each drawn unquantized (dashed,
-# open markers), at TQ2 (solid) and at TQ4 (dash-dot): one line per method and encoding.
+# Construction methods shown with full-precision directions (PDF Figure 6).
 CONSTRUCT_SHOWN = {
     "gonzalez": ("Gonzalez", INK_MUTED, "o"),
     "minimax": ("minimax", ORANGE, "s"),
-    "soft_anneal": ("annealing", GREEN, "v"),
+    "soft_anneal": ("soft anneal", GREEN, "v"),
 }
-CONSTRUCT_ENCODINGS = {"FP32": ("unquantized", "--", True), "TQ2": ("TQ2", "-", False),
-                       "TQ4": ("TQ4", "-.", False)}   # key -> label, linestyle, hollow
 # Insertion strategies shown. The initial cover is built with STREAM_BOOTSTRAP.
 STREAM_BOOTSTRAP = "sphere_merge"
 INSERT_SHOWN = {
@@ -181,19 +186,47 @@ plt.rcParams.update({
 # on whether neighbours share an axis. Axis labels and legends fall outside the
 # grid and are kept by the tight bounding box.
 PANEL = 1.2
-GAP_SHARED = 0.12
-GAP_LABELLED = 0.62
-MARGIN_TOP = 0.32
+GAP_SHARED = 0.22
+GAP_LABELLED = 0.85
+MARGIN_TOP = 0.48
 
 PCT_FMT = matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:g}")
 
 
 def save(fig, name):
+    _readable_axes(fig)
     OUT_FIG.mkdir(parents=True, exist_ok=True)
     fig.savefig(OUT_FIG / f"{name}.pdf")
     fig.savefig(OUT_FIG / f"{name}.png")
     plt.close(fig)
-    print(f"  figures/{name}.pdf")
+    print(f"  {OUT_FIG / name}.pdf")
+
+
+def _readable_axes(fig):
+    """Keep tick text clear of neighbouring ticks, axes, and axis titles."""
+    for ax in fig.axes:
+        ax.tick_params(axis="both", which="major", pad=4)
+        ax.xaxis.labelpad = 7
+        ax.yaxis.labelpad = 7
+        ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+    # Prune crowded x ticks using rendered extents, preserving the end ticks
+    # and their original formatting (percentages, ms, etc.).
+    for ax in fig.axes:
+        for _ in range(12):
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            lo, hi = sorted(ax.get_xlim())
+            ticks = [(loc, label) for loc, label in zip(ax.get_xticks(), ax.get_xticklabels())
+                     if lo <= loc <= hi and label.get_visible() and label.get_text()]
+            collision = next((i for i in range(len(ticks) - 1)
+                              if ticks[i][1].get_window_extent(renderer).x1 + 5
+                              > ticks[i + 1][1].get_window_extent(renderer).x0), None)
+            if collision is None or len(ticks) <= 2:
+                break
+            remove = collision + 1 if collision + 1 < len(ticks) - 1 else collision
+            ticks.pop(remove)
+            ax.set_xticks([loc for loc, _ in ticks])
+            ax.set_xticklabels([label.get_text() for _, label in ticks])
 
 
 def fig_legend(fig, handles, labels, ncol):
@@ -405,7 +438,7 @@ def quantization(mode="saved"):
     elif speedup:
         axes[0, 0].set_yscale("symlog", linthresh=Y_LINTHRESH)
         axes[0, 0].axhline(0, color=INK_MUTED, lw=0.8)
-        axes[0, 0].set_ylabel("throughput improvement (%)")
+        axes[0, 0].set_ylabel("modeled throughput\nimprovement (%)")
     else:
         axes[0, 0].set_ylabel("index accesses saved (%)")
         axes[0, 0].set_ylim(-2, 100)
@@ -434,11 +467,15 @@ def quantization_speedup():
 # ---------------------------------------------------------------------------
 
 def construction():
+    """PDF Figure 6: the three constructions with full-precision directions."""
     c = read_all("construct_methods/*.csv")
     c = c[~c.dataset.astype(str).str.startswith("scale_")].copy()
     c["corpus"] = to_corpus(c.dataset)
     if "quantize" not in c:                  # runs from before the encodings were swept were unquantized
         c["quantize"] = "FP32"
+    c = c[c["quantize"] == "FP32"]
+    if c.empty:
+        raise ValueError("no full-precision construction rows for the paper's construction figure")
     agg = c.groupby(["corpus", "method", "quantize", "memory_fraction"]).agg(
         mean=("fpr", "mean"), std=("fpr", "std")).reset_index()
     fig, axes = corpus_panels(sharey=True)
@@ -447,22 +484,21 @@ def construction():
         if d.empty:
             mark_empty(ax)
         for method, (_, color, marker) in CONSTRUCT_SHOWN.items():
-            for enc, (_, ls, hollow) in CONSTRUCT_ENCODINGS.items():
-                g = d[(d.method == method) & (d.quantize == enc)].sort_values("memory_fraction")
-                ax.errorbar(g.memory_fraction, g["mean"], yerr=g["std"].fillna(0), color=color,
-                            marker=marker, ls=ls, ms=3, capsize=1.2, elinewidth=0.7,
-                            mfc="white" if hollow else color)
+            g = d[d.method == method].sort_values("memory_fraction")
+            ax.errorbar(g.memory_fraction, g["mean"], yerr=g["std"].fillna(0), color=color,
+                        marker=marker, ls="-", ms=3, capsize=1.2, elinewidth=0.7)
         ax.set_xscale("log")
         ax.xaxis.set_major_formatter(MEMORY_FMT)
     axes[0, 0].set_ylabel("FPR")
     axes[0, 0].set_ylim(-0.03, 1.05)
     handles, labels = [], []
     for _, (name, color, marker) in CONSTRUCT_SHOWN.items():
-        for _, (enc_label, ls, hollow) in CONSTRUCT_ENCODINGS.items():
-            handles.append(plt.Line2D([], [], color=color, marker=marker, ls=ls, ms=3,
-                                      mfc="white" if hollow else color))
-            labels.append(f"{name} ({enc_label})")
-    fig_legend(fig, handles, labels, ncol=len(CONSTRUCT_ENCODINGS))
+        handles.append(plt.Line2D([], [], color=color, marker=marker, ls="-", ms=3))
+        labels.append(name)
+    fig_legend(fig, handles, labels, ncol=len(labels))
+    axes[0, len(CORPORA) // 2].set_title(
+        CORPUS_LABEL[CORPORA[len(CORPORA) // 2]]
+        + f"\n$\\tau={float(cosine_distance(c.tau.iloc[0])):g}$ (unquantized)", color=INK)
     shared_xlabel(axes, MEMORY_AXIS_LOG)
     save(fig, "construction-fpr-vs-k")
 
@@ -507,12 +543,12 @@ def streaming():
 
 # ---------------------------------------------------------------------------
 # fig:equal-memory  equal-memory-zero-fn-fpr-vs-budget
-# fig:equal-memory-nonzero-fn  equal-memory-nonzero-fn-wikianswers
+# fig:equal-memory-nonzero-fn  equal-memory-nonzero-fn-quora
 # ---------------------------------------------------------------------------
 
 # The methods each figure draws, in legend order. A method the run did not produce is skipped.
-ZERO_FN_METHODS = [CAP_COVER, CAP_COVER_TQ4, "VA+-file", "Zero-FN LSH", "QuantizedVector"]
-NONZERO_FN_METHODS = [CAP_COVER, CAP_COVER_TQ4, "DSH", "MLP", "IVF-PQ", "HNSW"]
+ZERO_FN_METHODS = [CAP_COVER, CAP_COVER_TQ2, CAP_COVER_TQ4, "VA+-file", "Zero-FN LSH", "QuantizedVector"]
+NONZERO_FN_METHODS = [CAP_COVER, CAP_COVER_TQ2, CAP_COVER_TQ4, "DSH", "MLP", "IVF-PQ", "HNSW"]
 NONZERO_FN_CORPUS = "Quora"      # the corpus with the most positive queries in the reduced run (49 at delta 0.02)
 
 
@@ -551,7 +587,7 @@ def equal_memory_zero_fn():
         ax.xaxis.set_major_formatter(MEMORY_FMT)
     axes[0, 0].set_ylabel("FPR")
     axes[0, 0].set_ylim(-0.03, 1.05)
-    fig_legend(fig, handles, list(styles), ncol=len(styles))
+    fig_legend(fig, handles, list(styles), ncol=min(4, len(styles)))
     shared_xlabel(axes, MEMORY_AXIS_LOG)
     save(fig, "equal-memory-zero-fn-fpr-vs-budget")
 
@@ -563,7 +599,7 @@ def equal_memory_nonzero_fn():
     corpus = NONZERO_FN_CORPUS if NONZERO_FN_CORPUS in CORPORA else CORPORA[0]
     d = e[e.Dataset == corpus]
     styles, handles = _method_handles(e, NONZERO_FN_METHODS)
-    size = 1.5 * PANEL
+    size = PANEL  # this two-panel figure occupies one paper column
     fig, axes = plt.subplots(1, 2, figsize=(2 * size + GAP_LABELLED, size + MARGIN_TOP), squeeze=False,
                              gridspec_kw=dict(left=0, right=1, bottom=0, wspace=GAP_LABELLED / size))
     for ax, column, label in zip(axes[0], ("FPR", "FNR"), ("FPR", "FNR")):
@@ -579,7 +615,7 @@ def equal_memory_nonzero_fn():
         ax.set_ylabel(label)
         ax.set_ylim(-0.03, 1.05)
         ax.set_xlabel(MEMORY_AXIS_LOG)
-    fig_legend(fig, handles, list(styles), ncol=len(styles))
+    fig_legend(fig, handles, list(styles), ncol=min(3, len(styles)))
     save(fig, f"equal-memory-nonzero-fn-{corpus.lower()}")
 
 
@@ -635,14 +671,33 @@ def throughput():
     d = pd.read_csv(RESULTS / "end_to_end.csv")
     d["corpus"] = to_corpus(d.dataset)
     d["tau_cos"] = cosine_distance(d.tau)
-    at_budget = d[np.isclose(d.memory_fraction, E2E_MEMORY_FRACTION)]
-    at_tau = d[np.isclose(d.tau, E2E_TAU)]
+    # Older runs sweep cap count, newer ones a byte budget. Keep the actual
+    # stored footprint separate from the sweep key so folds average correctly.
+    legacy = "memory_fraction" not in d
+    d["budget"] = d.k_fraction if legacy else d.memory_fraction
+    if "memory_bytes" in d:
+        d["memory_ratio"] = d.memory_bytes / (d.n_reference * DIM * FP32_BYTES)
+    else:
+        d["memory_ratio"] = d.memory_fraction
+    fixed_budget = 0.1 if legacy else E2E_MEMORY_FRACTION
+    at_budget = d[np.isclose(d.budget, fixed_budget)]
+    if at_budget.empty:
+        raise ValueError(f"no throughput rows at fixed budget {fixed_budget:g}")
+    # Do not manufacture a memory sweep at a threshold with only one budget.
+    sweep_tau = E2E_TAU
+    at_tau = d[np.isclose(d.tau, sweep_tau)]
+    if at_tau.budget.nunique() < 2:
+        sweep_tau = float(d.groupby("tau").budget.nunique().idxmax())
+        at_tau = d[np.isclose(d.tau, sweep_tau)]
+        print(f"  throughput memory sweep available at cosine distance {float(cosine_distance(sweep_tau)):g}")
     fixed_tau = f"fixed $\\tau={float(cosine_distance(E2E_TAU)):g}$"
-    fixed_memory = f"${MEMORY_RATIO}={100 * E2E_MEMORY_FRACTION:g}\\%$"
+    fixed_memory = (f"$k/|X|={100 * fixed_budget:g}\\%$" if legacy
+                    else f"memory budget {100 * fixed_budget:g}\\%")
     panels = [
         (at_budget, "tau_cos", TAU_LABEL, f"fixed {fixed_memory}", False),
-        (at_tau, "memory_fraction", MEMORY_AXIS_LOG, fixed_tau, True),
-        (None, "backend", "backend cost $L$ (log)", fixed_tau + ", " + fixed_memory, True),
+        (at_tau, "memory_ratio", MEMORY_AXIS_LOG,
+         f"fixed $\\tau={float(cosine_distance(sweep_tau)):g}$", True),
+        (None, "backend", "backend lookup cost $L$", fixed_tau + "\n" + fixed_memory, True),
     ]
     width = len(panels) * PANEL + (len(panels) - 1) * GAP_LABELLED
     height = PANEL + MARGIN_TOP
@@ -652,11 +707,11 @@ def throughput():
     for ax, (df, x, xlabel, title, logx) in zip(axes[0], panels):
         ax.set_box_aspect(1)
         if x == "backend":
-            _backend_cost_panel(ax, d[np.isclose(d.tau, E2E_TAU) & np.isclose(d.memory_fraction, E2E_MEMORY_FRACTION)])
+            _backend_cost_panel(ax, at_budget[np.isclose(at_budget.tau, E2E_TAU)])
             ax.set_xlabel(xlabel)
             ax.set_title(title, color=INK)
             continue
-        agg = (df.groupby(["corpus", "memory_fraction", "tau"])
+        agg = (df.groupby(["corpus", "budget", "tau"])
                .agg(x=(x, "mean"), y=("throughput_improvement_pct", "mean"),
                     sd=("throughput_improvement_pct", "std"))
                .reset_index())
@@ -679,9 +734,8 @@ def throughput():
             ax.set_xlim(agg.x.min() - 0.005, agg.x.max() + 0.005)
             ax.set_xticks(TAU_TICKS)
             ax.xaxis.set_major_formatter(PCT_FMT)
-        if x == "memory_fraction":
-            ax.set_xlim(0.005, 0.05)
-            ax.set_xticks([0.005, 0.01, 0.02, 0.03, 0.05])
+        if x == "memory_ratio":
+            ax.xaxis.set_major_locator(matplotlib.ticker.LogLocator(base=10, subs=(1, 2, 5)))
         ax.set_xlabel(xlabel)
         ax.set_title(title, color=INK)
     # One y range for all panels, so the zero line sits at the same height.
@@ -719,6 +773,38 @@ FIGURES = {
     "throughput": throughput,
 }
 
+# Data figures in the current paper.pdf; Figure 1 is the hand-drawn scheme.
+PAPER_FIGURES = ("throughput", "sweeps", "quantization-speedup", "equal-memory-nonzero-fn",
+                 "construction", "equal-memory-zero-fn")
+
+FIGURE_FILES = {
+    "throughput": "throughput-improvement",
+    "sweeps": "sweeps-grid",
+    "quantization-speedup": "quantization-speedup-vs-memory",
+    "quantization-throughput": "quantization-throughput-vs-memory",
+    "quantization": "quantization-saved-vs-memory",
+    "equal-memory-nonzero-fn": "equal-memory-nonzero-fn-quora",
+    "equal-memory-zero-fn": "equal-memory-zero-fn-fpr-vs-budget",
+    "construction": "construction-fpr-vs-k",
+    "streaming": "streaming-fpr-vs-position",
+}
+
+FIGURE_INPUTS = {
+    "throughput": ("end_to_end.csv",),
+    "sweeps": ("budget.csv", "blocklist.csv"),
+    "quantization-speedup": ("cap_quantization/*/*.csv", "end_to_end.csv"),
+    "quantization-throughput": ("cap_quantization/*/*.csv",),
+    "quantization": ("cap_quantization/*/*.csv",),
+    "equal-memory-nonzero-fn": ("equal_memory/*/equal_memory.csv",),
+    "equal-memory-zero-fn": ("equal_memory/*/equal_memory.csv",),
+    "construction": ("construct_methods/*.csv",),
+    "streaming": ("streaming/*/streaming.csv",),
+}
+
+
+def _fingerprint(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
 
 def plot_figures(requested=None, results=None, out=None):
     """Draws the named figures (default: all) from `results`/ into `out`/."""
@@ -732,8 +818,12 @@ def plot_figures(requested=None, results=None, out=None):
     if unknown:
         raise SystemExit(f"unknown figure(s) {unknown}; choose from {list(FIGURES)}")
     print("reading", RESULTS, "-> writing", OUT_FIG)
+    selected = requested or list(FIGURES)
+    inputs = {name: sorted({p for pattern in FIGURE_INPUTS[name] for p in RESULTS.glob(pattern)})
+              for name in selected}
+    hashes = {p: _fingerprint(p) for paths in inputs.values() for p in paths}
     failed = []
-    for name in requested or FIGURES:
+    for name in selected:
         try:
             FIGURES[name]()
         except Exception as e:      # one figure's missing data must not stop the others
@@ -741,12 +831,47 @@ def plot_figures(requested=None, results=None, out=None):
             print(f"  {name}: not drawn ({type(e).__name__}: {e})")
     if failed:
         raise SystemExit(f"figures not drawn: {', '.join(failed)}")
+    if any(_fingerprint(p) != digest for p, digest in hashes.items()):
+        raise RuntimeError("Source CSVs changed while plotting; rerun to use one consistent data snapshot")
+    manifest = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source_root": str(RESULTS.resolve()),
+        "plot_script_sha256": _fingerprint(Path(__file__)),
+        "threshold_units": "stored L2 thresholds are displayed as cosine distance = L2 squared / 2",
+        "paper_caption_checks": [
+            "Figure 4 reports modeled speedup, not a direct end-to-end timing measurement.",
+            "Figure 6 uses only FP32 rows; its threshold is taken from the source CSV, not the PDF caption.",
+            "Fixed TQ2 and TQ4 baselines retain their encoding labels and are not named automatic selection.",
+            "The throughput memory sweep uses an observed multi-budget threshold; see its panel title.",
+        ],
+        "figures": {},
+    }
+    for name in selected:
+        stem = FIGURE_FILES[name]
+        if name == "equal-memory-nonzero-fn":
+            corpus = NONZERO_FN_CORPUS if NONZERO_FN_CORPUS in CORPORA else CORPORA[0]
+            stem = f"equal-memory-nonzero-fn-{corpus.lower()}"
+        manifest["figures"][name] = {
+            "paper_figure": PAPER_FIGURES.index(name) + 2 if name in PAPER_FIGURES else None,
+            "inputs": [{"path": str(p.relative_to(RESULTS)), "sha256": hashes[p],
+                        "rows": len(pd.read_csv(p))} for p in inputs[name]],
+            "outputs": {f"{stem}.{ext}": _fingerprint(OUT_FIG / f"{stem}.{ext}") for ext in ("pdf", "png")},
+        }
+    (OUT_FIG / "plot-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 
 def main():
-    args = sys.argv[1:]
-    results = ROOT / args.pop(0) if args and (ROOT / args[0]).is_dir() else None
-    plot_figures(args, results)
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("inputs", nargs="*", help="optional results directory, then figure names")
+    parser.add_argument("--out", type=Path, default=OUT_FIG)
+    parser.add_argument("--paper-only", action="store_true", help="draw data Figures 2–7 in paper.pdf")
+    args = parser.parse_args()
+    inputs = list(args.inputs)
+    results = Path(inputs.pop(0)) if inputs and inputs[0] not in FIGURES else RESULTS
+    if args.paper_only and inputs:
+        parser.error("use --paper-only or individual figure names")
+    plot_figures(PAPER_FIGURES if args.paper_only else inputs, results, args.out)
 
 
 if __name__ == "__main__":

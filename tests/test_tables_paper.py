@@ -100,9 +100,9 @@ class TestPaperFoldAggregation(unittest.TestCase):
                              "Construct Size": 100, "FPR": fpr, "FNR": 0.0, "Infeasible": False})
         with patch.object(plot_paper, "read_all", return_value=pd.DataFrame(rows)):
             result = plot_paper._equal_memory_frame().set_index("method")
-        self.assertAlmostEqual(result.loc["Cap-Cover (TQ2)", "FPR"], 0.5)
+        self.assertAlmostEqual(result.loc["CapCover Filter", "FPR"], 0.5)
         self.assertAlmostEqual(result.loc["Zero-FN LSH", "FPR"], 0.4)
-        self.assertAlmostEqual(result.loc["Cap-Cover (TQ2)", "pct_raw"], 0.01)
+        self.assertAlmostEqual(result.loc["CapCover Filter", "pct_raw"], 0.01)
 
 
 if __name__ == "__main__":
