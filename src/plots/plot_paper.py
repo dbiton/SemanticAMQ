@@ -165,9 +165,9 @@ INSERT_SHOWN = {
 }
 # FPR panel per cosine-distance band (the stored band columns are unchanged).
 BAND_TITLE = {
-    "close": "Nearest cosine\ndistance to $X$\n$\\leq0.2$",
-    "related": "Nearest cosine\ndistance to $X$\n$(0.2,0.4]$",
-    "unrelated": "Nearest cosine\ndistance to $X$\n$>0.4$",
+    "close": "min cos distance to $X$\n$\\leq0.2$",
+    "related": "min cos distance to $X$\n$(0.2,0.4]$",
+    "unrelated": "min cos distance to $X$\n$>0.4$",
 }
 
 plt.rcParams.update({
@@ -301,7 +301,7 @@ def sweeps_grid():
     n_fpr, nrows = len(BAND_TITLE), len(sweeps)
     spacer = GAP_LABELLED - 2 * GAP_SHARED  # blank column before the accesses-saved panel
     width = (n_fpr + 1) * PANEL + spacer + (n_fpr + 1) * GAP_SHARED
-    title_margin = MARGIN_TOP + 0.14  # one extra line for explicit cosine-distance units
+    title_margin = MARGIN_TOP
     height = nrows * PANEL + (nrows - 1) * GAP_LABELLED + title_margin
     fig, grid = plt.subplots(
         nrows, n_fpr + 2, figsize=(width, height), squeeze=False,

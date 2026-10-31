@@ -1,7 +1,7 @@
 {
-  "generated_at_utc": "2026-10-31T16:02:24.278816+00:00",
+  "generated_at_utc": "2026-10-31T16:04:48.047702+00:00",
   "source_root": "/Users/bitondvir-david/Desktop/results",
-  "plot_script_sha256": "749f2dbed14cda5d11faf3d253f5bcdf90da630cc6195361ea56f5517ada2805",
+  "plot_script_sha256": "daf2d74072a8f7c37da7987ce030569812b2a298e7bbfc095fb2ebf9eb5e94c9",
   "threshold_units": "stored L2 thresholds are displayed as cosine distance = L2 squared / 2",
   "paper_caption_checks": [
     "Figure 4 reports modeled speedup, not a direct end-to-end timing measurement.",
@@ -25,8 +25,8 @@
         }
       ],
       "outputs": {
-        "sweeps-grid.pdf": "40a020497e249f752f5a29e9d6a418934d72fdb492626514858b1193cf3e27b2",
-        "sweeps-grid.png": "a1b3bda6f2e78bed7732df5de93f0e6681046bcb65d956f567461a85aa60b058"
+        "sweeps-grid.pdf": "bd9ba50a8ddf3aa46639ceaed4e6f15577b43fa16cb505ca88ee073061c8a98b",
+        "sweeps-grid.png": "1fcc2907c573530ba746a27d449fa19a3e87f0ecc972e649907e0b9295f8ff15"
       }
     },
     "quantization": {
