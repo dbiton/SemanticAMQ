@@ -1,6 +1,6 @@
 {
-  "generated_at_utc": "2026-10-31T17:38:43.838863+00:00",
-  "source_root": "/Users/bitondvir-david/Desktop/results",
+  "generated_at_utc": "2026-11-01T17:09:48.547187+00:00",
+  "source_root": "/Users/bitondvir-david/Desktop/Results",
   "plot_script_sha256": "91de9cc12ee142b0f8cbb5e23cc8ea4a12ccdb08b251b1b7951529db0f53129d",
   "threshold_units": "stored L2 thresholds are displayed as cosine distance = L2 squared / 2",
   "paper_caption_checks": [
@@ -15,18 +15,18 @@
       "inputs": [
         {
           "path": "blocklist.csv",
-          "sha256": "558f442f13d0b00ffbb9a088542ea92af6826bdf88eba2634850e04c62fb11ed",
-          "rows": 72
+          "sha256": "1fe3a026ebe0f77b6a558abe0ce0c56dc4f10cff6750566d0f8f8608a4150917",
+          "rows": 104
         },
         {
           "path": "budget.csv",
-          "sha256": "f84fbdc984dd61023eb05c58f8753ff6c91651b6c94a3d26b34019b8710d283a",
-          "rows": 48
+          "sha256": "67ad2a6aaabdc6d23b99304852d71b9304f96055b6ebb861800a904e3e28ea0f",
+          "rows": 104
         }
       ],
       "outputs": {
-        "sweeps-grid.pdf": "1c1739f0ec5708beeece84de0ac96d1be8d22919189c98f673e0b51803688d1f",
-        "sweeps-grid.png": "641c461e614f8cb38ed76f290093f68b329026d2a91a2ecfa8935d5477aec6f5"
+        "sweeps-grid.pdf": "83ef9388ec03da6b6ffbacd3795c3f1db561e99915ac0a52ae3b19a3c265077d",
+        "sweeps-grid.png": "e6bce92f49c0f9aee935400473a7c63becfb0d86e974c3c0ba99b974bb54196d"
       }
     },
     "quantization": {
@@ -34,33 +34,33 @@
       "inputs": [
         {
           "path": "cap_quantization/CCNews/cap_quantization.csv",
-          "sha256": "0436ea2beaf3729706ce67d14593c8ec1a47225b294bc20fef2b9b43f2e757a6",
-          "rows": 284
+          "sha256": "dfd9ea24dfb42509b2793a3858444954e39ebed0d5c491b6f7292775a2fafdd6",
+          "rows": 429
         },
         {
           "path": "cap_quantization/ChatGPTParaphrases/cap_quantization.csv",
-          "sha256": "48b9b0f90dcb25cfc84c55c96dd397a8f9e7d5a3378f781a412bdac72e4adcdc",
-          "rows": 272
+          "sha256": "b68b501600a56e650d54d370826e1e54c8c64618124183876b60d9dd160d7833",
+          "rows": 404
         },
         {
           "path": "cap_quantization/Quora/cap_quantization.csv",
-          "sha256": "94ed2bee93710b3b524fa498810d95b5d50c2c3fc5fb3b06854ca06d1510fd94",
-          "rows": 242
+          "sha256": "7bfae2ecc0e016db092727f72966367b7ca555a125db50e10e9441a523871097",
+          "rows": 394
         },
         {
           "path": "cap_quantization/WikiAnswers/cap_quantization.csv",
-          "sha256": "e7c830ea50775bb8d5b744234a9335041c4a2695c265e001c66983fda1532bd5",
-          "rows": 246
+          "sha256": "cc6681b0b8640afc136a0883a53bd854b05af6f08e7a14fe4495583a8df6c005",
+          "rows": 409
         },
         {
           "path": "cap_quantization/WildChat/cap_quantization.csv",
-          "sha256": "1a4b94b8c849b25ecf2bd7c3cc68501751594f3de71dfb911e834aba9801a575",
-          "rows": 263
+          "sha256": "730e4ecd688443995a3975c0c61a03da750f43cd385d1c1efd11f952b1e7d65b",
+          "rows": 403
         }
       ],
       "outputs": {
-        "quantization-saved-vs-memory.pdf": "a9bd366bca65e1358fb60b20926ca2ce7d0ac331c2fe62b783c8b50690e6b0d6",
-        "quantization-saved-vs-memory.png": "09dcd3f7673e239c6a512e626d198e58f3d69400bca7bbd6b26275babb5704a2"
+        "quantization-saved-vs-memory.pdf": "20c229d0fdce63e275a018a9d3347a10e6eca2d0f57082e97f21d39bac8117bf",
+        "quantization-saved-vs-memory.png": "228b7db329b239885e3b3b50949b8eff57059b6c10ceadfb8d6fd161f32f3db6"
       }
     },
     "quantization-throughput": {
@@ -68,33 +68,33 @@
       "inputs": [
         {
           "path": "cap_quantization/CCNews/cap_quantization.csv",
-          "sha256": "0436ea2beaf3729706ce67d14593c8ec1a47225b294bc20fef2b9b43f2e757a6",
-          "rows": 284
+          "sha256": "dfd9ea24dfb42509b2793a3858444954e39ebed0d5c491b6f7292775a2fafdd6",
+          "rows": 429
         },
         {
           "path": "cap_quantization/ChatGPTParaphrases/cap_quantization.csv",
-          "sha256": "48b9b0f90dcb25cfc84c55c96dd397a8f9e7d5a3378f781a412bdac72e4adcdc",
-          "rows": 272
+          "sha256": "b68b501600a56e650d54d370826e1e54c8c64618124183876b60d9dd160d7833",
+          "rows": 404
         },
         {
           "path": "cap_quantization/Quora/cap_quantization.csv",
-          "sha256": "94ed2bee93710b3b524fa498810d95b5d50c2c3fc5fb3b06854ca06d1510fd94",
-          "rows": 242
+          "sha256": "7bfae2ecc0e016db092727f72966367b7ca555a125db50e10e9441a523871097",
+          "rows": 394
         },
         {
           "path": "cap_quantization/WikiAnswers/cap_quantization.csv",
-          "sha256": "e7c830ea50775bb8d5b744234a9335041c4a2695c265e001c66983fda1532bd5",
-          "rows": 246
+          "sha256": "cc6681b0b8640afc136a0883a53bd854b05af6f08e7a14fe4495583a8df6c005",
+          "rows": 409
         },
         {
           "path": "cap_quantization/WildChat/cap_quantization.csv",
-          "sha256": "1a4b94b8c849b25ecf2bd7c3cc68501751594f3de71dfb911e834aba9801a575",
-          "rows": 263
+          "sha256": "730e4ecd688443995a3975c0c61a03da750f43cd385d1c1efd11f952b1e7d65b",
+          "rows": 403
         }
       ],
       "outputs": {
-        "quantization-throughput-vs-memory.pdf": "1f62e7e3db014088e51ef4a9633d638ce8d097da9ee52e0a0f33513e444310d7",
-        "quantization-throughput-vs-memory.png": "92417e6a1887dc32cf5de19a1f11cd00db6f84e135304066275aee8f4bb089b1"
+        "quantization-throughput-vs-memory.pdf": "d3643d5ce6a0dda6c4cf78ff2e8f8fc7935f2f0dd7b57258d72e5372c0f2cb15",
+        "quantization-throughput-vs-memory.png": "597010a2b7f35ca12a7d8df7bba084c1d5cd1cf31728222955e0a524a1596d70"
       }
     },
     "quantization-speedup": {
@@ -102,28 +102,28 @@
       "inputs": [
         {
           "path": "cap_quantization/CCNews/cap_quantization.csv",
-          "sha256": "0436ea2beaf3729706ce67d14593c8ec1a47225b294bc20fef2b9b43f2e757a6",
-          "rows": 284
+          "sha256": "dfd9ea24dfb42509b2793a3858444954e39ebed0d5c491b6f7292775a2fafdd6",
+          "rows": 429
         },
         {
           "path": "cap_quantization/ChatGPTParaphrases/cap_quantization.csv",
-          "sha256": "48b9b0f90dcb25cfc84c55c96dd397a8f9e7d5a3378f781a412bdac72e4adcdc",
-          "rows": 272
+          "sha256": "b68b501600a56e650d54d370826e1e54c8c64618124183876b60d9dd160d7833",
+          "rows": 404
         },
         {
           "path": "cap_quantization/Quora/cap_quantization.csv",
-          "sha256": "94ed2bee93710b3b524fa498810d95b5d50c2c3fc5fb3b06854ca06d1510fd94",
-          "rows": 242
+          "sha256": "7bfae2ecc0e016db092727f72966367b7ca555a125db50e10e9441a523871097",
+          "rows": 394
         },
         {
           "path": "cap_quantization/WikiAnswers/cap_quantization.csv",
-          "sha256": "e7c830ea50775bb8d5b744234a9335041c4a2695c265e001c66983fda1532bd5",
-          "rows": 246
+          "sha256": "cc6681b0b8640afc136a0883a53bd854b05af6f08e7a14fe4495583a8df6c005",
+          "rows": 409
         },
         {
           "path": "cap_quantization/WildChat/cap_quantization.csv",
-          "sha256": "1a4b94b8c849b25ecf2bd7c3cc68501751594f3de71dfb911e834aba9801a575",
-          "rows": 263
+          "sha256": "730e4ecd688443995a3975c0c61a03da750f43cd385d1c1efd11f952b1e7d65b",
+          "rows": 403
         },
         {
           "path": "end_to_end.csv",
@@ -132,8 +132,8 @@
         }
       ],
       "outputs": {
-        "quantization-speedup-vs-memory.pdf": "a8a1ce0f1e4a61498fd7b282b155efdbd0dec53d86b921d9d72625b1c06f7118",
-        "quantization-speedup-vs-memory.png": "251d93f4d1efb0039330c71e866a7ac8d3517c9e49a5444a0018fda6c8302ba5"
+        "quantization-speedup-vs-memory.pdf": "7dcdb21a280826a368b24489070c91e0dd5cbc624ace849408de88eea50ebd48",
+        "quantization-speedup-vs-memory.png": "9d65f48952f474e266635b3a8e254e7021e07103ab4086c3846869eb408930ce"
       }
     },
     "construction": {
@@ -141,33 +141,33 @@
       "inputs": [
         {
           "path": "construct_methods/ccnews.csv",
-          "sha256": "00cf21ed2a865f6bad8a6795b9b0c7cab094410175cf373094e984bf920d4532",
-          "rows": 148
+          "sha256": "aa7f0cd4fe6403eeeec5f09d0568fac9268d8051a05298c26097218d1d29a991",
+          "rows": 212
         },
         {
           "path": "construct_methods/chatgpt_paraphrases.csv",
-          "sha256": "13593131fb21729d17d7c679106c63f8a975ef7c02f5d090cf2f54580c75b014",
-          "rows": 150
+          "sha256": "ce6b7b518da696a07e56619b600e59714998b05c76ededc522d8ec0bf2a7a2fb",
+          "rows": 234
         },
         {
           "path": "construct_methods/quora.csv",
-          "sha256": "2d8382a085327a83ef98fdb7fc02592d64d20122d38eb86adb574590608d363e",
-          "rows": 152
+          "sha256": "9085b467bf1f017fd0d71e1be448f6151581f15d6724131a5e025dc7ed025b5e",
+          "rows": 234
         },
         {
           "path": "construct_methods/wikianswers.csv",
-          "sha256": "cb90e0d754b5545117fdebb14b417cddaf85f246bdc14ff456e993a1d4f4c4fc",
-          "rows": 141
+          "sha256": "8f6e6c2330e13714392f5a4cce7ac6f4fd93cf75b6386da583cab5b189aa81d0",
+          "rows": 214
         },
         {
           "path": "construct_methods/wildchat.csv",
-          "sha256": "8b569d12425dad306f1e46fba3cbe25211200e0829929b1c3442c28f19b9fc5d",
-          "rows": 150
+          "sha256": "9c529c237e625e570ba3fa1775925ca114745d298763b413e31cdf1956a729ad",
+          "rows": 224
         }
       ],
       "outputs": {
-        "construction-fpr-vs-k.pdf": "3cca60ab721efa60f15360075b9153dac7ab54f0fc59a387a364662ac61c35de",
-        "construction-fpr-vs-k.png": "d048fc0af25d91f0b50c6cf68265c39ae80e2de5c6d61dc20acb46f9f4c5caee"
+        "construction-fpr-vs-k.pdf": "949c2c2976f6cdf7568549e2a3b3894db55b46e6bb7460ac033be491f502584e",
+        "construction-fpr-vs-k.png": "d41fdad30b35e3b1dd817c0aff555116819b5d4ca0c13d2962c4dcba63d08b0d"
       }
     },
     "streaming": {
@@ -200,7 +200,7 @@
         }
       ],
       "outputs": {
-        "streaming-fpr-vs-position.pdf": "39686373e6b7b4e0ce3453cd6b300ce2d136b2d082de9bb1488e9926e6028823",
+        "streaming-fpr-vs-position.pdf": "cf12d8bf4e2d01f2c13b4e170b33fe19e6b9cdd8c99874638a4dc9ea090ac958",
         "streaming-fpr-vs-position.png": "ab422c68968e87f3712aec30909593179d27bdb23c0b3177e9be3d94124b273a"
       }
     },
@@ -209,33 +209,33 @@
       "inputs": [
         {
           "path": "equal_memory/CCNews/equal_memory.csv",
-          "sha256": "5c5d6ee780478591be1595b905437e7fa0bd507f1b813be455f3298728202ca1",
-          "rows": 170
+          "sha256": "97eef409ee26507b3f090784a07c7bcbde4cbfbe97b7e7b90a20e1b8b4c89aae",
+          "rows": 250
         },
         {
           "path": "equal_memory/ChatGPTParaphrases/equal_memory.csv",
-          "sha256": "71ef6a2d4313cc923be361c761d9dfdd30912640057f777189f893c777027cd1",
-          "rows": 135
+          "sha256": "fbb4f55f8d13b99d0e05756021cf99aba1e31974aba592a5a0205e2b20a1e1b6",
+          "rows": 218
         },
         {
           "path": "equal_memory/Quora/equal_memory.csv",
-          "sha256": "1e4353f7f2e070ede49f10fdec9387202b0457b88df4fe0cb5859fc1afac2633",
-          "rows": 162
+          "sha256": "fb248c07b8c2b79f7ea9d5093fcb98435c40e91613c91ac7c4a5011af517a4f7",
+          "rows": 247
         },
         {
           "path": "equal_memory/WikiAnswers/equal_memory.csv",
-          "sha256": "cdfbf2b8ace90c073d9c493a38f299d6c9f03cdc2099d9cc5993853bec6c76fc",
-          "rows": 134
+          "sha256": "f3b2bbfe15038488baa1beaed465338b87df0441003fdba3239d4f7af553256e",
+          "rows": 230
         },
         {
           "path": "equal_memory/WildChat/equal_memory.csv",
-          "sha256": "fed909a8d3f50a23be21430eae0f819ab578062d1be5e2c8a91b0450302f7f3a",
-          "rows": 157
+          "sha256": "912c6a58a31ce5240a0eb58bdc7e829c1c747bb3b0a734c8c77342bc5e739999",
+          "rows": 257
         }
       ],
       "outputs": {
-        "equal-memory-zero-fn-fpr-vs-budget.pdf": "5d17dafbbc623b0984c6838f760499f170048e851c1122ef2c4d6a648c6bf8ba",
-        "equal-memory-zero-fn-fpr-vs-budget.png": "102b35c53f92819f2a09ed39191c23a76dee0f4f12052a8d655dac5545b9656e"
+        "equal-memory-zero-fn-fpr-vs-budget.pdf": "a18c9e219a4bbb4397b4f67d140ab8a8b18adc569b0b2ef70f8774dbfbf7dd3c",
+        "equal-memory-zero-fn-fpr-vs-budget.png": "719bfe14ee1f51b5b2639bae758b251a16cf390f6b87a65d64af84e0aa61e38c"
       }
     },
     "equal-memory-nonzero-fn": {
@@ -243,33 +243,33 @@
       "inputs": [
         {
           "path": "equal_memory/CCNews/equal_memory.csv",
-          "sha256": "5c5d6ee780478591be1595b905437e7fa0bd507f1b813be455f3298728202ca1",
-          "rows": 170
+          "sha256": "97eef409ee26507b3f090784a07c7bcbde4cbfbe97b7e7b90a20e1b8b4c89aae",
+          "rows": 250
         },
         {
           "path": "equal_memory/ChatGPTParaphrases/equal_memory.csv",
-          "sha256": "71ef6a2d4313cc923be361c761d9dfdd30912640057f777189f893c777027cd1",
-          "rows": 135
+          "sha256": "fbb4f55f8d13b99d0e05756021cf99aba1e31974aba592a5a0205e2b20a1e1b6",
+          "rows": 218
         },
         {
           "path": "equal_memory/Quora/equal_memory.csv",
-          "sha256": "1e4353f7f2e070ede49f10fdec9387202b0457b88df4fe0cb5859fc1afac2633",
-          "rows": 162
+          "sha256": "fb248c07b8c2b79f7ea9d5093fcb98435c40e91613c91ac7c4a5011af517a4f7",
+          "rows": 247
         },
         {
           "path": "equal_memory/WikiAnswers/equal_memory.csv",
-          "sha256": "cdfbf2b8ace90c073d9c493a38f299d6c9f03cdc2099d9cc5993853bec6c76fc",
-          "rows": 134
+          "sha256": "f3b2bbfe15038488baa1beaed465338b87df0441003fdba3239d4f7af553256e",
+          "rows": 230
         },
         {
           "path": "equal_memory/WildChat/equal_memory.csv",
-          "sha256": "fed909a8d3f50a23be21430eae0f819ab578062d1be5e2c8a91b0450302f7f3a",
-          "rows": 157
+          "sha256": "912c6a58a31ce5240a0eb58bdc7e829c1c747bb3b0a734c8c77342bc5e739999",
+          "rows": 257
         }
       ],
       "outputs": {
-        "equal-memory-nonzero-fn-quora.pdf": "416410e53a281880de461268afd214bdeaee1315a98acd96e8c29f4f4ba06610",
-        "equal-memory-nonzero-fn-quora.png": "d6eb626186850c69f51582d86a4468f288959ab29c1e0a6f23da83b04a1516e1"
+        "equal-memory-nonzero-fn-quora.pdf": "0500161e8452f99f098eea82cf5f4d0fa33e6031819aa608b6729d011169585f",
+        "equal-memory-nonzero-fn-quora.png": "078033d3186801153b98433f208e2907fddb2c716b9bdeab156f39d4a834c49a"
       }
     },
     "throughput": {
@@ -282,7 +282,7 @@
         }
       ],
       "outputs": {
-        "throughput-improvement.pdf": "ef844092f892bd8bb369b44de6fa38247418a31ea136fc5be89ad075ae9c2a96",
+        "throughput-improvement.pdf": "ccb0cf92972aa9c4ba40fccf05b20b3195e3d933a91904cfd1840db8f5735e6b",
         "throughput-improvement.png": "d3cf39c2937c3ebe8fedb8db33b8fea7f81a2a39f18dd4076bf17d3ea2476c96"
       }
     }
