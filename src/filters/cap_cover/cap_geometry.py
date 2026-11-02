@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import faiss
 from typing import Tuple
@@ -30,6 +31,13 @@ try:
     _FUSED = hasattr(_rs, "row_angles")
 except ImportError:  # pure-NumPy fallback
     _rs, _FUSED = None, False
+
+
+def tail_rust() -> bool:
+    """Whether the construct-tail Rust kernels (construct_tail.rs) are used;
+    env CAPCOVER_TAIL=python selects the original NumPy/faiss code."""
+    return (_rs is not None and hasattr(_rs, "knn_ip") and os.environ.get("CAPCOVER_TAIL", "rust") != "python"
+            and _rs.knn_available_py())
 
 
 def row_angles(X: np.ndarray, U: np.ndarray, labels: np.ndarray) -> np.ndarray:
@@ -65,9 +73,17 @@ def chord_to_angle(chord) -> np.ndarray:
 def nearest_directions(X: np.ndarray, U: np.ndarray, k: int = 1) -> Tuple[np.ndarray, np.ndarray]:
     """(inner products, indices) of each row of X's k nearest unit directions
     by angle, from an exact IndexFlatIP search in float32. Ranks only."""
+    Xf = np.ascontiguousarray(X, dtype=np.float32)
+    Uf = np.ascontiguousarray(U, dtype=np.float32)
+    if len(Uf) and len(Xf) and tail_rust():
+        # Exact int8-screened float32 top-k (Rust, construct_tail.rs); same index sets as faiss.
+        ip, labels = _rs.knn_ip(Xf, Uf, min(k, len(Uf)), max(1, faiss.omp_get_max_threads()))
+        if k == 1:
+            return ip.ravel(), labels.ravel()
+        return ip, labels
     index = faiss.IndexFlatIP(U.shape[1])
-    index.add(np.ascontiguousarray(U, dtype=np.float32))
-    ip, labels = index.search(np.ascontiguousarray(X, dtype=np.float32), min(k, len(U)))
+    index.add(Uf)
+    ip, labels = index.search(Xf, min(k, len(U)))
     if k == 1:
         return ip.ravel(), labels.ravel()
     return ip, labels

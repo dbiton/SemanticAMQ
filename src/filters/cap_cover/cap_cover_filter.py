@@ -8,7 +8,7 @@ from filters.cap_cover.cap_quantizers import Quantize, _ENCODINGS, _SeededPQ, _f
 from filters.cap_cover.cap_scan import _CapScanMixin
 from filters.cap_cover.cap_interfaces import ConstructInterface, Cover, EncodedCover, InsertInterface
 from filters.cap_cover.cap_geometry import (angle_between, log_cap_measure, nearest_directions, segments,
-                                            segment_max, unit_rows, row_angles, pair_angles)
+                                            segment_max, unit_rows, row_angles, pair_angles, tail_rust, _rs)
 
 
 _ROTATION_SEED = 0x5EED
@@ -633,6 +633,10 @@ class CapCoverFilter(_CapScanMixin, Filter):
         # is repaired here rather than trusted: the fallback must be legal.
         np.maximum.at(bound, home, home_d)
 
+        if tail_rust():
+            # Same settle loop in Rust (construct_tail.rs); CAPCOVER_TAIL=python keeps the loop below.
+            return _rs.settle(np.ascontiguousarray(labels, dtype=np.int64), np.ascontiguousarray(dist),
+                              home, np.ascontiguousarray(home_d), bound)
         nearest_d = dist.min(axis=1)
         for i in np.argsort(-nearest_d, kind="stable"):
             row_l, row_d = labels[i], dist[i]
