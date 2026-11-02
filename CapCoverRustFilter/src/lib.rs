@@ -1,3 +1,4 @@
+pub mod construct_anneal;
 pub mod core;
 pub mod fastscan;
 pub mod pq_direct;
@@ -88,6 +89,7 @@ fn set_fastscan(on: bool) { crate::fastscan::ENABLED.store(on, std::sync::atomic
 #[pymodule]
 fn capcover_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CapIndex>()?;
+    construct_anneal::register(m)?;
     m.add_function(wrap_pyfunction!(fs_stats, m)?)?;
     m.add_function(wrap_pyfunction!(set_fastscan, m)?)?;
     Ok(())
