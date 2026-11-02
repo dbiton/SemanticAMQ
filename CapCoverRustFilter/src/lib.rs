@@ -5,6 +5,7 @@ pub mod construct_common;
 pub mod construct_gonzalez;
 pub mod construct_minimax;
 pub mod construct_anneal;
+pub mod construct_assign;
 
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::prelude::*;
@@ -98,5 +99,6 @@ fn capcover_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     crate::construct_gonzalez::register(m)?;
     crate::construct_minimax::register(m)?;
     crate::construct_anneal::register(m)?;
+    crate::construct_assign::register(m)?;
     Ok(())
 }

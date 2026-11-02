@@ -18,7 +18,7 @@ use pyo3::prelude::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-fn has_avx2() -> bool {
+pub(crate) fn has_avx2() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         return std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma");
@@ -31,7 +31,7 @@ fn has_avx2() -> bool {
 // dot products
 // ---------------------------------------------------------------------------------------------
 
-fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     let mut s = [0f32; 8];
     let n = a.len() / 8 * 8;
     for i in (0..n).step_by(8) {
@@ -292,11 +292,11 @@ fn bc_body(x32: &[f32], x64: &[f64], order: &[i64], starts: &[i64], counts: &[i6
 // Exact nearest direction: fused GEMM + arg-max
 // ---------------------------------------------------------------------------------------------
 
-const NR: usize = 16;
-const MR: usize = 6;
+pub(crate) const NR: usize = 16;
+pub(crate) const MR: usize = 6;
 
 /// U (k x d) packed into panels of NR directions: panel p, element [kk * NR + j] = U[p*NR + j][kk].
-fn pack_panels(u: &[f32], k: usize, d: usize) -> Vec<f32> {
+pub(crate) fn pack_panels(u: &[f32], k: usize, d: usize) -> Vec<f32> {
     let np = (k + NR - 1) / NR;
     let mut out = vec![0f32; np * d * NR];
     for p in 0..np {
