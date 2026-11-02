@@ -35,7 +35,8 @@ except ImportError:  # pure-NumPy fallback
 
 def tail_rust() -> bool:
     """Whether the construct-tail Rust kernels (construct_tail.rs) are used;
-    env CAPCOVER_TAIL=python selects the original NumPy/faiss code."""
+    env CAPCOVER_TAIL=python selects the original NumPy/faiss code. Needs a Rust knn kernel
+    (AVX-512 VNNI or AVX2+FMA); CAPCOVER_KNN only picks the kNN path, see nearest_directions."""
     return (_rs is not None and hasattr(_rs, "knn_ip") and os.environ.get("CAPCOVER_TAIL", "rust") != "python"
             and _rs.knn_available_py())
 
@@ -75,8 +76,9 @@ def nearest_directions(X: np.ndarray, U: np.ndarray, k: int = 1) -> Tuple[np.nda
     by angle, from an exact IndexFlatIP search in float32. Ranks only."""
     Xf = np.ascontiguousarray(X, dtype=np.float32)
     Uf = np.ascontiguousarray(U, dtype=np.float32)
-    if len(Uf) and len(Xf) and tail_rust() and np.isfinite(Xf).all() and np.isfinite(Uf).all():
-        # Exact int8-screened float32 top-k (Rust, construct_tail.rs); same index sets as faiss.
+    if len(Uf) and len(Xf) and tail_rust() and _rs.knn_path_py() != "faiss" and np.isfinite(Xf).all() and np.isfinite(Uf).all():
+        # Exact top-k (Rust, construct_tail.rs): AMX > AVX-512 VNNI (int8-screened) > AVX2+FMA (fused
+        # GEMM + running top-k); CAPCOVER_KNN=amx|vnni|avx2|faiss forces one. Same index sets as faiss.
         ip, labels = _rs.knn_ip(Xf, Uf, min(k, len(Uf)), max(1, faiss.omp_get_max_threads()))
         if k == 1:
             return ip.ravel(), labels.ravel()

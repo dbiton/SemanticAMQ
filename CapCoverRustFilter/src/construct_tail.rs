@@ -21,7 +21,10 @@ const PANEL: usize = 32; // database columns per packed panel
 const RB: usize = 16; // queries per block (two 8-row VNNI tiles, or one 16-row AMX tile)
 const WARM_PANELS: usize = 16; // panels scored unconditionally to seed the threshold
 
-pub fn knn_available() -> bool {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum KnnPath { Amx, Vnni, Avx2, Faiss }
+
+fn vnni_ok() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         std::is_x86_feature_detected!("avx512f")
@@ -34,6 +37,40 @@ pub fn knn_available() -> bool {
     {
         false
     }
+}
+
+fn avx2_ok() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::construct_knn_avx2::available()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Some Rust knn kernel (VNNI or AVX2) exists on this CPU, regardless of CAPCOVER_KNN.
+pub fn knn_available() -> bool {
+    vnni_ok() || avx2_ok()
+}
+
+/// The path knn_ip takes: CAPCOVER_KNN=amx|vnni|avx2|faiss forces one (an unavailable forced path
+/// resolves to faiss); otherwise AMX > AVX-512 VNNI > AVX2+FMA > faiss.
+fn knn_path() -> KnnPath {
+    let amx = vnni_ok() && amx_ok();
+    match std::env::var("CAPCOVER_KNN").ok().as_deref() {
+        Some("amx") => if amx { KnnPath::Amx } else { KnnPath::Faiss },
+        Some("vnni") => if vnni_ok() { KnnPath::Vnni } else { KnnPath::Faiss },
+        Some("avx2") => if avx2_ok() { KnnPath::Avx2 } else { KnnPath::Faiss },
+        Some("faiss") => KnnPath::Faiss,
+        _ => if amx { KnnPath::Amx } else if vnni_ok() { KnnPath::Vnni } else if avx2_ok() { KnnPath::Avx2 } else { KnnPath::Faiss },
+    }
+}
+
+#[pyfunction]
+fn knn_path_py() -> &'static str {
+    match knn_path() { KnnPath::Amx => "amx", KnnPath::Vnni => "vnni", KnnPath::Avx2 => "avx2", KnnPath::Faiss => "faiss" }
 }
 
 /// AMX int8 tiles usable (CPU flags, kernel permission granted, not disabled by CAPCOVER_TAIL_NOAMX).
@@ -243,7 +280,7 @@ fn pack_db(r: &Rows) -> Db {
 /// Top-k (descending inner product) of queries[i0..i0+nq) against the database.
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn search_block(qx: &Rows, xu8: &[u8], x: &[f32], db: &Db, dbf: &[f32], d: usize, k: usize,
+unsafe fn search_block(amx: bool, qx: &Rows, xu8: &[u8], x: &[f32], db: &Db, dbf: &[f32], d: usize, k: usize,
                        i0: usize, ip_out: &mut [f32], id_out: &mut [i64]) {
     let nq = RB.min(qx.n - i0);
     let dpad = qx.dpad;
@@ -262,7 +299,6 @@ unsafe fn search_block(qx: &Rows, xu8: &[u8], x: &[f32], db: &Db, dbf: &[f32], d
     let mut thr = [f32::NEG_INFINITY; RB];
     let mut cand: Vec<Vec<(f32, u32)>> = (0..RB).map(|_| Vec::new()).collect();
     let mut acc = [0i32; RB * PANEL];
-    let amx = amx_ok();
     if amx { x86::amx_config(); }
     let warm = WARM_PANELS.min(np);
     for p in 0..np {
@@ -331,8 +367,9 @@ fn knn_available_py() -> bool {
 #[pyo3(signature = (x, db, k, threads=1))]
 fn knn_ip<'py>(py: Python<'py>, x: PyReadonlyArray2<f32>, db: PyReadonlyArray2<f32>, k: usize, threads: usize)
                -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<i64>>)> {
-    if !knn_available() {
-        return Err(PyValueError::new_err("knn_ip needs AVX-512 VNNI"));
+    let path = knn_path();
+    if path == KnnPath::Faiss {
+        return Err(PyValueError::new_err("knn_ip: no Rust kernel selected (CAPCOVER_KNN=faiss or unsupported CPU)"));
     }
     let xs = x.as_slice().map_err(|_| PyValueError::new_err("x must be C-contiguous float32"))?;
     let ds = db.as_slice().map_err(|_| PyValueError::new_err("db must be C-contiguous float32"))?;
@@ -345,6 +382,16 @@ fn knn_ip<'py>(py: Python<'py>, x: PyReadonlyArray2<f32>, db: PyReadonlyArray2<f
     if n == 0 || k == 0 {
         return Ok((PyArray2::zeros(py, [n, k], false), PyArray2::zeros(py, [n, k], false)));
     }
+    if path == KnnPath::Avx2 {
+        if d == 0 || !xs.iter().all(|v| v.is_finite()) || !ds.iter().all(|v| v.is_finite()) {
+            return Err(PyValueError::new_err("knn_ip: empty or non-finite input"));
+        }
+        let (ip, id) = py.detach(|| crate::construct_knn_avx2::knn(xs, n, ds, m, d, k, threads));
+        let ipa = PyArray1::from_vec(py, ip).reshape([n, k])?;
+        let ida = PyArray1::from_vec(py, id).reshape([n, k])?;
+        return Ok((ipa, ida));
+    }
+    let amx = path == KnnPath::Amx;
     let dpad = (d + 63) / 64 * 64;
     let mut ip = vec![0f32; n * k];
     let mut id = vec![0i64; n * k];
@@ -355,7 +402,7 @@ fn knn_ip<'py>(py: Python<'py>, x: PyReadonlyArray2<f32>, db: PyReadonlyArray2<f
         let xu8: Vec<u8> = qx.q.iter().map(|&v| (v as i16 + 128) as u8).collect();
         let nblocks = n.div_ceil(RB);
         let run = |b: usize, ipc: &mut [f32], idc: &mut [i64]| unsafe {
-            search_block(&qx, &xu8, xs, &db_packed, ds, d, k, b * RB, ipc, idc);
+            search_block(amx, &qx, &xu8, xs, &db_packed, ds, d, k, b * RB, ipc, idc);
         };
         if threads <= 1 {
             for (b, (ipc, idc)) in ip.chunks_mut(RB * k).zip(id.chunks_mut(RB * k)).enumerate() {
@@ -521,6 +568,7 @@ fn fit_scalar<'py>(py: Python<'py>, c0: PyReadonlyArray2<f64>, x: PyReadonlyArra
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(knn_ip, m)?)?;
     m.add_function(wrap_pyfunction!(knn_available_py, m)?)?;
+    m.add_function(wrap_pyfunction!(knn_path_py, m)?)?;
     m.add_function(wrap_pyfunction!(settle, m)?)?;
     m.add_function(wrap_pyfunction!(fit_scalar, m)?)?;
     Ok(())

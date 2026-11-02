@@ -225,8 +225,11 @@ class NonFiniteKnnTest(unittest.TestCase):
         ip, lab = nearest_directions(X, U, 2)                    # wrapper falls back; must not raise a panic
         self.assertEqual(lab.shape, (50, 2))
         if hasattr(capcover_rs, "knn_ip") and capcover_rs.knn_available_py():
-            ip2, lab2 = capcover_rs.knn_ip(np.ascontiguousarray(X), np.ascontiguousarray(U), 2, 1)
-            self.assertEqual(lab2.shape, (50, 2))                # padded, no panic
+            try:
+                ip2, lab2 = capcover_rs.knn_ip(np.ascontiguousarray(X), np.ascontiguousarray(U), 2, 1)
+                self.assertEqual(lab2.shape, (50, 2))            # VNNI/AMX: padded, no panic
+            except ValueError:
+                self.assertEqual(capcover_rs.knn_path_py(), "avx2")   # AVX2 path rejects non-finite input
 
 
 if __name__ == "__main__" and False:
