@@ -1,3 +1,4 @@
+pub mod construct_gonzalez;
 pub mod core;
 pub mod fastscan;
 pub mod pq_direct;
@@ -90,5 +91,6 @@ fn capcover_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CapIndex>()?;
     m.add_function(wrap_pyfunction!(fs_stats, m)?)?;
     m.add_function(wrap_pyfunction!(set_fastscan, m)?)?;
+    construct_gonzalez::register(m)?;
     Ok(())
 }
