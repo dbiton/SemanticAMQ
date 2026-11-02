@@ -8,7 +8,7 @@ from filters.cap_cover.cap_quantizers import Quantize, _ENCODINGS, _SeededPQ, _f
 from filters.cap_cover.cap_scan import _CapScanMixin
 from filters.cap_cover.cap_interfaces import ConstructInterface, Cover, EncodedCover, InsertInterface
 from filters.cap_cover.cap_geometry import (angle_between, log_cap_measure, nearest_directions, segments,
-                                            segment_max, unit_rows)
+                                            segment_max, unit_rows, row_angles, pair_angles)
 
 
 _ROTATION_SEED = 0x5EED
@@ -626,14 +626,9 @@ class CapCoverFilter(_CapScanMixin, Filter):
             labels = labels.reshape(len(X), k)
         else:
             labels = np.concatenate([home[:, None], neighbors[home]], axis=1)
-        dist = np.full(labels.shape, np.inf)
-        for s in range(0, len(X), 2048):
-            rows = slice(s, s + 2048)
-            lab = labels[rows]
-            d = angle_between(X[rows, None, :], decoded[np.maximum(lab, 0)])
-            dist[rows] = np.where(lab >= 0, d, np.inf)
+        dist = pair_angles(X, decoded, labels)
 
-        home_d = angle_between(X, decoded[home])
+        home_d = row_angles(X, decoded, home)
         # A construct method whose cap does not hold its own nearest member
         # is repaired here rather than trusted: the fallback must be legal.
         np.maximum.at(bound, home, home_d)

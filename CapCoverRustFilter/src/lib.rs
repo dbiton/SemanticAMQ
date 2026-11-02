@@ -1,6 +1,7 @@
 pub mod core;
 pub mod fastscan;
 pub mod pq_direct;
+pub mod construct_common;
 pub mod construct_gonzalez;
 pub mod construct_minimax;
 pub mod construct_anneal;
@@ -93,6 +94,7 @@ fn capcover_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CapIndex>()?;
     m.add_function(wrap_pyfunction!(fs_stats, m)?)?;
     m.add_function(wrap_pyfunction!(set_fastscan, m)?)?;
+    crate::construct_common::register(m)?;
     crate::construct_gonzalez::register(m)?;
     crate::construct_minimax::register(m)?;
     crate::construct_anneal::register(m)?;
