@@ -18,7 +18,7 @@ use rayon::prelude::*;
 // ------------------------------------------------------------------ knn_ip
 
 const PANEL: usize = 32; // database columns per packed panel
-const RB: usize = 8; // queries per micro-tile
+const RB: usize = 16; // queries per block (two 8-row VNNI tiles, or one 16-row AMX tile)
 const WARM_PANELS: usize = 16; // panels scored unconditionally to seed the threshold
 
 pub fn knn_available() -> bool {
@@ -34,6 +34,34 @@ pub fn knn_available() -> bool {
     {
         false
     }
+}
+
+/// AMX int8 tiles usable (CPU flags, kernel permission granted, not disabled by CAPCOVER_TAIL_NOAMX).
+fn amx_ok() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::env::var_os("CAPCOVER_TAIL_NOAMX").is_some() {
+                return false;
+            }
+            let info = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+            if !(info.contains(" amx_int8") && info.contains(" amx_tile")) {
+                return false;
+            }
+            // arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)
+            let r: i64;
+            unsafe {
+                std::arch::asm!("syscall", inlateout("rax") 158i64 => r, in("rdi") 0x1023i64, in("rsi") 18i64,
+                                lateout("rcx") _, lateout("r11") _, options(nostack));
+            }
+            r == 0
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    })
 }
 
 struct Rows {
@@ -54,17 +82,23 @@ fn quantize(x: &[f32], n: usize, d: usize, dpad: usize) -> Rows {
         let row = &x[i * d..(i + 1) * d];
         let mx = row.iter().fold(0f32, |a, &v| a.max(v.abs()));
         let s = if mx > 0.0 { mx / 127.0 } else { 1.0 };
-        let (mut e2, mut n2) = (0f64, 0f64);
-        for (k, &v) in row.iter().enumerate() {
-            let qi = (v / s).round().clamp(-127.0, 127.0);
-            q[i * dpad + k] = qi as i8;
-            let r = v as f64 - (s as f64) * (qi as f64);
-            e2 += r * r;
-            n2 += (v as f64) * (v as f64);
+        // float32 throughout (vectorizes); the 1e-3 relative margins below dwarf its ~1e-5 accumulation error.
+        let (mut e2, mut n2) = ([0f32; 8], [0f32; 8]);
+        let inv = 1.0 / s;
+        let qrow = &mut q[i * dpad..i * dpad + d];
+        for (cv, cq) in row.chunks(8).zip(qrow.chunks_mut(8)) {
+            for l in 0..cv.len() {
+                let v = cv[l];
+                let qi = (v * inv).round().clamp(-127.0, 127.0);
+                cq[l] = qi as i8;
+                let r = v - s * qi;
+                e2[l] += r * r;
+                n2[l] += v * v;
+            }
         }
         scale[i] = s;
-        err[i] = (e2.sqrt() * (1.0 + 1e-6) + 1e-9) as f32;
-        norm[i] = (n2.sqrt() * (1.0 + 1e-6) + 1e-9) as f32;
+        err[i] = ((e2.iter().sum::<f32>() as f64).sqrt() * (1.0 + 1e-3) + 1e-7) as f32;
+        norm[i] = ((n2.iter().sum::<f32>() as f64).sqrt() * (1.0 + 1e-3) + 1e-7) as f32;
     }
     Rows { n, dpad, q, scale, err, norm }
 }
@@ -88,6 +122,46 @@ mod x86 {
             acc = _mm512_fmadd_ps(_mm512_maskz_loadu_ps(m, a.add(full)), _mm512_maskz_loadu_ps(m, b.add(full)), acc);
         }
         _mm512_reduce_add_ps(acc)
+    }
+
+    /// AMX: palette 1, tmm0..7 all 16 rows x 64 bytes. Per thread/block; pair with amx_release.
+    pub unsafe fn amx_config() {
+        let mut cfg = [0u8; 64];
+        cfg[0] = 1;
+        for i in 0..8 {
+            cfg[16 + 2 * i] = 64;
+            cfg[48 + i] = 16;
+        }
+        std::arch::asm!("ldtilecfg [{c}]", c = in(reg) cfg.as_ptr(), options(nostack));
+    }
+
+    pub unsafe fn amx_release() {
+        std::arch::asm!("tilerelease", options(nostack));
+    }
+
+    /// 16 queries (u8 rows, stride dpad) x one 32-column panel via tdpbusd:
+    /// acc[r*32 + col] (int32). tmm0/tmm1 = C halves, tmm2 = A, tmm3/tmm4 = B halves.
+    pub unsafe fn amx_panel(xq: *const u8, dpad: usize, panel: *const i8, out: *mut i32) {
+        let (sa, sb, sc) = (dpad, 128usize, 128usize);
+        std::arch::asm!("tilezero tmm0", "tilezero tmm1", options(nostack));
+        for c in 0..dpad / 64 {
+            let a = xq.add(c * 64);
+            let b0 = panel.add(c * 16 * 128);
+            let b1 = b0.add(64);
+            std::arch::asm!(
+                "tileloadd tmm2, [{a} + {sa}]",
+                "tileloadd tmm3, [{b0} + {sb}]",
+                "tileloadd tmm4, [{b1} + {sb}]",
+                "tdpbusd tmm0, tmm2, tmm3",
+                "tdpbusd tmm1, tmm2, tmm4",
+                a = in(reg) a, b0 = in(reg) b0, b1 = in(reg) b1, sa = in(reg) sa, sb = in(reg) sb,
+                options(nostack, readonly));
+        }
+        std::arch::asm!(
+            "tilestored [{o0} + {sc}], tmm0",
+            "tilestored [{o1} + {sc}], tmm1",
+            o0 = in(reg) out, o1 = in(reg) out.add(16), sc = in(reg) sc,
+            options(nostack));
     }
 
     /// Bitmask (32 lanes) of the panel's columns whose approx score for one query
@@ -187,10 +261,18 @@ unsafe fn search_block(qx: &Rows, xu8: &[u8], x: &[f32], db: &Db, dbf: &[f32], d
     }
     let mut thr = [f32::NEG_INFINITY; RB];
     let mut cand: Vec<Vec<(f32, u32)>> = (0..RB).map(|_| Vec::new()).collect();
-    let mut acc = [0i32; 16 * 16];
+    let mut acc = [0i32; RB * PANEL];
+    let amx = amx_ok();
+    if amx { x86::amx_config(); }
     let warm = WARM_PANELS.min(np);
     for p in 0..np {
-        x86::tile(xb.as_ptr(), dpad, db.panels.as_ptr().add(p * steps * PANEL * 4), acc.as_mut_ptr());
+        let panel = db.panels.as_ptr().add(p * steps * PANEL * 4);
+        if amx {
+            x86::amx_panel(xb.as_ptr(), dpad, panel, acc.as_mut_ptr());
+        } else {
+            x86::tile(xb.as_ptr(), dpad, panel, acc.as_mut_ptr());
+            x86::tile(xb.as_ptr().add(8 * dpad), dpad, panel, acc.as_mut_ptr().add(8 * PANEL));
+        }
         let valid = (db.m - p * PANEL).min(PANEL);
         let vmask: u32 = if valid >= 32 { u32::MAX } else { (1u32 << valid) - 1 };
         for r in 0..nq {
@@ -215,6 +297,9 @@ unsafe fn search_block(qx: &Rows, xu8: &[u8], x: &[f32], db: &Db, dbf: &[f32], d
                 }
             }
         }
+    }
+    if amx {
+        x86::amx_release();
     }
     for r in 0..nq {
         let i = i0 + r;
