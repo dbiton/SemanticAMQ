@@ -23,14 +23,14 @@ def resolve_kernel(kernel: Optional[str] = None) -> str:
     """Which Gonzalez selection kernel to use: 'int8' (fused AVX512 kernel with int8 screening),
     'lazy' (exact lazy/CELF kernel, AVX2 with scalar fallback) or 'numpy' (reference).
     Explicit argument > env CAPCOVER_GONZALEZ_KERNEL (int8|lazy|numpy|auto) > auto:
-    int8 when the CPU has AVX512 VNNI+VL+BW and CAPCOVER_GONZALEZ_NOQ is unset, else lazy,
-    else numpy when the extension lacks the kernels."""
+    lazy (portable, same picks on every CPU, as fast or faster than int8 in paired runs),
+    else int8 when only that kernel exists, else numpy. int8 stays available explicitly."""
     k = kernel if kernel is not None else os.environ.get("CAPCOVER_GONZALEZ_KERNEL", "auto")
     k = k.lower()
     if k == "auto":
-        if _rust_gonzalez_labels is not None and _screening_available():
-            return "int8"
-        return "lazy" if _rust_lazy_labels is not None else "numpy"
+        if _rust_lazy_labels is not None:
+            return "lazy"
+        return "int8" if _rust_gonzalez_labels is not None and _screening_available() else "numpy"
     if k not in KERNELS:
         raise ValueError(f"unknown Gonzalez kernel {k!r}; expected one of {KERNELS} or 'auto'")
     if k == "int8" and _rust_gonzalez_labels is None:

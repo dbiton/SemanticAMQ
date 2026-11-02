@@ -223,8 +223,8 @@ class TestDispatch(unittest.TestCase):
             os.environ["CAPCOVER_GONZALEZ_KERNEL"] = name
             self.assertEqual(GonzalesConstruct().kernel, name)
         os.environ["CAPCOVER_GONZALEZ_KERNEL"] = "auto"
-        self.assertEqual(GonzalesConstruct().kernel, "int8" if gc._screening_available() else "lazy")
-        os.environ["CAPCOVER_GONZALEZ_NOQ"] = "1"          # screening switched off: lazy takes over
+        self.assertEqual(GonzalesConstruct().kernel, "lazy")   # portable default, same picks on every CPU
+        os.environ["CAPCOVER_GONZALEZ_NOQ"] = "1"
         self.assertEqual(GonzalesConstruct().kernel, "lazy")
         os.environ["CAPCOVER_GONZALEZ_KERNEL"] = "bogus"
         with self.assertRaises(ValueError):
