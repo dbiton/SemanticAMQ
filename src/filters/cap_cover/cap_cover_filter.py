@@ -137,8 +137,13 @@ class CapCoverFilter(_CapScanMixin, Filter):
         selection_tau: float = 0.1,
         mixed: bool = True,
         rust_threads: Optional[int] = None,
+        spend_leftover: bool = False,
     ) -> None:
         super().__init__(dim, max_memory=max_memory)
+        # Opt-in (default off = the reference path): after a single encoding is
+        # chosen, bytes the budget leaves unspent buy the next finer code for the
+        # widest caps (_spend_leftover).
+        self.spend_leftover = bool(spend_leftover)
         # Threads of query()'s Rust scan: the evaluation runs one process per
         # core, so 1 (or env CAPCOVER_RUST_THREADS) is the default.
         self.rust_threads = int(os.environ.get("CAPCOVER_RUST_THREADS", 1)) if rust_threads is None else rust_threads
@@ -977,6 +982,8 @@ class CapCoverFilter(_CapScanMixin, Filter):
         U = unit_rows(cover.directions)
         theta = np.asarray(cover.angles, dtype=np.float64)
         home, neighbors = np.asarray(cover.labels, dtype=np.int64), cover.neighbors
+        if levels is None and self.spend_leftover:
+            levels = self._spend_leftover(U, theta)
         if levels is None:
             levels = np.full(len(U), self._uniform, dtype=np.int64)
         self._reset_buffers(len(U))
@@ -1005,6 +1012,47 @@ class CapCoverFilter(_CapScanMixin, Filter):
                                                   vectors=X[inverse])
         self._constructed = True
         self._dirs = None
+
+    def _spend_leftover(self, U: np.ndarray, theta: np.ndarray) -> Optional[np.ndarray]:
+        """Per-cap levels that spend the budget the chosen single encoding leaves
+        unspent: the widest caps (they set the accept region) take the next finer
+        encoding, as many as get_bytesize() still keeps within max_memory (charged
+        with the same terms: finest codebook, other group's codebook + count).
+        None when nothing finer exists, nothing is left, or no budget is set.
+        Sets the filter's encoding to the finest in use, as _choose_mixed does."""
+        if self.max_memory is None or self.insert_method is not None or not len(U):
+            return None
+        base = self._uniform
+        finer = [l for l in range(len(self.levels)) if self._code_sizes[l] > self._code_sizes[base]]
+        if not finer:
+            return None
+        nxt = min(finer, key=lambda l: int(self._code_sizes[l]))
+        n = len(U)
+        self._train_quantizers(U, level=base)
+        self._train_quantizers(U, level=nxt)
+
+        def total(n2: int) -> int:
+            self._uniform = nxt
+            try:
+                t = self._codebook_bytes() + n2 * self.bytes_per_cap(nxt)
+            finally:
+                self._uniform = base
+            if n - n2:
+                t += (n - n2) * self.bytes_per_cap(base) + self._quantizer_bytes(base) + self._GROUP_BYTES
+            return t
+        lo, hi = 0, n          # largest n2 whose total fits
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if total(mid) <= self.max_memory:
+                lo = mid
+            else:
+                hi = mid - 1
+        if lo == 0:
+            return None
+        levels = np.full(n, base, dtype=np.int64)
+        levels[np.argsort(-np.asarray(theta), kind="stable")[:lo]] = nxt
+        self._set_uniform(nxt)
+        return levels
 
     def _encode_cover(self, X, U, theta, home, levels, neighbors=None) -> EncodedCover:
         """Fit codes and reassign members using the already trained codebooks."""
