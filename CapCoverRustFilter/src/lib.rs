@@ -1,6 +1,13 @@
 pub mod core;
 pub mod fastscan;
 pub mod pq_direct;
+pub mod construct_common;
+pub mod construct_gonzalez;
+pub mod construct_minimax;
+pub mod construct_anneal;
+pub mod construct_assign;
+pub mod construct_tail;
+pub mod construct_knn_avx2;
 
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::prelude::*;
@@ -90,5 +97,11 @@ fn capcover_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CapIndex>()?;
     m.add_function(wrap_pyfunction!(fs_stats, m)?)?;
     m.add_function(wrap_pyfunction!(set_fastscan, m)?)?;
+    crate::construct_common::register(m)?;
+    crate::construct_gonzalez::register(m)?;
+    crate::construct_minimax::register(m)?;
+    crate::construct_anneal::register(m)?;
+    crate::construct_assign::register(m)?;
+    crate::construct_tail::register(m)?;
     Ok(())
 }

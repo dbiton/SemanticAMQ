@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import faiss
 from typing import Tuple
@@ -25,6 +26,46 @@ def angle_between(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     return 2.0 * np.arcsin(np.minimum(1.0, 0.5 * chord))
 
 
+try:
+    import capcover_rs as _rs
+    _FUSED = hasattr(_rs, "row_angles")
+except ImportError:  # pure-NumPy fallback
+    _rs, _FUSED = None, False
+
+
+def tail_rust() -> bool:
+    """Whether the construct-tail Rust kernels (construct_tail.rs) are used;
+    env CAPCOVER_TAIL=python selects the original NumPy/faiss code. Needs a Rust knn kernel
+    (AVX-512 VNNI or AVX2+FMA); CAPCOVER_KNN only picks the kNN path, see nearest_directions."""
+    return (_rs is not None and hasattr(_rs, "knn_ip") and os.environ.get("CAPCOVER_TAIL", "rust") != "python"
+            and _rs.knn_available_py())
+
+
+def row_angles(X: np.ndarray, U: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    """angle_between(X, U[labels]) without the gathered copy and difference
+    temporaries (fused Rust kernel; float64, summation order differs from
+    numpy's at the 1e-16 level)."""
+    if _FUSED:
+        return _rs.row_angles(np.ascontiguousarray(X, dtype=np.float64),
+                              np.ascontiguousarray(U, dtype=np.float64),
+                              np.ascontiguousarray(labels, dtype=np.int64))
+    return angle_between(X, U[labels])
+
+
+def pair_angles(X: np.ndarray, U: np.ndarray, idx: np.ndarray) -> np.ndarray:
+    """out[i, j] = angle(X[i], U[idx[i, j]]), +inf where idx[i, j] < 0."""
+    if _FUSED:
+        return _rs.pair_angles(np.ascontiguousarray(X, dtype=np.float64),
+                               np.ascontiguousarray(U, dtype=np.float64),
+                               np.ascontiguousarray(idx, dtype=np.int64))
+    out = np.full(idx.shape, np.inf)
+    for s in range(0, len(X), 2048):
+        lab = idx[s:s + 2048]
+        d = angle_between(X[s:s + 2048, None, :], U[np.maximum(lab, 0)])
+        out[s:s + 2048] = np.where(lab >= 0, d, np.inf)
+    return out
+
+
 def chord_to_angle(chord) -> np.ndarray:
     """Angle subtended by a chord of the unit sphere."""
     return 2.0 * np.arcsin(np.minimum(1.0, 0.5 * np.asarray(chord, dtype=np.float64)))
@@ -33,9 +74,18 @@ def chord_to_angle(chord) -> np.ndarray:
 def nearest_directions(X: np.ndarray, U: np.ndarray, k: int = 1) -> Tuple[np.ndarray, np.ndarray]:
     """(inner products, indices) of each row of X's k nearest unit directions
     by angle, from an exact IndexFlatIP search in float32. Ranks only."""
+    Xf = np.ascontiguousarray(X, dtype=np.float32)
+    Uf = np.ascontiguousarray(U, dtype=np.float32)
+    if len(Uf) and len(Xf) and tail_rust() and _rs.knn_path_py() != "faiss" and np.isfinite(Xf).all() and np.isfinite(Uf).all():
+        # Exact top-k (Rust, construct_tail.rs): AMX > AVX-512 VNNI (int8-screened) > AVX2+FMA (fused
+        # GEMM + running top-k); CAPCOVER_KNN=amx|vnni|avx2|faiss forces one. Same index sets as faiss.
+        ip, labels = _rs.knn_ip(Xf, Uf, min(k, len(Uf)), max(1, faiss.omp_get_max_threads()))
+        if k == 1:
+            return ip.ravel(), labels.ravel()
+        return ip, labels
     index = faiss.IndexFlatIP(U.shape[1])
-    index.add(np.ascontiguousarray(U, dtype=np.float32))
-    ip, labels = index.search(np.ascontiguousarray(X, dtype=np.float32), min(k, len(U)))
+    index.add(Uf)
+    ip, labels = index.search(Xf, min(k, len(U)))
     if k == 1:
         return ip.ravel(), labels.ravel()
     return ip, labels
@@ -237,7 +287,7 @@ def labelled_cap_cover(X: np.ndarray, U: np.ndarray, labels: np.ndarray = None
     if labels is None:
         _, labels = nearest_directions(X, U)
     labels = np.asarray(labels, dtype=np.int64)
-    theta = angle_between(X, U[labels])
+    theta = row_angles(X, U, labels)
     order, starts, counts = segments(labels, len(U))
     angles = segment_max(theta[order], starts, counts)
     kept = np.flatnonzero(counts > 0)

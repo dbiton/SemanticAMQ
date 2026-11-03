@@ -1,6 +1,7 @@
 """Direction quantizers behind CapCoverFilter's encodings."""
 import numpy as np
 import faiss
+from filters.cap_cover.cap_geometry import tail_rust, _rs
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -262,9 +263,14 @@ def _fit_scalar_codes(sq: faiss.ScalarQuantizer, U: np.ndarray, X: np.ndarray, l
         return sq.compute_codes(np.ascontiguousarray(C, dtype=np.float32))
     n_levels = 1 << int(round(np.log2(len(faiss.vector_to_array(sq.trained)) + 1) - 1))
     levels = np.sort(faiss.vector_to_array(sq.trained)[:n_levels].astype(np.float64))
+    labels = np.asarray(labels, dtype=np.int64)
+    if tail_rust():
+        # Per-cap coordinate search in Rust (construct_tail.rs); caps do not interact.
+        fitted = _rs.fit_scalar(np.ascontiguousarray(C), np.ascontiguousarray(X, dtype=np.float64), labels,
+                                np.ascontiguousarray(levels), int(passes))
+        return sq.compute_codes(np.ascontiguousarray(fitted, dtype=np.float32))
     idx = np.searchsorted(levels, C - 1e-12)
     idx = np.clip(idx, 0, n_levels - 1)
-    labels = np.asarray(labels, dtype=np.int64)
     order = np.argsort(labels, kind="stable")
     caps, starts = np.unique(labels[order], return_index=True)
     Xo, lo = X[order], labels[order]
