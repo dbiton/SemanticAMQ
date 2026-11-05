@@ -1,4 +1,4 @@
-"""CapCoverFilter figures for the tau sweep (see main.generate_cap_cover_system_tau):
+"""CapCoverFilter figures for the tau sweep (see experiments.generate_cap_cover_system_tau):
 BallCoverFilter's plot_system_tau.py, with the ball-specific geometric
 objective/volume-bounds panels (built from radii/centers, which CapCoverFilter
 has no analogue for) replaced by a single n_caps panel. tau is the swept
@@ -61,7 +61,7 @@ def _validate_schema(df: pd.DataFrame) -> None:
 
 def load_data() -> pd.DataFrame:
     if not os.path.exists(INPUT_PATH):
-        raise FileNotFoundError(f"Input file not found: {INPUT_PATH!r}. Run main.generate_cap_cover_system_tau first.")
+        raise FileNotFoundError(f"Input file not found: {INPUT_PATH!r}. Run experiments.generate_cap_cover_system_tau first.")
     df = pd.read_parquet(INPUT_PATH) if INPUT_PATH.endswith(".parquet") else pd.read_csv(INPUT_PATH)
     _validate_schema(df)
     return df

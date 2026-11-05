@@ -144,8 +144,8 @@ class TestMissingEvaluations(unittest.TestCase):
                 (results / "construct_methods").mkdir(exist_ok=True)
                 (results / "construct_methods" / f"{corpus}.csv").touch()
             self.assertEqual(paper.missing_evaluations(results, n_corpora=2),
-                             ["quantization", "equal-memory"])
+                             ["quantization", "streaming", "equal-memory"])
             (results / "equal_memory" / "A").mkdir(parents=True)
             (results / "equal_memory" / "A" / "equal_memory.csv").touch()      # one corpus of two: still missing
             self.assertIn("equal-memory", paper.missing_evaluations(results, n_corpora=2))
-            self.assertEqual(paper.missing_evaluations(results, n_corpora=1), ["quantization"])
+            self.assertEqual(paper.missing_evaluations(results, n_corpora=1), ["quantization", "streaming"])

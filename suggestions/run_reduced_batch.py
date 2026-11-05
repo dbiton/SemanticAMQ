@@ -14,13 +14,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import paper
-import main
+import experiments
 from filters.cap_cover.cap_quantizers import Quantize
 
 n = int(sys.argv[1]) if len(sys.argv) > 1 else 10_000
 workers = int(sys.argv[2]) if len(sys.argv) > 2 else 18
 paper.configure(num_vectors=n, workers=workers)
-main.BLOCKLIST_FOLDS = 1
+experiments.BLOCKLIST_FOLDS = 1
 
 paper.PAPER_BUDGET_PCT = (0.5, 2, 10)
 paper.PAPER_K_LADDER = [round(pct / 100 * 80_000) for pct in paper.PAPER_BUDGET_PCT]
@@ -32,7 +32,7 @@ if __name__ == "__main__":
     generators = [
         paper.GENERATORS["streaming"],
         paper.generate_quantization,
-        partial(main.generate_equal_memory, filters=paper.PAPER_EQUAL_MEMORY_FILTERS, n_folds=1,
+        partial(experiments.generate_equal_memory, filters=paper.PAPER_EQUAL_MEMORY_FILTERS, n_folds=1,
                 count_memory_steps=4),
     ]
     paper.set_thresholds()

@@ -1,6 +1,5 @@
 import logging
 import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Must happen before numpy/faiss are imported: otherwise each of Runner's
 # MAX_WORKERS processes also grabs every CPU core for its own internal
@@ -12,21 +11,12 @@ for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "
 import faiss
 import h5py
 import numpy as np
-import pandas as pd
 
 faiss.omp_set_num_threads(1)  # belt-and-suspenders alongside the env vars above
 
 from logging_config import configure_logging
 from runner import (Runner,
-                    CAP_QUANTIZATION_SWEEP, CAP_CONSTRUCT_METHODS, CAP_COVER_CONSTRUCT,
-                    system_tau_ground_truth_worker, _k_for_memory_fraction)
-from plots.plot_query_performance import generate_query_performance_figures
-from plots.plot_equal_memory import generate_equal_memory_figures
-from plots.plot_scaling import generate_scaling_figures
-from plots.plot_streaming import generate_streaming_figures
-from plots.plot_blocklist import generate_blocklist_figures
-from plots.plot_budget import generate_budget_figures
-from plots.plot_construct_methods import generate_construct_methods_figures, load_results as load_construct_methods
+                    CAP_QUANTIZATION_SWEEP, CAP_COVER_CONSTRUCT, _k_for_memory_fraction)
 from plots.plot_common import DATASETS, DATASET_LABELS
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from filters.cap_cover.cap_cover_filter import CapCoverFilter, Quantize
@@ -40,7 +30,6 @@ from filters.pacuk_lsh_filter import PacukLSHFilter
 from filters.sankowski_wygocki_filter import SankowskiWygockiFilter
 from filters.va_plus_filter import VAPlusFilter
 from util.dataset_paths import dataset_filenames, HDF5_DATASET_KEY
-from util.fetch_datasets import load_embeds
 from vector_source import VectorSource
 
 configure_logging()
@@ -104,33 +93,23 @@ DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
 # encodings (see CAP_QUANTIZATION_SWEEP), so keeping both lets either be
 # re-run/compared independently.
 CAP_QUANTIZATION_DIR = "results/cap_quantization"
-CAP_QUANTIZATION_PLOT_DIR = "plots/cap_quantization"
 
 
 def cap_quantization_csv(dataset: str) -> str:
     return os.path.join(CAP_QUANTIZATION_DIR, dataset, "cap_quantization.csv")
 
 
-def cap_quantization_plot_dir(dataset: str) -> str:
-    return os.path.join(CAP_QUANTIZATION_PLOT_DIR, dataset)
 
 # generate_scaling runs once per blocklist corpus and keeps each run in its
 # own folder, mirroring cap_quantization_csv/CAP_QUANTIZATION_DIR above: throughput
 # is pooled across corpora for plotting, but keeping each corpus's raw rows
 # apart on disk makes a single corpus's run inspectable/rerunnable on its own.
-SCALING_DIR = "results/scaling"
 
 
-def scaling_query_csv(dataset: str) -> str:
-    return os.path.join(SCALING_DIR, dataset, "scaling_query.csv")
 
 
-def scaling_insert_csv(dataset: str) -> str:
-    return os.path.join(SCALING_DIR, dataset, "scaling_insert.csv")
 
 
-def scaling_construction_csv(dataset: str) -> str:
-    return os.path.join(SCALING_DIR, dataset, "scaling_construction.csv")
 
 
 # generate_equal_memory runs once per blocklist corpus and keeps each run in
@@ -138,15 +117,12 @@ def scaling_construction_csv(dataset: str) -> str:
 # the same way too (see plot_equal_memory): one figure set per corpus, in its
 # own folder, rather than pooled into a single cross-corpus line per filter.
 EQUAL_MEMORY_DIR = "results/equal_memory"
-EQUAL_MEMORY_PLOT_DIR = "plots/equal_memory"
 
 
 def equal_memory_csv(dataset: str) -> str:
     return os.path.join(EQUAL_MEMORY_DIR, dataset, "equal_memory.csv")
 
 
-def equal_memory_plot_dir(dataset: str) -> str:
-    return os.path.join(EQUAL_MEMORY_PLOT_DIR, dataset)
 
 
 # generate_streaming runs once per blocklist corpus and keeps each run in its
@@ -422,135 +398,17 @@ def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None, n
                     )
 
 
-def save_equal_memory(job_results: List[Tuple[str, Any]]) -> list:
-    """Extracts this evaluation's rows from a shared Runner's combined
-    run() output (see generate_equal_memory()). The Runner itself already
-    wrote one results/equal_memory/<dataset>/equal_memory.csv per corpus
-    incrementally, one row-batch per completed job (see
-    generate_equal_memory()'s output_csv=), so this no longer writes the
-    file -- it only recovers this evaluation's rows for plot_equal_memory()."""
-    return rows_for_mode(job_results, 'equal_memory')
 
 
-def plot_equal_memory(results: list) -> None:
-    """One figure set per corpus, each in its own folder -- mirrors
-    plot_quantization's split, for the same reason: a filter's line pooled
-    across corpora hides which specific corpus it's winning or losing on,
-    and generate_equal_memory already keeps each corpus's raw rows in its
-    own results/equal_memory/<dataset>/ file (see equal_memory_csv)."""
-    df = pd.DataFrame(results)
-    for dataset in sorted(df["Dataset"].unique()):
-        outdir = equal_memory_plot_dir(str(dataset))
-        logger.info(f"Plotting equal-memory comparison for {dataset} -> {outdir}")
-        generate_equal_memory_figures(df=df[df["Dataset"] == dataset], outdir=outdir)
 
 
 # Output of generate_cap_cover_system_tau.
-CAP_COVER_SYSTEM_TAU_CSV = "results/cap_cover_system_tau.csv"
 
 
-def generate_cap_cover_system_tau(runner: Runner, num_vectors: int = WORKLOAD_NUM_VECTORS,
-                                  k_folds: int = 5, k_fraction: float = 0.1,
-                                  tau_values: Optional[List[float]] = None) -> None:
-    """CapCoverFilter's end-to-end filtering benefit: k_folds non-wrapping
-    80/20 folds per dataset, one CapCoverFilter.auto() cover
-    (runner._cap_cover) per (dataset, fold) in front of a flat index,
-    queried one at a time at every tau in tau_values without ever
-    rebuilding. Cap budget k is a fixed fraction of each fold's
-    construct-set size, converted to bytes by runner._cover_max_memory.
-
-    Ground truth (nearest-construct-set distance per query) is keyed only by
-    (dataset, num_vectors, k_folds, fold), not by which filter queries it, so
-    it is cached in results/system_tau_ground_truth and reused across runs.
-
-    Only submits 'cap_cover_system_tau' jobs (output_csv=CAP_COVER_SYSTEM_TAU_CSV)
-    -- does not run `runner`. num_vectors/k_folds/k_fraction/tau_values take explicit
-    arguments so a smaller local validation run doesn't have to
-    monkeypatch module globals -- see CLAUDE.md on sizing local runs."""
-    dim              = 384
-    tau_values       = [float(t) for t in np.logspace(-2, -0.5, num=10)] if tau_values is None else tau_values
-    ground_truth_dir = "results/system_tau_ground_truth"
-
-    datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
-    missing = [d for d in DATASET_KEYS if d not in datasets]
-    if missing:
-        logger.warning(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
-    if set(datasets) != set(DATASET_KEYS):
-        raise RuntimeError(
-            f"generate_cap_cover_system_tau needs all {len(DATASET_KEYS)} datasets "
-            f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
-        )
-
-    logger.info(f"Cap budget fixed as a fraction of the construct set: {k_fraction}")
-    logger.info(f"Fixed tau sweep (shared across datasets): {tau_values}")
-    logger.info(f"K-fold cross-validation: {k_folds} folds, non-wrapping contiguous 80/20 spans")
-
-    query_len = num_vectors // k_folds
-    construct_len = num_vectors - query_len
-
-    splits = []
-    for dataset in datasets:
-        total_rows = len(VectorSource(dataset))
-        fold_starts = advancing_fold_starts(total_rows, k_folds, query_len, num_vectors)
-        for fold, fold_start in enumerate(fold_starts):
-            query_start, query_end = fold_start, fold_start + query_len
-            construct_start, construct_end = query_end, query_end + construct_len
-            construct_source = VectorSource(dataset, construct_start, construct_end)
-            query_source = VectorSource(dataset, query_start, query_end)
-            splits.append((dataset, fold, construct_source, query_source))
-
-    os.makedirs(ground_truth_dir, exist_ok=True)
-    nn_dist_by_split = {}
-    to_compute = []
-    for dataset, fold, construct_source, query_source in splits:
-        cache_path = os.path.join(ground_truth_dir, f"{dataset}_{num_vectors}_{k_folds}fold_{fold}.npy")
-        if os.path.exists(cache_path):
-            nn_dist_by_split[(dataset, fold)] = np.load(cache_path)
-        else:
-            to_compute.append((dataset, fold, cache_path, construct_source, query_source))
-
-    if to_compute:
-        logger.info(f"Computing ground truth for {len(to_compute)} (dataset, fold) pair(s) not yet cached...")
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(system_tau_ground_truth_worker, dim, cs, qs): (dataset, fold, cache_path)
-                for dataset, fold, cache_path, cs, qs in to_compute
-            }
-            for future in as_completed(futures):
-                dataset, fold, cache_path = futures[future]
-                nn_dist = future.result()
-                np.save(cache_path, nn_dist)
-                nn_dist_by_split[(dataset, fold)] = nn_dist
-    else:
-        logger.info("All ground truth already cached on disk; skipping recomputation.")
-
-    for dataset, fold, construct_source, query_source in splits:
-        nn_dist = nn_dist_by_split[(dataset, fold)]
-        actual_results_by_tau = {t: (nn_dist <= t).tolist() for t in tau_values}
-
-        k = min(max(1, round(k_fraction * construct_len)), construct_len - 1)
-
-        runner.submit(
-            'cap_cover_system_tau',
-            output_csv=CAP_COVER_SYSTEM_TAU_CSV,
-            dim=dim, dataset=DATASET_KEYS[dataset],
-            k=k, tau_values=tau_values, seed=fold,
-            vectors_construct=construct_source,
-            vectors_query=query_source,
-            actual_results_by_tau=actual_results_by_tau,
-            )
 
 
-def save_cap_cover_system_tau(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
-    """Extracts this evaluation's rows from a shared Runner's combined
-    run() output (see generate_cap_cover_system_tau()); the Runner itself
-    already wrote CAP_COVER_SYSTEM_TAU_CSV incrementally."""
-    return pd.DataFrame(rows_for_mode(job_results, 'cap_cover_system_tau'))
 
 
-def plot_cap_cover_system_tau(df: pd.DataFrame) -> None:
-    from plots.plot_cap_cover_system_tau import generate_cap_cover_system_tau_figures
-    generate_cap_cover_system_tau_figures(df)
 
 
 # generate_blocklist()'s corpora: deliberately NOT DATASET_KEYS. That list is
@@ -731,14 +589,8 @@ def generate_blocklist(runner: Runner, cap_quantize: Optional[Quantize] = None) 
             )
 
 
-def save_blocklist(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
-    """Extracts this evaluation's rows from a shared Runner's combined run()
-    output (see generate_blocklist())."""
-    return pd.DataFrame(rows_for_mode(job_results, 'blocklist'))
 
 
-def plot_blocklist(df: pd.DataFrame) -> None:
-    generate_blocklist_figures(df)
 
 
 def generate_budget(runner: Runner, cap_quantize: Optional[Quantize] = None) -> None:
@@ -792,16 +644,8 @@ def generate_budget(runner: Runner, cap_quantize: Optional[Quantize] = None) -> 
             )
 
 
-def save_budget(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
-    """Extracts this evaluation's rows from a shared Runner's combined run()
-    output (see generate_budget()). Tagged mode 'budget' (runner.budget_worker)
-    rather than 'blocklist' (runner.blocklist_tau_worker) so the two
-    evaluations' rows split cleanly."""
-    return pd.DataFrame(rows_for_mode(job_results, 'budget'))
 
 
-def plot_budget(df: pd.DataFrame) -> None:
-    generate_budget_figures(df)
 
 
 def generate_cap_quantization(runner: Runner, memory_fractions: Optional[Sequence[float]] = None,
@@ -852,240 +696,18 @@ def generate_cap_quantization(runner: Runner, memory_fractions: Optional[Sequenc
                     )
 
 
-def save_cap_quantization(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
-    return pd.DataFrame(rows_for_mode(job_results, 'cap_quantization'))
 
 
-def plot_cap_quantization(df: pd.DataFrame) -> None:
-    from plots.plot_cap_quantization import generate_quantization_figures as generate_cap_quantization_figures
-    for dataset in sorted(df["dataset"].unique()):
-        outdir = cap_quantization_plot_dir(str(dataset))
-        logger.info(f"Plotting cap_quantization for {dataset} -> {outdir}")
-        generate_cap_quantization_figures(df[df["dataset"] == dataset], outdir=outdir)
 
 
-def generate_query_performance() -> pd.DataFrame:
-    """Measures single-query vs. batched-query latency/throughput of a
-    CapCoverFilter cover as a function of filter size k, across every
-    dataset in DATASET_KEYS. One job per (dataset, k, seed), written to
-    results/query_performance.csv."""
-    num_vectors           = WORKLOAD_NUM_VECTORS
-    dim                   = 384
-    percentage_construct  = 20
-    k_values              = [16, 32, 64, 128, 256, 512, 1024]
-    query_tau             = 0.1
-    seeds                 = [0, 1, 2]
-    single_query_limit    = 2000
-    output_csv            = "results/query_performance.csv"
-
-    datasets = [d for d in DATASET_KEYS if os.path.exists(dataset_filenames[d])]
-    missing = [d for d in DATASET_KEYS if d not in datasets]
-    if missing:
-        logger.warning(f"Skipping dataset(s) not found on disk: {', '.join(missing)}")
-    if set(datasets) != set(DATASET_KEYS):
-        raise RuntimeError(
-            f"generate_query_performance needs all {len(DATASET_KEYS)} datasets "
-            f"({', '.join(DATASET_KEYS)}) on disk; only found: {', '.join(datasets) or 'none'}"
-        )
-
-    # k must stay below a dataset's construct-set size, so clamp the sweep.
-    construct_sizes = {d: len(load_embeds(d, num_vectors)[0]) * percentage_construct // 100 for d in datasets}
-    min_construct = min(construct_sizes.values())
-    usable_k_values = [k for k in k_values if k < min_construct]
-    dropped_k = sorted(set(k_values) - set(usable_k_values))
-    if dropped_k:
-        logger.warning(
-            f"Dropping k values >= smallest construct set ({min_construct} vectors, "
-            f"from {min(construct_sizes, key=construct_sizes.get)}): {dropped_k}"
-        )
-    if not usable_k_values:
-        raise RuntimeError(
-            f"No k value in {k_values} is smaller than the smallest construct set "
-            f"({min_construct} vectors). Raise num_vectors/percentage_construct or lower k_values."
-        )
-    k_values = usable_k_values
-
-    runner = Runner(num_workers=MAX_WORKERS)
-
-    for dataset in datasets:
-        vectors = load_embeds(dataset, num_vectors)[0]
-        n = len(vectors)  # a dataset may hold fewer than num_vectors
-        num_construct = n * percentage_construct // 100
-
-        construct_source = VectorSource(dataset, 0, num_construct)
-        query_source = VectorSource(dataset, num_construct, n)
-
-        for k in k_values:
-            for seed in seeds:
-                runner.submit(
-                    'query_performance',
-                    dim=dim, dataset=DATASET_KEYS[dataset],
-                    k=k, seed=seed, query_tau=query_tau,
-                    vectors_construct=construct_source, vectors_query=query_source,
-                    single_query_limit=single_query_limit,
-                )
-
-    job_results = runner.run()
-    logger.info("Query performance evaluation completed.")
-
-    df = pd.DataFrame([row for job_rows in job_results for row in job_rows])
-
-    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
-    df.to_csv(output_csv, index=False)
-    logger.info(f"Wrote {output_csv}")
-
-    return df
 
 
-def plot_query_performance(df: pd.DataFrame) -> None:
-    generate_query_performance_figures(df)
 
 
-def generate_scaling(runner: Runner) -> None:
-    """Measures three CapCoverFilter throughput surfaces against filter
-    size k: query (k x batch_size grid), insertion (same grid, timing add()
-    instead), and construction (k x n, where indexed-set size itself
-    varies).
-
-    Reuses blocklist_workloads() -- the same corpora, position-based fold
-    splits, reference set B and query stream as generate_blocklist and
-    generate_quantization -- rather than cutting its own contiguous window
-    over a separate dataset, so throughput is measured on the same data the
-    correctness sweeps evaluate. Runs over every blocklist corpus and fold;
-    plot_scaling pools all of them into one line per k (or n) value, which is
-    valid because throughput is dataset-invariant here (Figure 4: "different
-    datasets do not really matter") -- so k and the construction n's are
-    bounded by the *smallest* corpus's reference set, keeping the same
-    absolute values comparable, and thus poolable, across corpora. k itself
-    is a fixed absolute ladder (2^11..2^16, one power of two per line color)
-    rather than a fraction of the reference set, since "Filter Size (k)" is
-    plotted and compared as an absolute count. Both sweeps stay at <=6 values
-    because plot_scaling draws one line per value and defines 6 line colors.
-
-    Only submits 'scaling_query'/'scaling_insert'/'scaling_construction'
-    jobs -- does not run `runner`. Each corpus writes its own
-    results/scaling/<dataset>/scaling_{query,insert,construction}.csv (see
-    scaling_query_csv() et al.), mirroring cap_quantization_csv/CAP_QUANTIZATION_DIR,
-    so the Runner writes all of them incrementally."""
-    num_vectors      = WORKLOAD_NUM_VECTORS
-    dim              = 384
-    n_folds          = BLOCKLIST_FOLDS
-    n_steps          = 6
-    # Ball budget k, as absolute filter sizes (plot_scaling's "Filter Size (k)"
-    # legend) rather than a fraction of a corpus's reference set: 2^11..2^16,
-    # one power of two per line color (LINE_COLORS has exactly 6 entries).
-    k_values_nominal = [2 ** i for i in range(11, 17)]
-    # Powers of 4 from a single query up to 1024: spans three orders of
-    # magnitude in 6 lines.
-    batch_sizes      = [1, 4, 16, 64, 256, 1024]
-    # Throughput is threshold-independent here (query() scores every ball
-    # before comparing), so this only has to be a valid tau, not a tuned one;
-    # 0.1 anyway, the operating point of every other evaluation.
-    tau_mid          = 0.1
-    # Fractions of each fold's blocklist query stream (see
-    # BlocklistWorkload.query_vectors) consumed by the
-    # query and insert sweeps. Both draw from the same stream since neither
-    # cares about overlap: only timing is measured, not correctness.
-    # insert_vector_fraction stays smaller: insert() mutates the cover, so
-    # its cost per vector grows with the ball count and a full stream would
-    # dominate the sweep's runtime for no extra resolution.
-    query_vector_fraction  = 1.0
-    insert_vector_fraction = 0.5
-
-    workloads = blocklist_workloads(num_vectors, n_folds=n_folds)
-    if not workloads:
-        raise RuntimeError(
-            "generate_scaling: no usable workload for any corpus (see the errors "
-            "above -- most likely WORKLOAD_NUM_VECTORS is too large for their "
-            "duplicate clusters)")
-
-    # k and the construction n's are shared across corpora (plot_scaling
-    # pools every dataset's rows into one line per value), so both are
-    # bounded by the smallest corpus's reference set rather than computed
-    # per corpus.
-    reference_len = min(len(w.selections[0]["reference"]) for w in workloads)
-    k_values = [k for k in k_values_nominal if k < reference_len]
-    if not k_values:
-        raise RuntimeError(
-            f"No k in {k_values_nominal} is below the smallest corpus's reference "
-            f"set ({reference_len} vectors). Raise WORKLOAD_NUM_VECTORS or lower "
-            "k_values_nominal.")
-    stream_sizes = sorted({max(1, reference_len // (2 ** i)) for i in range(n_steps)})
-
-    # workload.stream_size is a function of num_vectors alone (see
-    # build_blocklist_workload), so it is the same for every corpus.
-    stream_len = workloads[0].stream_size
-    n_query_vectors = max(1, round(stream_len * query_vector_fraction))
-    n_insert_vectors = max(1, round(stream_len * insert_vector_fraction))
-
-    # Drop batch sizes that no longer fit, rather than raising, so resizing
-    # the sweep never requires hand-editing the lists too.
-    usable_batch_sizes = sorted(b for b in batch_sizes if b < min(n_query_vectors, n_insert_vectors))
-    dropped = sorted(set(batch_sizes) - set(usable_batch_sizes))
-    if dropped:
-        logger.warning(f"Dropping batch_size value(s) >= min(n_query_vectors, n_insert_vectors) "
-                        f"({min(n_query_vectors, n_insert_vectors)}): {dropped}")
-    if not usable_batch_sizes:
-        raise RuntimeError(
-            f"No batch_size in {batch_sizes} is below min(n_query_vectors={n_query_vectors}, "
-            f"n_insert_vectors={n_insert_vectors}). Raise WORKLOAD_NUM_VECTORS or lower "
-            "batch_sizes.")
-
-    for workload in workloads:
-        for fold, sel in enumerate(workload.selections):
-            vectors_construct = workload.rows(sel["reference"])
-            vectors_query = workload.query_vectors(sel)
-            if len(vectors_query) < max(n_query_vectors, n_insert_vectors):
-                raise RuntimeError(
-                    f"{workload.name} fold {fold}: query stream holds {len(vectors_query)} "
-                    f"vectors but needs {max(n_query_vectors, n_insert_vectors)}. Lower "
-                    "query_vector_fraction/insert_vector_fraction or BLOCKLIST_QUERY_FRACTION.")
-
-            for k in k_values:
-                for batch_size in usable_batch_sizes:
-                    runner.submit(
-                        'scaling_query',
-                        output_csv=scaling_query_csv(workload.name),
-                        dim=dim, dataset=workload.name, k=k, batch_size=batch_size, seed=fold,
-                        tau_mid=tau_mid,
-                        vectors_construct=vectors_construct, vectors_query=vectors_query,
-                        n_query_vectors=n_query_vectors,
-                    )
-                    runner.submit(
-                        'scaling_insert',
-                        output_csv=scaling_insert_csv(workload.name),
-                        dim=dim, dataset=workload.name, k=k, batch_size=batch_size, seed=fold,
-                        vectors_construct=vectors_construct, vectors_insert=vectors_query,
-                        n_insert_vectors=n_insert_vectors,
-                    )
-
-            for k in k_values:
-                for n in stream_sizes:
-                    if k >= n or n > len(vectors_construct):
-                        continue
-                    runner.submit(
-                        'scaling_construction',
-                        output_csv=scaling_construction_csv(workload.name),
-                        dim=dim, dataset=workload.name, k=k, n=n, seed=fold,
-                        vectors_construct=vectors_construct,
-                    )
 
 
-def save_scaling(job_results: List[Tuple[str, Any]]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Extracts this evaluation's rows from a shared Runner's combined
-    run() output (see generate_scaling()). Each of the three query/insert/
-    construction job types was submitted under its own mode name AND its own
-    output_csv, so the Runner already wrote all three results/scaling_*.csv
-    files incrementally as their jobs completed -- this only rebuilds the
-    three DataFrames for plot_scaling()."""
-    df_query = pd.DataFrame(rows_for_mode(job_results, 'scaling_query'))
-    df_insert = pd.DataFrame(rows_for_mode(job_results, 'scaling_insert'))
-    df_construction = pd.DataFrame(rows_for_mode(job_results, 'scaling_construction'))
-    return df_query, df_insert, df_construction
 
 
-def plot_scaling(df_query: pd.DataFrame, df_insert: pd.DataFrame, df_construction: pd.DataFrame) -> None:
-    generate_scaling_figures(df_query, df_insert, df_construction)
 
 
 def generate_streaming(runner: Runner, construct_methods: Optional[List[str]] = None,
@@ -1222,26 +844,8 @@ def generate_streaming(runner: Runner, construct_methods: Optional[List[str]] = 
                                   sweep="k", construct_method=CAP_COVER_CONSTRUCT, **common)
 
 
-def save_streaming(job_results: List[Tuple[str, Any]], default_k: int = 16) -> Tuple[pd.DataFrame, int]:
-    """Rebuilds this evaluation's DataFrame from a shared Runner's run()
-    output, plus k_fixed (the smallest k among 'position'-sweep rows,
-    matching plot_all()'s own derivation)."""
-    df = pd.DataFrame(rows_for_mode(job_results, "stream_rebuild"))
-    if df.empty or "k" not in df.columns:
-        return df, default_k
-
-    if "sweep" in df.columns:
-        pos_k = df.loc[df["sweep"] == "position", "k"].dropna()
-        if not pos_k.empty:
-            return df, int(pos_k.min())
-
-    all_k = df["k"].dropna()
-    k_fixed = int(all_k.min()) if not all_k.empty else default_k
-    return df, k_fixed
 
 
-def plot_streaming(df: pd.DataFrame, k_fixed: int) -> None:
-    generate_streaming_figures(df, k_fixed=k_fixed)
 
 
 # Construction-method comparison: one CSV per corpus (plot_construct_methods
@@ -1253,15 +857,12 @@ CONSTRUCT_METHODS_DIR = "results/construct_methods"
 # (the paper's default) is not evaluated there, and soft_anneal starts from minimax's cover.
 CONSTRUCT_EVALUATED = ("gonzalez", "minimax", "soft_anneal")
 CONSTRUCT_QUANTIZES = (Quantize.FP32, Quantize.TQ2, Quantize.TQ4)
-CONSTRUCT_METHODS_PLOT_DIR = "plots/construct_methods"
 
 
 def construct_methods_csv(dataset: str) -> str:
     return os.path.join(CONSTRUCT_METHODS_DIR, f"{dataset}.csv")
 
 
-def construct_methods_scale_csv(dataset: str, n: int) -> str:
-    return os.path.join(CONSTRUCT_METHODS_DIR, f"scale_{dataset}_{n}.csv")
 
 
 def generate_construct_methods(runner: Runner) -> None:
@@ -1310,158 +911,12 @@ def generate_construct_methods(runner: Runner) -> None:
                         )
 
 
-def generate_construct_methods_scale(runner: Runner, dataset: str = "WikiAnswers", n: int = 100_000,
-                                     k_values: Tuple[int, ...] = (1000, 5000)) -> None:
-    """construct_filter time for every construction method on the first n
-    rows of one corpus, past the blocklist workload's size (see
-    runner.construct_method_scale_worker). Not part of the default sweep.
-
-    Only submits 'construct_method_scale' jobs -- does not run `runner`."""
-    if not os.path.exists(dataset_filenames[dataset]):
-        raise FileNotFoundError(f"{dataset}: {dataset_filenames[dataset]} not on disk.")
-    output_csv = construct_methods_scale_csv(dataset, n)
-    for method in CAP_CONSTRUCT_METHODS:
-        for k in k_values:
-            runner.submit('construct_method_scale', output_csv=output_csv,
-                          dim=384, dataset=dataset, n=n, method=method, k=k)
 
 
-def save_construct_methods(job_results: List[Tuple[str, Any]]) -> pd.DataFrame:
-    return pd.DataFrame(rows_for_mode(job_results, 'construct_method'))
 
 
-def plot_construct_methods(df: pd.DataFrame) -> None:
-    generate_construct_methods_figures(df, CONSTRUCT_METHODS_PLOT_DIR)
 
 
-def generate_and_plot_all() -> None:
-    """Submit-all, run-all, then plot-all: every generate_* function below
-    only submits jobs to one shared Runner instead of running its own, so
-    the combined job list executes as a single parallel batch and
-    runner.shuffle() can interleave fast and slow jobs across evaluations
-    rather than one worker draining a whole slow evaluation alone.
-
-    Each generate_ function tags its jobs with its own output_csv, so the
-    Runner writes each results/*.csv file incrementally as that
-    evaluation's jobs complete, not after the whole batch finishes -- a
-    crash mid-run only loses whichever jobs hadn't completed yet. There's
-    no separate save-all step: save_* functions still exist for a caller
-    that wants rows back as a DataFrame directly, but aren't needed here.
-
-    Each generate_ call is independently try/except-guarded so one
-    evaluation failing to submit doesn't take down the others. A failure
-    inside runner.run() itself aborts the whole batch, but every job that
-    did complete beforehand is still on disk."""
-    runner = Runner(num_workers=MAX_WORKERS)
-
-    # generate_construct_methods_scale is disabled.
-    for generate in (
-        generate_blocklist,
-        generate_budget,
-        generate_cap_quantization,
-        generate_streaming,
-        generate_construct_methods,
-        generate_scaling,
-        generate_equal_memory,
-        generate_cap_cover_system_tau,
-    ):
-        try:
-            generate(runner)
-        except Exception:
-            logger.exception(f"{generate.__name__} failed to submit")
-    runner.shuffle()
-    runner.run()
-    logger.info("All submitted jobs completed.")
-
-    plot_all()
 
 
-def plot_all() -> None:
-    """Re-renders every figure from data already persisted to disk, without
-    repeating the evaluation sweeps -- handy for iterating on plot styling
-    alone. Re-derives whatever generate-time metadata (k, k_fixed) each
-    plot_ needs from the loaded data. Requires at least one prior
-    generate_and_plot_all() (or generate_X + runner.run()) to have produced
-    those files."""
-    try:
-        df = pd.read_csv(CAP_COVER_SYSTEM_TAU_CSV)
-        plot_cap_cover_system_tau(df)
-    except Exception:
-        logger.exception("An error occurred")
 
-    try:
-        df = pd.read_csv(BLOCKLIST_CSV)
-        plot_blocklist(df)
-    except Exception:
-        logger.exception("An error occurred")
-
-    try:
-        df = pd.read_csv(BUDGET_CSV)
-        plot_budget(df)
-    except Exception:
-        logger.exception("An error occurred")
-
-    try:
-        plot_construct_methods(load_construct_methods(CONSTRUCT_METHODS_DIR))
-    except Exception:
-        logger.exception("An error occurred")
-
-    try:
-        # keep_default_na=False: stage/config strings are read verbatim; pandas
-        # would otherwise read back as NaN (see plot_quantization.py::load_data()).
-        frames = []
-        for name in BLOCKLIST_DATASETS:
-            path = cap_quantization_csv(name)
-            if os.path.exists(path):
-                # keep_default_na=False: stage/config strings are read verbatim;
-                # pandas would otherwise turn them into NaN.
-                frames.append(pd.read_csv(path, keep_default_na=False))
-        if frames:
-            plot_cap_quantization(pd.concat(frames, ignore_index=True))
-    except Exception:
-        logger.exception("An error occurred")
-
-    try:
-        frames = []
-        for name in BLOCKLIST_DATASETS:
-            path = equal_memory_csv(name)
-            if os.path.exists(path):
-                frames.append(pd.read_csv(path))
-        if frames:
-            plot_equal_memory(pd.concat(frames, ignore_index=True).to_dict("records"))
-    except Exception:
-        logger.exception("An error occurred")
-
-    try:
-        df = pd.read_csv("results/query_performance.csv")
-        plot_query_performance(df)
-    except Exception:
-        logger.exception("An error occurred")
-
-    try:
-        def _concat_scaling(csv_fn):
-            frames = [pd.read_csv(csv_fn(name)) for name in BLOCKLIST_DATASETS if os.path.exists(csv_fn(name))]
-            return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-        df_query = _concat_scaling(scaling_query_csv)
-        df_insert = _concat_scaling(scaling_insert_csv)
-        df_construction = _concat_scaling(scaling_construction_csv)
-        if not (df_query.empty or df_insert.empty or df_construction.empty):
-            plot_scaling(df_query, df_insert, df_construction)
-    except Exception:
-        logger.exception("An error occurred")
-
-    try:
-        frames = [pd.read_csv(streaming_csv(name)) for name in BLOCKLIST_DATASETS
-                 if os.path.exists(streaming_csv(name))]
-        if frames:
-            df = pd.concat(frames, ignore_index=True)
-            k_fixed = int(df.loc[df["sweep"] == "position", "k"].iloc[0])
-            plot_streaming(df, k_fixed=k_fixed)
-    except Exception:
-        logger.exception("An error occurred")
-
-
-if __name__ == "__main__":
-    # generate_and_plot_all()
-    plot_all()  # alternative: re-render figures from an existing results/*.csv run

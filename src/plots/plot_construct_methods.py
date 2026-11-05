@@ -1,4 +1,4 @@
-"""Construction-method figures (see main.generate_construct_methods).
+"""Construction-method figures (see experiments.generate_construct_methods).
 
 One figure per corpus, three panels against the ball budget k (% of |B|, log
 axis), one line per construction method, mean +/- 1 std over folds:
@@ -85,7 +85,7 @@ def load_results(results_dir: str) -> pd.DataFrame:
                    if not os.path.basename(p).startswith("scale_"))
     if not paths:
         raise FileNotFoundError(
-            f"No results in {results_dir!r}. Run main.generate_construct_methods first.")
+            f"No results in {results_dir!r}. Run experiments.generate_construct_methods first.")
     return pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
 
 

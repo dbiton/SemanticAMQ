@@ -1,5 +1,5 @@
 """Scaling-evaluation figures: BallCoverFilter throughput vs batch size / stream size.
-Rows come from every blocklist corpus/fold (see main.py's generate_scaling(), which
+Rows come from every blocklist corpus/fold (see experiments.py's generate_scaling(), which
 reuses blocklist_workloads()) and are pooled per k/n value, since throughput is
 dataset-invariant here. Query, insertion, and construction throughput each get one
 line per filter size k.
@@ -51,7 +51,7 @@ def _validate_schema(df: pd.DataFrame, required: List[str], name: str) -> None:
 def _load(path: str, required: List[str], name: str) -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(
-            f"Input file not found: {path!r}. Run generate_scaling() (main.py) first, "
+            f"Input file not found: {path!r}. Run generate_scaling() (experiments.py) first, "
             "or point the *_INPUT_PATH constant at a real results file."
         )
     df = pd.read_parquet(path) if path.endswith(".parquet") else pd.read_csv(path)

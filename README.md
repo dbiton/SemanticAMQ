@@ -61,86 +61,19 @@ $$
 C(u_i, \theta_i) = \lbrace x \in S^{d-1} : \angle(x, u_i) \le \theta_i \rbrace.
 $$
 
-<p align="center">
-  <img src="assets/cap-cover-scheme.png" alt="Embeddings on a circle covered by four caps, with one accepted and one rejected query" width="440">
-</p>
-
-**Figure 1.** Embeddings are covered by caps, each defined by a direction $u_i$ and an angle $\theta_i$. At query time each cap is widened by the angle that corresponds to $\tau$. The query marked "true" lands inside a widened cap and goes on to verification. The query marked "false" lands outside all of them and is rejected.
-
-A query is accepted if it falls inside at least one widened cap:
-
-$$
-\angle(q, u_i) \le \theta_i + \alpha_\tau \quad \text{for some } i, \qquad \alpha_\tau = \arccos(1 - \tau).
-$$
-
-> **Why a NO is always correct.** If $q$ is within $\tau$ of an indexed vector $x$, and $x$ lies in cap $i$, the triangle inequality for angles gives $\angle(q, u_i) \le \angle(q, x) + \angle(x, u_i) \le \alpha_\tau + \theta_i$. So $q$ is always accepted.
-
-Two more properties follow from this design:
-
-- **Threshold independence.** The caps depend only on the indexed vectors and the memory budget. $\tau$ appears only at query time, so one filter serves many thresholds without being rebuilt.
-- **A fixed byte budget.** Each cap can summarize many vectors, and the budget sets how many caps fit. A tighter budget adds false positives, never false negatives.
-
-## Building a cover
-
-False positives come from the excess space inside the caps, so the goal is a valid cover with small total volume. For a given byte budget:
-
-| Step | Method | What it does |
-|:---:|---|---|
-| 1 | **Farthest-first traversal** | Picks well-spread initial directions (Gonzalez) |
-| 2 | **Minimax refinement** | Moves each direction toward the center of its members' enclosing cap |
-| 3 | **Soft anneal** | Optimizes all directions together on the sphere to reduce the total cap volume $\sum_i \sigma(\theta_i)$, and keeps the best real cover it finds |
-| 4 | **Quantization** | Compresses the directions so more caps fit, then re-measures every angle so coverage still holds |
-
-The filter builds a cover for each candidate encoding and keeps the one with the smallest cap volume.
-
-The paper evaluates this static construction. The implementation also supports insertions.
-
-## Results
-
-We evaluate on five real-world corpora (WildChat, Quora, WikiAnswers, ChatGPT-Paraphrases and CC-News), embedded with all-MiniLM-L6-v2 ($d = 384$). Each of the five folds indexes 80,000 vectors and queries with 20,000 others. Memory is reported relative to the raw float32 embeddings, about 123 MB at this size.
-
-<p align="center">
-  <img src="assets/fpr-and-accesses-saved.png" alt="False-positive rate by query relatedness, and index accesses saved, as memory and threshold vary" width="880">
-</p>
-
-**Figure 2.** Top: varying the memory budget at $\tau = 0.05$. Bottom: varying $\tau$ at 2% memory. The first three columns show the false-positive rate for negative queries, grouped by similarity to their closest indexed vector. The last column shows index accesses saved, with each corpus's share of negative queries dashed.
-
-Compared with other zero-false-negative methods at equal memory, the geometric cover gives useful rejection at very small budgets, where the alternatives are ineffective or do not fit.
-
-<p align="center">
-  <img src="assets/baselines-equal-memory.png" alt="False-positive rate of CapCover Filter and zero-false-negative baselines as the memory budget grows" width="880">
-</p>
-
-**Figure 3.** Mean false-positive rate of zero-false-negative methods at equal memory budgets, at $\tau = 0.05$.
-
-## When to use it
-
-| Works best with | Helps less with |
-|---|---|
-| Tight thresholds, as in paraphrase detection and de-duplication | Looser thresholds, which widen every cap |
-| Very limited memory and clustered embeddings | Larger budgets, where point-level methods such as VA+-file can reach a lower false-positive rate |
-| Many queries that have no match | Negatives close to the indexed set, which stay hard to reject |
-| Expensive backend lookups | Cheap lookups: with filter cost $F$, rejection rate $r$ and lookup cost $L$, the filter pays off only when $L \gt F / r$ |
-
-## Theory
-
-The paper proves that:
-
-- Every valid cover has zero false negatives, including covers with quantized directions.
-- Exact angular decoding of a ball cover accepts no more than Euclidean expansion of the same balls.
-- Farthest-first construction has a factor-two guarantee on the largest cap radius, which does not extend to cap volume.
-- The false-positive rate is bounded by the geometry of the cover and by how many queries fall near the true decision boundary.
-- Any structure that guarantees a low false-positive rate under uniform queries, for every dataset, needs a minimum amount of space, whatever its encoding.
-
-<details>
-<summary><b>Key formulas</b></summary>
-
-<br>
-
-**Farthest-first guarantee.** The largest cap angle of the farthest-first cover $\mathcal{C}_G$ is at most twice the best possible with $k$ caps:
-
-```math
-R(\mathcal{C}_G) \le 2 R^\star_k(X).
+```
+src/
+  paper.py            entry point: runs the paper's evaluations and draws its figures
+  experiments.py      evaluation definitions (generate_* submit jobs to a Runner)
+  runner.py           parallel job harness (ProcessPoolExecutor) + per-job workers
+  filters/            SAMQ (cap_cover/) and baseline filter implementations
+  plots/               one module per evaluation's figure set
+  util/                dataset path registry + embedding loaders
+  vector_source.py     lazy/array-backed vector handles passed to worker processes
+tests/                 unittest-style tests, one file per filter/module
+datasets/              embedding pickles (not checked in, see below)
+results/               generated evaluation CSVs
+plots/<eval>/           generated figure PNGs
 ```
 
 **False-positive bound.** Under uniform queries, the total measure of the widened caps bounds the false-positive rate:
@@ -151,11 +84,17 @@ R(\mathcal{C}_G) \le 2 R^\star_k(X).
 
 **Space lower bound.** Take any deterministic structure that represents every set of $n$ points on the sphere in $\mathcal{B}$ bytes, with no false negatives and a uniform-query false-positive rate of at most $\varepsilon$. Then
 
-```math
-\mathcal{B} \ge \frac{n}{8} \log_2 \frac{1}{\sigma\bigl(\sigma^{-1}(\eta) - \alpha_\tau\bigr)}, \qquad \eta = \varepsilon + (1 - \varepsilon) n \sigma(\alpha_\tau) \lt 1.
+## Running an evaluation
+
+```
+python src/paper.py              # run every evaluation, then draw the figures
+python src/paper.py --only budget,streaming
+python src/paper.py plot         # re-draw figures from an earlier run's results/*.csv
 ```
 
-</details>
+`paper.py` replaces the former `main.py`; the evaluation definitions it runs
+live in [src/experiments.py](src/experiments.py). Running a generator
+truncates that evaluation's CSVs in `results/` (see CLAUDE.md).
 
 ## Installation
 

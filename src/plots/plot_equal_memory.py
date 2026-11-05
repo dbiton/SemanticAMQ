@@ -34,7 +34,7 @@ def apply_style() -> None:
 
 
 # Embedding dimensionality: fixed at 384 across every blocklist-workload
-# evaluation (see main.generate_equal_memory's own dim=384).
+# evaluation (see experiments.generate_equal_memory's own dim=384).
 _EMBEDDING_DIM = 384
 
 # Display overrides for recognized filter names; anything else falls back to
@@ -186,7 +186,7 @@ def load_data() -> pd.DataFrame:
     if not os.path.exists(INPUT_PATH):
         raise FileNotFoundError(
             f"Input file not found: {INPUT_PATH!r}. Run generate_equal_memory() "
-            "(main.py) first, or point INPUT_PATH at a real results file."
+            "(experiments.py) first, or point INPUT_PATH at a real results file."
         )
     if INPUT_PATH.endswith(".parquet"):
         df = pd.read_parquet(INPUT_PATH)
@@ -219,7 +219,7 @@ def aggregate(df: pd.DataFrame, value_col: str, dim: int = _EMBEDDING_DIM) -> pd
     purely so a pooled group's raw-storage denominator is computed from
     real per-row data rather than an arbitrary single row's value; in this
     sweep every corpus is in fact trimmed to the same reference-set size
-    (see main._fold_selections), so the average is exact, not approximate."""
+    (see experiments._fold_selections), so the average is exact, not approximate."""
     work = df.copy()
     work["filter"] = work["Config"].str.split(" + ", regex=False).str[0]
     work["Memory Budget (MB)"] = work["Memory Budget"] / (1024 * 1024)
@@ -490,7 +490,7 @@ def generate_equal_memory_figures(
         print(
             "Note: input is missing 'Construct Size' and/or 'Memory Usage', so the "
             "raw-storage-percentage panels were skipped. Rerun generate_equal_memory() "
-            "(main.py) with a current runner.py to get them."
+            "(experiments.py) with a current runner.py to get them."
         )
 
     save_legend(cfg)

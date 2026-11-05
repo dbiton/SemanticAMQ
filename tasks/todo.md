@@ -1,6 +1,6 @@
 # Publication cleanup tasks
 
-Implementation has not started. See [plan.md](plan.md) for scope and decisions.
+Partially implemented: `main.py` is replaced by `paper.py` + `src/experiments.py` (tasks 4/6 core, first slice of 8). Other items are open. See [plan.md](plan.md) for scope and decisions.
 All generator verification uses a recording runner or temporary output root.
 
 ## 1. Freeze the evaluation contract

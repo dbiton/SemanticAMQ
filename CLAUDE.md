@@ -34,7 +34,8 @@ Run everything from the **repo root**: dataset paths are relative
 ```bash
 python -m pytest tests                          # all tests
 python -m pytest tests/test_cap_cover_filter.py -k name   # one test
-python src/main.py                              # generate_and_plot_all(): full run
+python src/paper.py                             # full run: evaluations, then figures
+python src/paper.py plot                        # re-draw figures from existing results/
 PYTHONPATH=src python some_script.py            # ad-hoc scripts importing project modules
 ```
 
@@ -52,9 +53,9 @@ is for tests and single-cell validation. Size per-job memory against
 ## Layout
 
 ```
-src/main.py            evaluation definitions: generate_*/save_*/plot_* per evaluation,
-                       generate_and_plot_all() and plot_all()
-src/paper.py           paper.tex's data + figures only (subset of main.py's evaluations, trimmed to
+src/experiments.py     evaluation definitions: generate_* per evaluation (submit jobs only), workload
+                       construction (blocklist_workloads), output paths
+src/paper.py           the sole entry point (replaces the removed main.py): paper.tex's data + figures (trimmed to
                        what each figure reads); `python src/paper.py [plot]`. Figures: plots/plot_paper.py
                        `--only a,b` runs a subset (GENERATORS), `--missing` only those
                        with no CSVs in results/ (then draws the figures); also ablation, latency (filter in front of the flat index) and timing;
@@ -89,7 +90,7 @@ suggestions/           untracked scratch analyses and plans (not part of the pip
 
 ## Architecture
 
-**Evaluation flow.** Each evaluation in `main.py` has a `generate_X(runner)`
+**Evaluation flow.** Each evaluation in `experiments.py` has a `generate_X(runner)`
 that only *submits* jobs (`runner.submit(mode, output_csv=..., **kwargs)`),
 plus `save_X`/`plot_X`. `generate_and_plot_all()` submits every enabled
 evaluation to one shared `Runner`, calls `runner.shuffle()` to interleave slow
@@ -103,7 +104,7 @@ written incrementally to its `output_csv` by the coordinating process as jobs
 finish, so a crash only loses unfinished jobs. A failing job is logged and
 skipped. `run()` returns `(mode, result)` pairs **in completion order**:
 workers must return self-describing rows, and callers must never zip results
-positionally against submission order (use `main.rows_for_mode`).
+positionally against submission order (use `experiments.rows_for_mode`).
 
 **Registries** (check these for current names instead of hardcoding lists):
 - `runner.CAP_CONSTRUCT_METHODS`, `CAP_COVER_CONSTRUCT = "sphere_merge"`: construction strategies by name.
@@ -111,7 +112,7 @@ positionally against submission order (use `main.rows_for_mode`).
 - `runner._cap_cover(dim, k)`: the paper's configuration (`CapCoverFilter.auto()`).
 - `runner.CAP_QUANTIZATION_SWEEP`, `_POST_CONSTRUCTION_CONFIG_DIALS`,
   `_CONSTRUCTION_TIME_CONFIG_DIALS`: per-baseline tuning dials.
-- `util.dataset_paths.dataset_filenames`, `main.BLOCKLIST_DATASETS`,
+- `util.dataset_paths.dataset_filenames`, `experiments.BLOCKLIST_DATASETS`,
   `plots.plot_common.DATASETS`: which corpora exist vs. which each evaluation sweeps.
 
 **Filter construction** funnels through `runner._instantiate_filter` and
@@ -129,20 +130,20 @@ cosine similarity to its nearest construct vector, in `runner.SIMILARITY_BANDS`
 (close >= 0.8, related 0.6-0.8, unrelated < 0.6; columns `fpr_<band>`, `n_neg_<band>`).
 Bands only group results; labels are always distance at tau.
 
-**Workload sizing.** `main.WORKLOAD_NUM_VECTORS` is the single size knob for
+**Workload sizing.** `experiments.WORKLOAD_NUM_VECTORS` is the single size knob for
 every evaluation (80% construct / 20% queries). Ground truth is labelled by
 true distance at tau, never by which sampling stratum a query came from.
 
 ## Rules and gotchas
 
 - **Generators delete outputs.** `Runner.submit()` truncates each `output_csv`
-  on first submit. Calling any `main.generate_*` (even without `run()`, e.g. to
+  on first submit. Calling any `experiments.generate_*` (even without `run()`, e.g. to
   count jobs) wipes that evaluation's CSVs. `results/` is gitignored, is a copy
   of the run machine's output, and has no backup (`results-newer/`,
   `results-midway/`, `results-stale/` are *different* runs). Never dry-run
   generators from the repo root. Count jobs by reading loop bounds, or use a
   throwaway worktree without `results/`. `Runner(truncate=False)` appends.
-- **Thread guard before numpy/faiss.** `main.py` and `runner.py` set
+- **Thread guard before numpy/faiss.** `paper.py`, `experiments.py` and `runner.py` set
   `OMP/OPENBLAS/MKL/NUMEXPR_NUM_THREADS=1` before importing numpy/faiss. Any new
   entry point that uses `Runner` must do the same first, or BLAS threads x
   worker processes oversubscribe the machine.

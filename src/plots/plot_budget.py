@@ -1,4 +1,4 @@
-"""Ball-budget figures (see main.generate_budget).
+"""Ball-budget figures (see experiments.generate_budget).
 
 The same asymmetric blocklist workload as plot_blocklist, read along the other
 axis: there tau moves at a fixed ball budget; here tau is pinned at one value
@@ -104,7 +104,7 @@ def _validate_raw_storage_schema(df: pd.DataFrame) -> None:
 def load_data() -> pd.DataFrame:
     if not os.path.exists(INPUT_PATH):
         raise FileNotFoundError(
-            f"Input file not found: {INPUT_PATH!r}. Run generate_budget() (main.py) first."
+            f"Input file not found: {INPUT_PATH!r}. Run generate_budget() (experiments.py) first."
         )
     df = pd.read_csv(INPUT_PATH)
     validate_schema(df)
@@ -125,7 +125,7 @@ def fixed_tau(df: pd.DataFrame) -> float:
     if len(taus) > 1:
         raise ValueError(
             f"Expected a single tau, found {taus}. This evaluation holds tau constant "
-            "(see main.generate_budget); use plot_blocklist for the tau-swept view."
+            "(see experiments.generate_budget); use plot_blocklist for the tau-swept view."
         )
     return float(taus[0])
 

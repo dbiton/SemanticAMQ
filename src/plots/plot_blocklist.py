@@ -1,4 +1,4 @@
-"""Blocklist-workload figures (see main.generate_blocklist).
+"""Blocklist-workload figures (see experiments.generate_blocklist).
 
 Cap budget k is fixed (one representative value, see generate_blocklist's
 docstring) -- varying the budget is generate_budget's job, at its own fixed

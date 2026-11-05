@@ -1,5 +1,5 @@
 """CapCoverFilter's analogue of plot_quantization.py (see
-main.py::generate_cap_quantization): same long-format-CSV-to-panels shape
+experiments.py::generate_cap_quantization): same long-format-CSV-to-panels shape
 (x-axis = memory usage, one line per quantize method, single dataset), swept
 over CAP_QUANTIZATION_SWEEP (AUTO_CANDIDATES) instead of
 BallCoverFilter's QUANTIZATION_SWEEP.
@@ -116,7 +116,7 @@ def _validate_schema(df: pd.DataFrame) -> None:
 def load_data() -> pd.DataFrame:
     if not os.path.exists(INPUT_PATH):
         raise FileNotFoundError(
-            f"Input file not found: {INPUT_PATH!r}. Run generate_cap_quantization() (main.py) "
+            f"Input file not found: {INPUT_PATH!r}. Run generate_cap_quantization() (experiments.py) "
             "first, or point INPUT_PATH at a real results file."
         )
     df = pd.read_parquet(INPUT_PATH) if INPUT_PATH.endswith(".parquet") else pd.read_csv(INPUT_PATH, keep_default_na=False)

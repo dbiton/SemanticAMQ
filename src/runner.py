@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 # Must happen before numpy/faiss are imported (BLAS/OpenMP thread count x
 # Runner's process count otherwise multiply into CPU/memory oversubscription
-# -- see main.py's copy of this guard). Repeated here since each
+# -- see paper.py's copy of this guard). Repeated here since each
 # ProcessPoolExecutor worker re-imports this module fresh.
 for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_env_var, "1")
@@ -519,7 +519,7 @@ def equal_memory_worker(
     extra_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     # A filter can be submitted multiple times at one budget, once per
-    # quantize variant (see main.generate_equal_memory) -- suffix the variant
+    # quantize variant (see experiments.generate_equal_memory) -- suffix the variant
     # onto Config so each becomes its own labelled line downstream rather
     # than being pooled into one line. The suffix uses
     # "(...)"  rather than plot_equal_memory.aggregate's " + " delimiter, so
@@ -592,7 +592,7 @@ def equal_memory_worker(
         # express Memory Budget/Usage as a percentage of storing this set
         # raw (Construct Size * dim float32s) -- per row, since datasets
         # pooled into this sweep don't all share the same reference-set
-        # size (see main.generate_equal_memory's min-over-corpora budget
+        # size (see experiments.generate_equal_memory's min-over-corpora budget
         # scaling), unlike the shared budget grid itself.
         'Construct Size': len(construct_arr),
     }
@@ -926,7 +926,7 @@ def system_tau_ground_truth_worker(
     vectors_query: VectorInput,
 ) -> np.ndarray:
     """Nearest-construct-set-neighbor distance for every query vector, via a
-    brute-force flat index. Split into its own worker so main.py can run it
+    brute-force flat index. Split into its own worker so experiments.py can run it
     across a ProcessPoolExecutor and cache the result to disk, rather than
     generate_system_tau() paying this cost serially per dataset."""
     construct_arr = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
@@ -1260,7 +1260,7 @@ def blocklist_tau_worker(
     vectors_query: VectorInput,
     quantize: Optional[CapQuantize] = None,
 ) -> List[Dict[str, Any]]:
-    """Asymmetric blocklist workload (main.generate_blocklist): a tight
+    """Asymmetric blocklist workload (experiments.generate_blocklist): a tight
     reference set B and a query stream, labeled by distance to B at each
     tau and grouped by similarity band.
 
@@ -1286,7 +1286,7 @@ def budget_worker(
     quantize: Optional[CapQuantize] = None,
 ) -> List[Dict[str, Any]]:
     """The same asymmetric blocklist workload as blocklist_tau_worker
-    (main.generate_budget), read along the other axis: tau is fixed at a
+    (experiments.generate_budget), read along the other axis: tau is fixed at a
     single value and the memory budget is swept over memory_fractions.
 
     Requests log10_vol_high (see _blocklist_cover_rows's volume_bounds):
@@ -1491,7 +1491,7 @@ def stream_rebuild_worker(
     quantize: CapQuantize = CapQuantize.TQ4,
 ) -> List[Dict[str, Any]]:
     """Simulates one rebuild policy over vectors_stream (a blocklist fold's
-    reference set B, in arrival order -- see main.generate_streaming),
+    reference set B, in arrival order -- see experiments.generate_streaming),
     reporting query FPR and amortized cost per checkpoint.
       "streaming": CapCoverFilter.insert() per arrival, never rebuilt.
       "periodic": like "streaming", rebuilt from scratch every T arrivals.
@@ -1521,7 +1521,7 @@ def stream_rebuild_worker(
     bootstrap construct()).
 
     vectors_query is the fold's query stream (see
-    main.BlocklistWorkload.query_vectors). actual_at_checkpoint[c] is its distance-based
+    experiments.BlocklistWorkload.query_vectors). actual_at_checkpoint[c] is its distance-based
     ground truth against vectors_stream[:c] -- computed once by the caller,
     since every policy and method on a fold shares it.
 
@@ -1998,7 +1998,7 @@ _WORKER_FNS: Dict[str, Any] = {
     # Same underlying cover-and-margin core (_blocklist_cover_rows), second
     # worker: generate_budget runs the identical blocklist measurement but
     # sweeps the ball budget at a fixed tau instead of sweeping tau at a fixed
-    # budget (see main.generate_budget).
+    # budget (see experiments.generate_budget).
     'budget': budget_worker,
     'cap_quantization': cap_quantization_worker,
     'query_performance': query_performance_worker,
