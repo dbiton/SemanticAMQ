@@ -382,6 +382,7 @@ fn knn_ip<'py>(py: Python<'py>, x: PyReadonlyArray2<f32>, db: PyReadonlyArray2<f
     if n == 0 || k == 0 {
         return Ok((PyArray2::zeros(py, [n, k], false), PyArray2::zeros(py, [n, k], false)));
     }
+    #[cfg(target_arch = "x86_64")]
     if path == KnnPath::Avx2 {
         if d == 0 || !xs.iter().all(|v| v.is_finite()) || !ds.iter().all(|v| v.is_finite()) {
             return Err(PyValueError::new_err("knn_ip: empty or non-finite input"));
@@ -391,33 +392,40 @@ fn knn_ip<'py>(py: Python<'py>, x: PyReadonlyArray2<f32>, db: PyReadonlyArray2<f
         let ida = PyArray1::from_vec(py, id).reshape([n, k])?;
         return Ok((ipa, ida));
     }
-    let amx = path == KnnPath::Amx;
-    let dpad = (d + 63) / 64 * 64;
-    let mut ip = vec![0f32; n * k];
-    let mut id = vec![0i64; n * k];
-    py.detach(|| {
-        let qx = quantize(xs, n, d, dpad);
-        let qd = quantize(ds, m, d, dpad);
-        let db_packed = pack_db(&qd);
-        let xu8: Vec<u8> = qx.q.iter().map(|&v| (v as i16 + 128) as u8).collect();
-        let nblocks = n.div_ceil(RB);
-        let run = |b: usize, ipc: &mut [f32], idc: &mut [i64]| unsafe {
-            search_block(amx, &qx, &xu8, xs, &db_packed, ds, d, k, b * RB, ipc, idc);
-        };
-        if threads <= 1 {
-            for (b, (ipc, idc)) in ip.chunks_mut(RB * k).zip(id.chunks_mut(RB * k)).enumerate() {
-                run(b, ipc, idc);
+    #[cfg(target_arch = "x86_64")]
+    {
+        let amx = path == KnnPath::Amx;
+        let dpad = (d + 63) / 64 * 64;
+        let mut ip = vec![0f32; n * k];
+        let mut id = vec![0i64; n * k];
+        py.detach(|| {
+            let qx = quantize(xs, n, d, dpad);
+            let qd = quantize(ds, m, d, dpad);
+            let db_packed = pack_db(&qd);
+            let xu8: Vec<u8> = qx.q.iter().map(|&v| (v as i16 + 128) as u8).collect();
+            let nblocks = n.div_ceil(RB);
+            let run = |b: usize, ipc: &mut [f32], idc: &mut [i64]| unsafe {
+                search_block(amx, &qx, &xu8, xs, &db_packed, ds, d, k, b * RB, ipc, idc);
+            };
+            if threads <= 1 {
+                for (b, (ipc, idc)) in ip.chunks_mut(RB * k).zip(id.chunks_mut(RB * k)).enumerate() {
+                    run(b, ipc, idc);
+                }
+            } else if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+                pool.install(|| {
+                    ip.par_chunks_mut(RB * k).zip(id.par_chunks_mut(RB * k)).enumerate().for_each(|(b, (ipc, idc))| run(b, ipc, idc));
+                });
             }
-        } else if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
-            pool.install(|| {
-                ip.par_chunks_mut(RB * k).zip(id.par_chunks_mut(RB * k)).enumerate().for_each(|(b, (ipc, idc))| run(b, ipc, idc));
-            });
-        }
-        let _ = nblocks;
-    });
-    let ipa = PyArray1::from_vec(py, ip).reshape([n, k])?;
-    let ida = PyArray1::from_vec(py, id).reshape([n, k])?;
-    Ok((ipa, ida))
+            let _ = nblocks;
+        });
+        let ipa = PyArray1::from_vec(py, ip).reshape([n, k])?;
+        let ida = PyArray1::from_vec(py, id).reshape([n, k])?;
+        return Ok((ipa, ida));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        return Err(PyValueError::new_err("knn_ip: no Rust kernel on this architecture"));
+    }
 }
 
 // ------------------------------------------------------------------ settle

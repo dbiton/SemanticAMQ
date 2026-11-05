@@ -60,8 +60,8 @@ and angle per cap, quantizable to shrink memory -- see `Quantize` in
 [cap_cover_filter.py](src/filters/cap_cover/cap_cover_filter.py)),
 then answers a query by checking whether it falls within any cap's
 angle (widened by the query threshold). It is compared at equal memory against the
-baselines in [src/filters/](src/filters/): DSH, HNSW, IVF-PQ, a quantized flat
-index, VA+-file, an MLP, and two zero-false-negative LSH schemes.
+baselines in [src/filters/](src/filters/): VA+-file, a quantized point set, two
+zero-false-negative LSH schemes, and the approximate DSH, HNSW, IVF-PQ and MLP.
 
 $$
 C(u_i, \theta_i) = \lbrace x \in S^{d-1} : \angle(x, u_i) \le \theta_i \rbrace.
@@ -69,19 +69,20 @@ $$
 
 ```
 src/
-  paper.py            the entry point: runs the paper's evaluations, draws its figures and tables
+  paper.py            the entry point: runs the paper's evaluations, builds the Rust kernels, draws its figures
   experiments.py      evaluation definitions (generate_* submit jobs to a Runner)
   workloads.py        positional folds over a corpus file, exact ground truth
   runner.py           parallel job harness (ProcessPoolExecutor) + per-job workers
   filters/            Cap-Cover (cap_cover/) and the baselines
-  plots/              plot_paper.py (figures), tables_paper.py, table_quantization.py (LaTeX tables)
+  plots/              plot_paper.py (the figures)
+  rust_build.py       builds CapCoverRustFilter into the running interpreter (paper.py calls it)
   util/               dataset registry (import-light), dataset builders, space bound
   vector_source.py    lazy/array-backed vector handles passed to worker processes
 CapCoverRustFilter/   Rust crate behind CapCoverFilter.query()
 tests/                unittest-style tests, one file per filter/module
 datasets/             embedding files (HDF5 despite .pkl; not checked in)
 results/              generated CSVs (not checked in)
-figures/              generated figures and tables
+figures/              generated figures
 ```
 
 **False-positive bound.** Under uniform queries, the total measure of the widened caps bounds the false-positive rate:
@@ -90,7 +91,8 @@ Python 3.12 with faiss-cpu 1.15.1 is the tested combination.
 
 ```
 pip install -r requirements.txt            # evaluation and plotting
-pip install maturin && cd CapCoverRustFilter && maturin develop --release   # the Rust scan
+# the Rust scan is built by `python src/paper.py` (needs a Rust toolchain); by hand:
+pip install maturin && cd CapCoverRustFilter && maturin develop --release
 pip install -r requirements-data.txt       # only to build datasets (sentence_transformers)
 python src/util/fetch_datasets.py          # the paper's five corpora -> datasets/
 ```
@@ -106,21 +108,22 @@ Run from the repository root.
 
 ```
 python src/paper.py --list                       # evaluations, their scale and outputs
-python src/paper.py                              # everything, then figures and tables
-python src/paper.py --only budget,streaming      # a subset
+python src/paper.py                              # build the Rust kernels, run everything, draw the figures
+python src/paper.py --only budget,construction      # a subset
 python src/paper.py --missing                    # only evaluations without complete CSVs
 python src/paper.py plot [figure ...]            # re-draw from existing CSVs; needs no datasets
 python src/paper.py --num-vectors 10000 --folds 1 --results /tmp/small    # a reduced trial run
 ```
 
-Each evaluation runs at the scale paper.tex states for it (`paper.EVALUATIONS`): the sweeps and
-end-to-end throughput at 100,000 vectors x 5 folds, the quantization table, insertion, equal-memory
-and ablation runs at 10,000 vectors x 1 fold, latency on WildChat (20,000 indexed) and WikiAnswers
-(8,000). **Running an evaluation rewrites its CSVs** in `--results` (default `results/`); collecting
-jobs does not.
+Every evaluation uses the paper's workload: per corpus, five folds of 80,000 indexed vectors (from the
+start of the file) and 20,000 queries (from its end), at cosine-distance threshold tau = 0.05 and with
+Cap-Cover built by soft anneal with automatic encoding selection. Budgets are M_filter/M_raw, the filter's
+bytes over the raw float32 array. **Running an evaluation rewrites its CSVs** in `--results` (default
+`results/`); collecting jobs does not. `python src/paper.py` first runs `maturin develop --release`
+(incremental; `--no-build` skips it).
 
 Hardware: the full run was made on a 32-core Threadripper with 896 GB RAM (30 parallel workers,
-about 10 GB per job). The timed evaluations (end-to-end on 8 pinned cores; latency and timing on one)
+about 10 GB per job). The timed evaluations (end-to-end, on one pinned core; `--timing-workers` for more)
 run after the parallel batch and need an otherwise idle machine; timings from the parallel batch are
 not timing claims.
 
@@ -136,7 +139,7 @@ the extension (above) so the Python/Rust parity tests run.
 
 ## Outputs
 
-CSVs in `results/` (one file per evaluation, or per corpus); figures and LaTeX tables in `figures/`
+CSVs in `results/` (one file per evaluation, or per corpus); figures in `figures/`
 with a `plot-manifest.json` recording each figure's input files, row counts and hashes.
 
 ## Release tree

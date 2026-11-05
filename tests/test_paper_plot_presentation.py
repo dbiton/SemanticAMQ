@@ -12,14 +12,6 @@ class TestPaperPlotPresentation(unittest.TestCase):
     def tearDown(self):
         plt.close("all")
 
-    def test_automatic_and_fixed_encodings_have_distinct_names(self):
-        names = [plots.CONFIG_TO_METHOD[key] for key in (
-            "CapCoverFilter", "CapCoverFilter (TQ2)", "CapCoverFilter (TQ4)")]
-        self.assertEqual(len(set(names)), 3)
-        self.assertEqual(names[0], "CapCover Filter")
-        self.assertIn("TQ2", names[1])
-        self.assertIn("TQ4", names[2])
-
     def test_paper_construction_uses_only_unquantized_results(self):
         data = pd.DataFrame([
             {"dataset": "quora", "method": "soft_anneal", "quantize": encoding,
@@ -43,15 +35,15 @@ class TestPaperPlotPresentation(unittest.TestCase):
              "memory_bytes": memory, "tau": tau, "n_queries": 100,
              "positive_rate_pct": 20, "throughput_without_qps": 100,
              "throughput_with_qps": 200, "throughput_improvement_pct": 100}
-            for kf, memory, tau in ((0.05, 1000, 0.1), (0.1, 2000, 0.1),
+            for kf, memory, tau in ((0.05, 1000, 0.3), (0.1, 2000, 0.3),
                                     (0.1, 2000, plots.E2E_TAU))
         ])
         original = data.copy(deep=True)
         with patch.object(plots.pd, "read_csv", return_value=data.copy()), patch.object(plots, "save") as save:
             plots.throughput()
         fig = save.call_args.args[0]
-        self.assertIn("0.02", fig.axes[1].get_title())
-        self.assertIn("0.02", fig.axes[2].get_title())
+        self.assertIn("0.05", fig.axes[1].get_title())
+        self.assertIn("0.05", fig.axes[2].get_title())
         for ax in (fig.axes[0], fig.axes[2]):
             self.assertIn(plots.MEMORY_RATIO, ax.get_title())
             self.assertIn("1.30", ax.get_title())

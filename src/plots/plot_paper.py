@@ -5,26 +5,23 @@ Nothing here runs a filter or a sweep. Outputs (PDF for the paper, PNG preview)
 go to figures/ under the names paper.tex includes:
 
     sweeps-grid.*                      fig:end-to-end   budget.csv + blocklist.csv
-    quantization-saved-vs-memory.*     fig:quantization cap_quantization/<corpus>/*.csv
-    quantization-speedup-vs-memory.*  PDF Figure 4    cap_quantization/<corpus>/*.csv
-    quantization-throughput-vs-memory.* (supplement) cap_quantization/<corpus>/*.csv
-    construction-fpr-vs-k.*            fig:construction construct_methods/<corpus>.csv
-    streaming-fpr-vs-position.*        fig:streaming    streaming/<corpus>/streaming.csv
-    equal-memory-zero-fn-fpr-vs-budget.*      fig:equal-memory          equal_memory/<corpus>/equal_memory.csv
-    equal-memory-nonzero-fn-quora.*     PDF Figure 5    (same)
     throughput-improvement.*           fig:throughput   end_to_end.csv
-(The tables of plots/tables_paper.py and plots/table_quantization.py are not drawn here.)
+    quantization-speedup-vs-memory.*   fig:quantization cap_quantization/<corpus>/*.csv + end_to_end.csv
+    construction-fpr-vs-k.*            fig:construction construct_methods/<corpus>.csv
+    equal-memory-zero-fn-fpr-vs-budget.*  fig:equal-memory  equal_memory/<corpus>/equal_memory.csv
+    equal-memory-nonzero-fn-quora.*    (same; HNSW, IVF-PQ, DSH, MLP: not in paper.tex's figures)
+    construction-times.csv             construction time per method (construction_times())
 
 (figures/scheme.pdf is a hand-drawn diagram and is not produced here.)
 
 Run from the repo root with the global Python 3.12:
     PYTHONPATH=src python src/plots/plot_paper.py [results-folder] [figure ...] [--out directory]
-Use --paper-only to render data Figures 2–7 in the current paper.pdf.
+Use --paper-only for the figures paper.tex includes.
 Each run writes plot-manifest.json with input row counts, SHA-256 hashes,
 output hashes, and the mapping from paper figure numbers to filenames.
 results-folder defaults to results/. Figure names are the keys of FIGURES
-(sweeps, quantization, construction, streaming, equal-memory-zero-fn,
-equal-memory-nonzero-fn, throughput, quantization-throughput, quantization-speedup); default is all.
+(throughput, sweeps, quantization-speedup, construction, equal-memory-zero-fn,
+equal-memory-nonzero-fn); default is all.
 
 Thresholds are displayed as cosine distance; the stored CSV threshold values
 are converted only for presentation.
@@ -112,12 +109,8 @@ CORPUS_STYLE = {
 
 # Keep automatic selection distinct from explicitly fixed encodings.
 CAP_COVER = "CapCover Filter"
-CAP_COVER_TQ2 = "CapCover Filter (TQ2)"
-CAP_COVER_TQ4 = "CapCover Filter (TQ4)"
 METHOD_STYLE = {
     CAP_COVER: (BLUE, "o", "-"),
-    CAP_COVER_TQ2: (BLUE, "o", "-"),
-    CAP_COVER_TQ4: (BLUE, "s", "--"),
     "QuantizedVector": (ORANGE, "s", "-"),
     "IVF-PQ": (AQUA, "^", "-"),
     "HNSW": (YELLOW, "D", "-"),
@@ -127,7 +120,7 @@ METHOD_STYLE = {
     "VA+-file": (MAGENTA, "*", "-"),
 }
 CONFIG_TO_METHOD = {
-    "CapCoverFilter": CAP_COVER, "CapCoverFilter (TQ2)": CAP_COVER_TQ2, "CapCoverFilter (TQ4)": CAP_COVER_TQ4,
+    "CapCoverFilter": CAP_COVER,
     "QuantizedVectorFilter": "QuantizedVector",
     "IVFFilter": "IVF-PQ", "HNSWFilter": "HNSW",
     "DSHFilter": "DSH", "MLPFilter": "MLP",
@@ -150,7 +143,7 @@ QUANT_TOP_N = 5
 # End-to-end throughput (src/paper.py generates exactly these cells): the filter
 # in front of a flat index vs the index alone. The tau panel fixes the budget,
 # the memory panel fixes tau; the budget sweep is shared by the sweeps figure.
-PAPER_TAU_COS = 0.02                                          # cosine distance
+PAPER_TAU_COS = 0.05                                          # cosine distance
 PAPER_TAUS_COS = (0.005, 0.01, 0.02, 0.03, 0.05, 0.1, 0.15, 0.2)    # the tau sweeps (8 points), same unit
 TAU_TICKS = [0.02, 0.05, 0.1, 0.2]                            # cosine distance ticks of the tau axes
 
@@ -161,8 +154,8 @@ def l2_threshold(cosine_dist):
 
 
 E2E_TAU = l2_threshold(PAPER_TAU_COS)
-# Memory budgets are B/M: the filter's bytes over the raw index (float32 vectors). The values
-# must equal main.FIXED_MEMORY_FRACTION and main.BUDGET_MEMORY_FRACTIONS (src/paper.py asserts it).
+# Memory budgets are M_filter/M_raw: the filter's bytes over the raw index (float32 vectors). The values
+# must equal experiments.FIXED_MEMORY_FRACTION and BUDGET_MEMORY_FRACTIONS (src/paper.py asserts it).
 E2E_MEMORY_FRACTION = 0.02
 E2E_TAUS = tuple(l2_threshold(t) for t in PAPER_TAUS_COS)
 E2E_MEMORY_FRACTIONS = (0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05)
@@ -172,13 +165,6 @@ CONSTRUCT_SHOWN = {
     "gonzalez": ("Gonzalez", INK_MUTED, "o"),
     "minimax": ("minimax", ORANGE, "s"),
     "soft_anneal": ("soft anneal", GREEN, "v"),
-}
-# Insertion strategies shown. The initial cover is built with STREAM_BOOTSTRAP.
-STREAM_BOOTSTRAP = "sphere_merge"
-INSERT_SHOWN = {
-    "nearest": ("nearest", ORANGE, "s", "-"),
-    "cap_merge": ("cap merge", BLUE, "D", "-"),
-    "static_rebuild": ("static rebuild (oracle)", INK, None, "--"),
 }
 # Query bands use cosine similarity to the nearest indexed vector.
 BAND_TITLE = {
@@ -394,7 +380,7 @@ def quantization(mode="saved"):
     throughput, speedup = mode == "throughput", mode == "speedup"
     q = read_all("cap_quantization/*/*.csv")
     q["corpus"] = to_corpus(q.dataset)
-    # The budget is B/M; compact encodings fit more caps in it, up to one per vector.
+    # The budget is M_filter/M_raw; compact encodings fit more caps in it, up to one per vector.
     q["budget_pct"] = q.memory_fraction
     q["singleton"] = q.n_caps >= q.n_construct
     if speedup:
@@ -471,8 +457,6 @@ def quantization(mode="saved"):
                "speedup": "quantization-speedup-vs-memory"}[mode])
 
 
-def quantization_throughput():
-    quantization("throughput")
 
 
 def quantization_speedup():
@@ -524,38 +508,20 @@ def construction():
 # fig:streaming  streaming-fpr-vs-position
 # ---------------------------------------------------------------------------
 
-def streaming():
-    s = read_all("streaming/*/streaming.csv")
-    s["corpus"] = to_corpus(s.dataset)
-    pos = s[(s.sweep == "position") & (s.construct_method == STREAM_BOOTSTRAP)]
-    if pos.empty:
-        raise ValueError(f"no position-sweep rows bootstrapped with {STREAM_BOOTSTRAP}")
-    # The position sweep inserts the final fifth of the indexed set.
-    n_final = int(pos.position.max()) * 5
-    budget_fraction = float(pos.budget_bytes.iloc[0]) / (n_final * DIM * FP32_BYTES)
-    shown = [m for m in INSERT_SHOWN if m in set(pos.method)]
-    agg = pos.groupby(["corpus", "method", "position"]).fpr.agg(["mean", "std"]).reset_index()
-    fig, axes = corpus_panels(sharex=True, sharey=True)
-    for ax, corpus in zip(axes[0], CORPORA):
-        d = agg[agg.corpus == corpus]
-        if d.empty:
-            mark_empty(ax)
-        for method in shown:
-            _, color, marker, ls = INSERT_SHOWN[method]
-            g = d[d.method == method].sort_values("position")
-            if g.empty:
-                continue
-            ax.plot(g.position / 1000, g["mean"], color=color, marker=marker, ls=ls, ms=2.5,
-                    lw=1.2 if method == "static_rebuild" else 1.5)
-            ax.fill_between(g.position / 1000, g["mean"] - g["std"].fillna(0),
-                            g["mean"] + g["std"].fillna(0), color=color, alpha=0.12, lw=0)
-    axes[0, 0].set_ylabel(f"FPR\n({STREAM_BOOTSTRAP.replace('_', ' ')} boot.)")
-    axes[0, 0].set_ylim(-0.03, 1.05)
-    handles = [plt.Line2D([], [], color=INSERT_SHOWN[m][1], marker=INSERT_SHOWN[m][2],
-                          ls=INSERT_SHOWN[m][3]) for m in shown]
-    fig_legend(fig, handles, [INSERT_SHOWN[m][0] for m in shown], ncol=len(shown))
-    shared_xlabel(axes, f"inserts after bootstrap (thousands), $B\\approx{budget_fraction:.3g}M$")
-    save(fig, "streaming-fpr-vs-position")
+
+
+def construction_times():
+    """Total construction time (s) of each method on unquantized directions, mean and standard deviation over
+    the runs (corpora, folds, budgets): paper.tex's "Construction Methods" paragraph. Each method's time
+    includes the stages it builds on (minimax includes Gonzalez, soft anneal includes minimax).
+    Written to construction-times.csv. Timings from a parallel batch read slow (see paper.py)."""
+    c = read_all("construct_methods/*.csv")
+    c = c[c["quantize"] == "FP32"] if "quantize" in c else c
+    out = c.groupby("method").construct_s.agg(["mean", "std", "count"]).rename(
+        columns={"mean": "mean_s", "std": "std_s", "count": "runs"}).reset_index()
+    OUT_FIG.mkdir(parents=True, exist_ok=True)
+    out.to_csv(OUT_FIG / "construction-times.csv", index=False)
+    print(out.to_string(index=False))
 
 
 # ---------------------------------------------------------------------------
@@ -564,9 +530,9 @@ def streaming():
 # ---------------------------------------------------------------------------
 
 # The methods each figure draws, in legend order. A method the run did not produce is skipped.
-ZERO_FN_METHODS = [CAP_COVER, CAP_COVER_TQ2, CAP_COVER_TQ4, "VA+-file", "Zero-FN LSH", "QuantizedVector"]
-NONZERO_FN_METHODS = [CAP_COVER, CAP_COVER_TQ2, CAP_COVER_TQ4, "DSH", "MLP", "IVF-PQ", "HNSW"]
-NONZERO_FN_CORPUS = "Quora"      # the corpus with the most positive queries in the reduced run (49 at delta 0.02)
+ZERO_FN_METHODS = [CAP_COVER, "VA+-file", "Zero-FN LSH", "QuantizedVector"]
+NONZERO_FN_METHODS = [CAP_COVER, "DSH", "MLP", "IVF-PQ", "HNSW"]
+NONZERO_FN_CORPUS = "Quora"
 
 
 def _equal_memory_frame():
@@ -766,57 +732,37 @@ def throughput():
     save(fig, "throughput-improvement")
 
 
-def quantization_table():
-    """tab:quantization, as LaTeX (plots/table_quantization.py)."""
-    from plots.table_quantization import write
-    write(RESULTS, OUT_FIG / "quantization-table.tex")
 
 
-def paper_tables():
-    """tab:ablation, tab:sensitivity, tab:latency, tab:timing and the J_tau correlation
-    (plots/tables_paper.py)."""
-    from plots.tables_paper import write_all
-    write_all(RESULTS, OUT_FIG)
 
 
 FIGURES = {
+    "throughput": throughput,
     "sweeps": sweeps_grid,
-    "quantization": quantization,
-    "quantization-throughput": quantization_throughput,
     "quantization-speedup": quantization_speedup,
     "construction": construction,
-    "streaming": streaming,
     "equal-memory-zero-fn": equal_memory_zero_fn,
     "equal-memory-nonzero-fn": equal_memory_nonzero_fn,
-    "throughput": throughput,
 }
-
-# Data figures in the current paper.pdf; Figure 1 is the hand-drawn scheme.
-PAPER_FIGURES = ("throughput", "sweeps", "quantization-speedup", "equal-memory-nonzero-fn",
-                 "construction", "equal-memory-zero-fn")
 
 FIGURE_FILES = {
     "throughput": "throughput-improvement",
     "sweeps": "sweeps-grid",
     "quantization-speedup": "quantization-speedup-vs-memory",
-    "quantization-throughput": "quantization-throughput-vs-memory",
-    "quantization": "quantization-saved-vs-memory",
-    "equal-memory-nonzero-fn": "equal-memory-nonzero-fn-quora",
     "equal-memory-zero-fn": "equal-memory-zero-fn-fpr-vs-budget",
+    "equal-memory-nonzero-fn": "equal-memory-nonzero-fn-quora",
     "construction": "construction-fpr-vs-k",
-    "streaming": "streaming-fpr-vs-position",
 }
+# The data figures paper.tex includes; the non-zero-FN comparison (HNSW, IVF-PQ, DSH, MLP) is drawn too.
+PAPER_FIGURES = ("throughput", "sweeps", "quantization-speedup", "construction", "equal-memory-zero-fn")
 
 FIGURE_INPUTS = {
     "throughput": ("end_to_end.csv",),
     "sweeps": ("budget.csv", "blocklist.csv"),
     "quantization-speedup": ("cap_quantization/*/*.csv", "end_to_end.csv"),
-    "quantization-throughput": ("cap_quantization/*/*.csv",),
-    "quantization": ("cap_quantization/*/*.csv",),
-    "equal-memory-nonzero-fn": ("equal_memory/*/equal_memory.csv",),
     "equal-memory-zero-fn": ("equal_memory/*/equal_memory.csv",),
+    "equal-memory-nonzero-fn": ("equal_memory/*/equal_memory.csv",),
     "construction": ("construct_methods/*.csv",),
-    "streaming": ("streaming/*/streaming.csv",),
 }
 
 

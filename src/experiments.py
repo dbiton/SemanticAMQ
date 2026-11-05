@@ -15,8 +15,8 @@ faiss.omp_set_num_threads(1)  # belt-and-suspenders alongside the env vars above
 
 from logging_config import configure_logging
 from runner import (Runner,
-                    CAP_QUANTIZATION_SWEEP, CAP_COVER_CONSTRUCT, _k_for_memory_fraction)
-from typing import Any, Dict, List, Optional, Sequence
+                    CAP_QUANTIZATION_SWEEP)
+from typing import Any, List, Optional, Sequence
 from filters.cap_cover.cap_cover_filter import CapCoverFilter, Quantize
 from filters.dsh_filter import DSHFilter
 from filters.hnsw_filter import HNSWFilter
@@ -70,21 +70,20 @@ def l2_threshold(cosine_distance: float) -> float:
     return float(np.sqrt(2.0 * cosine_distance))
 
 
-FIXED_DELTA = 0.02                                                   # cosine distance, the paper's default
+FIXED_DELTA = 0.05                                                   # cosine distance, the paper's default
 BLOCKLIST_DELTAS = (0.005, 0.01, 0.02, 0.03, 0.05, 0.1, 0.15, 0.2)   # the tau sweeps (8 points)
 FIXED_TAU = l2_threshold(FIXED_DELTA)
 BLOCKLIST_TAUS = [l2_threshold(d) for d in BLOCKLIST_DELTAS]
 
 BLOCKLIST_FOLDS = 5
 
-# Memory budgets are chosen as B/M, the filter's bytes over the raw index (the |B| construct
+# Memory budgets are chosen as M_filter/M_raw, the filter's bytes over the raw index (the |B| construct
 # vectors as float32, dim*4 bytes each), never as a cap count k: the cover sizes itself from
 # the bytes (runner._k_for_memory_fraction). 8 points per sweep.
 #   BUDGET_MEMORY_FRACTIONS     generate_budget and the cap_quantization sweep
-#   FIXED_MEMORY_FRACTION       the one budget of the tau sweep, the streaming run, the throughput
-#                               tau panel, the latency timing and the insertion timing
+#   FIXED_MEMORY_FRACTION       the one budget of the tau sweep and of the throughput tau panel
 #   CONSTRUCT_MEMORY_FRACTIONS  the construction-method comparison (every encoding; a TQ2 cover has
-#                               a cap per vector from B/M = 6.3%, a TQ4 one from 12.6%)
+#                               a cap per vector from M_filter/M_raw = 6.3%, a TQ4 one from 12.6%)
 BUDGET_MEMORY_FRACTIONS = (0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05)
 FIXED_MEMORY_FRACTION = 0.02
 CONSTRUCT_MEMORY_FRACTIONS = (0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.07, 0.1)
@@ -138,11 +137,8 @@ def equal_memory_csv(dataset: str) -> str:
 # pools every dataset's rows the same way plot_scaling does (see its
 # docstring: "this figure is single-dataset" refers to color channel reuse
 # for method, not to a restriction on how many datasets feed it).
-STREAMING_DIR = "streaming"   # under RESULTS_DIR (see results_path)
 
 
-def streaming_csv(dataset: str) -> str:
-    return results_path(STREAMING_DIR, dataset, "streaming.csv")
 
 # generate_equal_memory()'s own comparison set: excludes DSBFFilter/
 # CoveringLSHFallbackFilter/LSBFFilter, which degenerate to ~100% duplicate
@@ -357,7 +353,7 @@ def generate_blocklist(runner: Runner, cap_quantize: Optional[Quantize] = None,
     """
     dim              = 384
     num_vectors      = num_vectors or WORKLOAD_NUM_VECTORS
-    memory_fraction  = FIXED_MEMORY_FRACTION  # fixed budget B/M; see docstring
+    memory_fraction  = FIXED_MEMORY_FRACTION  # fixed budget M_filter/M_raw; see docstring
     # Shared absolute grid for the tau-swept panels. Stops at 0.4: measured on
     # a 0..1.2 grid, every corpus was already pinned at FPR 1.000 and 0% saved
     # by tau=0.3, so the bulk of that range carried no information. All the
@@ -384,7 +380,7 @@ def generate_blocklist(runner: Runner, cap_quantize: Optional[Quantize] = None,
 
 def generate_budget(runner: Runner, cap_quantize: Optional[Quantize] = None,
                     num_vectors: Optional[int] = None, n_folds: Optional[int] = None) -> None:
-    """The blocklist workload read along its other axis: the memory budget B/M
+    """The blocklist workload read along its other axis: the memory budget M_filter/M_raw
     (BUDGET_MEMORY_FRACTIONS) is the swept variable and tau is held at one
     fixed value, where generate_blocklist instead sweeps tau at one fixed
     budget.
@@ -501,139 +497,6 @@ def generate_cap_quantization(runner: Runner, memory_fractions: Optional[Sequenc
 
 
 
-def generate_streaming(runner: Runner, construct_methods: Optional[List[str]] = None,
-                       k_sweep: bool = True, bootstrap_fraction: float = 0.5,
-                       num_vectors: Optional[int] = None, n_folds: Optional[int] = None) -> None:
-    """The paper's "dynamic evaluation" (Section 5.1/5.4, Figure 4): compares
-    CapCoverFilter's insertion strategies (CAP_INSERT_STRATEGIES --
-    cap_merge/nearest) via
-    stream_rebuild_worker's policy="streaming" against a static rebuild at
-    every checkpoint (policy="oracle"). Produces the streaming figure's
-    panels: (a) FPR vs. position + the static-rebuild references, (b)
-    threshold-expanded objective inflation vs. position -- at one fixed cap
-    budget k, where only the stream position varies; (c) insertion
-    throughput vs. filter size k.
-
-    Strategies are compared at equal bytes, not equal k: max_memory is the
-    static filter's footprint at k caps, and each strategy keeps as many
-    caps as fit with its own bookkeeping at its peak over the stream (see
-    InsertInterface.max_caps_for_budget; peak_memory_bytes is recorded).
-    The position sweep runs once per construct method in construct_methods,
-    which builds both the bootstrap and that run's oracle.
-
-    Reuses blocklist_workloads() -- the same corpora, position-based fold
-    splits, reference set B, query stream and fixed tau as generate_blocklist/
-    generate_budget/generate_quantization/generate_equal_memory -- so the
-    dynamic results are read on exactly the data the static ones are. Each
-    fold's B is the stream: its first bootstrap_fraction is built with
-    construct(), the way the static evaluations build all of it, and the rest
-    arrives through insert() one vector at a time. B is kept in the fold's own
-    order rather than reshuffled, so at the last checkpoint the oracle is the
-    very filter generate_blocklist builds at the same memory budget.
-
-    Queries are the fold's query_vectors(),
-    scored at every checkpoint against the distance-based ground truth
-    compute_static_actual_results gives for the part of B that has arrived so
-    far -- the definition every evaluation uses, and the one under which zero
-    false negatives is a guarantee rather than a hope.
-    The truth is computed here once per fold and shared by every job on it.
-
-    Bootstrapping on half of B rather than on k vectors matters: construct()
-    on exactly k points gives GonzalesConstruct one point per center and
-    hence zero-radius balls at position 0 -- a degenerate starting point that
-    saturates FPR within a few dozen insertions regardless of method.
-
-    k is the blocklist workload's own budget, the caps that fit FIXED_MEMORY_FRACTION of the raw index, and
-    |B| is trimmed to the same size on every corpus (see _fold_selections), so
-    k and the checkpoint positions are identical across corpora, which is
-    what makes plot_streaming's pooling meaningful.
-
-    FNR=0 is asserted per checkpoint inside stream_rebuild_worker (raises,
-    not recorded) -- a correctness requirement, not a plotted quantity.
-
-    construct_methods narrows the position sweep to those constructors and
-    k_sweep=False skips panel (c)'s k sweep (src/paper.py needs neither).
-
-    bootstrap_fraction is the share of B built by construct(); the rest is the insert
-    stream, so it sets how far the set outgrows the fixed budget k.
-
-    Only submits 'stream_rebuild' jobs -- does not run `runner`. Each corpus
-    writes its own results/streaming/<dataset>/streaming.csv (see
-    streaming_csv()), mirroring cap_quantization_csv/CAP_QUANTIZATION_DIR."""
-    num_vectors        = num_vectors or WORKLOAD_NUM_VECTORS
-    dim                = 384
-    n_folds            = n_folds or BLOCKLIST_FOLDS
-    methods            = ["nearest", "cap_merge"]
-    # The position sweep runs once per constructor: each builds both the
-    # streamed filter's bootstrap and its static-rebuild oracle, so every
-    # method's gap can be read against either reference. Gonzalez is the
-    # filter's own built-in fallback; runner.CAP_COVER_CONSTRUCT
-    # (sphere_merge) is CapCoverFilter's actual default. The k sweep uses
-    # CAP_COVER_CONSTRUCT only, unquantized like the position sweep.
-    construct_methods  = construct_methods or ["gonzalez", CAP_COVER_CONSTRUCT]
-    # The fixed absolute tau generate_budget/generate_quantization/
-    # generate_equal_memory use, so every blocklist-workload evaluation sits
-    # at the same operating point.
-    tau                = FIXED_TAU
-    memory_fraction    = FIXED_MEMORY_FRACTION  # generate_blocklist's fixed budget B/M
-    n_checkpoints      = 12
-
-    workloads = blocklist_workloads(num_vectors, n_folds=n_folds)
-    if not workloads:
-        raise RuntimeError(
-            "generate_streaming: no usable workload for any corpus (see the errors "
-            "above -- most likely WORKLOAD_NUM_VECTORS is too large for their "
-            "duplicate clusters)")
-
-    for workload in workloads:
-        output_csv = streaming_csv(workload.name)
-        os.makedirs(os.path.dirname(output_csv), exist_ok=True)
-        for fold, sel in enumerate(workload.selections):
-            vectors_stream = workload.rows(sel["reference"])
-            vectors_query = workload.query_vectors(sel)
-            n = len(vectors_stream)
-            k = _k_for_memory_fraction(dim, n, memory_fraction)  # as runner._blocklist_cover_rows sizes it
-            bootstrap_n = max(1, round(bootstrap_fraction * n))
-
-            # construct() covers positions [0, bootstrap_n); the position
-            # sweep only checkpoints the insert-only span after it.
-            checkpoints = sorted(set(
-                int(round(x)) for x in np.logspace(np.log10(bootstrap_n + 1), np.log10(n), num=n_checkpoints)
-            ))
-            actual_at_checkpoint = {
-                c: compute_static_actual_results(vectors_stream[:c], vectors_query, tau)
-                for c in checkpoints
-            }
-            logger.info(
-                f"{workload.name} fold {fold}: |B|={n}, k={k}, bootstrap={bootstrap_n}, "
-                f"duplicates among {len(vectors_query)} queries: "
-                f"{sum(actual_at_checkpoint[checkpoints[0]])} at the first checkpoint, "
-                f"{sum(actual_at_checkpoint[checkpoints[-1]])} at the last")
-
-            # Each row is self-describing (dataset/method/sweep/metric/
-            # fold_offset), so no positional reconstruction is needed despite
-            # Runner's completion-order results.
-            common = dict(
-                output_csv=output_csv, dim=dim, dataset=workload.name, seed=fold, tau=tau, T=None,
-                vectors_stream=vectors_stream, vectors_query=vectors_query,
-                actual_at_checkpoint=actual_at_checkpoint,
-                checkpoints=checkpoints, bootstrap_n=bootstrap_n, fold_offset=fold,
-            )
-
-            # --- panels (a)/(b): position sweep at the fixed budget k ---
-            for construct_method in construct_methods:
-                for method in methods:
-                    runner.submit('stream_rebuild', k=k, policy="streaming", insertion_level=method,
-                                  sweep="position", construct_method=construct_method, **common)
-                runner.submit('stream_rebuild', k=k, policy="oracle", sweep="position",
-                              construct_method=construct_method, **common)
-
-            # --- panel (c): filter size (k) sweep for insertion throughput ---
-            max_p = max(4, int(round(np.log2(k))))
-            for method in methods if k_sweep else []:
-                for k_val in [2 ** p for p in range(4, max_p + 1)]:
-                    runner.submit('stream_rebuild', k=k_val, policy="streaming", insertion_level=method,
-                                  sweep="k", construct_method=CAP_COVER_CONSTRUCT, **common)
 
 
 
@@ -647,8 +510,8 @@ def generate_streaming(runner: Runner, construct_methods: Optional[List[str]] = 
 CONSTRUCT_METHODS_DIR = "construct_methods"   # under RESULTS_DIR (see results_path)
 # The construction evaluation compares these, each unquantized (FP32), at TQ2 and at TQ4; sphere_merge
 # (the paper's default) is not evaluated there, and soft_anneal starts from minimax's cover.
-CONSTRUCT_EVALUATED = ("gonzalez", "minimax", "sphere_merge", "soft_anneal")
-CONSTRUCT_QUANTIZES = (Quantize.FP32, Quantize.TQ2, Quantize.TQ4)
+CONSTRUCT_EVALUATED = ("gonzalez", "minimax", "soft_anneal")
+CONSTRUCT_QUANTIZES = (Quantize.FP32,)      # the paper's construction comparison is unquantized
 
 
 def construct_methods_csv(dataset: str) -> str:
@@ -675,7 +538,7 @@ def generate_construct_methods(runner: Runner, num_vectors: Optional[int] = None
     num_vectors = num_vectors or WORKLOAD_NUM_VECTORS
     n_folds     = n_folds or BLOCKLIST_FOLDS
     tau         = FIXED_TAU
-    # B/M from 1% to 10% (8 points): the budgets where the covers are wide
+    # M_filter/M_raw from 1% to 10% (8 points): the budgets where the covers are wide
     # enough for the construction method to matter and not yet saturated.
     memory_fractions = list(CONSTRUCT_MEMORY_FRACTIONS)
     methods     = list(CONSTRUCT_EVALUATED)
@@ -701,79 +564,3 @@ def generate_construct_methods(runner: Runner, num_vectors: Optional[int] = None
                             vectors_construct=vectors_construct, vectors_query=vectors_query,
                             actual_results=actual_results,
                         )
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ---------------------------------------------------------------------------
-# Ablation, latency and timing: the evaluations behind the paper's tables. Each writes one CSV
-# (all corpora in it). The workers time construction/queries, so the latter two must run with a
-# single worker (src/paper.py runs them alone, one pinned core each).
-# ---------------------------------------------------------------------------
-ABLATION_CSV = "ablation.csv"   # under RESULTS_DIR (see results_path)
-LATENCY_CSV = "latency.csv"   # under RESULTS_DIR (see results_path)
-TIMING_CSV = "timing.csv"   # under RESULTS_DIR (see results_path)
-ABLATION_MEMORY_FRACTIONS = (0.02, 0.1)
-LATENCY_MEMORY_FRACTION = FIXED_MEMORY_FRACTION
-LATENCY_DELTAS = (0.005, 0.02, 0.1)
-
-
-def _workload_cells(num_vectors: Optional[int], n_folds: Optional[int], only: Optional[str] = None):
-    """(workload, fold, selection) for every corpus (or `only`) at this size."""
-    num_vectors = num_vectors or WORKLOAD_NUM_VECTORS
-    n_folds = n_folds or BLOCKLIST_FOLDS
-    workloads = blocklist_workloads(num_vectors, n_folds=n_folds, only=only)
-    if not workloads:
-        raise RuntimeError(f"no usable workload at {num_vectors} vectors x {n_folds} folds "
-                           f"(corpus missing or too short)")
-    for workload in workloads:
-        for fold, sel in enumerate(workload.selections):
-            yield workload, fold, sel
-
-
-def generate_ablation(runner: Runner, num_vectors: Optional[int] = None, n_folds: Optional[int] = None,
-                      memory_fractions: Sequence[float] = ABLATION_MEMORY_FRACTIONS) -> None:
-    """One 'ablation' job per (corpus, fold, budget): every arm of runner._ablation_arms at
-    the same bytes, scored at every ABLATION_DELTAS. Writes ABLATION_CSV. Only submits."""
-    for workload, fold, sel in _workload_cells(num_vectors, n_folds):
-        for mf in memory_fractions:
-            runner.submit('ablation', output_csv=results_path(ABLATION_CSV), dim=384, dataset=workload.plot_key, seed=fold,
-                          memory_fraction=mf, vectors_reference=workload.rows(sel["reference"]),
-                          vectors_query=workload.query_vectors(sel))
-
-
-def generate_latency(runner: Runner, sizes: Optional[Dict[str, int]] = None, n_folds: int = 1,
-                     memory_fraction: float = LATENCY_MEMORY_FRACTION,
-                     quantize: Optional[Quantize] = None) -> None:
-    """The filter in front of a flat index, timed per query: one 'filter_latency' job per
-    corpus in `sizes` (registry name -> workload vectors, default the paper's WildChat 25,000
-    = 20,000 indexed and WikiAnswers 10,000 = 8,000). Writes LATENCY_CSV. Only submits; run
-    with one worker."""
-    sizes = sizes or {"WildChat": 25_000, "WikiAnswers": 10_000}
-    for name, size in sizes.items():
-        for workload, fold, sel in _workload_cells(size, n_folds, only=name):
-            runner.submit('filter_latency', output_csv=results_path(LATENCY_CSV), dim=384, dataset=workload.plot_key, seed=fold,
-                          memory_fraction=memory_fraction, deltas=LATENCY_DELTAS, quantize=quantize,
-                          vectors_reference=workload.rows(sel["reference"]),
-                          vectors_query=workload.query_vectors(sel))
-
-
-def generate_timing(runner: Runner, num_vectors: int = 10_000, dataset: str = "WildChat",
-                    scan_quantizes: Sequence[Quantize] = ()) -> None:
-    """Construction time of each construction method, per-arrival insertion time of each
-    insertion strategy and, with `scan_quantizes`, one-batch query throughput of each
-    encoding (one 'pinned_timing' job, fold 0 of `dataset`). Writes TIMING_CSV. Only
-    submits; run with one worker."""
-    for workload, fold, sel in _workload_cells(num_vectors, 1, only=dataset):
-        runner.submit('pinned_timing', output_csv=results_path(TIMING_CSV), dim=384, dataset=workload.plot_key,
-                      vectors_reference=workload.rows(sel["reference"]),
-                      vectors_query=workload.query_vectors(sel), scan_quantizes=tuple(scan_quantizes))

@@ -7,6 +7,7 @@ pub mod construct_minimax;
 pub mod construct_anneal;
 pub mod construct_assign;
 pub mod construct_tail;
+#[cfg(target_arch = "x86_64")]
 pub mod construct_knn_avx2;
 
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyArrayMethods, PyUntypedArrayMethods};

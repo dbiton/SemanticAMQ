@@ -1,28 +1,31 @@
-"""The one entry point: generates the data behind paper.tex's figures and tables, and draws them.
+"""The one entry point: generates the data behind paper.tex's figures and draws them.
 
-    python src/paper.py                      # every evaluation, then the figures and tables
-    python src/paper.py --only budget,streaming
+    python src/paper.py                      # build the Rust kernels, run every evaluation, draw
+    python src/paper.py --only budget,construction
     python src/paper.py --missing            # only the evaluations with no complete CSVs yet
-    python src/paper.py plot                 # re-draw from existing CSVs (needs no datasets)
+    python src/paper.py plot                 # re-draw from existing CSVs (needs no datasets, no build)
     python src/paper.py plot sweeps throughput --results DIR --out DIR
     python src/paper.py --list               # evaluations, their scale and outputs
 
-Evaluation definitions live in experiments.py; figures in plots/plot_paper.py, tables in
-plots/tables_paper.py and plots/table_quantization.py. Each evaluation below runs at the
-scale paper.tex states for it (EVALUATIONS): the sweeps at 100,000 vectors per corpus (80,000
-indexed, 20,000 queries) on five folds, the quantization table, insertion, equal-memory and
-ablation runs at 10,000 vectors and one fold, the latency run on WildChat at 20,000 and
-WikiAnswers at 8,000 indexed vectors. --num-vectors / --folds override every evaluation (a
-reduced run); --results sets where CSVs are written and read.
+Running builds the Rust kernels first (rust_build.ensure_built: `maturin develop --release`,
+incremental), so a run always uses kernels compiled from the checked-out sources; --no-build skips it.
 
-Memory budgets are B/M, the filter's bytes over the raw float32 index (never a cap count k).
-Thresholds are cosine distance delta = 0.02 (experiments.FIXED_DELTA) unless a sweep varies them.
-Cap-Cover is built by runner.CAP_COVER_CONSTRUCT (sphere merge); soft anneal is its own arm in
-the construction and ablation evaluations.
+Evaluation definitions live in experiments.py; the figures in plots/plot_paper.py. Every evaluation
+runs at the workload paper.tex states: per corpus, five folds of 80,000 indexed vectors (from the start
+of the file) and 20,000 queries (from its end). --num-vectors / --folds override that for a reduced
+run; --results sets where CSVs are written and read.
 
-Evaluations that time something (end-to-end, latency, timing) run after the parallel batch,
-alone, on pinned cores: timings taken beside dozens of other jobs read several times too
-slow. Running an evaluation truncates its CSVs (see CLAUDE.md); collecting jobs does not.
+Memory budgets are M_filter/M_raw, the filter's bytes over the raw float32 embedding array (never a cap
+count k). The query threshold is tau = 0.05 cosine distance (experiments.FIXED_DELTA) unless a sweep
+varies it. Cap-Cover is built by soft anneal (runner.CAP_COVER_CONSTRUCT) with automatic encoding
+selection, except in the quantization comparison (fixed encodings) and the construction comparison
+(Gonzalez, minimax, soft anneal; unquantized).
+
+The end-to-end evaluation times a filter in front of a flat index, so it runs after the parallel batch,
+on pinned cores (--timing-workers, default 1: paper.tex times on one core, one job at a time).
+Construction times from the parallel batch read several times too slow; they are not timing claims
+unless the construction evaluation is run alone (--only construction --workers 1). Running an
+evaluation truncates its CSVs (see CLAUDE.md); collecting jobs does not.
 """
 import argparse
 import os
@@ -35,7 +38,14 @@ for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "
 # CapCoverFilter.auto); read in the worker processes too.
 os.environ.setdefault("CAPCOVER_SCAN_LIMIT_MS", "1.0")
 
-from dataclasses import dataclass
+if __name__ == "__main__":
+    # Before anything imports capcover_rs. Child processes re-import this file under another
+    # name, so only the command line the user typed builds.
+    if not ({"--no-build", "--list", "-h", "--help"} & set(sys.argv[1:]) or sys.argv[1:2] == ["plot"]):
+        import rust_build
+        rust_build.ensure_built()
+
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import Callable, Optional, Tuple
@@ -43,13 +53,11 @@ from typing import Callable, Optional, Tuple
 import experiments
 from experiments import (Runner, blocklist_workloads, equal_memory_filters, logger, results_path,
                          generate_blocklist, generate_budget, generate_cap_quantization,
-                         generate_construct_methods, generate_equal_memory, generate_streaming,
-                         generate_ablation, generate_latency, generate_timing)
+                         generate_construct_methods, generate_equal_memory)
 from filters.cap_cover.cap_quantizers import Quantize
 from plots import plot_paper
 from plots.plot_paper import (FIGURES, plot_figures, use_corpora, CONFIG_TO_METHOD,
-                              E2E_TAU, E2E_MEMORY_FRACTION, E2E_TAUS, E2E_MEMORY_FRACTIONS, PAPER_TAUS_COS,
-                              l2_threshold)
+                              E2E_TAU, E2E_MEMORY_FRACTION, E2E_TAUS, E2E_MEMORY_FRACTIONS, PAPER_TAUS_COS)
 from runner import CAP_QUANTIZATION_SWEEP, CAP_QUANTIZE_AUTO
 from util.dataset_paths import dataset_filenames
 from vector_source import VectorSource
@@ -67,11 +75,8 @@ assert len(experiments.BUDGET_MEMORY_FRACTIONS) == len(experiments.CONSTRUCT_MEM
 PAPER_EQUAL_MEMORY_FILTERS = list(equal_memory_filters)
 assert all(cls.__name__ in CONFIG_TO_METHOD for cls in PAPER_EQUAL_MEMORY_FILTERS)
 
-# The sweeps grid (blocklist, budget) and the throughput figure run CapCoverFilter at this one
-# encoding (not auto()'s choice); the equal-memory comparison draws one Cap-Cover line per
-# encoding of EQUAL_MEMORY_CAP_QUANTIZES.
-PAPER_CAP_QUANTIZE = Quantize.TQ2
-EQUAL_MEMORY_CAP_QUANTIZES = (Quantize.TQ2, Quantize.TQ4)
+# Cap-Cover runs with automatic encoding selection (cap_quantize=None) everywhere except the
+# quantization comparison below.
 
 # The encodings the quantization figure compares: the full-precision, scalar and TurboQuant
 # rungs down to 1 bit/dim, plus the seeded-PQ rungs auto() chooses among, and auto() itself.
@@ -79,18 +84,14 @@ PAPER_QUANTIZE = tuple(dict.fromkeys(
     (Quantize.FP32, Quantize.FP16, Quantize.SQ8, Quantize.TQ8, Quantize.SQ6, Quantize.SQ4, Quantize.TQ4,
      Quantize.TQ3, Quantize.TQ2, Quantize.TQ1) + tuple(CAP_QUANTIZATION_SWEEP) + (CAP_QUANTIZE_AUTO,)))
 
-# The encodings whose one-batch query throughput the quantization table reports (pinned timing).
-SCAN_QUANTIZES = tuple(q for q in PAPER_QUANTIZE if q != CAP_QUANTIZE_AUTO)
-
-FULL_SCALE = (100_000, 5)      # vectors per corpus, folds
-SMALL_SCALE = (10_000, 1)
+FULL_SCALE = (100_000, 5)      # vectors per corpus, folds: 80,000 indexed + 20,000 queries per fold
 
 END_TO_END_CSV = "end_to_end.csv"
-E2E_WORKERS = 8
+E2E_WORKERS = 1      # paper.tex: timing runs on one pinned core, one job at a time
 
 
 def generate_end_to_end(runner: Runner, num_vectors: Optional[int] = None, n_folds: Optional[int] = None) -> None:
-    """The throughput figure's data: per corpus and fold, a CapCoverFilter (PAPER_CAP_QUANTIZE) in
+    """The throughput figure's data: per corpus and fold, a CapCoverFilter (automatic encoding) in
     front of a flat index against the index alone (runner.end_to_end_worker), on the blocklist
     workload. Only the cells the three panels read: tau swept at the fixed budget
     E2E_MEMORY_FRACTION, and the budget swept at E2E_TAU. Only submits."""
@@ -101,7 +102,7 @@ def generate_end_to_end(runner: Runner, num_vectors: Optional[int] = None, n_fol
         for fold, sel in enumerate(workload.selections):
             runner.submit(
                 'end_to_end', output_csv=results_path(END_TO_END_CSV),
-                dim=384, dataset=workload.plot_key, seed=fold, cells=cells, quantize=PAPER_CAP_QUANTIZE,
+                dim=384, dataset=workload.plot_key, seed=fold, cells=cells, quantize=None,
                 vectors_reference=workload.rows(sel["reference"]),
                 vectors_query=workload.query_vectors(sel),
             )
@@ -119,26 +120,15 @@ class Evaluation:
 
 
 EVALUATIONS = {e.name: e for e in (
-    Evaluation("blocklist", partial(generate_blocklist, cap_quantize=PAPER_CAP_QUANTIZE), FULL_SCALE,
-               "blocklist.csv", False),
-    Evaluation("budget", partial(generate_budget, cap_quantize=PAPER_CAP_QUANTIZE), FULL_SCALE,
-               "budget.csv", False),
+    Evaluation("blocklist", generate_blocklist, FULL_SCALE, "blocklist.csv", False),
+    Evaluation("budget", generate_budget, FULL_SCALE, "budget.csv", False),
     Evaluation("construction", generate_construct_methods, FULL_SCALE, "construct_methods/*.csv", True),
-    Evaluation("quantization", partial(generate_cap_quantization, quantizes=PAPER_QUANTIZE), SMALL_SCALE,
+    Evaluation("quantization", partial(generate_cap_quantization, quantizes=PAPER_QUANTIZE), FULL_SCALE,
                "cap_quantization/*/*.csv", True),
-    Evaluation("streaming", partial(generate_streaming, construct_methods=[plot_paper.STREAM_BOOTSTRAP],
-                                    k_sweep=False), SMALL_SCALE, "streaming/*/streaming.csv", True),
     Evaluation("equal-memory", partial(generate_equal_memory, filters=PAPER_EQUAL_MEMORY_FILTERS,
-                                       count_memory_steps=8, tau=l2_threshold(experiments.FIXED_DELTA),
-                                       cap_quantizes=EQUAL_MEMORY_CAP_QUANTIZES),
-               SMALL_SCALE, "equal_memory/*/equal_memory.csv", True),
-    Evaluation("ablation", generate_ablation, SMALL_SCALE, "ablation.csv", False),
+                                       count_memory_steps=8), FULL_SCALE,
+               "equal_memory/*/equal_memory.csv", True),
     Evaluation("end-to-end", generate_end_to_end, FULL_SCALE, END_TO_END_CSV, False, workers=E2E_WORKERS),
-    Evaluation("latency", lambda runner, num_vectors=None, n_folds=None: generate_latency(runner), None,
-               "latency.csv", False, workers=1),
-    Evaluation("timing", lambda runner, num_vectors=None, n_folds=None: generate_timing(
-        runner, **({"num_vectors": num_vectors} if num_vectors else {}), scan_quantizes=SCAN_QUANTIZES), None,
-               "timing.csv", False, workers=1),
 )}
 
 
@@ -159,10 +149,8 @@ def check_datasets(evaluations, num_vectors=None, n_folds=None) -> None:
     run of hours would end with a figure that quietly lacks a dataset."""
     need = 0
     for e in evaluations:
-        nv, nf = e.scale or (SMALL_SCALE[0], 1)
+        nv, nf = e.scale
         need = max(need, (n_folds or nf) * (num_vectors or nv))
-    if "latency" in {e.name for e in evaluations}:
-        need = max(need, 25_000)
     problems = []
     for name in experiments.BLOCKLIST_DATASETS:
         path = dataset_filenames[name]
@@ -179,7 +167,7 @@ def check_datasets(evaluations, num_vectors=None, n_folds=None) -> None:
 def _submit_and_run(evaluations, num_workers, num_vectors=None, n_folds=None) -> None:
     runner = Runner(num_workers=num_workers)
     for e in evaluations:
-        nv, nf = e.scale or (None, None)
+        nv, nf = e.scale
         try:
             e.generate(runner, num_vectors=num_vectors or nv, n_folds=n_folds or nf)
         except Exception:
@@ -212,11 +200,10 @@ def plot_all(figures=None, out=None, results=None) -> None:
     results = results or experiments.RESULTS_DIR
     plot_figures(figures or list(FIGURES), results=results, out=out)
     if not figures:
-        for table in (plot_paper.quantization_table, plot_paper.paper_tables):
-            try:
-                table()
-            except FileNotFoundError as e:
-                logger.warning(f"{table.__name__}: {e}")
+        try:
+            plot_paper.construction_times()
+        except FileNotFoundError as e:
+            logger.warning(f"construction_times: {e}")
 
 
 def configure(datasets=None, workers=None, results=None) -> None:
@@ -243,6 +230,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--only", help="comma-separated evaluations to run (default: all)")
     parser.add_argument("--missing", action="store_true",
                         help="run only the evaluations whose CSVs are not all present, then draw")
+    parser.add_argument("--no-build", action="store_true", help="do not build the Rust kernels first")
+    parser.add_argument("--timing-workers", type=int, help=f"pinned cores for the timed evaluations (default {E2E_WORKERS})")
     parser.add_argument("--no-plot", action="store_true", help="skip drawing after a run")
     parser.add_argument("--list", action="store_true", help="list the evaluations and exit")
     parser.add_argument("--num-vectors", type=int, help="vectors per corpus, for every evaluation")
@@ -259,10 +248,12 @@ def main(argv=None) -> None:
     args = parser.parse_args(argv)
     if args.list:
         for e in EVALUATIONS.values():
-            scale = f"{e.scale[0]:,} vectors x {e.scale[1]} fold(s)" if e.scale else "fixed in its generator"
+            scale = f"{e.scale[0]:,} vectors x {e.scale[1]} fold(s)"
             print(f"{e.name:14s} {scale:34s} {e.outputs}" + (f"  [alone, {e.workers} pinned core(s)]" if e.workers else ""))
         return
     configure(args.datasets.split(",") if args.datasets else None, args.workers, args.results)
+    if args.timing_workers:
+        EVALUATIONS["end-to-end"] = replace(EVALUATIONS["end-to-end"], workers=args.timing_workers)
     if args.command == "plot":
         plot_all(args.figures, args.out, args.results)
         return

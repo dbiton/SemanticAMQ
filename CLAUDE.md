@@ -57,7 +57,7 @@ src/experiments.py     evaluation definitions: generate_* per evaluation (submit
                        construction (blocklist_workloads), output paths
 src/paper.py           the sole entry point (replaced main.py): EVALUATIONS (scale per paper.tex, outputs, timed or
                        not), argparse CLI (`--list`, `--only`, `--missing`, `plot`, `--results`, `--num-vectors`),
-                       then the figures and tables. Reduced run: `--num-vectors 10000 --folds 1 --results DIR`
+                       then the figures. Builds the Rust kernels first (rust_build.py). Reduced run: `--num-vectors 10000 --folds 1 --results DIR`
 src/runner.py          Runner (ProcessPoolExecutor job harness), one *_worker per mode,
                        filter registries, calibration/tuning of baseline dials
 src/filters/filter.py  Filter base: construct(), query(), insert() (optional), get_bytesize();
@@ -78,7 +78,7 @@ CapCoverRustFilter/    Rust crate capcover_rs (PyO3/maturin) behind CapCoverFilt
                        `pip install maturin && cd CapCoverRustFilter && maturin develop --release`
 src/filters/           baselines: dsh, hnsw, ivf, quantized_vector, va_plus, mlp,
                        pacuk_lsh / sankowski_wygocki (zero-FN LSH, on _floor_lsh.FloorLSHFilter)
-src/plots/             plot_paper.py (figures), tables_paper.py + table_quantization.py (LaTeX tables)
+src/plots/             plot_paper.py (the paper's figures)
 src/util/dataset_paths.py  dataset name -> HDF5 file registry (deliberately import-light)
 src/util/fetch_datasets.py builds datasets/ with sentence_transformers (heavy imports)
 src/vector_source.py   VectorSource: picklable lazy handle to an HDF5 slice for workers
@@ -90,10 +90,10 @@ suggestions/           untracked scratch analyses and plans (not part of the pip
 
 **Evaluation flow.** Each evaluation in `experiments.py` has a `generate_X(runner, num_vectors, n_folds)`
 that only *submits* jobs (`runner.submit(mode, output_csv=..., **kwargs)`); `paper.EVALUATIONS`
-lists them with the scale paper.tex states: blocklist, budget, construction, end-to-end at 100K vectors x 5
-folds; quantization, streaming, equal-memory, ablation at 10K x 1 fold; latency and timing fixed in their
-generators. The untimed ones run as one shuffled batch on `experiments.MAX_WORKERS`; end-to-end, latency and
-timing run afterwards, alone, on pinned cores. `python src/paper.py plot` re-renders from existing CSVs.
+lists them: blocklist, budget, construction, quantization, equal-memory and end-to-end, all on paper.tex's
+workload (100K vectors x 5 folds: 80K indexed, 20K queries) at tau = 0.05 cosine distance, Cap-Cover built by
+soft anneal with auto encoding. The untimed ones run as one shuffled batch on `experiments.MAX_WORKERS`;
+end-to-end runs afterwards on pinned cores (paper.tex: one core, one job at a time). `python src/paper.py plot` re-renders from existing CSVs.
 
 **Runner.** Modes map to workers in `runner._WORKER_FNS`. Each job's rows are
 written incrementally to its `output_csv` by the coordinating process as jobs
@@ -103,7 +103,7 @@ workers must return self-describing rows, and callers must never zip results
 positionally against submission order (each row names its dataset, config and fold).
 
 **Registries** (check these for current names instead of hardcoding lists):
-- `runner.CAP_CONSTRUCT_METHODS`, `CAP_COVER_CONSTRUCT = "sphere_merge"`: construction strategies by name.
+- `runner.CAP_CONSTRUCT_METHODS`, `CAP_COVER_CONSTRUCT = "soft_anneal"`: construction strategies by name.
 - `runner.CAP_INSERT_STRATEGIES`: insertion strategies by name.
 - `runner._cap_cover(dim, k)`: the paper's configuration (`CapCoverFilter.auto()`).
 - `runner.CAP_QUANTIZATION_SWEEP`, `_POST_CONSTRUCTION_CONFIG_DIALS`,
@@ -159,7 +159,7 @@ true distance at tau, never by which sampling stratum a query came from.
   membership filter forces (accept rule, honest memory accounting, shared
   coverage epsilon, the harness's usual per-filter dial). Never add adaptations
   that make a competitor stronger. The flip side: run Cap-Cover in its best
-  configuration (`_cap_cover`, sphere_merge), not the Gonzalez default.
+  configuration (`_cap_cover`, soft_anneal), not the Gonzalez default.
 - **Timings need pinning.** Construction timings measured under many workers
   read 3-14x slow; unpinned runs vary 1.5-2x from E-core scheduling. For timing
   claims run sequentially with `psutil.Process().cpu_affinity([0])`.
