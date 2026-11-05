@@ -1,6 +1,8 @@
 # Publication cleanup tasks
 
-Partially implemented: `main.py` is replaced by `paper.py` + `src/experiments.py` (tasks 4/6 core, first slice of 8). Also done: no-side-effect collection, per-evaluation scales, ablation/latency/timing generators, argparse CLI, sphere merge + delta 0.02 as the publication settings. Open items are unchecked below. See [plan.md](plan.md) for scope and decisions.
+Implemented (see git log): tasks 2-8, 10, 11 and the Python side of 12. Not done: task 9 beyond removing
+functions with no caller (option trimming needs the paper-scale ablation arms), the Rust build/tests and
+the paper-scale rerun, which need the evaluation machine.
 All generator verification uses a recording runner or temporary output root.
 
 ## 1. Freeze the evaluation contract
