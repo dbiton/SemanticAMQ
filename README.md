@@ -55,7 +55,13 @@ The filter says YES whenever $M_X(q, \tau) = 1$, and may also say YES for some o
 
 ## How it works
 
-Unit-normalized embeddings lie on a sphere. CapCover Filter stores a small set of **spherical caps** that together contain every indexed vector. Each cap is only a direction $u_i$ and an angle $\theta_i$:
+SAMQ (Cap-Cover) builds a cover of spherical caps over the construct set (direction
+and angle per cap, quantizable to shrink memory -- see `Quantize` in
+[cap_cover_filter.py](src/filters/cap_cover/cap_cover_filter.py)),
+then answers a query by checking whether it falls within any cap's
+angle (widened by the query threshold). It is compared at equal memory against the
+baselines in [src/filters/](src/filters/): DSH, HNSW, IVF-PQ, a quantized flat
+index, VA+-file, an MLP, and two zero-false-negative LSH schemes.
 
 $$
 C(u_i, \theta_i) = \lbrace x \in S^{d-1} : \angle(x, u_i) \le \theta_i \rbrace.
@@ -63,50 +69,77 @@ $$
 
 ```
 src/
-  paper.py            entry point: runs the paper's evaluations and draws its figures
+  paper.py            the entry point: runs the paper's evaluations, draws its figures and tables
   experiments.py      evaluation definitions (generate_* submit jobs to a Runner)
+  workloads.py        positional folds over a corpus file, exact ground truth
   runner.py           parallel job harness (ProcessPoolExecutor) + per-job workers
-  filters/            SAMQ (cap_cover/) and baseline filter implementations
-  plots/               one module per evaluation's figure set
-  util/                dataset path registry + embedding loaders
-  vector_source.py     lazy/array-backed vector handles passed to worker processes
-tests/                 unittest-style tests, one file per filter/module
-datasets/              embedding pickles (not checked in, see below)
-results/               generated evaluation CSVs
-plots/<eval>/           generated figure PNGs
+  filters/            Cap-Cover (cap_cover/) and the baselines
+  plots/              plot_paper.py (figures), tables_paper.py, table_quantization.py (LaTeX tables)
+  util/               dataset registry (import-light), dataset builders, space bound
+  vector_source.py    lazy/array-backed vector handles passed to worker processes
+CapCoverRustFilter/   Rust crate behind CapCoverFilter.query()
+tests/                unittest-style tests, one file per filter/module
+datasets/             embedding files (HDF5 despite .pkl; not checked in)
+results/              generated CSVs (not checked in)
+figures/              generated figures and tables
 ```
 
 **False-positive bound.** Under uniform queries, the total measure of the widened caps bounds the false-positive rate:
 
-```math
-\mathrm{FPR}_\nu(\mathcal{C}, \tau) \le \min\lbrace 1, J_\tau(\mathcal{C}) \rbrace, \qquad J_\tau(\mathcal{C}) = \sum_i \sigma(\theta_i + \alpha_\tau).
-```
-
-**Space lower bound.** Take any deterministic structure that represents every set of $n$ points on the sphere in $\mathcal{B}$ bytes, with no false negatives and a uniform-query false-positive rate of at most $\varepsilon$. Then
-
-## Running an evaluation
+Python 3.12 with faiss-cpu 1.15.1 is the tested combination.
 
 ```
-python src/paper.py              # run every evaluation, then draw the figures
-python src/paper.py --only budget,streaming
-python src/paper.py plot         # re-draw figures from an earlier run's results/*.csv
+pip install -r requirements.txt            # evaluation and plotting
+pip install maturin && cd CapCoverRustFilter && maturin develop --release   # the Rust scan
+pip install -r requirements-data.txt       # only to build datasets (sentence_transformers)
+python src/util/fetch_datasets.py          # the paper's five corpora -> datasets/
 ```
 
-`paper.py` replaces the former `main.py`; the evaluation definitions it runs
-live in [src/experiments.py](src/experiments.py). Running a generator
-truncates that evaluation's CSVs in `results/` (see CLAUDE.md).
+The evaluations read `datasets/embeds_<corpus>.pkl` for WildChat, Quora, WikiAnswers,
+ChatGPT-Paraphrases and CC-News (see `dataset_filenames` in
+[src/util/dataset_paths.py](src/util/dataset_paths.py)); each needs 500,000 rows for the
+five-fold 100,000-vector runs.
 
-## Installation
+## Running the evaluations
 
-CapCover Filter is implemented in Python with a Rust query kernel, and uses FAISS for exact search. It requires Python and the [Rust toolchain](https://rustup.rs/). The commands below install the Python dependencies and compile the Rust query kernel. Tested with Python 3.13 and Rust 1.91 on Windows.
+Run from the repository root.
 
-```bash
-git clone https://github.com/dbiton/SemanticAMQ.git
-cd SemanticAMQ
-pip install -r requirements.txt
-pip install ./CapCoverRustFilter
+```
+python src/paper.py --list                       # evaluations, their scale and outputs
+python src/paper.py                              # everything, then figures and tables
+python src/paper.py --only budget,streaming      # a subset
+python src/paper.py --missing                    # only evaluations without complete CSVs
+python src/paper.py plot [figure ...]            # re-draw from existing CSVs; needs no datasets
+python src/paper.py --num-vectors 10000 --folds 1 --results /tmp/small    # a reduced trial run
 ```
 
-## License
+Each evaluation runs at the scale paper.tex states for it (`paper.EVALUATIONS`): the sweeps and
+end-to-end throughput at 100,000 vectors x 5 folds, the quantization table, insertion, equal-memory
+and ablation runs at 10,000 vectors x 1 fold, latency on WildChat (20,000 indexed) and WikiAnswers
+(8,000). **Running an evaluation rewrites its CSVs** in `--results` (default `results/`); collecting
+jobs does not.
 
-© 2026 Dvir David Biton, Shay Hahiashvili, Nadav Keren, Gil Einziger, Roy Friedman
+Hardware: the full run was made on a 32-core Threadripper with 896 GB RAM (30 parallel workers,
+about 10 GB per job). The timed evaluations (end-to-end on 8 pinned cores; latency and timing on one)
+run after the parallel batch and need an otherwise idle machine; timings from the parallel batch are
+not timing claims.
+
+## Tests
+
+```
+pip install -r requirements-dev.txt
+python -m pytest tests
+```
+
+Tests that need the Rust extension's newer kernels or AVX-512 skip when they are unavailable; rebuild
+the extension (above) so the Python/Rust parity tests run.
+
+## Outputs
+
+CSVs in `results/` (one file per evaluation, or per corpus); figures and LaTeX tables in `figures/`
+with a `plot-manifest.json` recording each figure's input files, row counts and hashes.
+
+## Release tree
+
+`.gitattributes` marks scratch directories (`suggestions/`, `bench_construct/`, `tasks/`) `export-ignore`,
+so `git archive HEAD` produces the publication tree without them.
