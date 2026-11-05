@@ -17,13 +17,11 @@ faiss.omp_set_num_threads(1)  # belt-and-suspenders alongside the env vars above
 from logging_config import configure_logging
 from runner import (Runner,
                     CAP_QUANTIZATION_SWEEP, CAP_COVER_CONSTRUCT, _k_for_memory_fraction)
-from plots.plot_common import DATASETS, DATASET_LABELS
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from filters.cap_cover.cap_cover_filter import CapCoverFilter, Quantize
 from filters.dsh_filter import DSHFilter
 from filters.hnsw_filter import HNSWFilter
 from filters.ivf_filter import IVFFilter
-from filters.ivf_radii_filter import IVFRadiiFilter
 from filters.quantized_vector_filter import QuantizedVectorFilter
 from filters.mlp_filter import MLPFilter
 from filters.pacuk_lsh_filter import PacukLSHFilter
@@ -52,7 +50,6 @@ RESULTS_DIR = "results"
 def results_path(*parts: str) -> str:
     """A path under RESULTS_DIR, read at call time so one process can target another folder."""
     return os.path.join(RESULTS_DIR, *parts)
-DATASET = 'ELI5'
 
 # Vectors/dataset, split 80% construction / 20% queries. One knob for every
 # evaluation: the ground-truth FPR/FNR ones (cap_cover_system_tau, cap_quantization,
@@ -99,9 +96,6 @@ CONSTRUCT_MEMORY_FRACTIONS = (0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.07, 0.1)
 #
 #     stream (queries) = q * N          |B| (reference) = (1 - q) * N
 BLOCKLIST_QUERY_FRACTION = 0.2
-
-# Registry name -> canonical dataset key, one source of truth via plot_common.
-DATASET_KEYS = {DATASET_LABELS[d]: d for d in DATASETS}
 
 # generate_cap_quantization's analogue, parallel to generate_quantization
 # rather than replacing it in place -- the two sweep structurally different
@@ -158,39 +152,11 @@ def streaming_csv(dataset: str) -> str:
 # listed here.
 equal_memory_filters = [
     HNSWFilter, IVFFilter, DSHFilter, QuantizedVectorFilter, MLPFilter,
-    PacukLSHFilter, SankowskiWygockiFilter, VAPlusFilter, IVFRadiiFilter,
+    PacukLSHFilter, SankowskiWygockiFilter, VAPlusFilter,
 ]
 
-def advancing_fold_starts(pool_len: int, k_folds: int, fold_stride: int, window_len: int) -> List[int]:
-    """Non-wrapping K-fold-like sweep: fold f's window starts f*fold_stride
-    into the pool and is window_len vectors wide, never wrapping back to the
-    start. Raises if the pool isn't long enough for all k_folds windows,
-    rather than silently reusing or wrapping a shorter one. Returns the
-    fold-start offsets (0, fold_stride, 2*fold_stride, ...)."""
-    max_start = (k_folds - 1) * fold_stride
-    required = max_start + window_len
-    if pool_len < required:
-        raise ValueError(
-            f"advancing_fold_starts: pool of {pool_len} vectors is too short for a "
-            f"non-wrapping {k_folds}-fold sweep (window_len={window_len}, "
-            f"fold_stride={fold_stride}); needs >= {required} = "
-            "(k_folds-1)*fold_stride + window_len. Load/point at a longer stream, "
-            "or lower window_len/k_folds/fold_stride."
-        )
-    return [f * fold_stride for f in range(k_folds)]
 
 
-def rows_for_mode(job_results: List[Tuple[str, Any]], mode: str) -> list:
-    """Pulls one Runner mode's rows out of a shared Runner.run()'s combined
-    (mode, result) list -- result is either one dict per job or a list of
-    dicts, flattened uniformly here. Used by save_* functions to recover
-    just their own evaluation's rows from a Runner several share."""
-    rows = []
-    for job_mode, result in job_results:
-        if job_mode != mode:
-            continue
-        rows.extend(result if isinstance(result, list) else [result])
-    return rows
 
 
 def compute_static_actual_results(
@@ -448,10 +414,6 @@ BLOCKLIST_DATASETS = {
 }
 
 
-def _selection_is_usable(selections: List[Dict[str, np.ndarray]]) -> bool:
-    """Every fold needs a reference set and a query stream."""
-    return bool(selections) and all(
-        len(sel["reference"]) and len(sel["queries"]) for sel in selections)
 
 
 _READ_WINDOW = 65_536  # rows per contiguous HDF5 read in _read_rows (~100 MB at d=384)

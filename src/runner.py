@@ -77,16 +77,6 @@ def _cap_cover(dim: int, k: int, quantize: Optional[CapQuantize] = None) -> CapC
                                **({} if candidates is None else {"candidates": candidates}))
 
 
-def _cap_cover_insertable(dim: int, k: int) -> CapCoverFilter:
-    """A CapCoverFilter that can insert(), unlike _cap_cover's static
-    auto() (insert_method=None there): single-level TQ4 with CapNearestInsert, at the same equal-bytes budget as
-    _cap_cover. Kept separate from _cap_cover rather than giving it a
-    default insert_method, so cap_cover_system_tau's already-validated
-    static-cover numbers don't shift (an insert strategy's bookkeeping
-    reserves bytes from the cap budget even when insert() is never
-    called -- see InsertInterface.max_caps_for_budget)."""
-    return CapCoverFilter(dim=dim, max_memory=_cover_max_memory(dim, k),
-                          quantize=CapQuantize.TQ4, insert_method=CapNearestInsert())
 
 
 # The construct method of the evaluations' covers (_cap_cover, the adapter, the
@@ -134,11 +124,6 @@ def _iter_query_batches(vectors: VectorInput, batch_size: int) -> Iterator[np.nd
             yield arr[base:base + batch_size]
 
 
-def _iter_query_vectors(vectors: VectorInput) -> Iterator[np.ndarray]:
-    if isinstance(vectors, VectorSource):
-        yield from vectors
-    else:
-        yield from np.asarray(vectors)
 
 
 def _binary_confusion(predicted: Any, actual: Any) -> Tuple[int, int, int, int]:
@@ -156,9 +141,8 @@ def _precision_recall_f1(predicted: Any, actual: Any) -> Tuple[float, float, flo
 
 
 _DIRECT_TAU_FILTERS = {
-    "FirstNFilter", "CapCoverFilter", "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter",
-    "DSHFilter", "HNSWFilter", "IVFFilter", "QuantizedVectorFilter", "MLPFilter",
-    "PacukLSHFilter", "SankowskiWygockiFilter", "VAPlusFilter", "IVFRadiiFilter",
+    "CapCoverFilter", "DSHFilter", "HNSWFilter", "IVFFilter", "QuantizedVectorFilter", "MLPFilter",
+    "PacukLSHFilter", "SankowskiWygockiFilter", "VAPlusFilter",
 }
 
 
@@ -890,124 +874,12 @@ def construct_method_worker(
     return row
 
 
-def construct_method_scale_worker(dim: int, dataset: str, n: int, method: str, k: int) -> Dict[str, Any]:
-    """construct_filter alone on the first n rows of a corpus, plus a coverage
-    check of its output: how a construction method's time grows past the
-    blocklist workload's size. Raises on a coverage violation, as
-    construct_method_worker does on a false negative."""
-    X = np.ascontiguousarray(VectorSource(dataset, 0, n).to_array(), dtype=np.float32)
-    filt = CapCoverFilter(dim, max_caps=k, insert_method=None)
-    start = time.perf_counter()
-    directions, angles = CAP_CONSTRUCT_METHODS[method]().construct_filter(filt, X)
-    seconds = time.perf_counter() - start
-
-    # Angle from each vector to its 16 nearest cap directions (which include
-    # the one it was assigned to), minus that cap's stored angle -- the
-    # angle-cover analogue of construct_method_worker's radius-containment
-    # check, at the filter's own coverage epsilon.
-    directions = unit_rows(np.ascontiguousarray(directions, dtype=np.float64))
-    index = faiss.IndexFlatIP(dim)
-    index.add(directions.astype(np.float32))
-    X_unit = unit_rows(X.astype(np.float64))
-    sims, labels = index.search(X_unit.astype(np.float32), min(16, len(directions)))
-    actual_angle = np.arccos(np.clip(sims, -1.0, 1.0).astype(np.float64))
-    worst = float((actual_angle - angles[labels]).min(axis=1).max())
-    row = {"dataset": dataset, "n": len(X), "method": method, "k": k, "n_caps": len(angles),
-           "method_s": seconds, "psi_max": float(angles.max()), "psi_mean": float(angles.mean()),
-           "worst_uncovered": worst, "covered": worst <= CapCoverFilter._COVERAGE_EPSILON}
-    if not row["covered"]:
-        raise InvariantViolation(f"Coverage violation at scale: {row}")
-    return row
-
-
-def system_tau_ground_truth_worker(
-    dim: int,
-    vectors_construct: VectorInput,
-    vectors_query: VectorInput,
-) -> np.ndarray:
-    """Nearest-construct-set-neighbor distance for every query vector, via a
-    brute-force flat index. Split into its own worker so experiments.py can run it
-    across a ProcessPoolExecutor and cache the result to disk, rather than
-    generate_system_tau() paying this cost serially per dataset."""
-    construct_arr = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
-    query_arr = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
-    index = faiss.IndexFlatL2(dim)
-    index.add(construct_arr)
-    nn_sq_dist, _ = index.search(query_arr, 1)
-    return np.sqrt(np.clip(nn_sq_dist[:, 0], 0, None)).astype(np.float32)
 
 
 
 
-def cap_cover_system_tau_worker(
-    dim: int,
-    dataset: str,
-    k: int,
-    tau_values: List[float],
-    seed: int,
-    vectors_construct: VectorInput,
-    vectors_query: VectorInput,
-    actual_results_by_tau: Dict[float, List[bool]],
-) -> List[Dict[str, Any]]:
-    """CapCoverFilter's analogue of system_tau_worker: one CapCoverFilter.auto()
-    cover (_cap_cover's equal-byte budget for k balls) plus a flat L2 index
-    over the same construct set, queried one at a time at every tau in
-    tau_values without ever rebuilding -- the realistic online setting a
-    byte-budgeted membership filter sits in front of a flat index in.
-    Reports n_caps for the cover's size."""
-    construct_arr = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
-    query_arr = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
-    n_q = len(query_arr)
-    for t, actual in actual_results_by_tau.items():
-        if len(actual) != n_q:
-            raise ValueError(
-                f"vectors_query ({n_q}) and actual_results_by_tau[{t}] ({len(actual)}) length mismatch"
-            )
 
-    index = faiss.IndexFlatL2(dim)
-    index.add(construct_arr)
 
-    filt = _cap_cover(dim, k)
-    filt.construct(construct_arr)
-    n_caps = len(filt.all_caps)
-
-    rows: List[Dict[str, Any]] = []
-    for t in tau_values:
-        actual = np.asarray(actual_results_by_tau[t], dtype=bool)
-        redundancy_rate = float(np.mean(actual)) if len(actual) > 0 else 0.0
-
-        start = time.perf_counter()
-        for i in range(n_q):
-            index.range_search(query_arr[i:i + 1], t * t)
-        time_without = time.perf_counter() - start
-
-        predicted = np.empty(n_q, dtype=bool)
-        start = time.perf_counter()
-        for i in range(n_q):
-            v = query_arr[i:i + 1]
-            hit = filt.query(v, distance_threshold=t)[0]
-            predicted[i] = hit
-            if hit:
-                index.range_search(v, t * t)
-        time_with = time.perf_counter() - start
-
-        n_index_accesses = int(predicted.sum())
-        rates = _confusion_rates(predicted.tolist(), actual)
-        throughput_without = n_q / max(time_without, 1e-9)
-        throughput_with = n_q / max(time_with, 1e-9)
-
-        rows.append({
-            "dataset": dataset, "k": k, "tau": t, "seed": seed,
-            "redundancy_rate": redundancy_rate,
-            "tp_rate_pct": redundancy_rate * 100.0,
-            "throughput_improvement_pct": (throughput_with - throughput_without) / throughput_without * 100.0,
-            "mean_index_accesses": n_index_accesses,
-            "n_queries": n_q,
-            "positive_rate_pct": n_index_accesses / max(n_q, 1) * 100.0,
-            "fpr": rates["fpr"], "fnr": rates["fnr"],
-            "n_caps": n_caps,
-        })
-    return rows
 
 
 def _pin_to_own_core() -> None:
@@ -1301,162 +1173,12 @@ def budget_worker(
     )
 
 
-def query_performance_worker(
-    dim: int,
-    dataset: str,
-    k: int,
-    seed: int,
-    query_tau: float,
-    vectors_construct: VectorInput,
-    vectors_query: VectorInput,
-    single_query_limit: int = 2000,
-) -> List[Dict[str, Any]]:
-    """Times one query at a time vs. batched queries against the same cover;
-    single-query mode is capped at single_query_limit, batched is uncapped."""
-    construct_arr = _to_construct_array(vectors_construct)
-
-    filt = _cap_cover(dim, k)
-    filt.construct(construct_arr)
-
-    rows: List[Dict[str, Any]] = []
-
-    n_single = 0
-    start = time.perf_counter()
-    for v in _iter_query_vectors(vectors_query):
-        if n_single >= single_query_limit:
-            break
-        filt.query(v[np.newaxis, :], distance_threshold=query_tau)
-        n_single += 1
-    elapsed_single = time.perf_counter() - start
-    rows.append({
-        "dataset": dataset, "k": k, "seed": seed, "mode": "single",
-        "n_queries": n_single,
-        "latency_ms": elapsed_single / max(n_single, 1) * 1000,
-        "throughput_qps": n_single / max(elapsed_single, 1e-9),
-    })
-
-    n_batched = 0
-    start = time.perf_counter()
-    for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
-        filt.query(block, distance_threshold=query_tau)
-        n_batched += len(block)
-    elapsed_batched = time.perf_counter() - start
-    rows.append({
-        "dataset": dataset, "k": k, "seed": seed, "mode": "batched",
-        "n_queries": n_batched,
-        "latency_ms": elapsed_batched / max(n_batched, 1) * 1000,
-        "throughput_qps": n_batched / max(elapsed_batched, 1e-9),
-    })
-
-    return rows
 
 
-def scaling_query_worker(
-    dim: int,
-    dataset: str,
-    k: int,
-    batch_size: int,
-    seed: int,
-    tau_mid: float,
-    vectors_construct: VectorInput,
-    vectors_query: VectorInput,
-    n_query_vectors: int = 8192,
-) -> Dict[str, Any]:
-    """Measures batched-query throughput for a CapCoverFilter at filter
-    size k, querying in batches of `batch_size`. Every batch_size times the
-    same n_query_vectors, so the panel's lines are directly comparable.
-
-    tau_mid is part of the measurement: query() abandons a ball once a
-    partial distance passes r + tau, and stops a query at the first ball
-    that accepts it (see CapCoverFilter's scan kernels), so a
-    larger tau means more work per ball and earlier exits. Throughput is
-    therefore reported at this one threshold, not for every tau."""
-    construct_arr = _to_construct_array(vectors_construct)
-    query_arr = _to_construct_array(vectors_query)
-    if len(query_arr) < n_query_vectors:
-        raise ValueError(
-            f"scaling_query_worker needs {n_query_vectors} query vectors but the holdout "
-            f"holds {len(query_arr)}. Widen the holdout in generate_scaling() (it is sized "
-            f"max(n_query_vectors, n_insert_vectors)) or lower n_query_vectors."
-        )
-
-    filt = _cap_cover(dim, k)
-    filt.construct(construct_arr)
-
-    stream = query_arr[:n_query_vectors]
-
-    start = time.perf_counter()
-    for i in range(0, len(stream), batch_size):
-        filt.query(stream[i:i + batch_size], distance_threshold=tau_mid)
-    elapsed = time.perf_counter() - start
-
-    return {
-        "dataset": dataset, "k": k, "batch_size": batch_size, "seed": seed,
-        "n_queries": len(stream),
-        "throughput_qps": len(stream) / max(elapsed, 1e-9),
-    }
 
 
-def scaling_insert_worker(
-    dim: int,
-    dataset: str,
-    k: int,
-    batch_size: int,
-    seed: int,
-    vectors_construct: VectorInput,
-    vectors_insert: VectorInput,
-    n_insert_vectors: int = 8192,
-) -> Dict[str, Any]:
-    """Like scaling_query_worker, but times insert() in batches of
-    `batch_size` after the initial construct()."""
-    construct_arr = _to_construct_array(vectors_construct)
-    insert_arr = _to_construct_array(vectors_insert)
-    if len(insert_arr) < n_insert_vectors:
-        raise ValueError(
-            f"scaling_insert_worker needs {n_insert_vectors} insert vectors but the holdout "
-            f"holds {len(insert_arr)}. Widen the holdout in generate_scaling() (it is sized "
-            f"max(n_query_vectors, n_insert_vectors)) or lower n_insert_vectors."
-        )
-
-    filt = _cap_cover_insertable(dim, k)
-    filt.construct(construct_arr)
-
-    stream = insert_arr[:n_insert_vectors]
-
-    start = time.perf_counter()
-    for i in range(0, len(stream), batch_size):
-        filt.insert(stream[i:i + batch_size])
-    elapsed = time.perf_counter() - start
-
-    return {
-        "dataset": dataset, "k": k, "batch_size": batch_size, "seed": seed,
-        "n_inserted": len(stream),
-        "throughput_ips": len(stream) / max(elapsed, 1e-9),
-    }
 
 
-def scaling_construction_worker(
-    dim: int,
-    dataset: str,
-    k: int,
-    n: int,
-    seed: int,
-    vectors_construct: VectorInput,
-) -> Dict[str, Any]:
-    """Measures construction throughput for a CapCoverFilter at filter size
-    k built over n indexed vectors -- swept over a (k, n) grid."""
-    construct_arr = _to_construct_array(vectors_construct)[:n]
-
-    start = time.perf_counter()
-    filt = _cap_cover(dim, k)
-    filt.construct(construct_arr)
-    elapsed = time.perf_counter() - start
-
-    return {
-        "dataset": dataset, "k": k, "n": n, "seed": seed,
-        "construct_time_s": elapsed,
-        "throughput_vps": n / max(elapsed, 1e-9),
-    }
 
 
 def _rebuild_policy_tags(policy: str, insertion_level: Optional[str]) -> tuple:
@@ -1992,7 +1714,6 @@ def pinned_timing_worker(
 
 
 _WORKER_FNS: Dict[str, Any] = {
-    'cap_cover_system_tau': cap_cover_system_tau_worker,
     'end_to_end': end_to_end_worker,
     'blocklist': blocklist_tau_worker,
     # Same underlying cover-and-margin core (_blocklist_cover_rows), second
@@ -2001,14 +1722,9 @@ _WORKER_FNS: Dict[str, Any] = {
     # budget (see experiments.generate_budget).
     'budget': budget_worker,
     'cap_quantization': cap_quantization_worker,
-    'query_performance': query_performance_worker,
     'equal_memory': equal_memory_worker,
-    'scaling_query': scaling_query_worker,
-    'scaling_insert': scaling_insert_worker,
-    'scaling_construction': scaling_construction_worker,
     'stream_rebuild': stream_rebuild_worker,
     'construct_method': construct_method_worker,
-    'construct_method_scale': construct_method_scale_worker,
     'ablation': ablation_worker,
     'filter_latency': filter_latency_worker,
     'pinned_timing': pinned_timing_worker,

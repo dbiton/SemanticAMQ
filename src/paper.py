@@ -47,7 +47,7 @@ from experiments import (Runner, blocklist_workloads, equal_memory_filters, logg
                          generate_ablation, generate_latency, generate_timing)
 from filters.cap_cover.cap_quantizers import Quantize
 from plots import plot_paper
-from plots.plot_paper import (FIGURES, plot_figures, use_corpora, CONFIG_TO_METHOD, EQUAL_MEMORY_HIDDEN,
+from plots.plot_paper import (FIGURES, plot_figures, use_corpora, CONFIG_TO_METHOD,
                               E2E_TAU, E2E_MEMORY_FRACTION, E2E_TAUS, E2E_MEMORY_FRACTIONS, PAPER_TAUS_COS,
                               l2_threshold)
 from runner import CAP_QUANTIZATION_SWEEP, CAP_QUANTIZE_AUTO
@@ -61,9 +61,9 @@ assert E2E_MEMORY_FRACTION == experiments.FIXED_MEMORY_FRACTION
 assert tuple(E2E_MEMORY_FRACTIONS) == tuple(experiments.BUDGET_MEMORY_FRACTIONS)
 assert len(experiments.BUDGET_MEMORY_FRACTIONS) == len(experiments.CONSTRUCT_MEMORY_FRACTIONS) == 8
 
-# The baselines the two equal-memory figures draw; the rest would be run and discarded.
-PAPER_EQUAL_MEMORY_FILTERS = [cls for cls in equal_memory_filters
-                              if CONFIG_TO_METHOD.get(cls.__name__) not in EQUAL_MEMORY_HIDDEN]
+# The baselines the two equal-memory figures draw.
+PAPER_EQUAL_MEMORY_FILTERS = list(equal_memory_filters)
+assert all(cls.__name__ in CONFIG_TO_METHOD for cls in PAPER_EQUAL_MEMORY_FILTERS)
 
 # The sweeps grid (blocklist, budget) and the throughput figure run CapCoverFilter at this one
 # encoding (not auto()'s choice); the equal-memory comparison draws one Cap-Cover line per

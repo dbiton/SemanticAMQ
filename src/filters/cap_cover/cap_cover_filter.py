@@ -378,16 +378,6 @@ class CapCoverFilter(_CapScanMixin, Filter):
             return unit_rows(codes.view(np.float32).reshape(len(codes), self.dim))
         return unit_rows(sq.decode(codes))
 
-    def _decode_raw(self, codes: np.ndarray, level: int) -> np.ndarray:
-        """The float32 vectors `level`'s codes decode to, before
-        normalization: decode() is exactly unit_rows() of these, so a scan
-        can screen in float32 and re-decide the few boundary pairs from the
-        same values."""
-        codes = np.ascontiguousarray(codes[:, :self.code_size(level)], dtype=np.uint8)
-        sq = self._quantizers[level]
-        if sq is None:
-            return codes.view(np.float32).reshape(len(codes), self.dim)
-        return np.ascontiguousarray(sq.decode(codes), dtype=np.float32)
 
     def fit_cap_code(self, u: np.ndarray, parts: np.ndarray, part_angles: np.ndarray,
                      candidates: int = 8, passes: int = 2, max_moves: int = 64) -> np.ndarray:

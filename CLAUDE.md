@@ -29,7 +29,7 @@ Use the **global Python 3.12** (`python` on PATH, faiss 1.15.1), not `.venv`
 `HadamardRotation.reverse_transform` only works in 1.15.1).
 
 Run everything from the **repo root**: dataset paths are relative
-(`./datasets/...`) and outputs go to `results/` and `plots/`.
+(`./datasets/...`) and CSVs go to `results/` (`--results DIR` to change) and figures to `figures/`.
 
 ```bash
 python -m pytest tests                          # all tests
@@ -55,11 +55,9 @@ is for tests and single-cell validation. Size per-job memory against
 ```
 src/experiments.py     evaluation definitions: generate_* per evaluation (submit jobs only), workload
                        construction (blocklist_workloads), output paths
-src/paper.py           the sole entry point (replaces the removed main.py): paper.tex's data + figures (trimmed to
-                       what each figure reads); `python src/paper.py [plot]`. Figures: plots/plot_paper.py
-                       `--only a,b` runs a subset (GENERATORS), `--missing` only those
-                       with no CSVs in results/ (then draws the figures); also ablation, latency (filter in front of the flat index) and timing;
-                       tables: plots/tables_paper.py; reduced-scale driver: suggestions/run_reduced_batch.py
+src/paper.py           the sole entry point (replaced main.py): EVALUATIONS (scale per paper.tex, outputs, timed or
+                       not), argparse CLI (`--list`, `--only`, `--missing`, `plot`, `--results`, `--num-vectors`),
+                       then the figures and tables. Reduced run: `--num-vectors 10000 --folds 1 --results DIR`
 src/runner.py          Runner (ProcessPoolExecutor job harness), one *_worker per mode,
                        filter registries, calibration/tuning of baseline dials
 src/filters/filter.py  Filter base: construct(), query(), insert() (optional), get_bytesize();
@@ -78,9 +76,9 @@ src/filters/cap_cover/
 CapCoverRustFilter/    Rust crate capcover_rs (PyO3/maturin) behind CapCoverFilter.query();
                        rust-improve.md = design/benchmark report. Build into the Python in use:
                        `pip install maturin && cd CapCoverRustFilter && maturin develop --release`
-src/filters/           baselines: dsh, hnsw, ivf, quantized_vector, va_plus, race, mlp,
+src/filters/           baselines: dsh, hnsw, ivf, quantized_vector, va_plus, mlp,
                        pacuk_lsh / sankowski_wygocki (zero-FN LSH, on _floor_lsh.FloorLSHFilter)
-src/plots/             one module per evaluation's figures; plot_common.py = shared style/datasets
+src/plots/             plot_paper.py (figures), tables_paper.py + table_quantization.py (LaTeX tables)
 src/util/dataset_paths.py  dataset name -> HDF5 file registry (deliberately import-light)
 src/util/fetch_datasets.py builds datasets/ with sentence_transformers (heavy imports)
 src/vector_source.py   VectorSource: picklable lazy handle to an HDF5 slice for workers
@@ -90,21 +88,19 @@ suggestions/           untracked scratch analyses and plans (not part of the pip
 
 ## Architecture
 
-**Evaluation flow.** Each evaluation in `experiments.py` has a `generate_X(runner)`
-that only *submits* jobs (`runner.submit(mode, output_csv=..., **kwargs)`),
-plus `save_X`/`plot_X`. `generate_and_plot_all()` submits every enabled
-evaluation to one shared `Runner`, calls `runner.shuffle()` to interleave slow
-and fast jobs, then `runner.run()`, then `plot_all()`. Evaluations currently
-enabled: blocklist, budget, cap_quantization, streaming, construct_methods,
-scaling, equal_memory, cap_cover_system_tau (construct_methods_scale is
-commented out). `plot_all()` re-renders figures from existing CSVs without re-running.
+**Evaluation flow.** Each evaluation in `experiments.py` has a `generate_X(runner, num_vectors, n_folds)`
+that only *submits* jobs (`runner.submit(mode, output_csv=..., **kwargs)`); `paper.EVALUATIONS`
+lists them with the scale paper.tex states: blocklist, budget, construction, end-to-end at 100K vectors x 5
+folds; quantization, streaming, equal-memory, ablation at 10K x 1 fold; latency and timing fixed in their
+generators. The untimed ones run as one shuffled batch on `experiments.MAX_WORKERS`; end-to-end, latency and
+timing run afterwards, alone, on pinned cores. `python src/paper.py plot` re-renders from existing CSVs.
 
 **Runner.** Modes map to workers in `runner._WORKER_FNS`. Each job's rows are
 written incrementally to its `output_csv` by the coordinating process as jobs
 finish, so a crash only loses unfinished jobs. A failing job is logged and
 skipped. `run()` returns `(mode, result)` pairs **in completion order**:
 workers must return self-describing rows, and callers must never zip results
-positionally against submission order (use `experiments.rows_for_mode`).
+positionally against submission order (each row names its dataset, config and fold).
 
 **Registries** (check these for current names instead of hardcoding lists):
 - `runner.CAP_CONSTRUCT_METHODS`, `CAP_COVER_CONSTRUCT = "sphere_merge"`: construction strategies by name.
@@ -136,13 +132,11 @@ true distance at tau, never by which sampling stratum a query came from.
 
 ## Rules and gotchas
 
-- **Generators delete outputs.** `Runner.submit()` truncates each `output_csv`
-  on first submit. Calling any `experiments.generate_*` (even without `run()`, e.g. to
-  count jobs) wipes that evaluation's CSVs. `results/` is gitignored, is a copy
-  of the run machine's output, and has no backup (`results-newer/`,
-  `results-midway/`, `results-stale/` are *different* runs). Never dry-run
-  generators from the repo root. Count jobs by reading loop bounds, or use a
-  throwaway worktree without `results/`. `Runner(truncate=False)` appends.
+- **Running deletes outputs.** `Runner.submit()` only collects jobs; `Runner.run()` truncates each
+  distinct `output_csv` before executing (`Runner(truncate=False)` appends). So running an evaluation
+  rewrites its CSVs in `--results` (default `results/`, gitignored, a copy of the run machine's output, no
+  backup; `results-newer/`, `results-midway/`, `results-stale/` are *different* runs). Use `--results` to
+  point a test run elsewhere. Calling `generate_*` with a recording runner is safe.
 - **Thread guard before numpy/faiss.** `paper.py`, `experiments.py` and `runner.py` set
   `OMP/OPENBLAS/MKL/NUMEXPR_NUM_THREADS=1` before importing numpy/faiss. Any new
   entry point that uses `Runner` must do the same first, or BLAS threads x

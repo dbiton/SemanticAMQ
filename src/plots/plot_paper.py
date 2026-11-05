@@ -40,6 +40,7 @@ a gap is drawn as a gap, never filled from a different subset.
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -50,7 +51,26 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from plots.plot_common import TAU_LABEL, cosine_distance
+
+
+TAU_LABEL = r"$\tau$ (cosine distance)"
+
+
+def cosine_distance(tau_l2):
+    """Convert stored L2 distances between unit vectors for plot presentation."""
+    return np.asarray(tau_l2, dtype=float) ** 2 / 2.0
+
+
+def drop_over_budget(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop rows the runner flagged 'Over Budget' (the index exceeded its byte budget, so the row is
+    unsound). Tolerates a missing column and 'True'/'False' strings from CSV."""
+    if "Over Budget" not in df.columns:
+        return df
+    over = df["Over Budget"].map(lambda v: str(v).strip().lower() in ("true", "1", "1.0"))
+    if over.any():
+        logging.getLogger(__name__).warning("Dropping %d over-budget row(s) from the equal-memory plots.",
+                                            int(over.sum()))
+    return df[~over].copy()
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 RESULTS = ROOT / "results"
@@ -100,7 +120,6 @@ METHOD_STYLE = {
     CAP_COVER_TQ4: (BLUE, "s", "--"),
     "QuantizedVector": (ORANGE, "s", "-"),
     "IVF-PQ": (AQUA, "^", "-"),
-    "IVF-Radii": (INK_2, "h", "-"),
     "HNSW": (YELLOW, "D", "-"),
     "DSH": (VIOLET, "v", "--"),
     "MLP": (RED, "x", ":"),
@@ -110,13 +129,11 @@ METHOD_STYLE = {
 CONFIG_TO_METHOD = {
     "CapCoverFilter": CAP_COVER, "CapCoverFilter (TQ2)": CAP_COVER_TQ2, "CapCoverFilter (TQ4)": CAP_COVER_TQ4,
     "QuantizedVectorFilter": "QuantizedVector",
-    "IVFFilter": "IVF-PQ", "IVFRadiiFilter": "IVF-Radii", "HNSWFilter": "HNSW",
+    "IVFFilter": "IVF-PQ", "HNSWFilter": "HNSW",
     "DSHFilter": "DSH", "MLPFilter": "MLP",
     "PacukLSHFilter": "Zero-FN LSH", "SankowskiWygockiFilter": "Zero-FN LSH",
     "VAPlusFilter": "VA+-file",
 }
-# Never drawn, so src/paper.py does not run them.
-EQUAL_MEMORY_HIDDEN = {"IVF-Radii"}
 
 def use_corpora(names):
     """Draw these corpora (display names) instead of the paper's five: for a
@@ -553,7 +570,7 @@ NONZERO_FN_CORPUS = "Quora"      # the corpus with the most positive queries in 
 
 
 def _equal_memory_frame():
-    e = read_all("equal_memory/*/equal_memory.csv")
+    e = drop_over_budget(read_all("equal_memory/*/equal_memory.csv"))
     e = e[~e.Infeasible.astype(bool)].copy()
     e["Dataset"] = to_corpus(e.Dataset)
     e["pct_raw"] = e["Memory Budget"] / (e["Construct Size"] * DIM * FP32_BYTES)
