@@ -5,6 +5,7 @@ import unittest
 import numpy as np
 
 import runner
+from tests.helpers import lazy
 from filters.cap_cover.cap_cover_filter import CapCoverFilter
 
 DIM = 16
@@ -43,7 +44,7 @@ class TestBlocklistGroundTruth(unittest.TestCase):
     def setUp(self):
         self.B, self.Q = _workload()
         self.rows = runner._blocklist_cover_rows(
-            DIM, "synthetic", 0, MEMORY_FRACTIONS, TAUS, self.B, self.Q, volume_bounds=False)
+            DIM, "synthetic", 0, MEMORY_FRACTIONS, TAUS, lazy(self.B), lazy(self.Q), volume_bounds=False)
         self.nn = _nn(self.B, self.Q)
 
     def test_labels_and_bands_come_from_distance(self):

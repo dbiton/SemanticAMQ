@@ -99,12 +99,11 @@ def generate_end_to_end(runner: Runner, num_vectors: Optional[int] = None, n_fol
     num_vectors = num_vectors or experiments.WORKLOAD_NUM_VECTORS
     n_folds = n_folds or experiments.BLOCKLIST_FOLDS
     for workload in blocklist_workloads(num_vectors, n_folds=n_folds):
-        for fold, sel in enumerate(workload.selections):
+        for seed, fold in enumerate(workload.folds):
             runner.submit(
                 'end_to_end', output_csv=results_path(END_TO_END_CSV),
-                dim=384, dataset=workload.plot_key, seed=fold, cells=cells, quantize=None,
-                vectors_reference=workload.rows(sel["reference"]),
-                vectors_query=workload.query_vectors(sel),
+                dim=384, dataset=workload.plot_key, seed=seed, cells=cells, quantize=None,
+                vectors_reference=fold.reference, vectors_query=fold.queries,
             )
 
 

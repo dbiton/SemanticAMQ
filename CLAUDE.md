@@ -141,6 +141,10 @@ true distance at tau, never by which sampling stratum a query came from.
   `OMP/OPENBLAS/MKL/NUMEXPR_NUM_THREADS=1` before importing numpy/faiss. Any new
   entry point that uses `Runner` must do the same first, or BLAS threads x
   worker processes oversubscribe the machine.
+- **Jobs carry lazy handles, never arrays.** `workloads.Fold` holds two `VectorSource` slices (picklable
+  pointers into the HDF5 file); workers read their own slice, and `runner._to_construct_array` rejects
+  anything else. Ground-truth labels and the equal-memory calibration split are computed once per fold in
+  the generator and passed as small bool/index arrays. Tests build handles with `tests.helpers.lazy`.
 - **Keep worker imports light.** `dataset_paths.py` and `vector_source.py` must
   not import torch/sentence_transformers/datasets (~400 MB RSS per worker).
   Pass `VectorSource` handles to workers rather than large arrays. Importing

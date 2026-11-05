@@ -5,7 +5,7 @@ import os
 import multiprocessing
 import random
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 # Must happen before numpy/faiss are imported (BLAS/OpenMP thread count x
 # Runner's process count otherwise multiply into CPU/memory oversubscription
@@ -105,23 +105,24 @@ CAP_INSERT_STRATEGIES = {
 # Quantize member, so the sweep tests what auto() actually picks from.
 CAP_QUANTIZATION_SWEEP = tuple(_CAP_AUTO_CANDIDATES)
 
-VectorInput = Union[np.ndarray, VectorSource]
+# Workers are handed lazy handles (a picklable pointer to an HDF5 slice), never arrays: a job's
+# pickle stays a few bytes and the worker reads only its own slice.
+VectorInput = VectorSource
 _QUERY_BATCH = 32
 
 
+def _require_source(vectors: Any) -> VectorSource:
+    if not isinstance(vectors, VectorSource):
+        raise TypeError(f"workers take a VectorSource, not {type(vectors).__name__}")
+    return vectors
+
+
 def _to_construct_array(vectors: VectorInput) -> np.ndarray:
-    if isinstance(vectors, VectorSource):
-        return vectors.to_array()
-    return np.asarray(vectors)
+    return _require_source(vectors).to_array()
 
 
 def _iter_query_batches(vectors: VectorInput, batch_size: int) -> Iterator[np.ndarray]:
-    if isinstance(vectors, VectorSource):
-        yield from vectors.iter_batches(batch_size)
-    else:
-        arr = np.asarray(vectors)
-        for base in range(0, len(arr), batch_size):
-            yield arr[base:base + batch_size]
+    yield from _require_source(vectors).iter_batches(batch_size)
 
 
 
@@ -495,8 +496,9 @@ def equal_memory_worker(
     distance_threshold: float,
     memory_budget: int,
     vectors_construct: VectorInput,
-    vectors_calibration: VectorInput,
-    vectors_query: VectorInput,
+    vectors_stream: VectorInput,
+    calibration_idx: np.ndarray,
+    query_idx: np.ndarray,
     actual_calibration: List[bool],
     actual_query: List[bool],
     dataset: str = "",
@@ -511,7 +513,8 @@ def equal_memory_worker(
     quantize = (extra_kwargs or {}).get("quantize")
     config = f"{filter_cls.__name__} ({quantize.value})" if quantize is not None else filter_cls.__name__
     construct_arr = _to_construct_array(vectors_construct)
-    calib_arr = _to_construct_array(vectors_calibration)
+    stream_arr = _to_construct_array(vectors_stream)
+    calib_arr = stream_arr[np.asarray(calibration_idx, dtype=np.int64)]
     calib_actual = np.asarray(actual_calibration, dtype=bool)
 
     try:
@@ -537,8 +540,9 @@ def equal_memory_worker(
 
     predicted: List[bool] = []
     start = time.perf_counter()
-    for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
-        predicted.extend(filter_instance.query(block))
+    query_arr = stream_arr[np.asarray(query_idx, dtype=np.int64)]
+    for base in range(0, len(query_arr), _QUERY_BATCH):
+        predicted.extend(filter_instance.query(query_arr[base:base + _QUERY_BATCH]))
     elapsed = time.perf_counter() - start
 
     tp, fp, fn, tn = _binary_confusion(predicted, actual_query)
@@ -810,8 +814,8 @@ def construct_method_worker(
     memory_fraction: float,
     tau: float,
     seed: int,
-    vectors_construct: np.ndarray,
-    vectors_query: np.ndarray,
+    vectors_construct: VectorInput,
+    vectors_query: VectorInput,
     actual_results: np.ndarray,
     quantize: CapQuantize = CapQuantize.FP32,
 ) -> Dict[str, Any]:
@@ -828,8 +832,8 @@ def construct_method_worker(
 
     A nonzero FNR is a bug in the construction method, not a data point, so
     it raises (the Runner logs and skips the job) instead of returning."""
-    construct = np.ascontiguousarray(vectors_construct, dtype=np.float32)
-    queries = np.ascontiguousarray(vectors_query, dtype=np.float32)
+    construct = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
+    queries = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
     actual = np.asarray(actual_results, dtype=bool)
     n = len(construct)
     k = _k_for_memory_fraction(dim, n, memory_fraction, 32)     # the nominal FP32 cap count

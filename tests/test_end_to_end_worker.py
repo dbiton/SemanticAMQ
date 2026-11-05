@@ -4,6 +4,7 @@ import unittest
 import numpy as np
 
 import runner
+from tests.helpers import lazy
 
 DIM = 32
 
@@ -21,7 +22,7 @@ class TestEndToEndWorker(unittest.TestCase):
         Q = _unit(np.vstack([centers[rng.integers(0, 10, 40)] + 0.05 * rng.normal(size=(40, DIM)),
                              rng.normal(size=(40, DIM))]))
         cells = [(0.1, 0.1), (0.1, 0.3), (0.2, 0.1)]
-        rows = runner.end_to_end_worker(DIM, "synthetic", 3, cells, B, Q, repeats=1)
+        rows = runner.end_to_end_worker(DIM, "synthetic", 3, cells, lazy(B), lazy(Q), repeats=1)
         self.assertEqual([(r["memory_fraction"], r["tau"]) for r in rows], sorted(cells))
         for r in rows:
             self.assertEqual((r["dataset"], r["seed"], r["n_queries"]), ("synthetic", 3, 80))

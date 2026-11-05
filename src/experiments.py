@@ -26,7 +26,7 @@ from filters.mlp_filter import MLPFilter
 from filters.pacuk_lsh_filter import PacukLSHFilter
 from filters.sankowski_wygocki_filter import SankowskiWygockiFilter
 from filters.va_plus_filter import VAPlusFilter
-from workloads import (BlocklistWorkload, build_blocklist_workload, compute_static_actual_results,
+from workloads import (BlocklistWorkload, build_blocklist_workload, fold_ground_truth,
                        stratified_calibration_split)
 
 configure_logging()
@@ -173,7 +173,7 @@ def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None, n
     evaluates. tau is one fixed absolute value, the same one generate_budget
     and generate_quantization use, so every filter here is compared at the
     same operating point quantization_worker uses. Each fold's query
-    stream (see BlocklistWorkload.query_vectors) is split into a calibration
+    stream (the fold's query slice) is split into a calibration
     slice and a disjoint measurement slice -- stratified on the ground truth,
     NOT a prefix cut, see stratified_calibration_split -- replacing the old
     flat percentage_calibration split of one dataset.
@@ -220,7 +220,7 @@ def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None, n
     # dataset's rows into one line per filter/budget), so -- like
     # generate_scaling's k -- they are scaled off the smallest corpus's
     # reference set rather than computed per corpus.
-    reference_len = min(len(w.selections[0]["reference"]) for w in workloads)
+    reference_len = min(len(w.folds[0].reference) for w in workloads)
     # 100% = storing the construct set raw, as a plain list of float32
     # vectors (dim*4 bytes each) -- the same denominator
     # plot_equal_memory's raw-storage-% panels divide by. Swept from
@@ -234,19 +234,19 @@ def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None, n
     for workload in workloads:
         output_csv = equal_memory_csv(workload.name)
         os.makedirs(os.path.dirname(output_csv), exist_ok=True)
-        for fold, sel in enumerate(workload.selections):
-            vectors_construct = workload.rows(sel["reference"])
-            stream = workload.query_vectors(sel)
+        for fold, sel in enumerate(workload.folds):
+            vectors_construct, vectors_stream = sel.reference, sel.queries
             # Ground truth over the whole stream first, then a STRATIFIED cut
             # into the two slices -- a prefix cut of the file-ordered stream
             # can put every positive in calibration and none in measurement.
-            # See stratified_calibration_split.
-            actual_stream = compute_static_actual_results(vectors_construct, stream, tau)
-            vectors_calibration, vectors_query, actual_calibration, actual_query = (
-                stratified_calibration_split(stream, actual_stream, calibration_fraction, seed=fold))
+            # See stratified_calibration_split. Jobs get the stream handle and the two index sets.
+            actual_stream = fold_ground_truth(sel, tau)
+            calibration_idx, query_idx = stratified_calibration_split(actual_stream, calibration_fraction, seed=fold)
+            actual_calibration = actual_stream[calibration_idx].tolist()
+            actual_query = actual_stream[query_idx].tolist()
             logger.info(
-                f"{workload.name} fold {fold}: calibration {len(vectors_calibration)} vectors "
-                f"({sum(actual_calibration)} duplicates), measurement {len(vectors_query)} "
+                f"{workload.name} fold {fold}: calibration {len(calibration_idx)} vectors "
+                f"({sum(actual_calibration)} duplicates), measurement {len(query_idx)} "
                 f"({sum(actual_query)} duplicates)")
 
             for memory_budget in memory_budgets:
@@ -260,8 +260,8 @@ def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None, n
                         filter_cls=filter_cls,
                         dim=dim, distance_threshold=tau,
                         memory_budget=int(memory_budget),
-                        vectors_construct=vectors_construct, vectors_calibration=vectors_calibration,
-                        vectors_query=vectors_query,
+                        vectors_construct=vectors_construct, vectors_stream=vectors_stream,
+                        calibration_idx=calibration_idx, query_idx=query_idx,
                         actual_calibration=actual_calibration, actual_query=actual_query,
                         dataset=workload.name,
                     )
@@ -275,8 +275,8 @@ def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None, n
                         filter_cls=CapCoverFilter,
                         dim=dim, distance_threshold=tau,
                         memory_budget=int(memory_budget),
-                        vectors_construct=vectors_construct, vectors_calibration=vectors_calibration,
-                        vectors_query=vectors_query,
+                        vectors_construct=vectors_construct, vectors_stream=vectors_stream,
+                        calibration_idx=calibration_idx, query_idx=query_idx,
                         actual_calibration=actual_calibration, actual_query=actual_query,
                         dataset=workload.name, **cap_kwargs,
                     )
@@ -363,14 +363,13 @@ def generate_blocklist(runner: Runner, cap_quantize: Optional[Quantize] = None,
     n_folds          = n_folds or BLOCKLIST_FOLDS
 
     for workload in blocklist_workloads(num_vectors, n_folds=n_folds):
-        for fold, sel in enumerate(workload.selections):
+        for fold, sel in enumerate(workload.folds):
             runner.submit(
                 'blocklist',
                 output_csv=results_path(BLOCKLIST_CSV),
                 dim=dim, dataset=workload.plot_key, seed=fold,
                 memory_fraction=memory_fraction, tau_values=tau_values, quantize=cap_quantize,
-                vectors_reference=workload.rows(sel["reference"]),
-                vectors_query=workload.query_vectors(sel),
+                vectors_reference=sel.reference, vectors_query=sel.queries,
             )
 
 
@@ -419,14 +418,13 @@ def generate_budget(runner: Runner, cap_quantize: Optional[Quantize] = None,
     tau             = FIXED_TAU
 
     for workload in blocklist_workloads(num_vectors, n_folds=n_folds):
-        for fold, sel in enumerate(workload.selections):
+        for fold, sel in enumerate(workload.folds):
             runner.submit(
                 'budget',
                 output_csv=results_path(BUDGET_CSV),
                 dim=dim, dataset=workload.plot_key, seed=fold,
                 memory_fractions=memory_fractions, tau=tau, quantize=cap_quantize,
-                vectors_reference=workload.rows(sel["reference"]),
-                vectors_query=workload.query_vectors(sel),
+                vectors_reference=sel.reference, vectors_query=sel.queries,
             )
 
 
@@ -461,16 +459,14 @@ def generate_cap_quantization(runner: Runner, memory_fractions: Optional[Sequenc
             "duplicate clusters)")
 
     for workload in workloads:
-        reference_len = len(workload.selections[0]["reference"])
+        reference_len = len(workload.folds[0].reference)
         logger.info(f"{workload.name}: memory_fractions={list(memory_fractions)} (|B|={reference_len}), tau={tau:.4f}")
 
         output_csv = cap_quantization_csv(workload.name)
         os.makedirs(os.path.dirname(output_csv), exist_ok=True)
-        for fold, sel in enumerate(workload.selections):
-            vectors_construct = workload.rows(sel["reference"])
-            vectors_query = workload.query_vectors(sel)
-            actual_results = compute_static_actual_results(
-                vectors_construct, vectors_query, tau)
+        for fold, sel in enumerate(workload.folds):
+            vectors_construct, vectors_query = sel.reference, sel.queries
+            actual_results = fold_ground_truth(sel, tau)
             for memory_fraction in memory_fractions:
                 for quantize in quantizes:
                     runner.submit(
@@ -545,11 +541,9 @@ def generate_construct_methods(runner: Runner, num_vectors: Optional[int] = None
 
     for workload in blocklist_workloads(num_vectors, n_folds=n_folds):
         output_csv = construct_methods_csv(workload.plot_key)
-        for fold, sel in enumerate(workload.selections):
-            vectors_construct = workload.rows(sel["reference"])
-            vectors_query = workload.query_vectors(sel)
-            actual_results = np.asarray(
-                compute_static_actual_results(vectors_construct, vectors_query, tau), dtype=bool)
+        for fold, sel in enumerate(workload.folds):
+            vectors_construct, vectors_query = sel.reference, sel.queries
+            actual_results = fold_ground_truth(sel, tau)
             n = len(vectors_construct)
             logger.info(f"{workload.name} fold {fold}: |B|={n}, {len(vectors_query)} queries, "
                         f"{int(actual_results.sum())} within tau={tau} of B")

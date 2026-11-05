@@ -58,37 +58,3 @@ class VectorSource:
             dset = f[self.dataset_key]
             stop = self._resolve_stop(dset.shape[0])
             return np.asarray(dset[self.start:stop], dtype=np.float32)
-
-
-@dataclass(frozen=True)
-class ArrayVectorSource(VectorSource):
-    """In-memory drop-in for VectorSource (e.g. synthetic/out-of-distribution
-    queries not backed by a dataset file) -- costs a full array pickle per
-    job, unlike the lazy disk-backed base class."""
-    array: Optional[np.ndarray] = None
-
-    def __post_init__(self):
-        if self.array is None:
-            raise ValueError("ArrayVectorSource must be initialized with a numpy array.")
-
-    def _resolve_stop(self, dset_len: int) -> int:
-        return dset_len if self.stop is None else min(self.stop, dset_len)
-
-    def __len__(self) -> int:
-        return max(0, self._resolve_stop(self.array.shape[0]) - self.start)
-
-    def iter_batches(self, batch_size: Optional[int] = None) -> Iterator[np.ndarray]:
-        batch_size = batch_size or self.chunk_size
-        stop = self._resolve_stop(self.array.shape[0])
-        for base in range(self.start, stop, batch_size):
-            end = min(base + batch_size, stop)
-            yield np.asarray(self.array[base:end], dtype=np.float32)
-
-    def __iter__(self) -> Iterator[np.ndarray]:
-        for block in self.iter_batches():
-            for vector in block:
-                yield vector
-
-    def to_array(self) -> np.ndarray:
-        stop = self._resolve_stop(self.array.shape[0])
-        return np.asarray(self.array[self.start:stop], dtype=np.float32)

@@ -3,17 +3,17 @@ at tau, and the stratified calibration split. Explicit inputs only -- no evaluat
 experiments.py supplies the sizes, folds and corpora."""
 import logging
 import os
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 # Before numpy/faiss are imported (see experiments.py): one thread per worker process.
 for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_env_var, "1")
 
 import faiss
-import h5py
 import numpy as np
 
-from util.dataset_paths import dataset_filenames, HDF5_DATASET_KEY
+from util.dataset_paths import dataset_filenames
 from vector_source import VectorSource
 
 logger = logging.getLogger(__name__)
@@ -22,64 +22,24 @@ logger = logging.getLogger(__name__)
 
 
 
-_READ_WINDOW = 65_536  # rows per contiguous HDF5 read in _read_rows (~100 MB at d=384)
-
-
-def _read_rows(dataset: str, idx: np.ndarray) -> np.ndarray:
-    """Just the requested rows of a dataset's embeddings, straight from HDF5.
-
-    Read as contiguous windows of _READ_WINDOW rows, keeping the requested rows
-    of each, rather than by h5py fancy indexing: that builds one selection per
-    point and scales superlinearly -- 582s for a fold's 80K scattered rows
-    against 1.6s for all 808K Quora rows read contiguously. The request is
-    sorted for the read and then mapped back to the caller's order.
-    """
-    order = np.argsort(idx, kind="stable")
-    sorted_idx = idx[order]
-    uniq, inverse = np.unique(sorted_idx, return_inverse=True)
-    with h5py.File(dataset_filenames[dataset], "r") as f:
-        dset = f[HDF5_DATASET_KEY]
-        block = np.empty((len(uniq), dset.shape[1]), dtype=np.float32)
-        a = 0
-        while a < len(uniq):
-            lo = int(uniq[a])
-            b = int(np.searchsorted(uniq, lo + _READ_WINDOW))
-            block[a:b] = dset[lo:int(uniq[b - 1]) + 1][uniq[a:b] - lo]
-            a = b
-    out = np.empty((len(idx), block.shape[1]), dtype=np.float32)
-    out[order] = block[inverse]
-    return np.ascontiguousarray(out)
+@dataclass(frozen=True)
+class Fold:
+    """One fold: lazy handles to its indexed rows and its query rows. Handles are what jobs carry
+    (a few bytes to pickle); a worker reads its slice from the HDF5 file when it needs it."""
+    reference: VectorSource
+    queries: VectorSource
 
 
 class BlocklistWorkload:
-    """One corpus's blocklist workload: cluster labels, the per-fold
-    reference/query index selection, and a reader for the rows it names.
+    """One corpus's blocklist workload: its folds, each a pair of lazy VectorSource slices.
 
-    Shared by generate_blocklist and generate_quantization so both evaluate on
-    the same construction and query sets. The two then differ only in what
-    they sweep -- ball budget versus quantizer -- which is the point: a
-    difference between their results is a difference in the swept variable,
-    not in the data underneath.
-    """
+    Shared by every evaluation, so they all run on the same construction and query sets and a
+    difference between their results is a difference in the swept variable, not in the data."""
 
-    def __init__(self, name: str, plot_key: str, selections: List[Dict[str, np.ndarray]],
-                 pool: Optional[np.ndarray], stream_size: int, reference_target: int) -> None:
+    def __init__(self, name: str, plot_key: str, folds: List[Fold]) -> None:
         self.name = name
         self.plot_key = plot_key
-        self.selections = selections
-        self._pool = pool
-        self.stream_size = stream_size
-        self.reference_target = reference_target
-
-    def rows(self, idx: np.ndarray) -> np.ndarray:
-        idx = np.asarray(idx, dtype=np.int64)
-        return self._pool[idx] if self._pool is not None else _read_rows(self.name, idx)
-
-    def query_vectors(self, sel: Dict[str, np.ndarray]) -> np.ndarray:
-        """A fold's queries as one array. Ground truth is always distance to
-        the reference set at tau (compute_static_actual_results); how related
-        a query is to the set (runner.SIMILARITY_BANDS) only groups FPR."""
-        return self.rows(sel["queries"])
+        self.folds = folds
 
 
 def build_blocklist_workload(name: str, plot_key: str, num_vectors: int, n_folds: int,
@@ -89,7 +49,7 @@ def build_blocklist_workload(name: str, plot_key: str, num_vectors: int, n_folds
 
     No clustering and no sampling: fold f constructs from the f-th window of
     the first rows of the file and queries from the f-th window of its last
-    rows, so the two regions never overlap and folds are disjoint. All
+    rows (both contiguous, so each is one VectorSource slice), so the two regions never overlap and folds are disjoint. All
     queries are carried as one stream; strata are not defined by file
     position, and ground truth is distance at tau regardless."""
     if not os.path.exists(dataset_filenames[name]):
@@ -105,14 +65,14 @@ def build_blocklist_workload(name: str, plot_key: str, num_vectors: int, n_folds
             f"query rows need {n_folds * num_vectors} rows but the file has {total}.")
         return None
 
-    selections = [{
-        "reference": np.arange(f * reference_target, (f + 1) * reference_target, dtype=np.int64),
-        "queries": np.arange(total - (f + 1) * stream_size, total - f * stream_size, dtype=np.int64),
-    } for f in range(n_folds)]
+    folds = [Fold(
+        reference=VectorSource(name, f * reference_target, (f + 1) * reference_target),
+        queries=VectorSource(name, total - (f + 1) * stream_size, total - f * stream_size),
+    ) for f in range(n_folds)]
 
     logger.info(f"{name}: |B|={reference_target} from the start of the file, "
                 f"stream={stream_size} from the end ({total} rows)")
-    return BlocklistWorkload(name, plot_key, selections, None, stream_size, reference_target)
+    return BlocklistWorkload(name, plot_key, folds)
 
 
 
@@ -138,15 +98,14 @@ def compute_static_actual_results(
 
 
 def stratified_calibration_split(
-    stream: np.ndarray,
     actual: List[bool],
     calibration_fraction: float,
     seed: int = 0,
-) -> Tuple[np.ndarray, np.ndarray, List[bool], List[bool]]:
+) -> Tuple[np.ndarray, np.ndarray]:
     """Cuts a query stream into a calibration slice and a disjoint measurement
     slice that carry the SAME duplicate rate, and returns
-    (calibration_vectors, measurement_vectors, calibration_actual,
-    measurement_actual).
+    (calibration_idx, measurement_idx): positions in the stream, so a job can slice the
+    lazily read stream itself instead of being sent the vectors.
 
     Stratified on `actual`, and shuffled within each stratum, because a
     prefix slice of a file-ordered stream is not a sample of it (earlier, the
@@ -166,11 +125,7 @@ def stratified_calibration_split(
 
     Stratifying keeps both slices representative of the whole stream, so the
     dial chosen on one is the dial that should win on the other."""
-    stream = np.asarray(stream)
     labels = np.asarray(actual, dtype=bool)
-    if len(stream) != len(labels):
-        raise ValueError(
-            f"stratified_calibration_split: {len(stream)} vectors but {len(labels)} labels.")
 
     rng = np.random.default_rng(seed)
     calibration_idx, measurement_idx = [], []
@@ -201,10 +156,16 @@ def stratified_calibration_split(
             "config dial candidate will score F1=0 and the first one tried wins by default.")
     if not labels.any():
         logger.warning(
-            f"stratified_calibration_split: none of the {len(stream)} queries is within tau of "
+            f"stratified_calibration_split: none of the {len(labels)} queries is within tau of "
             "the construct set, so FNR is undefined (reported as 0.0) for every filter. tau is "
             "too tight for this corpus's duplicate geometry.")
 
-    return (stream[calibration_idx], stream[measurement_idx],
-            labels[calibration_idx].tolist(), labels[measurement_idx].tolist())
+    return calibration_idx, measurement_idx
 
+
+
+def fold_ground_truth(fold: Fold, distance_threshold: float) -> np.ndarray:
+    """Per query of the fold: is it within `distance_threshold` of an indexed vector. Reads the fold's two
+    slices, computes the labels and lets the vectors go, so a generator holds only these bools."""
+    return np.asarray(compute_static_actual_results(
+        fold.reference.to_array(), fold.queries.to_array(), distance_threshold), dtype=bool)
