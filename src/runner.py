@@ -1243,7 +1243,7 @@ def stream_rebuild_worker(
     bootstrap construct()).
 
     vectors_query is the fold's query stream (see
-    experiments.BlocklistWorkload.query_vectors). actual_at_checkpoint[c] is its distance-based
+    workloads.BlocklistWorkload.query_vectors). actual_at_checkpoint[c] is its distance-based
     ground truth against vectors_stream[:c] -- computed once by the caller,
     since every policy and method on a fold shares it.
 

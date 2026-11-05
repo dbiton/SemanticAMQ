@@ -51,6 +51,8 @@ from plots.plot_paper import (FIGURES, plot_figures, use_corpora, CONFIG_TO_METH
                               E2E_TAU, E2E_MEMORY_FRACTION, E2E_TAUS, E2E_MEMORY_FRACTIONS, PAPER_TAUS_COS,
                               l2_threshold)
 from runner import CAP_QUANTIZATION_SWEEP, CAP_QUANTIZE_AUTO
+from util.dataset_paths import dataset_filenames
+from vector_source import VectorSource
 
 # The figures read the thresholds and budgets plot_paper names; the generators use experiments'.
 # They are one set of values.
@@ -163,11 +165,11 @@ def check_datasets(evaluations, num_vectors=None, n_folds=None) -> None:
         need = max(need, 25_000)
     problems = []
     for name in experiments.BLOCKLIST_DATASETS:
-        path = experiments.dataset_filenames[name]
+        path = dataset_filenames[name]
         if not os.path.exists(path):
             problems.append(f"{name}: {path} not found")
             continue
-        rows = len(experiments.VectorSource(name))
+        rows = len(VectorSource(name))
         if rows < need:
             problems.append(f"{name}: {rows:,} rows, need {need:,}")
     if problems:
@@ -225,9 +227,9 @@ def configure(datasets=None, workers=None, results=None) -> None:
     if results:
         experiments.RESULTS_DIR = str(results)
     if datasets:
-        unknown = [d for d in datasets if d not in experiments.dataset_filenames]
+        unknown = [d for d in datasets if d not in dataset_filenames]
         if unknown:
-            raise SystemExit(f"unknown dataset(s) {unknown}; choose from {sorted(experiments.dataset_filenames)}")
+            raise SystemExit(f"unknown dataset(s) {unknown}; choose from {sorted(dataset_filenames)}")
         experiments.BLOCKLIST_DATASETS.clear()
         experiments.BLOCKLIST_DATASETS.update({d: d.lower() for d in datasets})
         use_corpora(list(datasets))

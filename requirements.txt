@@ -1,12 +1,14 @@
-datasets
-sentence_transformers
-faiss-cpu
-pandas
+# Evaluation and plotting (python src/paper.py). Python 3.12 with faiss-cpu 1.15.1 is the tested pair.
 numpy
-matplotlib
+pandas
 scipy
 scikit-learn
+matplotlib
 numba
-pybloom_live
 h5py
-pytest
+faiss-cpu
+torch          # MLP baseline
+pybloom_live   # DSH and zero-FN LSH baselines
+psutil         # CPU pinning for the timed evaluations outside Linux
+# The Rust scan behind CapCoverFilter.query(): build it into this interpreter with
+#   pip install maturin && cd CapCoverRustFilter && maturin develop --release

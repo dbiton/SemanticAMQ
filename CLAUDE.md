@@ -109,7 +109,7 @@ positionally against submission order (each row names its dataset, config and fo
 - `runner.CAP_QUANTIZATION_SWEEP`, `_POST_CONSTRUCTION_CONFIG_DIALS`,
   `_CONSTRUCTION_TIME_CONFIG_DIALS`: per-baseline tuning dials.
 - `util.dataset_paths.dataset_filenames`, `experiments.BLOCKLIST_DATASETS`,
-  `plots.plot_common.DATASETS`: which corpora exist vs. which each evaluation sweeps.
+  the figures' `plots.plot_paper.CORPORA`: which corpora exist vs. which each evaluation sweeps.
 
 **Filter construction** funnels through `runner._instantiate_filter` and
 `runner._build_calibrated_filter`. A filter that cannot fit its construct set
