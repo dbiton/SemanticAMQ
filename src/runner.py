@@ -92,7 +92,7 @@ def _cap_cover_insertable(dim: int, k: int) -> CapCoverFilter:
 # The construct method of the evaluations' covers (_cap_cover, the adapter, the
 # quantization sweep): soft anneal, minimax's cover refined against the accept-region
 # volume. CapCoverFilter's own default (no construct_method) is still sphere merge.
-CAP_COVER_CONSTRUCT = "soft_anneal"
+CAP_COVER_CONSTRUCT = "sphere_merge"
 
 # CapCoverFilter's own construct-method registry: only the strategies its
 # package implements.
@@ -2057,7 +2057,7 @@ class InvariantViolation(ValueError):
 class Runner:
     def __init__(self, num_workers: int = 1, truncate: bool = True) -> None:
         """truncate=False preserves an output_csv's existing rows (see
-        submit()) instead of starting fresh, so a resumed run appends."""
+        run()) instead of starting fresh, so a resumed run appends."""
         self.num_workers = num_workers
         self.truncate = truncate
         self._jobs: List[Dict[str, Any]] = []
@@ -2068,19 +2068,18 @@ class Runner:
     def submit(self, mode: str, output_csv: Optional[str] = None, **kwargs: Any) -> None:
         """output_csv, if given, is this job's target CSV: rewritten from
         every row completed so far for that path each time one of its jobs
-        completes, so a long-running sweep's progress is visible on disk
+        completes (run() starts the file fresh; submit() itself touches nothing on disk), so a long-running sweep's progress is visible on disk
         before it finishes. output_csv, not mode, is the routing key --
         several jobs (even of different modes) can share one path, or each
         target its own. A job with no output_csv is only returned by run()."""
         if mode not in _WORKER_FNS:
             raise ValueError(f"Unknown mode {mode!r}. Valid: {list(_WORKER_FNS)}")
-        if output_csv is not None and output_csv not in self._initialized_csvs:
-            self._init_csv(output_csv)
         self._jobs.append({'mode': mode, 'output_csv': output_csv, **kwargs})
 
     def _init_csv(self, output_csv: str) -> None:
-        """Runs once per distinct output_csv, at first submit(), so
-        truncation happens before any job targeting that path has run."""
+        """Runs once per distinct output_csv, at the start of run(), so
+        truncation happens before any job targeting that path has run and
+        only for paths a run really executes."""
         self._initialized_csvs.add(output_csv)
         if not self.truncate and os.path.exists(output_csv):
             self._rows_by_csv[output_csv] = pd.read_csv(output_csv).to_dict("records")
@@ -2102,6 +2101,10 @@ class Runner:
         submission order (sequential) -- the mode tag lets a caller that
         shared this Runner across job types split results back apart."""
         self._violations: List[str] = []
+        for job in self._jobs:
+            csv = job.get('output_csv')
+            if csv is not None and csv not in self._initialized_csvs:
+                self._init_csv(csv)
         results = self._run_sequential() if self.num_workers == 1 else self._run_parallel()
         if self._violations:
             raise InvariantViolation(

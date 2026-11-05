@@ -43,15 +43,15 @@ class TestPaperPlotPresentation(unittest.TestCase):
              "memory_bytes": memory, "tau": tau, "n_queries": 100,
              "positive_rate_pct": 20, "throughput_without_qps": 100,
              "throughput_with_qps": 200, "throughput_improvement_pct": 100}
-            for kf, memory, tau in ((0.05, 1000, 0.2), (0.1, 2000, 0.2),
+            for kf, memory, tau in ((0.05, 1000, 0.1), (0.1, 2000, 0.1),
                                     (0.1, 2000, plots.E2E_TAU))
         ])
         original = data.copy(deep=True)
         with patch.object(plots.pd, "read_csv", return_value=data.copy()), patch.object(plots, "save") as save:
             plots.throughput()
         fig = save.call_args.args[0]
-        self.assertIn("0.05", fig.axes[1].get_title())
-        self.assertIn("0.05", fig.axes[2].get_title())
+        self.assertIn("0.02", fig.axes[1].get_title())
+        self.assertIn("0.02", fig.axes[2].get_title())
         for ax in (fig.axes[0], fig.axes[2]):
             self.assertIn(plots.MEMORY_RATIO, ax.get_title())
             self.assertIn("1.30", ax.get_title())

@@ -1,8 +1,6 @@
-"""Every evaluation paper.py runs (paper.GENERATORS) must use CapCoverFilter.
+"""Every evaluation paper.py runs (paper.EVALUATIONS) must use CapCoverFilter.
 
-Static check: no generator is called, since generators truncate their output
-CSVs (see CLAUDE.md, "Generators delete outputs"). Instead the AST of experiments.py
-of experiments.py gives, for each generator paper.GENERATORS wires in, the runner modes each one
+Static check, no generator is called. The AST of experiments.py gives, for each generator paper.EVALUATIONS wires in, the runner modes each one
 submits, and the worker each mode maps to; those workers' source must not build
 a BallCoverFilter.
 """
@@ -41,10 +39,11 @@ def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
 
 
 def _called_generators(tree: ast.Module) -> list:
-    """Names of the experiments.py generate_* functions paper.GENERATORS runs."""
+    """Names of the experiments.py generate_* functions paper.EVALUATIONS runs."""
     import paper    # lazily: importing it sets CAPCOVER_SCAN_LIMIT_MS for the whole session
     names = []
-    for gen in paper.GENERATORS.values():
+    for evaluation in paper.EVALUATIONS.values():
+        gen = evaluation.generate
         name = getattr(gen, "__name__", None) or gen.func.__name__
         if any(isinstance(n, ast.FunctionDef) and n.name == name for n in tree.body):
             names.append(name)
@@ -71,7 +70,7 @@ class TestCapCoverWiring(unittest.TestCase):
         self.generators = _called_generators(self.tree)
 
     def test_paper_runs_generators(self):
-        self.assertTrue(self.generators, "paper.GENERATORS wires no experiments.py generator")
+        self.assertTrue(self.generators, "paper.EVALUATIONS wires no experiments.py generator")
 
     def test_no_enabled_generator_submits_ball_cover_filter(self):
         for name in self.generators:

@@ -118,4 +118,4 @@ def write(results: Path, out: Path) -> None:
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    write(ROOT / (args[0] if args else "results"), ROOT / (args[1] if len(args) > 1 else "suggestions/figures/quantization-table.tex"))
+    write(ROOT / (args[0] if args else "results"), ROOT / (args[1] if len(args) > 1 else "figures/quantization-table.tex"))

@@ -2,7 +2,7 @@
 (src/paper.py generates exactly the data they need).
 
 Nothing here runs a filter or a sweep. Outputs (PDF for the paper, PNG preview)
-go to suggestions/figures/ under the names paper.tex includes:
+go to figures/ under the names paper.tex includes:
 
     sweeps-grid.*                      fig:end-to-end   budget.csv + blocklist.csv
     quantization-saved-vs-memory.*     fig:quantization cap_quantization/<corpus>/*.csv
@@ -54,7 +54,7 @@ from plots.plot_common import TAU_LABEL, cosine_distance
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 RESULTS = ROOT / "results"
-OUT_FIG = ROOT / "suggestions" / "figures"
+OUT_FIG = ROOT / "figures"
 
 DIM = 384
 FP32_BYTES = 4
@@ -133,7 +133,7 @@ QUANT_TOP_N = 5
 # End-to-end throughput (src/paper.py generates exactly these cells): the filter
 # in front of a flat index vs the index alone. The tau panel fixes the budget,
 # the memory panel fixes tau; the budget sweep is shared by the sweeps figure.
-PAPER_TAU_COS = 0.05                                          # cosine distance
+PAPER_TAU_COS = 0.02                                          # cosine distance
 PAPER_TAUS_COS = (0.005, 0.01, 0.02, 0.03, 0.05, 0.1, 0.15, 0.2)    # the tau sweeps (8 points), same unit
 TAU_TICKS = [0.02, 0.05, 0.1, 0.2]                            # cosine distance ticks of the tau axes
 

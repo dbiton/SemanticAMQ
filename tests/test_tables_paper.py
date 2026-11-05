@@ -11,7 +11,7 @@ from plots import plot_paper
 
 
 def _latency_rows():
-    base = dict(delta=0.05, n_reference=20000, filter_mean_ms=3.9, filter_p99_ms=5.4, accept_rate_all_pct=11.5,
+    base = dict(delta=0.02, n_reference=20000, filter_mean_ms=3.9, filter_p99_ms=5.4, accept_rate_all_pct=11.5,
                 backend_mean_ms=1.2, throughput_improvement_pct=-70.0, breakeven_backend_ms=4.4)
     return pd.DataFrame([dict(base, dataset="wildchat"),
                          dict(base, dataset="quora", n_reference=8000, throughput_improvement_pct=250.0,
@@ -44,7 +44,7 @@ class TestAblationTable(unittest.TestCase):
         for arm, fpr in (("full", 0.5), ("minimax", 0.6)):
             for ds in ("a", "b"):
                 for kf in (0.01, 0.02):
-                    rows.append(dict(arm=arm, dataset=ds, fold=0, memory_fraction=kf, delta=0.05, fpr=fpr))
+                    rows.append(dict(arm=arm, dataset=ds, fold=0, memory_fraction=kf, delta=0.02, fpr=fpr))
         tex = tables_paper.ablation_table(pd.DataFrame(rows))
         self.assertIn("minimax", tex)
         self.assertNotIn("soft anneal", tex)

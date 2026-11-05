@@ -1,8 +1,8 @@
 """The tables paper.tex adds beyond table_quantization.py, as LaTeX (written to
-suggestions/figures/), plus the numbers its text quotes from them. Built only from existing
+figures/), plus the numbers its text quotes from them. Built only from existing
 results/ CSVs (src/paper.py generates them):
 
-    ablation-table.tex       tab:ablation       ablation.csv   FPR of each variant at delta = 0.05
+    ablation-table.tex       tab:ablation       ablation.csv   FPR of each variant at delta = 0.02
     sensitivity-table.tex    tab:sensitivity    ablation.csv   change in FPR when the cover is built for another
                                                                threshold / sphere-merge parameter
     latency-table.tex        tab:latency        latency.csv    the filter in front of the flat index
@@ -26,7 +26,7 @@ def _memory_label(memory_fraction: float) -> str:
     """A budget B/M (filter bytes over the raw FP32 embedding bytes) as a column header."""
     return f"$B={memory_fraction:g}M$"
 
-DELTA = 0.05
+DELTA = 0.02
 # variant -> (component, label); first of each component is the paper's configuration
 ABLATION_ROWS = [
     ("full", "Rule", "cap (paper)"),
@@ -163,7 +163,7 @@ def timing_table(t: pd.DataFrame) -> str:
     ks = sorted(c.memory_fraction.unique())
     out = [f"{BS}begin{{tabular}}{{@{{}}l" + "r" * len(ks) + "@{}}", f"{BS}toprule",
            f"Construction (s) & " + " & ".join(_memory_label(k) for k in ks) + f" {BS*2}", f"{BS}midrule"]
-    for m in ("gonzalez", "minimax", "soft_anneal"):
+    for m in ("gonzalez", "minimax", "sphere_merge", "soft_anneal"):
         r = c[c.method == m].groupby("memory_fraction").seconds.mean()
         out.append(f"{m.replace('_', ' ')} & " + " & ".join("--" if k not in r.index else f"{r[k]:.1f}" for k in ks) + f" {BS*2}")
     ins = t[t.kind == "insert"]
@@ -195,4 +195,4 @@ def write_all(results: Path, out: Path) -> None:
 
 if __name__ == "__main__":
     res = ROOT / (sys.argv[1] if len(sys.argv) > 1 else "results")
-    write_all(res, ROOT / (sys.argv[2] if len(sys.argv) > 2 else "suggestions/figures"))
+    write_all(res, ROOT / (sys.argv[2] if len(sys.argv) > 2 else "figures"))

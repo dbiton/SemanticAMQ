@@ -1,6 +1,6 @@
 # Publication cleanup tasks
 
-Partially implemented: `main.py` is replaced by `paper.py` + `src/experiments.py` (tasks 4/6 core, first slice of 8). Other items are open. See [plan.md](plan.md) for scope and decisions.
+Partially implemented: `main.py` is replaced by `paper.py` + `src/experiments.py` (tasks 4/6 core, first slice of 8). Also done: no-side-effect collection, per-evaluation scales, ablation/latency/timing generators, argparse CLI, sphere merge + delta 0.02 as the publication settings. Open items are unchecked below. See [plan.md](plan.md) for scope and decisions.
 All generator verification uses a recording runner or temporary output root.
 
 ## 1. Freeze the evaluation contract
