@@ -1,0 +1,26 @@
+\begin{tabular}{@{}llrrrr@{}}
+\toprule
+& & \multicolumn{2}{c}{$k=2\%$} & \multicolumn{2}{c}{$k=10\%$} \\
+\cmidrule(lr){3-4}\cmidrule(lr){5-6}
+Component & Variant & FPR & \multicolumn{1}{c}{$\Delta$} & FPR & \multicolumn{1}{c}{$\Delta$} \\
+\midrule
+Rule & cap (paper) & .578 &  & .140 &  \\
+ & ball at the cap direction & .637 & +.059$^{15}$ & .173 & +.033$^{12}$ \\
+ & ball, minimum enclosing & .739 & +.161$^{15}$ & .301 & +.161$^{12}$ \\
+\addlinespace[2pt]
+Build & sphere merge (paper) & .578 &  & .140 &  \\
+ & minimax & .592 & +.014$^{10}$ & .144 & +.004$^{7}$ \\
+ & Gonzalez & .998 & +.421$^{15}$ & .614 & +.474$^{15}$ \\
+ & sphere merge + soft anneal & .576 & -.002$^{4}$ & .139 & .000$^{2}$ \\
+\addlinespace[2pt]
+Enc. & auto (paper) & .578 &  & .140 &  \\
+ & TurboQuant rungs only & .625 & +.047$^{15}$ & .245 & +.105$^{9}$ \\
+ & seeded-PQ rungs only & .587 & +.010$^{4}$ & .140 & .000$^{6}$ \\
+ & TQ4 only & .736 & +.159$^{15}$ & .391 & +.252$^{12}$ \\
+ & FP32 only & 1.000 & +.422$^{15}$ & .874 & +.735$^{15}$ \\
+ & one encoding for all caps & .584 & +.006$^{9}$ & .198 & +.058$^{10}$ \\
+\addlinespace[2pt]
+Codes & fitted (paper) & .578 &  & .140 &  \\
+ & nearest to the direction & .619 & +.041$^{15}$ & .154 & +.014$^{12}$ \\
+\bottomrule
+\end{tabular}

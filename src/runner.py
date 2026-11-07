@@ -5,11 +5,11 @@ import os
 import multiprocessing
 import random
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 # Must happen before numpy/faiss are imported (BLAS/OpenMP thread count x
 # Runner's process count otherwise multiply into CPU/memory oversubscription
-# -- see main.py's copy of this guard). Repeated here since each
+# -- see paper.py's copy of this guard). Repeated here since each
 # ProcessPoolExecutor worker re-imports this module fresh.
 for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_env_var, "1")
@@ -29,7 +29,7 @@ from filters.filter import InsufficientMemoryError
 from filters.dsh_filter import DSHFilter
 from filters.cap_cover.cap_cover_filter import (CapCoverFilter, Quantize as CapQuantize,
                                                 AUTO_CANDIDATES as _CAP_AUTO_CANDIDATES)
-from filters.cap_cover.cap_geometry import log10_cap_measure, unit_rows
+from filters.cap_cover.cap_geometry import log10_cap_measure
 from filters.cap_cover.nearest_insert import NearestInsert as CapNearestInsert
 from filters.cap_cover.cap_merge_insert import CapMergeInsert as CapCoverMergeInsert
 from filters.cap_cover.gonzales_construct import GonzalesConstruct as CapGonzalesConstruct
@@ -60,7 +60,7 @@ def _k_for_memory_fraction(dim: int, n: int, memory_fraction: float,
                            bits_per_dim: int = _BUDGET_BITS_PER_DIM) -> int:
     """The nominal cap count (at bits_per_dim, see _cover_max_memory) whose byte
     budget is `memory_fraction` of the raw index, n float32 vectors (the paper's
-    B/M). Evaluations choose a budget as B/M; this is only how the cover sizes
+    M_filter/M_raw). Evaluations choose a budget as M_filter/M_raw; this is only how the cover sizes
     itself from it."""
     k = round(memory_fraction * n * dim * 4 / _cover_max_memory(dim, 1, bits_per_dim))
     return min(max(1, k), n)
@@ -77,16 +77,6 @@ def _cap_cover(dim: int, k: int, quantize: Optional[CapQuantize] = None) -> CapC
                                **({} if candidates is None else {"candidates": candidates}))
 
 
-def _cap_cover_insertable(dim: int, k: int) -> CapCoverFilter:
-    """A CapCoverFilter that can insert(), unlike _cap_cover's static
-    auto() (insert_method=None there): single-level TQ4 with CapNearestInsert, at the same equal-bytes budget as
-    _cap_cover. Kept separate from _cap_cover rather than giving it a
-    default insert_method, so cap_cover_system_tau's already-validated
-    static-cover numbers don't shift (an insert strategy's bookkeeping
-    reserves bytes from the cap budget even when insert() is never
-    called -- see InsertInterface.max_caps_for_budget)."""
-    return CapCoverFilter(dim=dim, max_memory=_cover_max_memory(dim, k),
-                          quantize=CapQuantize.TQ4, insert_method=CapNearestInsert())
 
 
 # The construct method of the evaluations' covers (_cap_cover, the adapter, the
@@ -115,30 +105,26 @@ CAP_INSERT_STRATEGIES = {
 # Quantize member, so the sweep tests what auto() actually picks from.
 CAP_QUANTIZATION_SWEEP = tuple(_CAP_AUTO_CANDIDATES)
 
-VectorInput = Union[np.ndarray, VectorSource]
+# Workers are handed lazy handles (a picklable pointer to an HDF5 slice), never arrays: a job's
+# pickle stays a few bytes and the worker reads only its own slice.
+VectorInput = VectorSource
 _QUERY_BATCH = 32
 
 
+def _require_source(vectors: Any) -> VectorSource:
+    if not isinstance(vectors, VectorSource):
+        raise TypeError(f"workers take a VectorSource, not {type(vectors).__name__}")
+    return vectors
+
+
 def _to_construct_array(vectors: VectorInput) -> np.ndarray:
-    if isinstance(vectors, VectorSource):
-        return vectors.to_array()
-    return np.asarray(vectors)
+    return _require_source(vectors).to_array()
 
 
 def _iter_query_batches(vectors: VectorInput, batch_size: int) -> Iterator[np.ndarray]:
-    if isinstance(vectors, VectorSource):
-        yield from vectors.iter_batches(batch_size)
-    else:
-        arr = np.asarray(vectors)
-        for base in range(0, len(arr), batch_size):
-            yield arr[base:base + batch_size]
+    yield from _require_source(vectors).iter_batches(batch_size)
 
 
-def _iter_query_vectors(vectors: VectorInput) -> Iterator[np.ndarray]:
-    if isinstance(vectors, VectorSource):
-        yield from vectors
-    else:
-        yield from np.asarray(vectors)
 
 
 def _binary_confusion(predicted: Any, actual: Any) -> Tuple[int, int, int, int]:
@@ -156,9 +142,8 @@ def _precision_recall_f1(predicted: Any, actual: Any) -> Tuple[float, float, flo
 
 
 _DIRECT_TAU_FILTERS = {
-    "FirstNFilter", "CapCoverFilter", "DSBFFilter", "CoveringLSHFallbackFilter", "LSBFFilter",
-    "DSHFilter", "HNSWFilter", "IVFFilter", "QuantizedVectorFilter", "MLPFilter",
-    "PacukLSHFilter", "SankowskiWygockiFilter", "VAPlusFilter", "IVFRadiiFilter",
+    "CapCoverFilter", "DSHFilter", "HNSWFilter", "IVFFilter", "QuantizedVectorFilter", "MLPFilter",
+    "PacukLSHFilter", "SankowskiWygockiFilter", "VAPlusFilter",
 }
 
 
@@ -511,15 +496,16 @@ def equal_memory_worker(
     distance_threshold: float,
     memory_budget: int,
     vectors_construct: VectorInput,
-    vectors_calibration: VectorInput,
-    vectors_query: VectorInput,
+    vectors_stream: VectorInput,
+    calibration_idx: np.ndarray,
+    query_idx: np.ndarray,
     actual_calibration: List[bool],
     actual_query: List[bool],
     dataset: str = "",
     extra_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     # A filter can be submitted multiple times at one budget, once per
-    # quantize variant (see main.generate_equal_memory) -- suffix the variant
+    # quantize variant (see experiments.generate_equal_memory) -- suffix the variant
     # onto Config so each becomes its own labelled line downstream rather
     # than being pooled into one line. The suffix uses
     # "(...)"  rather than plot_equal_memory.aggregate's " + " delimiter, so
@@ -527,7 +513,8 @@ def equal_memory_worker(
     quantize = (extra_kwargs or {}).get("quantize")
     config = f"{filter_cls.__name__} ({quantize.value})" if quantize is not None else filter_cls.__name__
     construct_arr = _to_construct_array(vectors_construct)
-    calib_arr = _to_construct_array(vectors_calibration)
+    stream_arr = _to_construct_array(vectors_stream)
+    calib_arr = stream_arr[np.asarray(calibration_idx, dtype=np.int64)]
     calib_actual = np.asarray(actual_calibration, dtype=bool)
 
     try:
@@ -553,8 +540,9 @@ def equal_memory_worker(
 
     predicted: List[bool] = []
     start = time.perf_counter()
-    for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
-        predicted.extend(filter_instance.query(block))
+    query_arr = stream_arr[np.asarray(query_idx, dtype=np.int64)]
+    for base in range(0, len(query_arr), _QUERY_BATCH):
+        predicted.extend(filter_instance.query(query_arr[base:base + _QUERY_BATCH]))
     elapsed = time.perf_counter() - start
 
     tp, fp, fn, tn = _binary_confusion(predicted, actual_query)
@@ -592,7 +580,7 @@ def equal_memory_worker(
         # express Memory Budget/Usage as a percentage of storing this set
         # raw (Construct Size * dim float32s) -- per row, since datasets
         # pooled into this sweep don't all share the same reference-set
-        # size (see main.generate_equal_memory's min-over-corpora budget
+        # size (see experiments.generate_equal_memory's min-over-corpora budget
         # scaling), unlike the shared budget grid itself.
         'Construct Size': len(construct_arr),
     }
@@ -711,7 +699,7 @@ def cap_quantization_worker(
     row, tagged stage="quantizing" always (CAP_QUANTIZATION_SWEEP has no
     FP32/uncompressed member to single out as a baseline stage).
 
-    max_memory is memory_fraction of the raw index (B/M), held fixed across
+    max_memory is memory_fraction of the raw index (M_filter/M_raw), held fixed across
     every quantize candidate (and CAP_QUANTIZE_AUTO), so the sweep varies only
     the encoding.
 
@@ -826,14 +814,14 @@ def construct_method_worker(
     memory_fraction: float,
     tau: float,
     seed: int,
-    vectors_construct: np.ndarray,
-    vectors_query: np.ndarray,
+    vectors_construct: VectorInput,
+    vectors_query: VectorInput,
     actual_results: np.ndarray,
     quantize: CapQuantize = CapQuantize.FP32,
 ) -> Dict[str, Any]:
     """One CapCoverFilter built by CAP_CONSTRUCT_METHODS[method] with as many caps
     of the `quantize` encoding (FP32: unquantized) as fit in memory_fraction of the
-    raw index (B/M), and no insert method, so the construction method and the
+    raw index (M_filter/M_raw), and no insert method, so the construction method and the
     encoding are the only things that vary between rows.
 
     Returns one row: cover volume, angles, FPR/FNR against distance ground
@@ -844,8 +832,8 @@ def construct_method_worker(
 
     A nonzero FNR is a bug in the construction method, not a data point, so
     it raises (the Runner logs and skips the job) instead of returning."""
-    construct = np.ascontiguousarray(vectors_construct, dtype=np.float32)
-    queries = np.ascontiguousarray(vectors_query, dtype=np.float32)
+    construct = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
+    queries = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
     actual = np.asarray(actual_results, dtype=bool)
     n = len(construct)
     k = _k_for_memory_fraction(dim, n, memory_fraction, 32)     # the nominal FP32 cap count
@@ -890,124 +878,12 @@ def construct_method_worker(
     return row
 
 
-def construct_method_scale_worker(dim: int, dataset: str, n: int, method: str, k: int) -> Dict[str, Any]:
-    """construct_filter alone on the first n rows of a corpus, plus a coverage
-    check of its output: how a construction method's time grows past the
-    blocklist workload's size. Raises on a coverage violation, as
-    construct_method_worker does on a false negative."""
-    X = np.ascontiguousarray(VectorSource(dataset, 0, n).to_array(), dtype=np.float32)
-    filt = CapCoverFilter(dim, max_caps=k, insert_method=None)
-    start = time.perf_counter()
-    directions, angles = CAP_CONSTRUCT_METHODS[method]().construct_filter(filt, X)
-    seconds = time.perf_counter() - start
-
-    # Angle from each vector to its 16 nearest cap directions (which include
-    # the one it was assigned to), minus that cap's stored angle -- the
-    # angle-cover analogue of construct_method_worker's radius-containment
-    # check, at the filter's own coverage epsilon.
-    directions = unit_rows(np.ascontiguousarray(directions, dtype=np.float64))
-    index = faiss.IndexFlatIP(dim)
-    index.add(directions.astype(np.float32))
-    X_unit = unit_rows(X.astype(np.float64))
-    sims, labels = index.search(X_unit.astype(np.float32), min(16, len(directions)))
-    actual_angle = np.arccos(np.clip(sims, -1.0, 1.0).astype(np.float64))
-    worst = float((actual_angle - angles[labels]).min(axis=1).max())
-    row = {"dataset": dataset, "n": len(X), "method": method, "k": k, "n_caps": len(angles),
-           "method_s": seconds, "psi_max": float(angles.max()), "psi_mean": float(angles.mean()),
-           "worst_uncovered": worst, "covered": worst <= CapCoverFilter._COVERAGE_EPSILON}
-    if not row["covered"]:
-        raise InvariantViolation(f"Coverage violation at scale: {row}")
-    return row
-
-
-def system_tau_ground_truth_worker(
-    dim: int,
-    vectors_construct: VectorInput,
-    vectors_query: VectorInput,
-) -> np.ndarray:
-    """Nearest-construct-set-neighbor distance for every query vector, via a
-    brute-force flat index. Split into its own worker so main.py can run it
-    across a ProcessPoolExecutor and cache the result to disk, rather than
-    generate_system_tau() paying this cost serially per dataset."""
-    construct_arr = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
-    query_arr = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
-    index = faiss.IndexFlatL2(dim)
-    index.add(construct_arr)
-    nn_sq_dist, _ = index.search(query_arr, 1)
-    return np.sqrt(np.clip(nn_sq_dist[:, 0], 0, None)).astype(np.float32)
 
 
 
 
-def cap_cover_system_tau_worker(
-    dim: int,
-    dataset: str,
-    k: int,
-    tau_values: List[float],
-    seed: int,
-    vectors_construct: VectorInput,
-    vectors_query: VectorInput,
-    actual_results_by_tau: Dict[float, List[bool]],
-) -> List[Dict[str, Any]]:
-    """CapCoverFilter's analogue of system_tau_worker: one CapCoverFilter.auto()
-    cover (_cap_cover's equal-byte budget for k balls) plus a flat L2 index
-    over the same construct set, queried one at a time at every tau in
-    tau_values without ever rebuilding -- the realistic online setting a
-    byte-budgeted membership filter sits in front of a flat index in.
-    Reports n_caps for the cover's size."""
-    construct_arr = np.ascontiguousarray(_to_construct_array(vectors_construct), dtype=np.float32)
-    query_arr = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
-    n_q = len(query_arr)
-    for t, actual in actual_results_by_tau.items():
-        if len(actual) != n_q:
-            raise ValueError(
-                f"vectors_query ({n_q}) and actual_results_by_tau[{t}] ({len(actual)}) length mismatch"
-            )
 
-    index = faiss.IndexFlatL2(dim)
-    index.add(construct_arr)
 
-    filt = _cap_cover(dim, k)
-    filt.construct(construct_arr)
-    n_caps = len(filt.all_caps)
-
-    rows: List[Dict[str, Any]] = []
-    for t in tau_values:
-        actual = np.asarray(actual_results_by_tau[t], dtype=bool)
-        redundancy_rate = float(np.mean(actual)) if len(actual) > 0 else 0.0
-
-        start = time.perf_counter()
-        for i in range(n_q):
-            index.range_search(query_arr[i:i + 1], t * t)
-        time_without = time.perf_counter() - start
-
-        predicted = np.empty(n_q, dtype=bool)
-        start = time.perf_counter()
-        for i in range(n_q):
-            v = query_arr[i:i + 1]
-            hit = filt.query(v, distance_threshold=t)[0]
-            predicted[i] = hit
-            if hit:
-                index.range_search(v, t * t)
-        time_with = time.perf_counter() - start
-
-        n_index_accesses = int(predicted.sum())
-        rates = _confusion_rates(predicted.tolist(), actual)
-        throughput_without = n_q / max(time_without, 1e-9)
-        throughput_with = n_q / max(time_with, 1e-9)
-
-        rows.append({
-            "dataset": dataset, "k": k, "tau": t, "seed": seed,
-            "redundancy_rate": redundancy_rate,
-            "tp_rate_pct": redundancy_rate * 100.0,
-            "throughput_improvement_pct": (throughput_with - throughput_without) / throughput_without * 100.0,
-            "mean_index_accesses": n_index_accesses,
-            "n_queries": n_q,
-            "positive_rate_pct": n_index_accesses / max(n_q, 1) * 100.0,
-            "fpr": rates["fpr"], "fnr": rates["fnr"],
-            "n_caps": n_caps,
-        })
-    return rows
 
 
 def _pin_to_own_core() -> None:
@@ -1043,65 +919,91 @@ def end_to_end_worker(
     filter and only for the accepted ones with it. One row per (memory_fraction,
     tau) in `cells`; one cover per memory_fraction (_cap_cover), built once.
 
-    throughput_improvement_pct = (with - without) / without. Both timings come
-    from this one process back to back, each the best of `repeats` runs, so
-    the ratio is far steadier than either absolute qps when many workers share
-    the machine (absolute timings still want a pinned run, see CLAUDE.md).
-    The filter is warmed up before timing (the first query() hands the caps
-    to Rust). Raises on a false negative, as every worker does. Pins itself to
-    one core when CAPCOVER_PIN_CORES is set (_pin_to_own_core)."""
+    Each cell gets fresh, warmed baseline/filtered passes in alternating order;
+    reported runtimes are medians of complete passes, not per-query timings.
+    Filter-only passes are measured independently for backend-cost projections.
+    Construction and lazy first-query preparation are recorded separately and
+    reused across thresholds. Loading, index setup, ground truth, validation,
+    memory accounting, and warmup are outside query timers. Required per-query
+    rotation, decoding and backend result materialization remain timed.
+    Raises on a false negative. Pins itself to one core when
+    CAPCOVER_PIN_CORES is set (_pin_to_own_core)."""
+    if repeats < 1:
+        raise ValueError("repeats must be positive")
     _pin_to_own_core()
     B = np.ascontiguousarray(_to_construct_array(vectors_reference), dtype=np.float32)
     Q = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
     n_q = len(Q)
+    if n_q == 0:
+        raise ValueError("end-to-end timing requires at least one query")
     index = faiss.IndexFlatL2(dim)
     index.add(B)
     d2, _ = index.search(Q, 1)
     nn = np.sqrt(np.clip(d2[:, 0], 0, None))
 
-    def best_time(fn) -> float:
-        best = float("inf")
-        for _ in range(repeats):
-            start = time.perf_counter()
-            fn()
-            best = min(best, time.perf_counter() - start)
-        return best
-
-    without: Dict[float, float] = {}
-    for tau in sorted({float(t) for _, t in cells}):
-        def search_all(tau=tau) -> None:
-            for i in range(n_q):
-                index.range_search(Q[i:i + 1], tau * tau)
-        without[tau] = best_time(search_all)
+    def elapsed(fn) -> float:
+        start = time.perf_counter()
+        fn()
+        duration = time.perf_counter() - start
+        if not np.isfinite(duration) or duration <= 0:
+            raise ValueError(f"invalid query runtime: {duration}")
+        return duration
 
     rows: List[Dict[str, Any]] = []
     for mf in sorted({float(f) for f, _ in cells}):
         k = _k_for_memory_fraction(dim, len(B), mf)
+        start = time.perf_counter()
         filt = _cap_cover(dim, k, quantize)
         filt.construct(B)
+        construct_s = time.perf_counter() - start
         memory_bytes = filt.get_bytesize()
         encoding = filt.encoding_label
-        for tau in sorted(float(t) for f, t in cells if float(f) == mf):
-            predicted = np.zeros(n_q, dtype=bool)
-            filt.query(Q[:1], distance_threshold=tau)
-
-            def filtered_search() -> None:
-                for i in range(n_q):
-                    v = Q[i:i + 1]
-                    hit = filt.query(v, distance_threshold=tau)[0]
-                    predicted[i] = hit
-                    if hit:
-                        index.range_search(v, tau * tau)
-            with_s = best_time(filtered_search)
-
+        thresholds = sorted(float(t) for f, t in cells if float(f) == mf)
+        start = time.perf_counter()
+        filt.query(Q[:1], distance_threshold=thresholds[0])
+        prepare_s = time.perf_counter() - start
+        for tau in thresholds:
+            radius = tau * tau
+            # Validate the same single-query API used by the timed path.
+            predicted = np.fromiter(
+                (filt.query(Q[i:i + 1], distance_threshold=tau)[0] for i in range(n_q)),
+                dtype=bool, count=n_q)
             actual = nn <= tau
             fn = int(np.sum(actual & ~predicted))
             if fn:
                 raise InvariantViolation(
                     f"Zero-false-negative invariant violated: {fn} FN "
                     f"(dataset={dataset}, fold={seed}, k={k}, tau={tau})")
-            qps_without = n_q / max(without[tau], 1e-9)
-            qps_with = n_q / max(with_s, 1e-9)
+
+            def search_all() -> None:
+                for i in range(n_q):
+                    index.range_search(Q[i:i + 1], radius)
+
+            def filter_only() -> None:
+                for i in range(n_q):
+                    filt.query(Q[i:i + 1], distance_threshold=tau)[0]
+
+            def filtered_search() -> None:
+                for i in range(n_q):
+                    v = Q[i:i + 1]
+                    if filt.query(v, distance_threshold=tau)[0]:
+                        index.range_search(v, radius)
+
+            search_all()
+            filtered_search()
+            without_times, with_times, filter_times = [], [], []
+            for repeat in range(repeats):
+                pair = [(search_all, without_times), (filtered_search, with_times)]
+                if repeat % 2:
+                    pair.reverse()
+                for operation, samples in pair:
+                    samples.append(elapsed(operation))
+                filter_times.append(elapsed(filter_only))
+            without_s = float(np.median(without_times))
+            with_s = float(np.median(with_times))
+            filter_s = float(np.median(filter_times))
+            qps_without = n_q / without_s
+            qps_with = n_q / with_s
             rows.append({
                 "dataset": dataset, "seed": seed, "memory_fraction": mf, "k": k,
                 "n_caps": filt._num_caps, "n_reference": len(B), "memory_bytes": memory_bytes,
@@ -1111,6 +1013,10 @@ def end_to_end_worker(
                 "positive_rate_pct": 100.0 * float(predicted.mean()),
                 "true_positive_rate_pct": 100.0 * float(actual.mean()),
                 "fpr": _confusion_rates(predicted.tolist(), actual)["fpr"],
+                "construct_s": construct_s, "prepare_s": prepare_s,
+                "query_without_s": without_s, "query_with_s": with_s,
+                "filter_query_s": filter_s, "timing_repeats": repeats,
+                "timing_protocol": "paired-median-v2",
                 "throughput_without_qps": qps_without, "throughput_with_qps": qps_with,
                 "throughput_improvement_pct": 100.0 * (qps_with - qps_without) / qps_without,
             })
@@ -1132,7 +1038,7 @@ def _blocklist_cover_rows(
     quantize: Optional[CapQuantize] = None,
 ) -> List[Dict[str, Any]]:
     """Shared core of blocklist_tau_worker and budget_worker: build a
-    CapCoverFilter (`quantize`'s encoding, auto()'s choice if None) per memory budget (B/M) in memory_fractions and emit one
+    CapCoverFilter (`quantize`'s encoding, auto()'s choice if None) per memory budget (M_filter/M_raw) in memory_fractions and emit one
     sweep="tau" row per (budget, tau) pair. Both callers read only these rows -- see each one's own
     docstring for which axis it treats as fixed and which it sweeps.
 
@@ -1260,7 +1166,7 @@ def blocklist_tau_worker(
     vectors_query: VectorInput,
     quantize: Optional[CapQuantize] = None,
 ) -> List[Dict[str, Any]]:
-    """Asymmetric blocklist workload (main.generate_blocklist): a tight
+    """Asymmetric blocklist workload (experiments.generate_blocklist): a tight
     reference set B and a query stream, labeled by distance to B at each
     tau and grouped by similarity band.
 
@@ -1286,7 +1192,7 @@ def budget_worker(
     quantize: Optional[CapQuantize] = None,
 ) -> List[Dict[str, Any]]:
     """The same asymmetric blocklist workload as blocklist_tau_worker
-    (main.generate_budget), read along the other axis: tau is fixed at a
+    (experiments.generate_budget), read along the other axis: tau is fixed at a
     single value and the memory budget is swept over memory_fractions.
 
     Requests log10_vol_high (see _blocklist_cover_rows's volume_bounds):
@@ -1301,718 +1207,41 @@ def budget_worker(
     )
 
 
-def query_performance_worker(
-    dim: int,
-    dataset: str,
-    k: int,
-    seed: int,
-    query_tau: float,
-    vectors_construct: VectorInput,
-    vectors_query: VectorInput,
-    single_query_limit: int = 2000,
-) -> List[Dict[str, Any]]:
-    """Times one query at a time vs. batched queries against the same cover;
-    single-query mode is capped at single_query_limit, batched is uncapped."""
-    construct_arr = _to_construct_array(vectors_construct)
-
-    filt = _cap_cover(dim, k)
-    filt.construct(construct_arr)
-
-    rows: List[Dict[str, Any]] = []
-
-    n_single = 0
-    start = time.perf_counter()
-    for v in _iter_query_vectors(vectors_query):
-        if n_single >= single_query_limit:
-            break
-        filt.query(v[np.newaxis, :], distance_threshold=query_tau)
-        n_single += 1
-    elapsed_single = time.perf_counter() - start
-    rows.append({
-        "dataset": dataset, "k": k, "seed": seed, "mode": "single",
-        "n_queries": n_single,
-        "latency_ms": elapsed_single / max(n_single, 1) * 1000,
-        "throughput_qps": n_single / max(elapsed_single, 1e-9),
-    })
-
-    n_batched = 0
-    start = time.perf_counter()
-    for block in _iter_query_batches(vectors_query, _QUERY_BATCH):
-        filt.query(block, distance_threshold=query_tau)
-        n_batched += len(block)
-    elapsed_batched = time.perf_counter() - start
-    rows.append({
-        "dataset": dataset, "k": k, "seed": seed, "mode": "batched",
-        "n_queries": n_batched,
-        "latency_ms": elapsed_batched / max(n_batched, 1) * 1000,
-        "throughput_qps": n_batched / max(elapsed_batched, 1e-9),
-    })
-
-    return rows
 
 
-def scaling_query_worker(
-    dim: int,
-    dataset: str,
-    k: int,
-    batch_size: int,
-    seed: int,
-    tau_mid: float,
-    vectors_construct: VectorInput,
-    vectors_query: VectorInput,
-    n_query_vectors: int = 8192,
-) -> Dict[str, Any]:
-    """Measures batched-query throughput for a CapCoverFilter at filter
-    size k, querying in batches of `batch_size`. Every batch_size times the
-    same n_query_vectors, so the panel's lines are directly comparable.
-
-    tau_mid is part of the measurement: query() abandons a ball once a
-    partial distance passes r + tau, and stops a query at the first ball
-    that accepts it (see CapCoverFilter's scan kernels), so a
-    larger tau means more work per ball and earlier exits. Throughput is
-    therefore reported at this one threshold, not for every tau."""
-    construct_arr = _to_construct_array(vectors_construct)
-    query_arr = _to_construct_array(vectors_query)
-    if len(query_arr) < n_query_vectors:
-        raise ValueError(
-            f"scaling_query_worker needs {n_query_vectors} query vectors but the holdout "
-            f"holds {len(query_arr)}. Widen the holdout in generate_scaling() (it is sized "
-            f"max(n_query_vectors, n_insert_vectors)) or lower n_query_vectors."
-        )
-
-    filt = _cap_cover(dim, k)
-    filt.construct(construct_arr)
-
-    stream = query_arr[:n_query_vectors]
-
-    start = time.perf_counter()
-    for i in range(0, len(stream), batch_size):
-        filt.query(stream[i:i + batch_size], distance_threshold=tau_mid)
-    elapsed = time.perf_counter() - start
-
-    return {
-        "dataset": dataset, "k": k, "batch_size": batch_size, "seed": seed,
-        "n_queries": len(stream),
-        "throughput_qps": len(stream) / max(elapsed, 1e-9),
-    }
 
 
-def scaling_insert_worker(
-    dim: int,
-    dataset: str,
-    k: int,
-    batch_size: int,
-    seed: int,
-    vectors_construct: VectorInput,
-    vectors_insert: VectorInput,
-    n_insert_vectors: int = 8192,
-) -> Dict[str, Any]:
-    """Like scaling_query_worker, but times insert() in batches of
-    `batch_size` after the initial construct()."""
-    construct_arr = _to_construct_array(vectors_construct)
-    insert_arr = _to_construct_array(vectors_insert)
-    if len(insert_arr) < n_insert_vectors:
-        raise ValueError(
-            f"scaling_insert_worker needs {n_insert_vectors} insert vectors but the holdout "
-            f"holds {len(insert_arr)}. Widen the holdout in generate_scaling() (it is sized "
-            f"max(n_query_vectors, n_insert_vectors)) or lower n_insert_vectors."
-        )
-
-    filt = _cap_cover_insertable(dim, k)
-    filt.construct(construct_arr)
-
-    stream = insert_arr[:n_insert_vectors]
-
-    start = time.perf_counter()
-    for i in range(0, len(stream), batch_size):
-        filt.insert(stream[i:i + batch_size])
-    elapsed = time.perf_counter() - start
-
-    return {
-        "dataset": dataset, "k": k, "batch_size": batch_size, "seed": seed,
-        "n_inserted": len(stream),
-        "throughput_ips": len(stream) / max(elapsed, 1e-9),
-    }
 
 
-def scaling_construction_worker(
-    dim: int,
-    dataset: str,
-    k: int,
-    n: int,
-    seed: int,
-    vectors_construct: VectorInput,
-) -> Dict[str, Any]:
-    """Measures construction throughput for a CapCoverFilter at filter size
-    k built over n indexed vectors -- swept over a (k, n) grid."""
-    construct_arr = _to_construct_array(vectors_construct)[:n]
-
-    start = time.perf_counter()
-    filt = _cap_cover(dim, k)
-    filt.construct(construct_arr)
-    elapsed = time.perf_counter() - start
-
-    return {
-        "dataset": dataset, "k": k, "n": n, "seed": seed,
-        "construct_time_s": elapsed,
-        "throughput_vps": n / max(elapsed, 1e-9),
-    }
 
 
-def _rebuild_policy_tags(policy: str, insertion_level: Optional[str]) -> tuple:
-    """(metric, method) tag used by the streaming figure. "oracle" always
-    gets one fixed reference tag; "streaming"/"periodic" report whichever
-    insertion_level they ran, so all methods plot as directly comparable
-    lines rather than one needing a special reference tag of its own."""
-    if policy == "oracle":
-        return "static_reference", "static_rebuild"
-    return "checkpoint", insertion_level or "nearest"
 
 
-def stream_rebuild_worker(
-    dim: int,
-    dataset: str,
-    k: int,
-    seed: int,
-    tau: float,
-    policy: str,
-    vectors_stream: VectorInput,
-    vectors_query: VectorInput,
-    actual_at_checkpoint: Dict[int, List[bool]],
-    checkpoints: List[int],
-    T: Optional[int] = None,
-    insertion_level: Optional[str] = None,
-    sweep: Optional[str] = None,
-    fold_offset: Optional[int] = None,
-    bootstrap_n: Optional[int] = None,
-    construct_method: Optional[str] = None,
-    stream_order: Optional[str] = None,
-    insert_memory_percent: Optional[float] = None,
-    quantize: CapQuantize = CapQuantize.TQ4,
-) -> List[Dict[str, Any]]:
-    """Simulates one rebuild policy over vectors_stream (a blocklist fold's
-    reference set B, in arrival order -- see main.generate_streaming),
-    reporting query FPR and amortized cost per checkpoint.
-      "streaming": CapCoverFilter.insert() per arrival, never rebuilt.
-      "periodic": like "streaming", rebuilt from scratch every T arrivals.
-      "oracle": rebuilt from scratch at every checkpoint.
-    sweep/fold_offset/stream_order are pass-through tag columns only.
-
-    construct_method names a CAP_CONSTRUCT_METHODS entry (default: the
-    filter's own, SphereMergeConstruct) and is used for every construct()
-    the policy makes: the oracle's rebuilds, and the streaming/periodic
-    bootstrap. insertion_level sweeps CAP_INSERT_STRATEGIES, which only has
-    2 members (cap_merge/nearest).
-
-    Every filter here stores its directions as `quantize` (default TQ4, the
-    4 bits/dim that _cover_max_memory counts a cap in), so the byte budget of
-    k caps really holds ~k caps. With the filter's FP32 default it held k/8,
-    and the oracle itself sat at FPR ~1 on corpora where the static
-    evaluations (which build with auto()) do not.
-
-    Memory is held to one budget for every method: max_memory is the static
-    filter's footprint at k caps, and CapCoverFilter sizes each insert
-    strategy's cap count so that its peak get_bytesize() between insert()
-    calls fits it (see InsertInterface.max_caps_for_budget).
-    peak_memory_bytes is that peak as measured over the stream so far, next
-    to budget_bytes. max_insert_s is the slowest single insert() so far, the
-    spike a rebuilding strategy trades for its amortized cost, and
-    insert_time_s the insert-only total (cumulative_time_s also counts the
-    bootstrap construct()).
-
-    vectors_query is the fold's query stream (see
-    main.BlocklistWorkload.query_vectors). actual_at_checkpoint[c] is its distance-based
-    ground truth against vectors_stream[:c] -- computed once by the caller,
-    since every policy and method on a fold shares it.
-
-    bootstrap_n sizes the initial construct() window independently of the
-    ball budget k -- default min(k, n), which for k <= n gives
-    GonzalesConstruct one input point per center and hence zero-radius balls
-    at position 0. Pass an explicit bootstrap_n (e.g. an order of magnitude
-    larger than k) to start from a filter with real coverage instead. Both
-    policies checkpoint only past it, and report position as arrivals since
-    it, so their rows line up."""
-    stream_arr = _to_construct_array(vectors_stream)
-    query_arr = _to_construct_array(vectors_query)
-    n = len(stream_arr)
-    n_q = len(query_arr)
-    metric, method = _rebuild_policy_tags(policy, insertion_level)
-    # By default pooled reserves a 20% pool and every other method constructs
-    # at full capacity; insert_memory_percent overrides that for any method.
-    if insert_memory_percent is None:
-        insert_memory_percent = 20.0 if insertion_level == "pooled" else 0.0
-    bootstrap_n = min(bootstrap_n if bootstrap_n is not None else k, n)
-    checkpoint_set = sorted(set(c for c in checkpoints if bootstrap_n < c <= n))
-    missing = [c for c in checkpoint_set if c not in actual_at_checkpoint]
-    if missing:
-        raise ValueError(f"actual_at_checkpoint has no ground truth for checkpoint(s) {missing}")
-    if construct_method is not None and construct_method not in CAP_CONSTRUCT_METHODS:
-        raise ValueError(f"Unknown construct_method {construct_method!r}; expected one of "
-                         f"{sorted(CAP_CONSTRUCT_METHODS)}")
-    budget_bytes = _cover_max_memory(dim, k)
-
-    def _new_filter(insert_method: Any = None, **kwargs: Any) -> CapCoverFilter:
-        if construct_method is not None:
-            kwargs["construct_method"] = CAP_CONSTRUCT_METHODS[construct_method]()
-        return CapCoverFilter(dim=dim, max_memory=budget_bytes, insert_method=insert_method,
-                              quantize=quantize, **kwargs)
-
-    peak_memory_bytes = 0
-    max_insert_s = 0.0
-    insert_time_s = 0.0
-
-    def _checkpoint_row(filt: CapCoverFilter, pos: int, cumulative_time_s: float) -> Dict[str, Any]:
-        """Measures one checkpoint. Raises rather than recording a false
-        negative, like every other FNR check here: every stream vector seen
-        so far must still be recalled, and so must every query the ground
-        truth says is within tau of them."""
-        recalled = np.asarray(filt.query(stream_arr[:pos], distance_threshold=tau), dtype=bool)
-        actual = np.asarray(actual_at_checkpoint[pos], dtype=bool)
-        predicted = np.asarray(filt.query(query_arr, distance_threshold=tau), dtype=bool)
-        rates = _confusion_rates(predicted, actual)
-        if not recalled.all() or rates["fnr"] != 0.0:
-            raise InvariantViolation(
-                f"Zero-false-negative invariant violated (dataset={dataset}, policy={policy}, "
-                f"insertion_level={insertion_level}, k={k}, seed={seed}, position={pos}): "
-                f"stream fnr={1.0 - recalled.mean()}, query fnr={rates['fnr']}"
-            )
-        n_inserted = pos - bootstrap_n
-        streamed = policy != "oracle" and n_inserted > 0
-        return {
-            "dataset": dataset, "policy": policy, "T": T, "k": k, "seed": seed,
-            "position": pos - bootstrap_n, "tau": tau,
-            "fpr": rates["fpr"], "fnr": rates["fnr"],
-            **_pos_neg_summary(actual),
-            "n_queries": n_q, "n_duplicates": int(actual.sum()),
-            "log10_j_tau": _cap_log10_volume(filt, tau),
-            "n_caps": filt._num_caps,
-            "memory_bytes": filt.get_bytesize(),
-            "peak_memory_bytes": max(peak_memory_bytes, filt.get_bytesize()),
-            "budget_bytes": budget_bytes,
-            "cumulative_time_s": cumulative_time_s,
-            "amortized_cost_s": cumulative_time_s / pos,
-            "insert_time_s": insert_time_s if streamed else float("nan"),
-            "amortized_insert_s": insert_time_s / n_inserted if streamed else float("nan"),
-            "max_insert_s": max_insert_s if streamed else float("nan"),
-            "construct_method": construct_method or CAP_COVER_CONSTRUCT,
-            "stream_order": stream_order,
-            "insert_memory_percent": insert_memory_percent,
-            "metric": metric, "method": method, "sweep": sweep, "fold_offset": fold_offset,
-        }
-
-    rows: List[Dict[str, Any]] = []
-    cumulative_time_s = 0.0
-
-    if policy == "oracle":
-        for c in checkpoint_set:
-            filt = _new_filter()
-            t0 = time.perf_counter()
-            filt.construct(stream_arr[:c])
-            cumulative_time_s += time.perf_counter() - t0
-            rows.append(_checkpoint_row(filt, c, cumulative_time_s))
-        return rows
-
-    if policy not in ("streaming", "periodic"):
-        raise ValueError(f"Unknown policy {policy!r}; expected 'streaming', 'periodic', or 'oracle'")
-
-    if insertion_level not in CAP_INSERT_STRATEGIES:
-        raise ValueError(
-            f"Unknown insertion_level {insertion_level!r}; expected one of "
-            f"{sorted(CAP_INSERT_STRATEGIES)}"
-        )
-    rebuild_every = T if (policy == "periodic" and T is not None) else None
-    filt = _new_filter(insert_method=CAP_INSERT_STRATEGIES[insertion_level](),
-                       insert_memory_percent=insert_memory_percent)
-    # Bootstrap with construct() on the same vectors and construct_method for
-    # every insertion_level, so every checkpoint from bootstrap_n onward
-    # compares each method's own decision rule -- at its own ball count, since
-    # each strategy's bookkeeping takes its share of the one byte budget.
-    t0 = time.perf_counter()
-    filt.construct(stream_arr[:bootstrap_n])
-    cumulative_time_s += time.perf_counter() - t0
-    peak_memory_bytes = filt.get_bytesize()
-
-    ci = 0
-    for t in range(bootstrap_n, n):
-        pos = t + 1
-        t0 = time.perf_counter()
-        if rebuild_every is not None and pos % rebuild_every == 0:
-            filt.construct(stream_arr[:pos])
-        else:
-            filt.insert(stream_arr[t][np.newaxis, :])
-        dt = time.perf_counter() - t0
-        cumulative_time_s += dt
-        insert_time_s += dt
-        max_insert_s = max(max_insert_s, dt)
-        peak_memory_bytes = max(peak_memory_bytes, filt.get_bytesize())
-
-        if ci < len(checkpoint_set) and pos == checkpoint_set[ci]:
-            rows.append(_checkpoint_row(filt, pos, cumulative_time_s))
-            ci += 1
-
-    return rows
-
-
-# --------------------------------------------------------------------------
-# Paper experiments: ablation, backends, pinned timings
-# --------------------------------------------------------------------------
-
-# Thresholds (cosine distance) of the ablation: the paper's sweep, 0.005-0.2.
-ABLATION_DELTAS = (0.005, 0.01, 0.02, 0.05, 0.1, 0.2)
-
-
-def tau_of_cosine_distance(delta: float) -> float:
-    """The L2 threshold of unit vectors at cosine distance `delta` (||a-b||^2 = 2 delta)."""
-    return float(np.sqrt(2.0 * delta))
-
-
-def ball_accept_thresholds(theta: np.ndarray, tau_prime: float, rule: str) -> np.ndarray:
-    """cos(psi_i): the smallest cosine between a unit query and the direction
-    u_i of a cap (u_i, theta_i) at which a ball cover storing the same bytes
-    accepts the query. Both ball covers contain the cap, so both accept more
-    than the cap rule's psi <= theta + alpha (Theorem 3):
-      "ball_sphere": the ball centred on u_i with the cap's chord as radius,
-                     2 sin(theta/2); accept iff ||q - u_i|| <= r + tau';
-      "ball_meb":    the Euclidean minimum enclosing ball of the cap, centre
-                     cos(theta) u_i and radius sin(theta) (no extra bytes: the
-                     centre's length follows from the stored angle).
-    A cap wider than a quarter sphere has the whole unit ball as its MEB,
-    which accepts every unit query."""
-    theta = np.asarray(theta, dtype=np.float64)
-    if rule == "ball_sphere":
-        return np.cos(2.0 * np.arcsin(np.minimum(1.0, np.sin(theta / 2.0) + tau_prime / 2.0)))
-    if rule == "ball_meb":
-        c, s = np.cos(theta), np.sin(theta)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            thr = (1.0 + c * c - (s + tau_prime) ** 2) / (2.0 * c)
-        return np.where(c > 1e-9, thr, -np.inf)
-    raise ValueError(f"unknown ball rule {rule!r}")
-
-
-def _accept_cosines(theta: np.ndarray, tau: float, rule: str) -> np.ndarray:
-    """cos(psi_i) thresholds of `rule` ("cap", "ball_sphere" or "ball_meb") at tau,
-    with CapCoverFilter's own coverage slack added to tau."""
-    tau_prime = tau + CapCoverFilter._COVERAGE_EPSILON + CapCoverFilter._NORM_TOLERANCE
-    if rule == "cap":
-        return np.cos(np.minimum(theta + 2.0 * np.arcsin(min(1.0, tau_prime / 2.0)), np.pi))
-    return ball_accept_thresholds(theta, tau_prime, rule)
-
-
-def _accepted_by_rule(Qn: np.ndarray, D: np.ndarray, theta: np.ndarray, taus: List[float],
-                      rule: str, chunk: int = 512) -> np.ndarray:
-    """accepted[t, q]: unit query q is accepted at taus[t] by `rule` over the caps
-    (directions D, angles theta). float64 throughout."""
-    out = np.zeros((len(taus), len(Qn)), dtype=bool)
-    thr = [_accept_cosines(theta, tau, rule) for tau in taus]
-    for s in range(0, len(Qn), chunk):
-        C = Qn[s:s + chunk] @ D.T
-        for t in range(len(taus)):
-            out[t, s:s + chunk] = (C >= thr[t][None, :] - 1e-12).any(axis=1)
-    return out
-
-
-def _ablation_arms(dim: int, k: int) -> Dict[str, Any]:
-    """name -> zero-argument factory of the CapCoverFilter an ablation arm builds,
-    every one at the byte budget of k nominal caps (_cover_max_memory) and each
-    differing from "full" (the paper's configuration, _cap_cover) in one choice."""
-    mem = _cover_max_memory(dim, k)
-    tq = [q for q in _CAP_AUTO_CANDIDATES if q.value.startswith("TQ")]
-    spq = [q for q in _CAP_AUTO_CANDIDATES if q.value.startswith("SPQ")]
-
-    def auto(**kw):
-        return lambda: CapCoverFilter.auto(dim, max_memory=mem, **kw)
-
-    return {
-        "full": lambda: _cap_cover(dim, k),
-        # construction
-        "minimax": auto(construct_method=CapMinimaxConstruct()),
-        "gonzalez": auto(construct_method=CapGonzalesConstruct()),
-        "soft_anneal": auto(construct_method=CapSoftAnnealConstruct()),
-        # direction encoding
-        "tq_only": auto(candidates=tq),
-        "spq_only": auto(candidates=spq),
-        "tq4_fixed": lambda: CapCoverFilter(dim, max_memory=mem, quantize=CapQuantize.TQ4),
-        "fp32_fixed": lambda: CapCoverFilter(dim, max_memory=mem, quantize=CapQuantize.FP32),
-        "no_mixing": auto(mixed=False),
-        # fitted vs nearest codes
-        "nearest_codes": auto(fit_codes=False),
-        # sphere merge's offset t (default 0.1) and exponent p (default 8)
-        "t0.05": auto(construct_method=CapSphereMergeConstruct(cost_offset=0.05)),
-        "t0.2": auto(construct_method=CapSphereMergeConstruct(cost_offset=0.2)),
-        "t0.4": auto(construct_method=CapSphereMergeConstruct(cost_offset=0.4)),
-        "p4": auto(construct_method=CapSphereMergeConstruct(exponent=4.0)),
-        "p16": auto(construct_method=CapSphereMergeConstruct(exponent=16.0)),
-        # the threshold the encoding is chosen at (default tau = 0.1, delta = 0.005)
-        "select_delta0.02": auto(selection_tau=tau_of_cosine_distance(0.02)),
-        "select_delta0.1": auto(selection_tau=tau_of_cosine_distance(0.1)),
-    }
-
-
-def ablation_worker(
-    dim: int,
-    dataset: str,
-    seed: int,
-    memory_fraction: float,
-    vectors_reference: VectorInput,
-    vectors_query: VectorInput,
-    deltas: Tuple[float, ...] = ABLATION_DELTAS,
-    arms: Optional[List[str]] = None,
-) -> List[Dict[str, Any]]:
-    """The ablation behind the paper's component table, for one (corpus, fold,
-    budget): the arms of _ablation_arms, each a CapCoverFilter built from the
-    same reference set at the same bytes and scored on the same queries at every
-    cosine distance in `deltas`; plus two accept rules over the "full" arm's
-    own cover, "ball_sphere" and "ball_meb" (ball_accept_thresholds): what a
-    ball cover storing the same bytes would accept, isolating cap vs ball.
-
-    Labels are the distance at each tau. One row per (arm, delta). Raises on
-    any false negative, ball rules included. Construction times here come from
-    a parallel run and are not timing claims."""
-    B = np.ascontiguousarray(_to_construct_array(vectors_reference), dtype=np.float32)
-    Q = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
-    bix = faiss.IndexFlatL2(dim)
-    bix.add(B)
-    d2, _ = bix.search(Q, 1)
-    nn = np.sqrt(np.clip(d2[:, 0], 0, None))
-    nn_cos = 1.0 - nn.astype(np.float64) ** 2 / 2.0
-    taus = [tau_of_cosine_distance(d) for d in deltas]
-    k = _k_for_memory_fraction(dim, len(B), memory_fraction)
-    factories = _ablation_arms(dim, k)
-    if arms is not None:
-        factories = {a: factories[a] for a in arms}
-
-    rows: List[Dict[str, Any]] = []
-
-    def emit(arm: str, filt: CapCoverFilter, accepted: np.ndarray, accept_angle: np.ndarray,
-             build_s: float, theta: np.ndarray) -> None:
-        for t, (delta, tau) in enumerate(zip(deltas, taus)):
-            actual = nn <= tau
-            predicted = accepted[t]
-            fn = int(np.sum(actual & ~predicted))
-            if fn:
-                raise InvariantViolation(f"Zero-false-negative invariant violated: {fn} FN "
-                                         f"(arm={arm}, dataset={dataset}, fold={seed}, k={k}, delta={delta})")
-            rates = _confusion_rates(predicted.tolist(), actual)
-            psi = np.minimum(accept_angle[t], np.pi)
-            log10_j = float(logsumexp(log10_cap_measure(psi, dim) * _LN10)) / _LN10 if len(psi) else float("-inf")
-            rows.append({
-                "dataset": dataset, "fold": seed, "memory_fraction": float(memory_fraction), "k": k,
-                "n_reference": len(B), "n_queries": len(Q), "arm": arm, "delta": float(delta), "tau": tau,
-                "fpr": rates["fpr"], "fnr": rates["fnr"],
-                **_per_band_rates(predicted, actual, nn_cos),
-                "accesses_saved_pct": 100.0 * (1.0 - float(predicted.mean())),
-                "log10_j_tau": log10_j, "n_caps": filt._num_caps, "memory_bytes": filt.get_bytesize(),
-                "psi_med": float(np.median(theta)) if len(theta) else 0.0,
-                "build_s": build_s, "encoding": getattr(filt, "encoding_label", ""),
-            })
-
-    for arm, factory in factories.items():
-        filt = factory()
-        t0 = time.perf_counter()
-        try:
-            filt.construct(B)
-        except InsufficientMemoryError as e:
-            logger.warning(f"ablation arm {arm} infeasible ({dataset}, k={k}): {e}")
-            continue
-        build_s = time.perf_counter() - t0
-        theta = filt.all_angles
-        Qn = unit_rows(filt.to_working(Q))
-        D = filt.all_directions
-        for rule in (("cap", "ball_sphere", "ball_meb") if arm == "full" else ("cap",)):
-            accepted = _accepted_by_rule(Qn, D, theta, taus, rule)
-            angle = np.stack([np.arccos(np.clip(_accept_cosines(theta, tau, rule), -1.0, 1.0)) for tau in taus])
-            emit(arm if rule == "cap" else rule, filt, accepted, angle, build_s, theta)
-    return rows
 
 
 # ---- per-query latency of the filter in front of the exact (flat) index ------
 
-def filter_latency_worker(
-    dim: int,
-    dataset: str,
-    seed: int,
-    memory_fraction: float,
-    deltas: Tuple[float, ...],
-    vectors_reference: VectorInput,
-    vectors_query: VectorInput,
-    n_timed: int = 1000,
-    timing_seed: int = 0,
-    quantize: Optional[CapQuantize] = None,
-) -> List[Dict[str, Any]]:
-    """A CapCoverFilter (`quantize`'s encoding, auto()'s choice if None) in front of the exact backend, a flat index answering by
-    range_search (a fairer baseline than hand-computed distances), timed one query
-    at a time on one pinned core (_pin_to_own_core; run with a single worker).
-
-    The filter and the backend are each timed per query once on a seeded sample of
-    `n_timed` queries; the filtered system's per-query latency is then
-    filter_i + accept_i * backend_i, exactly what a sequential filter-then-backend
-    loop spends on query i. One row per delta: throughput and p50/p99 latency with
-    and without the filter, and the break-even backend cost filter_mean /
-    rejection_rate, the lookup cost above which the filter raises throughput. The
-    filter is exact (zero false negatives, raised on)."""
-    _pin_to_own_core()
-    B = np.ascontiguousarray(_to_construct_array(vectors_reference), dtype=np.float32)
-    Q = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
-    n = len(B)
-    flat = faiss.IndexFlatL2(dim)
-    flat.add(B)
-    d2, _ = flat.search(Q, 1)
-    nn = np.sqrt(np.clip(d2[:, 0], 0, None))
-    timed = np.sort(np.random.default_rng(timing_seed).choice(len(Q), size=min(n_timed, len(Q)), replace=False))
-
-    k = _k_for_memory_fraction(dim, n, memory_fraction)
-    filt = _cap_cover(dim, k, quantize)
-    t0 = time.perf_counter()
-    filt.construct(B)
-    filter_build_s = time.perf_counter() - t0
-    filter_bytes = filt.get_bytesize()
-
-    def per_query_ms(fn, queries: np.ndarray) -> np.ndarray:
-        out = np.empty(len(queries))
-        for i in range(len(queries)):
-            v = queries[i:i + 1]
-            t = time.perf_counter_ns()
-            fn(v)
-            out[i] = (time.perf_counter_ns() - t) / 1e6
-        return out
-
-    filt.query(Q[:1], distance_threshold=0.2)          # hands the caps to Rust
-    flat.range_search(Q[:1], 0.04)
-    rows: List[Dict[str, Any]] = []
-    for delta in deltas:
-        tau = tau_of_cosine_distance(delta)
-        actual_all = nn <= tau
-        accept_all = np.asarray(filt.query(Q, distance_threshold=tau), dtype=bool)
-        fn = int(np.sum(actual_all & ~accept_all))
-        if fn:
-            raise InvariantViolation(f"Zero-false-negative invariant violated: {fn} FN "
-                                     f"(dataset={dataset}, fold={seed}, k={k}, delta={delta})")
-        accept = accept_all[timed]
-        filter_ms = per_query_ms(lambda v: filt.query(v, distance_threshold=tau), Q[timed])
-        without = per_query_ms(lambda v: flat.range_search(v, tau * tau), Q[timed])
-        with_f = filter_ms + accept * without
-        reject = 1.0 - float(accept.mean())
-        qps_without, qps_with = 1000.0 / without.mean(), 1000.0 / with_f.mean()
-        rows.append({
-            "dataset": dataset, "fold": seed, "delta": float(delta), "tau": tau,
-            "n_reference": n, "n_timed": len(timed), "memory_fraction": float(memory_fraction),
-            "encoding": filt.encoding_label,
-            "filter_build_s": filter_build_s, "filter_bytes": filter_bytes,
-            "filter_pct_of_raw": 100.0 * filter_bytes / (n * dim * 4),
-            "accept_rate_pct": 100.0 * float(accept.mean()),
-            "accept_rate_all_pct": 100.0 * float(accept_all.mean()),
-            "positive_rate_pct": 100.0 * float(actual_all.mean()),
-            "filter_mean_ms": float(filter_ms.mean()), "filter_p99_ms": float(np.percentile(filter_ms, 99)),
-            "backend_mean_ms": float(without.mean()), "backend_p50_ms": float(np.percentile(without, 50)),
-            "backend_p99_ms": float(np.percentile(without, 99)),
-            "with_mean_ms": float(with_f.mean()), "with_p50_ms": float(np.percentile(with_f, 50)),
-            "with_p99_ms": float(np.percentile(with_f, 99)),
-            "qps_without": qps_without, "qps_with": qps_with,
-            "throughput_improvement_pct": 100.0 * (qps_with - qps_without) / qps_without,
-            "breakeven_backend_ms": float(filter_ms.mean() / reject) if reject > 0 else float("inf"),
-        })
-    return rows
 
 
-def pinned_timing_worker(
-    dim: int,
-    dataset: str,
-    vectors_reference: VectorInput,
-    memory_fractions: Tuple[float, ...] = (0.01, 0.02, 0.05),
-    insert_memory_fraction: float = 0.02,
-    bootstrap_fraction: float = 0.8,
-    max_inserts: int = 2000,
-    vectors_query: Optional[VectorInput] = None,
-    scan_quantizes: Tuple[CapQuantize, ...] = (),
-    scan_budget_pcts: Tuple[float, ...] = (2.0,),
-    scan_delta: float = 0.05,
-) -> List[Dict[str, Any]]:
-    """Construction time of each CAP_CONSTRUCT_METHODS entry (the configuration
-    of construct_method_worker: FP32 caps, max_caps=k), per-arrival insertion
-    time of each CAP_INSERT_STRATEGIES entry (TQ4 caps at the byte budget of
-    the byte budget insert_memory_fraction of the raw index, as stream_rebuild_worker) and, given
-    vectors_query, the query throughput of one batch call of a cover in each of
-    `scan_quantizes` at each budget of `scan_budget_pcts` (% of the raw index, as
-    cap_quantization_worker's byte budgets) at cosine distance `scan_delta`, on the
-    core _pin_to_own_core picks. Sequential by construction: run it with a
-    single worker."""
-    _pin_to_own_core()
-    B = np.ascontiguousarray(_to_construct_array(vectors_reference), dtype=np.float32)
-    n = len(B)
-    rows: List[Dict[str, Any]] = []
-    for method, cls in CAP_CONSTRUCT_METHODS.items():
-        for mf in memory_fractions:
-            k = _k_for_memory_fraction(dim, n, mf, 32)
-            filt = CapCoverFilter(dim, construct_method=cls(), max_caps=k, insert_method=None)
-            t0 = time.perf_counter()
-            filt.construct(B)
-            rows.append({"dataset": dataset, "kind": "construct", "method": method, "memory_fraction": mf, "k": k,
-                         "n_reference": n, "seconds": time.perf_counter() - t0, "n_caps": filt._num_caps})
-    k = _k_for_memory_fraction(dim, n, insert_memory_fraction)
-    boot = max(1, round(bootstrap_fraction * n))
-    for strategy, cls in CAP_INSERT_STRATEGIES.items():
-        filt = CapCoverFilter(dim, max_memory=_cover_max_memory(dim, k), quantize=CapQuantize.TQ4,
-                              insert_method=cls())
-        filt.construct(B[:boot])
-        times = []
-        for t in range(boot, min(n, boot + max_inserts)):
-            t0 = time.perf_counter_ns()
-            filt.insert(B[t:t + 1])
-            times.append((time.perf_counter_ns() - t0) / 1e6)
-        times = np.asarray(times)
-        rows.append({"dataset": dataset, "kind": "insert", "method": strategy, "memory_fraction": insert_memory_fraction,
-                     "k": k, "n_reference": n, "n_inserts": len(times), "n_caps": filt._num_caps,
-                     "mean_ms": float(times.mean()), "p50_ms": float(np.percentile(times, 50)),
-                     "p99_ms": float(np.percentile(times, 99)), "max_ms": float(times.max())})
-    if vectors_query is not None:
-        Q = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
-        tau = tau_of_cosine_distance(scan_delta)
-        for quantize in scan_quantizes:
-            for pct in scan_budget_pcts:
-                k = min(max(1, round(pct / 100.0 * n)), n)
-                max_memory = _cover_max_memory(dim, k, 32)
-                construct_method = CAP_CONSTRUCT_METHODS[CAP_COVER_CONSTRUCT]()
-                if quantize == CAP_QUANTIZE_AUTO:
-                    filt = CapCoverFilter.auto(dim, max_memory=max_memory, construct_method=construct_method)
-                else:
-                    filt = CapCoverFilter(dim, max_memory=max_memory, quantize=quantize,
-                                          construct_method=construct_method)
-                try:
-                    filt.construct(B)
-                except InsufficientMemoryError:
-                    continue
-                filt.query(Q[:1], distance_threshold=tau)      # hands the caps to Rust
-                t0 = time.perf_counter()
-                filt.query(Q, distance_threshold=tau)
-                seconds = time.perf_counter() - t0
-                rows.append({"dataset": dataset, "kind": "scan", "method": _quantize_name(quantize), "budget_pct": float(pct),
-                             "k": k, "n_reference": n, "n_queries": len(Q), "n_caps": filt._num_caps,
-                             "memory_bytes": filt.get_bytesize(), "qps": len(Q) / max(seconds, 1e-9)})
-    return rows
 
 
 _WORKER_FNS: Dict[str, Any] = {
-    'cap_cover_system_tau': cap_cover_system_tau_worker,
     'end_to_end': end_to_end_worker,
     'blocklist': blocklist_tau_worker,
     # Same underlying cover-and-margin core (_blocklist_cover_rows), second
     # worker: generate_budget runs the identical blocklist measurement but
     # sweeps the ball budget at a fixed tau instead of sweeping tau at a fixed
-    # budget (see main.generate_budget).
+    # budget (see experiments.generate_budget).
     'budget': budget_worker,
     'cap_quantization': cap_quantization_worker,
-    'query_performance': query_performance_worker,
     'equal_memory': equal_memory_worker,
-    'scaling_query': scaling_query_worker,
-    'scaling_insert': scaling_insert_worker,
-    'scaling_construction': scaling_construction_worker,
-    'stream_rebuild': stream_rebuild_worker,
     'construct_method': construct_method_worker,
-    'construct_method_scale': construct_method_scale_worker,
-    'ablation': ablation_worker,
-    'filter_latency': filter_latency_worker,
-    'pinned_timing': pinned_timing_worker,
 }
+
+
+def tau_of_cosine_distance(delta: float) -> float:
+    """The L2 threshold of unit vectors at cosine distance `delta` (||a-b||^2 = 2 delta)."""
+    return float(np.sqrt(2.0 * delta))
 
 
 def _describe_job(kwargs: Dict[str, Any]) -> str:
@@ -2057,7 +1286,7 @@ class InvariantViolation(ValueError):
 class Runner:
     def __init__(self, num_workers: int = 1, truncate: bool = True) -> None:
         """truncate=False preserves an output_csv's existing rows (see
-        submit()) instead of starting fresh, so a resumed run appends."""
+        run()) instead of starting fresh, so a resumed run appends."""
         self.num_workers = num_workers
         self.truncate = truncate
         self._jobs: List[Dict[str, Any]] = []
@@ -2068,19 +1297,18 @@ class Runner:
     def submit(self, mode: str, output_csv: Optional[str] = None, **kwargs: Any) -> None:
         """output_csv, if given, is this job's target CSV: rewritten from
         every row completed so far for that path each time one of its jobs
-        completes, so a long-running sweep's progress is visible on disk
+        completes (run() starts the file fresh; submit() itself touches nothing on disk), so a long-running sweep's progress is visible on disk
         before it finishes. output_csv, not mode, is the routing key --
         several jobs (even of different modes) can share one path, or each
         target its own. A job with no output_csv is only returned by run()."""
         if mode not in _WORKER_FNS:
             raise ValueError(f"Unknown mode {mode!r}. Valid: {list(_WORKER_FNS)}")
-        if output_csv is not None and output_csv not in self._initialized_csvs:
-            self._init_csv(output_csv)
         self._jobs.append({'mode': mode, 'output_csv': output_csv, **kwargs})
 
     def _init_csv(self, output_csv: str) -> None:
-        """Runs once per distinct output_csv, at first submit(), so
-        truncation happens before any job targeting that path has run."""
+        """Runs once per distinct output_csv, at the start of run(), so
+        truncation happens before any job targeting that path has run and
+        only for paths a run really executes."""
         self._initialized_csvs.add(output_csv)
         if not self.truncate and os.path.exists(output_csv):
             self._rows_by_csv[output_csv] = pd.read_csv(output_csv).to_dict("records")
@@ -2102,6 +1330,10 @@ class Runner:
         submission order (sequential) -- the mode tag lets a caller that
         shared this Runner across job types split results back apart."""
         self._violations: List[str] = []
+        for job in self._jobs:
+            csv = job.get('output_csv')
+            if csv is not None and csv not in self._initialized_csvs:
+                self._init_csv(csv)
         results = self._run_sequential() if self.num_workers == 1 else self._run_parallel()
         if self._violations:
             raise InvariantViolation(

@@ -21,9 +21,6 @@ def stable_hash_to_int(key) -> int:
     return struct.unpack('<I', digest[:4])[0]
 
 
-def stable_bit_index(key, num_bits: int) -> int:
-    """Map `key` to a bit position in [0, num_bits)."""
-    return stable_hash_to_int(key) % num_bits
 
 
 def signature_to_key(signature):

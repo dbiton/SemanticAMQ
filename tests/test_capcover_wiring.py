@@ -1,8 +1,6 @@
-"""Every evaluation main.generate_and_plot_all() runs must use CapCoverFilter.
+"""Every evaluation paper.py runs (paper.EVALUATIONS) must use CapCoverFilter.
 
-Static check: no generator is called, since generators truncate their output
-CSVs (see CLAUDE.md, "Generators delete outputs"). Instead the AST of main.py
-gives the generators generate_and_plot_all() invokes, the runner modes each one
+Static check, no generator is called. The AST of experiments.py gives, for each generator paper.EVALUATIONS wires in, the runner modes each one
 submits, and the worker each mode maps to; those workers' source must not build
 a BallCoverFilter.
 """
@@ -14,7 +12,7 @@ import unittest
 
 import runner
 
-MAIN_PATH = os.path.join(os.path.dirname(__file__), "..", "src", "main.py")
+MAIN_PATH = os.path.join(os.path.dirname(__file__), "..", "src", "experiments.py")
 BALL_COVER_NAMES = ("BallCoverFilter", "_ball_cover")
 
 
@@ -37,16 +35,18 @@ def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return node
-    raise AssertionError(f"main.py has no function {name!r}")
+    raise AssertionError(f"experiments.py has no function {name!r}")
 
 
 def _called_generators(tree: ast.Module) -> list:
-    """Names of generate_* functions referenced (called or looped over) inside generate_and_plot_all."""
-    body = _function(tree, "generate_and_plot_all")
+    """Names of the experiments.py generate_* functions paper.EVALUATIONS runs."""
+    import paper    # lazily: importing it sets CAPCOVER_SCAN_LIMIT_MS for the whole session
     names = []
-    for node in ast.walk(body):
-        if isinstance(node, ast.Name) and node.id.startswith("generate_"):
-            names.append(node.id)
+    for evaluation in paper.EVALUATIONS.values():
+        gen = evaluation.generate
+        name = getattr(gen, "__name__", None) or gen.func.__name__
+        if any(isinstance(n, ast.FunctionDef) and n.name == name for n in tree.body):
+            names.append(name)
     return names
 
 
@@ -69,8 +69,8 @@ class TestCapCoverWiring(unittest.TestCase):
         self.tree = _main_tree()
         self.generators = _called_generators(self.tree)
 
-    def test_generate_and_plot_all_invokes_generators(self):
-        self.assertTrue(self.generators, "generate_and_plot_all calls no generators")
+    def test_paper_runs_generators(self):
+        self.assertTrue(self.generators, "paper.EVALUATIONS wires no experiments.py generator")
 
     def test_no_enabled_generator_submits_ball_cover_filter(self):
         for name in self.generators:
@@ -87,14 +87,6 @@ class TestCapCoverWiring(unittest.TestCase):
             for mode in modes:
                 used = _code_names(runner._WORKER_FNS[mode]) & set(BALL_COVER_NAMES)
                 self.assertFalse(used, f"{name} -> mode {mode!r} worker code uses {sorted(used)}")
-
-    def test_plot_all_reads_cap_cover_outputs(self):
-        plot_all = _function(self.tree, "plot_all")
-        called = {n.func.id for n in ast.walk(plot_all)
-                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-        self.assertIn("plot_cap_quantization", called)
-        self.assertIn("plot_cap_cover_system_tau", called)
-        self.assertNotIn("plot_quantization", called)
 
 
 if __name__ == "__main__":

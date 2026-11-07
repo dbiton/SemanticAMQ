@@ -66,9 +66,6 @@ def pair_angles(X: np.ndarray, U: np.ndarray, idx: np.ndarray) -> np.ndarray:
     return out
 
 
-def chord_to_angle(chord) -> np.ndarray:
-    """Angle subtended by a chord of the unit sphere."""
-    return 2.0 * np.arcsin(np.minimum(1.0, 0.5 * np.asarray(chord, dtype=np.float64)))
 
 
 def nearest_directions(X: np.ndarray, U: np.ndarray, k: int = 1) -> Tuple[np.ndarray, np.ndarray]:

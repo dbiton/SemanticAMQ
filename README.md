@@ -55,119 +55,94 @@ The filter says YES whenever $M_X(q, \tau) = 1$, and may also say YES for some o
 
 ## How it works
 
-Unit-normalized embeddings lie on a sphere. CapCover Filter stores a small set of **spherical caps** that together contain every indexed vector. Each cap is only a direction $u_i$ and an angle $\theta_i$:
+SAMQ (Cap-Cover) builds a cover of spherical caps over the construct set (direction
+and angle per cap, quantizable to shrink memory -- see `Quantize` in
+[cap_cover_filter.py](src/filters/cap_cover/cap_cover_filter.py)),
+then answers a query by checking whether it falls within any cap's
+angle (widened by the query threshold). It is compared at equal memory against the
+baselines in [src/filters/](src/filters/): VA+-file, a quantized point set, two
+zero-false-negative LSH schemes, and the approximate DSH, HNSW, IVF-PQ and MLP.
 
 $$
 C(u_i, \theta_i) = \lbrace x \in S^{d-1} : \angle(x, u_i) \le \theta_i \rbrace.
 $$
 
-<p align="center">
-  <img src="assets/cap-cover-scheme.png" alt="Embeddings on a circle covered by four caps, with one accepted and one rejected query" width="440">
-</p>
-
-**Figure 1.** Embeddings are covered by caps, each defined by a direction $u_i$ and an angle $\theta_i$. At query time each cap is widened by the angle that corresponds to $\tau$. The query marked "true" lands inside a widened cap and goes on to verification. The query marked "false" lands outside all of them and is rejected.
-
-A query is accepted if it falls inside at least one widened cap:
-
-$$
-\angle(q, u_i) \le \theta_i + \alpha_\tau \quad \text{for some } i, \qquad \alpha_\tau = \arccos(1 - \tau).
-$$
-
-> **Why a NO is always correct.** If $q$ is within $\tau$ of an indexed vector $x$, and $x$ lies in cap $i$, the triangle inequality for angles gives $\angle(q, u_i) \le \angle(q, x) + \angle(x, u_i) \le \alpha_\tau + \theta_i$. So $q$ is always accepted.
-
-Two more properties follow from this design:
-
-- **Threshold independence.** The caps depend only on the indexed vectors and the memory budget. $\tau$ appears only at query time, so one filter serves many thresholds without being rebuilt.
-- **A fixed byte budget.** Each cap can summarize many vectors, and the budget sets how many caps fit. A tighter budget adds false positives, never false negatives.
-
-## Building a cover
-
-False positives come from the excess space inside the caps, so the goal is a valid cover with small total volume. For a given byte budget:
-
-| Step | Method | What it does |
-|:---:|---|---|
-| 1 | **Farthest-first traversal** | Picks well-spread initial directions (Gonzalez) |
-| 2 | **Minimax refinement** | Moves each direction toward the center of its members' enclosing cap |
-| 3 | **Soft anneal** | Optimizes all directions together on the sphere to reduce the total cap volume $\sum_i \sigma(\theta_i)$, and keeps the best real cover it finds |
-| 4 | **Quantization** | Compresses the directions so more caps fit, then re-measures every angle so coverage still holds |
-
-The filter builds a cover for each candidate encoding and keeps the one with the smallest cap volume.
-
-The paper evaluates this static construction. The implementation also supports insertions.
-
-## Results
-
-We evaluate on five real-world corpora (WildChat, Quora, WikiAnswers, ChatGPT-Paraphrases and CC-News), embedded with all-MiniLM-L6-v2 ($d = 384$). Each of the five folds indexes 80,000 vectors and queries with 20,000 others. Memory is reported relative to the raw float32 embeddings, about 123 MB at this size.
-
-<p align="center">
-  <img src="assets/fpr-and-accesses-saved.png" alt="False-positive rate by query relatedness, and index accesses saved, as memory and threshold vary" width="880">
-</p>
-
-**Figure 2.** Top: varying the memory budget at $\tau = 0.05$. Bottom: varying $\tau$ at 2% memory. The first three columns show the false-positive rate for negative queries, grouped by similarity to their closest indexed vector. The last column shows index accesses saved, with each corpus's share of negative queries dashed.
-
-Compared with other zero-false-negative methods at equal memory, the geometric cover gives useful rejection at very small budgets, where the alternatives are ineffective or do not fit.
-
-<p align="center">
-  <img src="assets/baselines-equal-memory.png" alt="False-positive rate of CapCover Filter and zero-false-negative baselines as the memory budget grows" width="880">
-</p>
-
-**Figure 3.** Mean false-positive rate of zero-false-negative methods at equal memory budgets, at $\tau = 0.05$.
-
-## When to use it
-
-| Works best with | Helps less with |
-|---|---|
-| Tight thresholds, as in paraphrase detection and de-duplication | Looser thresholds, which widen every cap |
-| Very limited memory and clustered embeddings | Larger budgets, where point-level methods such as VA+-file can reach a lower false-positive rate |
-| Many queries that have no match | Negatives close to the indexed set, which stay hard to reject |
-| Expensive backend lookups | Cheap lookups: with filter cost $F$, rejection rate $r$ and lookup cost $L$, the filter pays off only when $L \gt F / r$ |
-
-## Theory
-
-The paper proves that:
-
-- Every valid cover has zero false negatives, including covers with quantized directions.
-- Exact angular decoding of a ball cover accepts no more than Euclidean expansion of the same balls.
-- Farthest-first construction has a factor-two guarantee on the largest cap radius, which does not extend to cap volume.
-- The false-positive rate is bounded by the geometry of the cover and by how many queries fall near the true decision boundary.
-- Any structure that guarantees a low false-positive rate under uniform queries, for every dataset, needs a minimum amount of space, whatever its encoding.
-
-<details>
-<summary><b>Key formulas</b></summary>
-
-<br>
-
-**Farthest-first guarantee.** The largest cap angle of the farthest-first cover $\mathcal{C}_G$ is at most twice the best possible with $k$ caps:
-
-```math
-R(\mathcal{C}_G) \le 2 R^\star_k(X).
+```
+src/
+  paper.py            the entry point: runs the paper's evaluations, builds the Rust kernels, draws its figures
+  experiments.py      evaluation definitions (generate_* submit jobs to a Runner)
+  workloads.py        positional folds over a corpus file, exact ground truth
+  runner.py           parallel job harness (ProcessPoolExecutor) + per-job workers
+  filters/            Cap-Cover (cap_cover/) and the baselines
+  plots/              plot_paper.py (the figures)
+  rust_build.py       builds CapCoverRustFilter into the running interpreter (paper.py calls it)
+  util/               dataset registry (import-light), dataset builders, space bound
+  vector_source.py    lazy/array-backed vector handles passed to worker processes
+CapCoverRustFilter/   Rust crate behind CapCoverFilter.query()
+tests/                unittest-style tests, one file per filter/module
+datasets/             embedding files (HDF5 despite .pkl; not checked in)
+results/              generated CSVs (not checked in)
+figures/              generated figures
 ```
 
 **False-positive bound.** Under uniform queries, the total measure of the widened caps bounds the false-positive rate:
 
-```math
-\mathrm{FPR}_\nu(\mathcal{C}, \tau) \le \min\lbrace 1, J_\tau(\mathcal{C}) \rbrace, \qquad J_\tau(\mathcal{C}) = \sum_i \sigma(\theta_i + \alpha_\tau).
+Python 3.12 with faiss-cpu 1.15.1 is the tested combination.
+
+```
+pip install -r requirements.txt            # evaluation and plotting
+# the Rust scan is built by `python src/paper.py` (needs a Rust toolchain); by hand:
+pip install maturin && cd CapCoverRustFilter && maturin develop --release
+pip install -r requirements-data.txt       # only to build datasets (sentence_transformers)
+python src/util/fetch_datasets.py          # the paper's five corpora -> datasets/
 ```
 
-**Space lower bound.** Take any deterministic structure that represents every set of $n$ points on the sphere in $\mathcal{B}$ bytes, with no false negatives and a uniform-query false-positive rate of at most $\varepsilon$. Then
+The evaluations read `datasets/embeds_<corpus>.pkl` for WildChat, Quora, WikiAnswers,
+ChatGPT-Paraphrases and CC-News (see `dataset_filenames` in
+[src/util/dataset_paths.py](src/util/dataset_paths.py)); each needs 500,000 rows for the
+five-fold 100,000-vector runs.
 
-```math
-\mathcal{B} \ge \frac{n}{8} \log_2 \frac{1}{\sigma\bigl(\sigma^{-1}(\eta) - \alpha_\tau\bigr)}, \qquad \eta = \varepsilon + (1 - \varepsilon) n \sigma(\alpha_\tau) \lt 1.
+## Running the evaluations
+
+Run from the repository root.
+
+```
+python src/paper.py --list                       # evaluations, their scale and outputs
+python src/paper.py                              # build the Rust kernels, run everything, draw the figures
+python src/paper.py --only budget,construction      # a subset
+python src/paper.py --missing                    # only evaluations without complete CSVs
+python src/paper.py plot [figure ...]            # re-draw from existing CSVs; needs no datasets
+python src/paper.py --num-vectors 10000 --folds 1 --results /tmp/small    # a reduced trial run
 ```
 
-</details>
+Every evaluation uses the paper's workload: per corpus, five folds of 80,000 indexed vectors (from the
+start of the file) and 20,000 queries (from its end), at cosine-distance threshold tau = 0.05 and with
+Cap-Cover built by soft anneal with automatic encoding selection. Budgets are M_filter/M_raw, the filter's
+bytes over the raw float32 array. **Running an evaluation rewrites its CSVs** in `--results` (default
+`results/`); collecting jobs does not. `python src/paper.py` first runs `maturin develop --release`
+(incremental; `--no-build` skips it).
 
-## Installation
+Hardware: the full run was made on a 32-core Threadripper with 896 GB RAM (30 parallel workers,
+about 10 GB per job). The timed evaluations (end-to-end, on one pinned core; `--timing-workers` for more)
+run after the parallel batch and need an otherwise idle machine; timings from the parallel batch are
+not timing claims.
 
-CapCover Filter is implemented in Python with a Rust query kernel, and uses FAISS for exact search. It requires Python and the [Rust toolchain](https://rustup.rs/). The commands below install the Python dependencies and compile the Rust query kernel. Tested with Python 3.13 and Rust 1.91 on Windows.
+## Tests
 
-```bash
-git clone https://github.com/dbiton/SemanticAMQ.git
-cd SemanticAMQ
-pip install -r requirements.txt
-pip install ./CapCoverRustFilter
+```
+pip install -r requirements-dev.txt
+python -m pytest tests
 ```
 
-## License
+Tests that need the Rust extension's newer kernels or AVX-512 skip when they are unavailable; rebuild
+the extension (above) so the Python/Rust parity tests run.
 
-© 2026 Dvir David Biton, Shay Hahiashvili, Nadav Keren, Gil Einziger, Roy Friedman
+## Outputs
+
+CSVs in `results/` (one file per evaluation, or per corpus); figures in `figures/`
+with a `plot-manifest.json` recording each figure's input files, row counts and hashes.
+
+## Release tree
+
+`.gitattributes` marks scratch directories (`suggestions/`, `bench_construct/`, `tasks/`) `export-ignore`,
+so `git archive HEAD` produces the publication tree without them.

@@ -1,0 +1,4 @@
+# Dataset preparation only (python src/util/fetch_datasets.py); the evaluation never imports these.
+-r requirements.txt
+datasets
+sentence_transformers

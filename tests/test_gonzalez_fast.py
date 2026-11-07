@@ -105,7 +105,11 @@ class _Cases:
         a = gonzalez_chosen_numpy(X, 10)
         b = self.chosen(X, 10)
         self.assertEqual(a.tolist(), [0])
-        self.assertEqual(b.tolist(), [0])
+        # The stop is best_ip >= 1.0 in float32; x.x of this row is 0.99999997, which rounds to 1.0
+        # or just below depending on the dot's summation order (x86 vs ARM). Either way the first
+        # pick is row 0 and every pick is an exact copy of it: the cover is trivial.
+        self.assertEqual(b[0], 0)
+        self.assertTrue(np.all(X[b] == X[0]))
 
     def test_early_stop_all_chosen(self):
         base = _unit(np.random.default_rng(7).standard_normal((12, 40)))

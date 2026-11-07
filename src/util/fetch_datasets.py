@@ -1,5 +1,12 @@
+"""Builds datasets/embeds_<corpus>.pkl (HDF5 despite the name) with sentence_transformers: the
+dataset-preparation side of the project, kept apart from the evaluation code (heavy imports).
+
+    python src/util/fetch_datasets.py                 # the paper's five corpora
+    python src/util/fetch_datasets.py ELI5 MMLU       # others, by name (see BUILDERS)
+"""
 import ast
 import os
+import sys
 import h5py
 
 # Increase timeout to 100 seconds (default is 10)
@@ -8,7 +15,7 @@ os.environ["HF_HUB_ETAG_TIMEOUT"] = "100"
 os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "100"
 
 import numpy as np
-from typing import *
+from typing import Any, Dict, List, Tuple
 from datasets import load_dataset
 from sentence_transformers import SentenceTransformer
 from contextlib import contextmanager
@@ -17,20 +24,11 @@ from datasets.combine import concatenate_datasets
 from scipy.cluster.hierarchy import DisjointSet
 from sklearn.preprocessing import normalize
 
-from util.dataset_paths import dataset_filenames  # load_embeds/load_meta both index this
 
 embeds_dir = "datasets"
 MAX_STREAM_LENGTH = 750_000
 models: Dict[str, SentenceTransformer] = {}
 
-def load_embeds(dataset_name: str, N: int):
-    path = dataset_filenames[dataset_name]
-    with h5py.File(path, "r") as f:
-        embeds = f["normalized_embeds"][:N]
-        text_bytes = f["text"][:N]
-        embeds_texts = [t.decode("utf-8") for t in text_bytes]
-    embeds = np.array(embeds, dtype=np.float32)
-    return embeds, embeds_texts
 
 def embed_strings(strings: List[str], model_name: str = "all-MiniLM-L6-v2") -> np.ndarray:
     if model_name not in models:
@@ -111,24 +109,6 @@ def pack_and_dump(path: str, texts: List[str], meta: Dict[str, List[Any]], model
     print(f"Saved HDF5 to {path}")
 
 
-def load_meta(dataset_name: str, N: Optional[int] = None) -> Dict[str, np.ndarray]:
-    """Metadata columns written by _write_meta, as {column: array of N rows}.
-
-    Returns {} for the datasets built before metadata was persisted -- their
-    .pkl predates _write_meta and has no "meta" group, so a caller that needs
-    e.g. Quora's set_id must delete that file and rebuild.
-    """
-    path = dataset_filenames[dataset_name]
-    out: Dict[str, np.ndarray] = {}
-    with h5py.File(path, "r") as f:
-        if "meta" not in f:
-            return out
-        for key in f["meta"]:
-            col = f["meta"][key][:N] if N is not None else f["meta"][key][:]
-            if col.dtype.kind in ("S", "O"):
-                col = np.array([v.decode("utf-8") if isinstance(v, bytes) else v for v in col], dtype=object)
-            out[key] = col
-    return out
 
 def build_eli5() -> Tuple[List[str], Dict[str, List[Any]]]:
     ds = load_dataset("sentence-transformers/eli5", trust_remote_code=True)
@@ -164,36 +144,6 @@ def build_wildchat() -> Tuple[List[str], Dict[str, List[Any]]]:
     }
     return texts, meta
 
-def build_qrecc() -> Tuple[List[str], Dict[str, List[Any]]]:
-    ds = load_dataset("svakulenk0/qrecc")
-    texts, session_id, turn_id = [], [], []
-    # Fields: 'conversation_id' (or 'qid_conv'), 'turn_id' (or 'turn'), 'question'
-    for split in ("train", "validation", "test"):
-        if split not in ds:
-            continue
-        for ex in ds[split]:
-            q = ex.get("question") or ex.get("rewritten_question") or ex.get("raw_question")
-            if not q:
-                continue
-            cid = ex.get("conversation_id") or ex.get("qid_conv") or ex.get("conversation_no") or "unk"
-            tid = ex.get("turn_id") or ex.get("turn") or 0
-            texts.append(q)
-            session_id.append(f"qrecc_{cid}")
-            turn_id.append(int(tid))
-    # Sort by (session, turn) to preserve order
-    order = sorted(range(len(texts)), key=lambda i: (session_id[i], turn_id[i]))
-    texts = [texts[i] for i in order]
-    session_id = [session_id[i] for i in order]
-    turn_id = [turn_id[i] for i in order]
-    meta = {
-        "dataset": ["QReCC"] * len(texts),
-        "session_id": session_id,
-        "turn_id": turn_id,
-        "language": ["en"] * len(texts),
-        "timestamp": [None] * len(texts),
-        "pair_id": [None] * len(texts),
-    }
-    return texts, meta
 
 def build_stackoverflow() -> Tuple[List[str], Dict[str, List[Any]]]:
     ds = load_dataset("pacovaldez/stackoverflow-questions")
@@ -531,98 +481,34 @@ def build_wikianswers() -> Tuple[List[str], Dict[str, List[Any]]]:
     return texts, meta
 
 
+# registry name (util.dataset_paths) -> (builder, output file)
+BUILDERS = {
+    "WildChat": (build_wildchat, "embeds_wildchat.pkl"),
+    "Quora": (build_quora, "embeds_quora_qp.pkl"),
+    "WikiAnswers": (build_wikianswers, "embeds_wikianswers.pkl"),
+    "ChatGPTParaphrases": (build_chatgpt_paraphrases, "embeds_chatgpt_paraphrases.pkl"),
+    "CCNews": (build_ccnews, "embeds_ccnews.pkl"),
+    "ELI5": (build_eli5, "embeds_eli5.pkl"),
+    "MMLU": (build_mmlu, "embeds_mmlu.pkl"),
+    "StackOverflow": (build_stackoverflow, "embeds_stackoverflow.pkl"),
+    "TriviaQA": (build_triviaqa, "embeds_triviaqa.pkl"),
+    "HotPotQA": (build_hotpotqa, "embeds_hotpotqa.pkl"),
+    "NaturalQuestions": (build_nq, "embeds_nq.pkl"),
+    "MsMarco": (build_msmarco, "embeds_msmarco.pkl"),
+    "peS2o": (build_pes2o, "embeds_pes2o.pkl"),
+}
+PAPER_CORPORA = ("WildChat", "Quora", "WikiAnswers", "ChatGPTParaphrases", "CCNews")
+
+
 if __name__ == "__main__":
     os.makedirs(embeds_dir, exist_ok=True)
-
-    try:
-        print("generating CC-News...")
-        texts, meta = build_ccnews()
-        pack_and_dump(os.path.join(embeds_dir, "embeds_ccnews.pkl"), texts, meta)
-    except Exception as e:
-        print(f"Failed to generate CC-News: {e}")
-
-    try:
-        print("generating ChatGPT-paraphrases...")
-        texts, meta = build_chatgpt_paraphrases()
-        pack_and_dump(os.path.join(embeds_dir, "embeds_chatgpt_paraphrases.pkl"), texts, meta)
-    except Exception as e:
-        print(f"Failed to generate ChatGPT-paraphrases: {e}")
-
-    try:
-        print("generating StackOverflow...")
-        texts, meta = build_stackoverflow()
-        pack_and_dump(os.path.join(embeds_dir, "embeds_stackoverflow.pkl"), texts, meta)
-    except Exception as e:
-        print(f"Failed to generate StackOverflow: {e}")
-
-    try:
-        print("generating Quora Question Pairs...")
-        texts, meta = build_quora()
-        pack_and_dump(os.path.join(embeds_dir, "embeds_quora_qp.pkl"), texts, meta)
-    except Exception as e:
-        print(f"Failed to generate Quora Question Pairs: {e}")
-
-    try:
-        print("generating WildChat...")
-        texts, meta = build_wildchat()
-        pack_and_dump(os.path.join(embeds_dir, "embeds_wildchat.pkl"), texts, meta)
-    except Exception as e:
-        print(f"Failed to generate WildChat: {e}")
-
-    try:
-        print("generating TriviaQA...")
-        texts, meta = build_triviaqa()
-        pack_and_dump(os.path.join(embeds_dir, "embeds_triviaqa.pkl"), texts, meta)
-    except Exception as e:
-        print(f"Failed to generate TriviaQA: {e}")
-
-    try:
-        print("generating HotpotQA...")
-        texts, meta = build_hotpotqa()
-        pack_and_dump(os.path.join(embeds_dir, "embeds_hotpotqa.pkl"), texts, meta)
-    except Exception as e:
-        print(f"Failed to generate HotpotQA: {e}")
-
-    try:
-        print("generating MMLU...")
-        texts, meta = build_mmlu()
-        pack_and_dump(os.path.join(embeds_dir, "embeds_mmlu.pkl"), texts, meta)
-    except Exception as e:
-        print(f"Failed to generate MMLU: {e}")
-
-    try:
-        print("generating ELI5...")
-        texts, meta = build_eli5()
-        pack_and_dump(os.path.join(embeds_dir, "embeds_eli5.pkl"), texts, meta)
-    except Exception as e:
-        print(f"Failed to generate ELI5: {e}")
-
-    try:
-        print("generating Natural Questions...")
-        texts, meta = build_nq()
-        pack_and_dump(os.path.join(embeds_dir, "embeds_nq.pkl"), texts, meta)
-    except Exception as e:
-        print(f"Failed to generate Natural Questions: {e}")
-
-    try:
-        print("generating MS MARCO...")
-        texts, meta = build_msmarco()
-        pack_and_dump(os.path.join(embeds_dir, "embeds_msmarco.pkl"), texts, meta)
-    except Exception as e:
-        print(f"Failed to generate MS MARCO: {e}")
-
-    try:
-        print("generating peS2o...")
-        texts, meta = build_pes2o()
-        pack_and_dump(os.path.join(embeds_dir, "embeds_pes2o.pkl"), texts, meta)
-    except Exception as e:
-        print(f"Failed to generate peS2o: {e}")
-
-    try:
-        print("generating WikiAnswers...")
-        texts, meta = build_wikianswers()
-        pack_and_dump(os.path.join(embeds_dir, "embeds_wikianswers.pkl"), texts, meta)
-    except Exception as e:
-        print(f"Failed to generate WikiAnswers: {e}")
-
-    print("Done.")
+    for name in sys.argv[1:] or PAPER_CORPORA:
+        if name not in BUILDERS:
+            raise SystemExit(f"unknown corpus {name!r}; choose from {sorted(BUILDERS)}")
+        builder, filename = BUILDERS[name]
+        try:
+            print(f"generating {name}...")
+            texts, meta = builder()
+            pack_and_dump(os.path.join(embeds_dir, filename), texts, meta)
+        except Exception as e:
+            print(f"Failed to generate {name}: {e}")
