@@ -386,11 +386,12 @@ def quantization(mode="saved"):
     if speedup:
         e2e = pd.read_csv(RESULTS / "end_to_end.csv")
         lookup = float((1.0 / e2e.throughput_without_qps).mean())
-        p = np.maximum(q.n_index_accesses / q.n_queries, 0.5 / q.n_queries)
+        p = q.n_index_accesses / q.n_queries
         q["improvement"] = 100.0 * (lookup / (1.0 / q.query_throughput_qps + p * lookup) - 1.0)
         print(f"  simulated speedup at a flat-index lookup of {lookup * 1e3:.1f} ms")
     agg = (q.groupby(["corpus", "quantize", "budget_pct"])
            .agg(saved=("index_accesses_saved_pct", "mean"), qps=("query_throughput_qps", "median"), gain=("improvement" if speedup else "index_accesses_saved_pct", "mean"),
+                gain_sd=("improvement" if speedup else "index_accesses_saved_pct", "std"),
                 singleton=("singleton", "mean"))
            .reset_index())
     ceilings = q.groupby("corpus").neg_share_pct.median()
@@ -420,6 +421,10 @@ def quantization(mode="saved"):
                 continue
             y = g.qps if throughput else g.gain if speedup else g.saved
             ax.plot(g.budget_pct, y, color=color, ls=ls, lw=1.2, zorder=2)
+            if speedup:                                  # +-1 std over folds, kept on the symlog axis
+                sd = g.gain_sd.fillna(0).to_numpy()
+                ax.errorbar(g.budget_pct, y, yerr=sd, color=color, ls="none", elinewidth=0.5,
+                            capsize=1, zorder=1)
             full = g.singleton >= 0.5
             ax.scatter(g.budget_pct[~full], y[~full], color=color, marker=marker,
                        s=12, edgecolor="white", lw=0.5, zorder=3)
@@ -614,12 +619,21 @@ BACKEND_TICKS = {1e-4: "100 µs", 1e-3: "1 ms", 1e-2: "10 ms", 1e-1: "100 ms", 1
 
 def _backend_cost_panel(ax, d):
     """Improvement (%) against the cost L of one backend lookup, from each row's
-    measured t_f and p (see throughput()); mean over folds, one marker per
-    corpus at its measured flat-index cost. A fold that accepts nothing has p
-    floored at half a query, since the improvement is unbounded as p -> 0."""
-    p = np.maximum(d.positive_rate_pct / 100.0, 0.5 / d.n_queries)
+    independently measured filter-only cost and acceptance rate. Legacy CSVs
+    cannot support this projection; never infer or clip a timing residual."""
+    if "filter_query_s" not in d or d.filter_query_s.isna().any():
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_axis_off()
+        ax.text(0.5, 0.5, "Filter-only timing unavailable\nRerun end-to-end evaluation",
+                ha="center", va="center", transform=ax.transAxes, fontsize=6)
+        return
+    if (not np.isfinite(d.filter_query_s).all() or (d.filter_query_s <= 0).any()
+            or not np.isfinite(d.n_queries).all() or (d.n_queries <= 0).any()):
+        raise ValueError("filter_query_s and n_queries must be finite and positive")
+    p = d.positive_rate_pct / 100.0
     l0 = 1.0 / d.throughput_without_qps
-    t_f = (1.0 / d.throughput_with_qps - p * l0).clip(lower=0.0)
+    t_f = d.filter_query_s / d.n_queries
     d = d.assign(p=p, l0=l0, t_f=t_f)
     for corpus in CORPORA:
         g = d[d.corpus == corpus]
@@ -722,9 +736,11 @@ def throughput():
             ax.xaxis.set_major_locator(matplotlib.ticker.LogLocator(base=10, subs=(1, 2, 5)))
         ax.set_xlabel(xlabel)
         ax.set_title(title, color=INK)
-    # One y range for all panels, so the zero line sits at the same height.
+    # Share the full data/error-bar range, including negative improvements.
+    ymin = min(-100.0, *(ax.get_ylim()[0] for ax in axes[0]))
+    ymax = max(Y_TOP, *(ax.get_ylim()[1] for ax in axes[0]))
     for ax in axes[0]:
-        ax.set_ylim(-Y_LINTHRESH, Y_TOP)
+        ax.set_ylim(ymin, ymax)
     axes[0, 0].set_ylabel("throughput improvement (%)")
     present = [c for c in CORPORA if c in set(to_corpus(d.dataset))]
     handles = [plt.Line2D([], [], color=CORPUS_STYLE[c][0], marker=CORPUS_STYLE[c][1]) for c in present]
@@ -804,6 +820,7 @@ def plot_figures(requested=None, results=None, out=None):
         "threshold_units": "stored L2 thresholds are displayed as cosine distance = L2 squared / 2",
         "paper_caption_checks": [
             "Figure 4 reports modeled speedup, not a direct end-to-end timing measurement.",
+            "Figure 2's backend-cost projection requires independent filter-only timings; legacy runs show an unavailable notice.",
             "Figure 6 uses only FP32 rows; its threshold is taken from the source CSV, not the PDF caption.",
             "Fixed TQ2 and TQ4 baselines retain their encoding labels and are not named automatic selection.",
             "Both fixed-threshold throughput panels use the configured cosine distance; a single available budget is plotted as a point.",

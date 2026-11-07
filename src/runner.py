@@ -919,65 +919,91 @@ def end_to_end_worker(
     filter and only for the accepted ones with it. One row per (memory_fraction,
     tau) in `cells`; one cover per memory_fraction (_cap_cover), built once.
 
-    throughput_improvement_pct = (with - without) / without. Both timings come
-    from this one process back to back, each the best of `repeats` runs, so
-    the ratio is far steadier than either absolute qps when many workers share
-    the machine (absolute timings still want a pinned run, see CLAUDE.md).
-    The filter is warmed up before timing (the first query() hands the caps
-    to Rust). Raises on a false negative, as every worker does. Pins itself to
-    one core when CAPCOVER_PIN_CORES is set (_pin_to_own_core)."""
+    Each cell gets fresh, warmed baseline/filtered passes in alternating order;
+    reported runtimes are medians of complete passes, not per-query timings.
+    Filter-only passes are measured independently for backend-cost projections.
+    Construction and lazy first-query preparation are recorded separately and
+    reused across thresholds. Loading, index setup, ground truth, validation,
+    memory accounting, and warmup are outside query timers. Required per-query
+    rotation, decoding and backend result materialization remain timed.
+    Raises on a false negative. Pins itself to one core when
+    CAPCOVER_PIN_CORES is set (_pin_to_own_core)."""
+    if repeats < 1:
+        raise ValueError("repeats must be positive")
     _pin_to_own_core()
     B = np.ascontiguousarray(_to_construct_array(vectors_reference), dtype=np.float32)
     Q = np.ascontiguousarray(_to_construct_array(vectors_query), dtype=np.float32)
     n_q = len(Q)
+    if n_q == 0:
+        raise ValueError("end-to-end timing requires at least one query")
     index = faiss.IndexFlatL2(dim)
     index.add(B)
     d2, _ = index.search(Q, 1)
     nn = np.sqrt(np.clip(d2[:, 0], 0, None))
 
-    def best_time(fn) -> float:
-        best = float("inf")
-        for _ in range(repeats):
-            start = time.perf_counter()
-            fn()
-            best = min(best, time.perf_counter() - start)
-        return best
-
-    without: Dict[float, float] = {}
-    for tau in sorted({float(t) for _, t in cells}):
-        def search_all(tau=tau) -> None:
-            for i in range(n_q):
-                index.range_search(Q[i:i + 1], tau * tau)
-        without[tau] = best_time(search_all)
+    def elapsed(fn) -> float:
+        start = time.perf_counter()
+        fn()
+        duration = time.perf_counter() - start
+        if not np.isfinite(duration) or duration <= 0:
+            raise ValueError(f"invalid query runtime: {duration}")
+        return duration
 
     rows: List[Dict[str, Any]] = []
     for mf in sorted({float(f) for f, _ in cells}):
         k = _k_for_memory_fraction(dim, len(B), mf)
+        start = time.perf_counter()
         filt = _cap_cover(dim, k, quantize)
         filt.construct(B)
+        construct_s = time.perf_counter() - start
         memory_bytes = filt.get_bytesize()
         encoding = filt.encoding_label
-        for tau in sorted(float(t) for f, t in cells if float(f) == mf):
-            predicted = np.zeros(n_q, dtype=bool)
-            filt.query(Q[:1], distance_threshold=tau)
-
-            def filtered_search() -> None:
-                for i in range(n_q):
-                    v = Q[i:i + 1]
-                    hit = filt.query(v, distance_threshold=tau)[0]
-                    predicted[i] = hit
-                    if hit:
-                        index.range_search(v, tau * tau)
-            with_s = best_time(filtered_search)
-
+        thresholds = sorted(float(t) for f, t in cells if float(f) == mf)
+        start = time.perf_counter()
+        filt.query(Q[:1], distance_threshold=thresholds[0])
+        prepare_s = time.perf_counter() - start
+        for tau in thresholds:
+            radius = tau * tau
+            # Validate the same single-query API used by the timed path.
+            predicted = np.fromiter(
+                (filt.query(Q[i:i + 1], distance_threshold=tau)[0] for i in range(n_q)),
+                dtype=bool, count=n_q)
             actual = nn <= tau
             fn = int(np.sum(actual & ~predicted))
             if fn:
                 raise InvariantViolation(
                     f"Zero-false-negative invariant violated: {fn} FN "
                     f"(dataset={dataset}, fold={seed}, k={k}, tau={tau})")
-            qps_without = n_q / max(without[tau], 1e-9)
-            qps_with = n_q / max(with_s, 1e-9)
+
+            def search_all() -> None:
+                for i in range(n_q):
+                    index.range_search(Q[i:i + 1], radius)
+
+            def filter_only() -> None:
+                for i in range(n_q):
+                    filt.query(Q[i:i + 1], distance_threshold=tau)[0]
+
+            def filtered_search() -> None:
+                for i in range(n_q):
+                    v = Q[i:i + 1]
+                    if filt.query(v, distance_threshold=tau)[0]:
+                        index.range_search(v, radius)
+
+            search_all()
+            filtered_search()
+            without_times, with_times, filter_times = [], [], []
+            for repeat in range(repeats):
+                pair = [(search_all, without_times), (filtered_search, with_times)]
+                if repeat % 2:
+                    pair.reverse()
+                for operation, samples in pair:
+                    samples.append(elapsed(operation))
+                filter_times.append(elapsed(filter_only))
+            without_s = float(np.median(without_times))
+            with_s = float(np.median(with_times))
+            filter_s = float(np.median(filter_times))
+            qps_without = n_q / without_s
+            qps_with = n_q / with_s
             rows.append({
                 "dataset": dataset, "seed": seed, "memory_fraction": mf, "k": k,
                 "n_caps": filt._num_caps, "n_reference": len(B), "memory_bytes": memory_bytes,
@@ -987,6 +1013,10 @@ def end_to_end_worker(
                 "positive_rate_pct": 100.0 * float(predicted.mean()),
                 "true_positive_rate_pct": 100.0 * float(actual.mean()),
                 "fpr": _confusion_rates(predicted.tolist(), actual)["fpr"],
+                "construct_s": construct_s, "prepare_s": prepare_s,
+                "query_without_s": without_s, "query_with_s": with_s,
+                "filter_query_s": filter_s, "timing_repeats": repeats,
+                "timing_protocol": "paired-median-v2",
                 "throughput_without_qps": qps_without, "throughput_with_qps": qps_with,
                 "throughput_improvement_pct": 100.0 * (qps_with - qps_without) / qps_without,
             })
