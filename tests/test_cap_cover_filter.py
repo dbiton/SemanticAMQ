@@ -362,7 +362,7 @@ class TestAutoScanLimit(unittest.TestCase):
         small = {q for q in CapCoverFilter.auto(384, 123_000, scan_limit_ms=1.0).levels}
         large = {q for q in CapCoverFilter.auto(384, 6_000_000, scan_limit_ms=1.0).levels}
         self.assertEqual(small, set(AUTO_CANDIDATES))
-        self.assertEqual(large, {Quantize.TQ2, Quantize.TQ4})
+        self.assertEqual(large, {Quantize.TQ1, Quantize.TQ2, Quantize.TQ4})
         for q in large:
             self.assertLessEqual(6_000_000 * SCAN_NS_PER_BYTE[q] / 1e6, 1.0)
 
@@ -373,7 +373,7 @@ class TestAutoScanLimit(unittest.TestCase):
         old = os.environ.get("CAPCOVER_SCAN_LIMIT_MS")
         os.environ["CAPCOVER_SCAN_LIMIT_MS"] = "1.0"
         try:
-            self.assertEqual(len(CapCoverFilter.auto(384, 6_000_000).levels), 2)
+            self.assertEqual(len(CapCoverFilter.auto(384, 6_000_000).levels), 3)
             self.assertEqual(len(CapCoverFilter.auto(384, 6_000_000, scan_limit_ms=1e9).levels), len(AUTO_CANDIDATES))
         finally:
             if old is None:

@@ -28,11 +28,16 @@ unless the construction evaluation is run alone (--only construction --workers 1
 evaluation truncates its CSVs (see CLAUDE.md); collecting jobs does not.
 """
 import argparse
+import json
 import os
+import platform
+import subprocess
 import sys
+import time
 
 # Must happen before numpy/faiss are imported: otherwise every worker process also grabs every CPU core.
-for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+                 "RAYON_NUM_THREADS", "NUMBA_NUM_THREADS"):
     os.environ.setdefault(_env_var, "1")
 # auto() drops the encodings that cost too much to scan at a large budget (see
 # CapCoverFilter.auto); read in the worker processes too.
@@ -90,8 +95,9 @@ END_TO_END_CSV = "end_to_end.csv"
 E2E_WORKERS = 1      # paper.tex: timing runs on one pinned core, one job at a time
 
 
-def generate_end_to_end(runner: Runner, num_vectors: Optional[int] = None, n_folds: Optional[int] = None) -> None:
-    """The throughput figure's data: per corpus and fold, a CapCoverFilter (automatic encoding) in
+def generate_end_to_end(runner: Runner, num_vectors: Optional[int] = None, n_folds: Optional[int] = None,
+                        quantize: Optional[Quantize] = None) -> None:
+    """The throughput figure's data: per corpus and fold, a CapCoverFilter (automatic encoding, or `quantize`'s) in
     front of a flat index against the index alone (runner.end_to_end_worker), on the blocklist
     workload. Only the cells the three panels read: tau swept at the fixed budget
     E2E_MEMORY_FRACTION, and the budget swept at E2E_TAU. Only submits."""
@@ -102,7 +108,7 @@ def generate_end_to_end(runner: Runner, num_vectors: Optional[int] = None, n_fol
         for seed, fold in enumerate(workload.folds):
             runner.submit(
                 'end_to_end', output_csv=results_path(END_TO_END_CSV),
-                dim=384, dataset=workload.plot_key, seed=seed, cells=cells, quantize=None,
+                dim=384, dataset=workload.plot_key, seed=seed, cells=cells, quantize=quantize,
                 vectors_reference=fold.reference, vectors_query=fold.queries,
             )
 
@@ -175,9 +181,25 @@ def _submit_and_run(evaluations, num_workers, num_vectors=None, n_folds=None) ->
     runner.run()
 
 
+def _pin_environment(n_workers: int, condition: str) -> None:
+    """Pins the next pool's workers (CAPCOVER_PIN_CPUS, from the --pin list when given, else CPUs
+    0..n-1) and labels the timings it takes (runner._timing_context)."""
+    if PIN_CPUS:
+        os.environ["CAPCOVER_PIN_CPUS"] = ",".join(str(c) for c in PIN_CPUS[:n_workers])
+        os.environ.pop("CAPCOVER_PIN_CORES", None)
+    else:
+        os.environ["CAPCOVER_PIN_CORES"] = str(n_workers)
+    os.environ["CAPCOVER_TIMING_CONDITION"] = condition
+    os.environ["CAPCOVER_TIMING_WORKERS"] = str(n_workers)
+
+
+PIN_CPUS: list = []      # --pin: one CPU per physical core, L3-balanced (util.cpu_topology.spread_cpus)
+
+
 def run_evaluations(names, num_vectors=None, n_folds=None) -> None:
     """Runs the named evaluations: the untimed ones as one shuffled batch on experiments.MAX_WORKERS,
-    then each timed group alone on its own pinned cores."""
+    then each timed group on its own pinned cores: alone (one job at a time, "isolated") or, with
+    --timing-mode concurrent, several jobs at once ("concurrent": rows say so in timing_condition)."""
     unknown = [n for n in names if n not in EVALUATIONS]
     if unknown:
         raise SystemExit(f"unknown evaluation(s) {unknown}; choose from {list(EVALUATIONS)}")
@@ -185,13 +207,64 @@ def run_evaluations(names, num_vectors=None, n_folds=None) -> None:
     check_datasets(chosen, num_vectors, n_folds)
     batch = [e for e in chosen if e.workers is None]
     if batch:
+        if PIN_CPUS:
+            _pin_environment(experiments.MAX_WORKERS, "n/a (untimed batch; construction times read slow under load)")
         _submit_and_run(batch, experiments.MAX_WORKERS, num_vectors, n_folds)
         logger.info("Main batch completed.")
     for e in (e for e in chosen if e.workers is not None):
-        os.environ["CAPCOVER_PIN_CORES"] = str(e.workers)
+        _pin_environment(e.workers, "isolated" if e.workers == 1 else "concurrent")
         _submit_and_run([e], e.workers, num_vectors, n_folds)
         logger.info(f"{e.name} completed.")
     logger.info("All submitted jobs completed.")
+
+
+def write_manifest(args, names, num_vectors, n_folds) -> None:
+    """results/run_manifest.json: the execution settings and timing protocol of this run, so
+    concurrent and isolated timings cannot be confused later. Never overwrites an earlier manifest."""
+    results = Path(experiments.RESULTS_DIR)
+    results.mkdir(parents=True, exist_ok=True)
+    timed = [e for e in (EVALUATIONS[n] for n in names) if e.workers is not None]
+    try:
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10).stdout.strip()
+        dirty = bool(subprocess.run(["git", "status", "--porcelain", "--", "src"], capture_output=True, text=True,
+                                    timeout=10).stdout.strip())
+    except Exception:
+        commit, dirty = "", None
+    timing_workers = timed[0].workers if timed else None
+    manifest = {
+        "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "argv": sys.argv, "evaluations": names, "num_vectors": num_vectors, "folds": n_folds,
+        "git_commit": commit, "src_dirty": dirty, "python": sys.version.split()[0], "host": platform.node(),
+        "logical_cpus": os.cpu_count(), "affinity_cpus": len(os.sched_getaffinity(0)),
+        "pool_workers": experiments.MAX_WORKERS, "pinned_cpus": PIN_CPUS or None,
+        "thread_env": {k: os.environ.get(k) for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                                                      "NUMEXPR_NUM_THREADS", "RAYON_NUM_THREADS", "NUMBA_NUM_THREADS",
+                                                      "CAPCOVER_RUST_THREADS", "CAPCOVER_SCAN_LIMIT_MS")},
+        "timing": {
+            "evaluations": [e.name for e in timed], "mode": args.timing_mode, "concurrent_jobs": timing_workers,
+            "condition": None if not timed else ("isolated" if timing_workers == 1 else "concurrent"),
+            "protocol": "paired-median-v2: warmup, alternating baseline/filtered order, independent filter-only pass, "
+                        "median of complete passes; construction/prepare/query reported separately",
+            "caveat": ("concurrent: collected while other timing jobs run on distinct pinned physical cores; shared L3, "
+                       "memory bandwidth and power budget are contended, so absolute times carry a systematic bias that "
+                       "five folds do not average out. Improvements are unclipped; filter cost is measured, not inferred."
+                       if timing_workers and timing_workers > 1 else "isolated: one timing job at a time on one pinned core"),
+        },
+    }
+    path = results / "run_manifest.json"
+    if path.exists():
+        path = results / f"run_manifest.{time.strftime('%Y%m%d-%H%M%S')}.json"
+    path.write_text(json.dumps(manifest, indent=2))
+    logger.info(f"execution settings and timing protocol recorded in {path}")
+
+
+def refuse_existing_results(names) -> None:
+    """Running truncates each evaluation's CSVs (CLAUDE.md). Stops if the results folder already
+    holds rows for the evaluations about to run, unless --overwrite-results was given."""
+    results = Path(experiments.RESULTS_DIR)
+    clash = sorted(str(p) for n in names for p in results.glob(EVALUATIONS[n].outputs) if p.stat().st_size > 0)
+    if clash:
+        raise SystemExit("refusing to truncate existing results (pass --overwrite-results to allow):\n  " + "\n  ".join(clash))
 
 
 def plot_all(figures=None, out=None, results=None) -> None:
@@ -231,7 +304,18 @@ def build_parser() -> argparse.ArgumentParser:
                         help="run only the evaluations whose CSVs are not all present, then draw")
     parser.add_argument("--no-build", action="store_true", help="do not build the Rust kernels first")
     parser.add_argument("--timing-workers", type=int, help=f"pinned cores for the timed evaluations (default {E2E_WORKERS})")
+    parser.add_argument("--timing-mode", choices=("isolated", "concurrent"), default="isolated",
+                        help="isolated (default): timed evaluations one job at a time on one pinned core. concurrent: "
+                             "several timed jobs at once, each on its own pinned physical core (--timing-workers, default "
+                             "the pool size); rows are labelled timing_condition=concurrent")
+    parser.add_argument("--pin", action="store_true",
+                        help="pin each pool worker to its own physical core, round-robin over the L3 domains "
+                             "(default: unpinned during the batch, CPUs 0..N-1 for the timed phase)")
+    parser.add_argument("--overwrite-results", action="store_true",
+                        help="allow truncating CSVs already in --results (default: refuse)")
     parser.add_argument("--no-plot", action="store_true", help="skip drawing after a run")
+    parser.add_argument("--e2e-quantize", choices=[q.name for q in Quantize],
+                        help="fix the end-to-end evaluation's Cap-Cover encoding (default: auto's choice per job)")
     parser.add_argument("--list", action="store_true", help="list the evaluations and exit")
     parser.add_argument("--num-vectors", type=int, help="vectors per corpus, for every evaluation")
     parser.add_argument("--folds", type=int, help="folds, for every evaluation")
@@ -251,8 +335,22 @@ def main(argv=None) -> None:
             print(f"{e.name:14s} {scale:34s} {e.outputs}" + (f"  [alone, {e.workers} pinned core(s)]" if e.workers else ""))
         return
     configure(args.datasets.split(",") if args.datasets else None, args.workers, args.results)
+    if args.pin and args.command == "run":
+        from util.cpu_topology import spread_cpus
+        PIN_CPUS[:] = spread_cpus(experiments.MAX_WORKERS)
     if args.timing_workers:
-        EVALUATIONS["end-to-end"] = replace(EVALUATIONS["end-to-end"], workers=args.timing_workers)
+        timing_workers = args.timing_workers
+    elif args.timing_mode == "concurrent":
+        n_jobs = len(experiments.BLOCKLIST_DATASETS) * (args.folds or experiments.BLOCKLIST_FOLDS)
+        timing_workers = max(1, min(experiments.MAX_WORKERS, n_jobs))
+    else:
+        timing_workers = E2E_WORKERS
+    if args.timing_mode == "isolated" and timing_workers != 1:
+        parser.error("--timing-mode isolated runs one timing job at a time; use --timing-mode concurrent for --timing-workers > 1")
+    EVALUATIONS["end-to-end"] = replace(EVALUATIONS["end-to-end"], workers=timing_workers)
+    if args.e2e_quantize:
+        EVALUATIONS["end-to-end"] = replace(EVALUATIONS["end-to-end"], generate=partial(
+            generate_end_to_end, quantize=Quantize[args.e2e_quantize]))
     if args.command == "plot":
         plot_all(args.figures, args.out, args.results)
         return
@@ -264,6 +362,9 @@ def main(argv=None) -> None:
     else:
         names = args.only.split(",") if args.only else list(EVALUATIONS)
     if names:
+        if not args.overwrite_results:
+            refuse_existing_results(names)
+        write_manifest(args, names, args.num_vectors, args.folds)
         run_evaluations(names, args.num_vectors, args.folds)
     if not args.no_plot and (args.missing or not args.only):
         plot_all(out=args.out, results=args.results)

@@ -5,7 +5,8 @@ import os
 # MAX_WORKERS processes also grabs every CPU core for its own internal
 # threads, and process x thread parallelism multiply into severe
 # oversubscription (observed: whole-system unresponsiveness).
-for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+                 "RAYON_NUM_THREADS", "NUMBA_NUM_THREADS"):
     os.environ.setdefault(_env_var, "1")
 
 import faiss
@@ -263,7 +264,7 @@ def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None, n
                         vectors_construct=vectors_construct, vectors_stream=vectors_stream,
                         calibration_idx=calibration_idx, query_idx=query_idx,
                         actual_calibration=actual_calibration, actual_query=actual_query,
-                        dataset=workload.name,
+                        dataset=workload.name, fold=fold,
                     )
                 # CapCoverFilter: one submission per encoding in cap_quantizes, labelled
                 # "CapCoverFilter (TQ2)" etc. by equal_memory_worker's Config naming; with none,
@@ -278,7 +279,7 @@ def generate_equal_memory(runner: Runner, filters: Optional[List[Any]] = None, n
                         vectors_construct=vectors_construct, vectors_stream=vectors_stream,
                         calibration_idx=calibration_idx, query_idx=query_idx,
                         actual_calibration=actual_calibration, actual_query=actual_query,
-                        dataset=workload.name, **cap_kwargs,
+                        dataset=workload.name, fold=fold, **cap_kwargs,
                     )
 
 

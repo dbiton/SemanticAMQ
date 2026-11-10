@@ -11,7 +11,8 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 # Runner's process count otherwise multiply into CPU/memory oversubscription
 # -- see paper.py's copy of this guard). Repeated here since each
 # ProcessPoolExecutor worker re-imports this module fresh.
-for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+                 "RAYON_NUM_THREADS", "NUMBA_NUM_THREADS"):
     os.environ.setdefault(_env_var, "1")
 
 import faiss
@@ -71,10 +72,13 @@ def _cap_cover(dim: int, k: int, quantize: Optional[CapQuantize] = None) -> CapC
     """CapCoverFilter.auto() at the nominal k-cover byte budget
     (_cover_max_memory); with `quantize`, that one encoding (auto() over a single
     candidate) in place of auto's choice."""
-    candidates = None if quantize is None else [quantize]
-    return CapCoverFilter.auto(dim, max_memory=_cover_max_memory(dim, k),
-                               construct_method=CAP_CONSTRUCT_METHODS[CAP_COVER_CONSTRUCT](),
-                               **({} if candidates is None else {"candidates": candidates}))
+    construct_method = CAP_CONSTRUCT_METHODS[CAP_COVER_CONSTRUCT]()
+    if quantize is None:
+        return CapCoverFilter.auto(dim, max_memory=_cover_max_memory(dim, k), construct_method=construct_method)
+    # An explicitly requested encoding is used as asked, as the quantization sweep does: auto()'s scan-limit
+    # gate (SCAN_NS_PER_BYTE) only covers auto's own candidates and would drop or substitute it.
+    return CapCoverFilter(dim, quantize=[quantize], max_memory=_cover_max_memory(dim, k), mixed=False,
+                          construct_method=construct_method)
 
 
 
@@ -490,6 +494,16 @@ def _build_calibrated_filter(
     return filter_instance, construction_time
 
 
+def equal_memory_config_label(filter_cls: Any, extra_kwargs: Optional[Dict[str, Any]] = None) -> str:
+    """The `Config` column of an equal-memory row. A filter can be submitted multiple times at one
+    budget, once per quantize variant (see experiments.generate_equal_memory) -- the variant is
+    suffixed onto Config so each becomes its own labelled line downstream rather than being pooled
+    into one line. The suffix uses "(...)" rather than plot_equal_memory.aggregate's " + " delimiter,
+    so its filter-identity split leaves the whole string intact."""
+    quantize = (extra_kwargs or {}).get("quantize")
+    return f"{filter_cls.__name__} ({quantize.value})" if quantize is not None else filter_cls.__name__
+
+
 def equal_memory_worker(
     filter_cls: Any,
     dim: int,
@@ -503,15 +517,9 @@ def equal_memory_worker(
     actual_query: List[bool],
     dataset: str = "",
     extra_kwargs: Optional[Dict[str, Any]] = None,
+    fold: Optional[int] = None,
 ) -> Dict[str, Any]:
-    # A filter can be submitted multiple times at one budget, once per
-    # quantize variant (see experiments.generate_equal_memory) -- suffix the variant
-    # onto Config so each becomes its own labelled line downstream rather
-    # than being pooled into one line. The suffix uses
-    # "(...)"  rather than plot_equal_memory.aggregate's " + " delimiter, so
-    # its filter-identity split leaves the whole string intact.
-    quantize = (extra_kwargs or {}).get("quantize")
-    config = f"{filter_cls.__name__} ({quantize.value})" if quantize is not None else filter_cls.__name__
+    config = equal_memory_config_label(filter_cls, extra_kwargs)
     construct_arr = _to_construct_array(vectors_construct)
     stream_arr = _to_construct_array(vectors_stream)
     calib_arr = stream_arr[np.asarray(calibration_idx, dtype=np.int64)]
@@ -536,6 +544,7 @@ def equal_memory_worker(
             'Latency (ms)': float('nan'), 'Throughput (qps)': float('nan'),
             'Infeasible': True,
             'Construct Size': len(construct_arr),
+            **({'Fold': fold} if fold is not None else {}),
         }
 
     predicted: List[bool] = []
@@ -583,6 +592,7 @@ def equal_memory_worker(
         # size (see experiments.generate_equal_memory's min-over-corpora budget
         # scaling), unlike the shared budget grid itself.
         'Construct Size': len(construct_arr),
+        **({'Fold': fold} if fold is not None else {}),
     }
 
 
@@ -886,21 +896,47 @@ def construct_method_worker(
 
 
 
-def _pin_to_own_core() -> None:
-    """If CAPCOVER_PIN_CORES=N, pin this worker process to core (its index in the
-    pool) mod N, so N timing workers never share a core or its SMT sibling
-    (cores 0..N-1 are distinct physical cores on Linux). Best effort."""
+def pin_cpus_from_env() -> List[int]:
+    """The CPUs workers are pinned to: CAPCOVER_PIN_CPUS (comma-separated CPU ids, one pool worker
+    each) if set, else CPUs 0..N-1 for CAPCOVER_PIN_CORES=N (cores 0..N-1 are distinct physical cores
+    on Linux), else none."""
+    listed = os.environ.get("CAPCOVER_PIN_CPUS", "").strip()
+    if listed:
+        return [int(c) for c in listed.split(",") if c.strip()]
     n = int(os.environ.get("CAPCOVER_PIN_CORES", "0") or 0)
-    if n <= 0:
+    return list(range(n)) if n > 0 else []
+
+
+def _pin_to_own_core() -> None:
+    """Pins this worker process to one CPU from pin_cpus_from_env(): the one at its index in the
+    pool, modulo the list, so no two workers share a core (or its SMT sibling, when the list names
+    one CPU per physical core). No-op when neither variable is set. Runs as the pool's initializer
+    and again at the top of end_to_end_worker (same CPU both times). Best effort."""
+    cpus = pin_cpus_from_env()
+    if not cpus:
         return
     ident = multiprocessing.current_process()._identity
-    core = (ident[0] - 1 if ident else 0) % n
+    cpu = cpus[(ident[0] - 1 if ident else 0) % len(cpus)]
     if hasattr(os, "sched_setaffinity"):
-        os.sched_setaffinity(0, {core})
+        os.sched_setaffinity(0, {cpu})
     else:                       # Windows/macOS: psutil, where it can pin at all
         import psutil
         if hasattr(psutil.Process(), "cpu_affinity"):
-            psutil.Process().cpu_affinity([core])
+            psutil.Process().cpu_affinity([cpu])
+
+
+def _timing_context() -> Dict[str, Any]:
+    """Columns that say under what load a timing was taken. paper.py sets CAPCOVER_TIMING_CONDITION
+    ('isolated': one timing job at a time; 'concurrent': several jobs share the machine, so memory
+    bandwidth, L3 and the power budget are contended) and CAPCOVER_TIMING_WORKERS."""
+    cpu = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else []
+    return {
+        "timing_condition": os.environ.get("CAPCOVER_TIMING_CONDITION", "unspecified"),
+        "timing_concurrent_jobs": int(os.environ.get("CAPCOVER_TIMING_WORKERS", "0") or 0),
+        "pinned_cpu": cpu[0] if len(cpu) == 1 else -1,
+        "worker_threads": f"omp={os.environ.get('OMP_NUM_THREADS')},rayon={os.environ.get('RAYON_NUM_THREADS')},"
+                          f"rust_query={os.environ.get('CAPCOVER_RUST_THREADS', '1')}",
+    }
 
 
 def end_to_end_worker(
@@ -1016,7 +1052,7 @@ def end_to_end_worker(
                 "construct_s": construct_s, "prepare_s": prepare_s,
                 "query_without_s": without_s, "query_with_s": with_s,
                 "filter_query_s": filter_s, "timing_repeats": repeats,
-                "timing_protocol": "paired-median-v2",
+                "timing_protocol": "paired-median-v2", **_timing_context(),
                 "throughput_without_qps": qps_without, "throughput_with_qps": qps_with,
                 "throughput_improvement_pct": 100.0 * (qps_with - qps_without) / qps_without,
             })
@@ -1392,7 +1428,7 @@ class Runner:
 
     def _run_parallel(self) -> List[Tuple[str, Any]]:
         futures: Dict[Any, Tuple[str, str, Optional[str]]] = {}
-        with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
+        with ProcessPoolExecutor(max_workers=self.num_workers, initializer=_pin_to_own_core) as executor:
             for job in self._jobs:
                 mode = job['mode']
                 output_csv = job.get('output_csv')

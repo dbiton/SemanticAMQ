@@ -22,19 +22,21 @@ def _fits(dim: int, q: Quantize) -> bool:
 
 
 # Candidate encodings CapCoverFilter.auto() chooses among: the seeded-PQ rungs
-# below 1 bit/dim plus TurboQuant above it, so small budgets can buy many
+# below 1 bit/dim plus TurboQuant from 1 bit/dim up, so small budgets can buy many
 # coarse caps and large ones fewer, finer caps.
 AUTO_CANDIDATES = (Quantize.SPQ12, Quantize.SPQ16, Quantize.SPQ24, Quantize.SPQ36, Quantize.SPQ48,
-                   Quantize.SPQ64, Quantize.TQ2, Quantize.TQ3, Quantize.TQ4)
+                   Quantize.SPQ64, Quantize.TQ1, Quantize.TQ2, Quantize.TQ3, Quantize.TQ4)
 
 # What scanning a cap costs, per stored byte, in nanoseconds: one query against
 # the Rust scan, one core of an Apple M-series laptop at d = 384 (a Threadripper
 # 3970X is 1.0-2x slower; CapCoverRustFilter/bench/ns_per_cap.py measures it).
 # A scan costs caps x ns/cap and caps = budget / bytes per cap, so at a byte
-# budget the cost is budget x this number. The TurboQuant rungs run through the
+# budget the cost is budget x this number. TQ1 is NOT measured by ns_per_cap.py yet: 0.10 (TQ2's) is an
+# upper bound -- in the cap_quantization sweep its end-to-end scan cost per byte was ~58% of TQ2's.
+# The TurboQuant rungs run through the
 # SIMD table scan; the seeded-PQ ones through codebook tables.
 SCAN_NS_PER_BYTE = {
-    Quantize.TQ4: 0.09, Quantize.TQ2: 0.10, Quantize.TQ3: 0.32, Quantize.SPQ64: 0.39, Quantize.SPQ48: 0.53,
+    Quantize.TQ4: 0.09, Quantize.TQ2: 0.10, Quantize.TQ1: 0.10, Quantize.TQ3: 0.32, Quantize.SPQ64: 0.39, Quantize.SPQ48: 0.53,
     Quantize.SPQ16: 0.58, Quantize.SPQ36: 0.63, Quantize.SPQ24: 0.94, Quantize.SPQ12: 1.89,
 }
 
