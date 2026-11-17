@@ -9,6 +9,11 @@
 </p>
 
 <p align="center">
+  <a href="https://arxiv.org/abs/2611.20132">Read the paper</a> &nbsp;·&nbsp;
+  <a href="#citation">Citation</a>
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/Python-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/Rust-B7410E?style=flat-square&logo=rust&logoColor=white" alt="Rust">
   <img src="https://img.shields.io/badge/FAISS-0467DF?style=flat-square&logo=meta&logoColor=white" alt="FAISS">
@@ -146,3 +151,22 @@ with a `plot-manifest.json` recording each figure's input files, row counts and 
 
 `.gitattributes` marks scratch directories (`suggestions/`, `bench_construct/`, `tasks/`) `export-ignore`,
 so `git archive HEAD` produces the publication tree without them.
+
+## Citation
+
+If you use this work, please cite our paper,
+[CapCover Filter: Semantic Approximate Membership Queries over Embeddings](https://arxiv.org/abs/2611.20132).
+Copy the following BibTeX entry into your `.bib` file:
+
+```bibtex
+@misc{biton2026capcover,
+  title         = {{CapCover Filter}: Semantic Approximate Membership Queries over Embeddings},
+  author        = {Biton, Dvir David and Hahiashvili, Shay and Keren, Nadav and Einziger, Gil and Friedman, Roy},
+  year          = {2026},
+  eprint        = {2611.20132},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.DB},
+  doi           = {10.48550/arXiv.2611.20132},
+  url           = {https://arxiv.org/abs/2611.20132}
+}
+```
